@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv
+/uv.lock.tmp
+
+# Reclaim runtime data — never commit real scan indexes or quarantine manifests
+data/*.db
+data/*.sqlite
+data/quarantine/
+data/scan-index/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

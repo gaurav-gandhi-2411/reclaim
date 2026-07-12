@@ -1,0 +1,69 @@
+[project]
+name = "reclaim"
+version = "0.1.0"
+description = "Rules-first Windows disk-cleanup tool with hard safety gates and fully recoverable actions."
+authors = [
+    { name = "Gaurav Gandhi", email = "gaurav.gandhi2411@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "structlog>=24.4",
+    "send2trash>=1.8",
+    "blake3>=1.0",
+    "jinja2>=3.1",
+]
+
+[project.scripts]
+reclaim = "reclaim.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",
+    "httpx>=0.27",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "T20", "DTZ", "PTH", "TRY", "RUF"]
+ignore = [
+    "TRY003", # long messages inside typed exception classes are fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108"]           # assert allowed in tests; predictable temp paths in fixtures
+"evals/**" = ["S101", "S108"]
+"scripts/**" = ["T201"]                 # print() is fine in operational scripts
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["reclaim"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/reclaim"]
+omit = ["src/reclaim/cli.py"]
+
+[tool.coverage.report]
+fail_under = 80
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
