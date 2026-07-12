@@ -1,0 +1,36 @@
+# Reclaim runtime config. Copy to `config.toml` (gitignored) and edit.
+# Anything left out here falls back to the built-in defaults in src/reclaim/config.py.
+
+[safety]
+# User deny-list — highest precedence after built-in deny. Glob (fnmatch-style, matched
+# against the forward-slash path) by default; prefix a pattern with "re:" for regex.
+# Example: deny = ["*/Old Backups/*", "re:.*\\.bak$"]
+deny = []
+
+# User allow-list — can promote a built-in review-only file (e.g. a finance-pattern match)
+# to eligible. Can never override a built-in deny (protected roots, git repos, protected
+# extensions, databases/VMs, Docker/WSL roots, cloud placeholders).
+allow = []
+
+# Uncomment to override the built-in protected-root patterns (defaults cover C:\Windows,
+# Program Files, Program Files (x86), ProgramData, and AppData binary directories).
+# protected_roots = ["C:/Windows/*", "C:/Program Files/*"]
+
+# Uncomment to override the built-in Docker/WSL data-root patterns.
+# docker_wsl_roots = ["*/AppData/Local/Docker/*"]
+
+# Uncomment to override the built-in protected credential/secret extensions.
+# protected_extensions = [".kdbx", ".ppk", ".pem", ".key", ".pfx", ".crt", ".gpg"]
+
+# Uncomment to override the built-in database/VM-image extensions.
+# database_extensions = [".db", ".sqlite", ".mdf"]
+# vm_extensions = [".vhdx", ".vmdk", ".qcow2"]
+
+# Uncomment to override the built-in finance/tax/legal filename tokens (case-insensitive).
+# finance_tokens = ["tax", "1099", "w2", "w-2", "invoice", "receipt", "statement",
+#                    "contract", "agreement", "legal", "irs"]
+
+[categories]
+# Conservative default: node_modules inside a clean git repo is only exempted from the
+# blanket in-repo block when this is explicitly turned on.
+dev_artifacts = false

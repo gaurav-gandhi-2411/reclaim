@@ -18,6 +18,9 @@ data/*.sqlite
 data/quarantine/
 data/scan-index/
 
+# User's real config (may contain personal deny/allow paths) — config.example.toml is committed
+config.toml
+
 # IDE / OS
 .vscode/
 .idea/
