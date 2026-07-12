@@ -42,9 +42,20 @@ CREATE TABLE IF NOT EXISTS files (
     is_reparse_point INTEGER NOT NULL,
     git_repo_root TEXT,
     git_repo_clean INTEGER NOT NULL,
-    last_scanned REAL NOT NULL
+    last_scanned REAL NOT NULL,
+    hash_size INTEGER,
+    hash_mtime REAL,
+    partial_hash TEXT,
+    full_hash TEXT
 );
 """
+# hash_size/hash_mtime record the (size, mtime) a row's hash columns were computed against —
+# the Stage 4 dedup pipeline's cache-validity check (`cached_partial_hash`/`cached_full_hash`)
+# compares them to the row's *current* size/mtime, same invalidation logic as `is_unchanged`.
+# Deliberately not part of `_COLUMNS`/`upsert_records`: a scanner upsert (new size/mtime after a
+# real content change) must never silently carry a stale hash forward, and keeping these four
+# columns out of the generic upsert path means they only ever change via the dedicated
+# `store_partial_hashes`/`store_full_hashes` writes below.
 # `path TEXT PRIMARY KEY` already builds an implicit unique index on path, which is what the
 # brief's "at least an index on path" asks for — a second explicit index on the same column
 # would be a dead duplicate, so it's deliberately omitted here.
@@ -70,6 +81,41 @@ def is_unchanged(stored: StoredStat | None, *, current_size: int, current_mtime:
     if stored is None:
         return False
     return stored.size == current_size and stored.mtime == current_mtime
+
+
+@dataclass(frozen=True, slots=True)
+class HashCacheEntry:
+    """Cached hash values for one path, plus the (size, mtime) they were computed against.
+    Valid only as long as those match the path's *current* size/mtime — see
+    `cached_partial_hash`/`cached_full_hash`."""
+
+    hash_size: int
+    hash_mtime: float
+    partial_hash: str | None
+    full_hash: str | None
+
+
+def cached_partial_hash(
+    entry: HashCacheEntry | None, *, current_size: int, current_mtime: float
+) -> str | None:
+    """Returns the cached partial hash if `entry` is still valid for (current_size,
+    current_mtime); otherwise None, meaning the caller must recompute."""
+    if entry is None or entry.partial_hash is None:
+        return None
+    if entry.hash_size != current_size or entry.hash_mtime != current_mtime:
+        return None
+    return entry.partial_hash
+
+
+def cached_full_hash(
+    entry: HashCacheEntry | None, *, current_size: int, current_mtime: float
+) -> str | None:
+    """Same validity check as `cached_partial_hash`, for the full-file hash."""
+    if entry is None or entry.full_hash is None:
+        return None
+    if entry.hash_size != current_size or entry.hash_mtime != current_mtime:
+        return None
+    return entry.full_hash
 
 
 def _escape_like_prefix(value: str) -> str:
@@ -197,6 +243,55 @@ class ScanIndex:
                 (prefix, f"{prefix}/%"),
             )
         return {row["path"]: StoredStat(size=row["size"], mtime=row["mtime"]) for row in cursor}
+
+    def load_hash_cache(self, root: Path | None = None) -> dict[str, HashCacheEntry]:
+        """Loads path -> cached hash entry for every row with a computed hash (optionally
+        scoped under `root`), mirroring `load_stat_cache`'s one-query-not-per-file shape."""
+        base = "SELECT path, hash_size, hash_mtime, partial_hash, full_hash FROM files"
+        if root is None:
+            cursor = self._conn.execute(f"{base} WHERE hash_size IS NOT NULL")
+        else:
+            prefix = _escape_like_prefix(root.as_posix().rstrip("/"))
+            cursor = self._conn.execute(
+                f"{base} WHERE hash_size IS NOT NULL AND (path = ? OR path LIKE ? ESCAPE '\\')",
+                (prefix, f"{prefix}/%"),
+            )
+        return {
+            row["path"]: HashCacheEntry(
+                hash_size=row["hash_size"],
+                hash_mtime=row["hash_mtime"],
+                partial_hash=row["partial_hash"],
+                full_hash=row["full_hash"],
+            )
+            for row in cursor
+        }
+
+    def store_partial_hashes(self, entries: Iterable[tuple[Path, int, float, str]]) -> int:
+        """Batch-writes `(path, size, mtime, partial_hash)` tuples for rows that already exist
+        (the dedup pipeline only ever hashes files already present in the index). Leaves
+        `full_hash` untouched so a partial-hash pass never clobbers a previously cached
+        full-hash value for the same row."""
+        rows = [(size, mtime, digest, path.as_posix()) for path, size, mtime, digest in entries]
+        if not rows:
+            return 0
+        self._conn.executemany(
+            "UPDATE files SET hash_size = ?, hash_mtime = ?, partial_hash = ? WHERE path = ?",
+            rows,
+        )
+        self._conn.commit()
+        return len(rows)
+
+    def store_full_hashes(self, entries: Iterable[tuple[Path, int, float, str]]) -> int:
+        """Batch-writes `(path, size, mtime, full_hash)` tuples; see `store_partial_hashes`."""
+        rows = [(size, mtime, digest, path.as_posix()) for path, size, mtime, digest in entries]
+        if not rows:
+            return 0
+        self._conn.executemany(
+            "UPDATE files SET hash_size = ?, hash_mtime = ?, full_hash = ? WHERE path = ?",
+            rows,
+        )
+        self._conn.commit()
+        return len(rows)
 
     def subtree_size_bytes(self, root: Path) -> int:
         """Sum of `size` for every non-directory row at or under `root` — the aggregate size a

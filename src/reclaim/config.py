@@ -186,6 +186,11 @@ class CategoriesConfig(BaseModel):
     old_installers: OldInstallersConfig = Field(default_factory=OldInstallersConfig)
     archive_pairs: bool = False
     large_logs: LargeLogsConfig = Field(default_factory=LargeLogsConfig)
+    # Spec lists exact duplicates under "auto-quarantine eligible" (Tier-A-capable, gated like
+    # every other category) but the Decision Policy's Tier B example also names "duplicate
+    # clusters" — resolved the same way as every other category: Tier-A-capable, default off,
+    # so by default duplicates land in Tier B exactly as that example describes.
+    duplicates: bool = False
 
 
 class Config(BaseSettings):

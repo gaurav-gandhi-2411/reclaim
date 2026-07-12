@@ -24,7 +24,7 @@ stage starts. No auto-merge; GG merges.
 | 1 | SafetyValidator + golden fixture tree + hard CI gate | done | zero protected files ever appear in Tier A; build fails on any hit |
 | 2 | Scanner (os.scandir, SQLite index, cloud-placeholder detection) | done | placeholder-exclusion unit test passes; perf budget ≥100K files/min on SSD (real number pending GG's SSD, see checkpoint) |
 | 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | done | detector fixtures pass, manifest-adjacency check enforced |
-| 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | not started | precision = 1.0 on fixtures |
+| 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | done | precision = 1.0 on fixtures |
 | 5 | Executor + quarantine manifest + batch undo | not started | every quarantined fixture file restorable in tests |
 | 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | not started | dashboard renders against fixture data; no prior-project branding reused |
 
@@ -178,6 +178,57 @@ stage starts. No auto-merge; GG merges.
   Downloads/Temp, oldest path, shortest depth) the user can override per cluster — this also
   needs to run through `SafetyValidator` before any cluster member is proposed.
 
+### 2026-07-13 — Stage 4 complete: Exact-duplicate pipeline
+- `src/reclaim/dedup.py`: staged hashing exactly per spec — size bucket (skip singletons and
+  0-byte files) → 64KB first+last partial BLAKE3 hash (whole-file hash if ≤128KB, no
+  double-read) → full BLAKE3 hash only for surviving `(size, partial_hash)` groups with ≥2
+  members. Only files that could plausibly be duplicates are ever fully hashed.
+  `select_keep()`/`find_duplicate_clusters()`/`generate_duplicate_candidates()` mirror
+  `detectors.py::generate_candidates()`'s contract so Stage 5/6 combine both candidate lists
+  uniformly.
+- Keep-heuristic (exact priority, ties broken lexicographically for reproducibility): not
+  under Downloads/Temp > earliest `ctime` (Windows creation time — the "which copy existed
+  first" signal, chosen deliberately over `mtime`) > shortest path depth.
+- **Tier A/B resolution** (spec has two passages in tension — flagging the resolution, not
+  hiding it): "Exact duplicates" is listed under "Rule Categories (auto-quarantine eligible)"
+  but Decision Policy's Tier B description names "duplicate clusters" as a review-queue
+  example. Resolved consistently with every other category's contract: `duplicates` is
+  Tier-A-capable via `config.categories.duplicates` (default `False`, same conservative
+  posture as everything else), so by default it lands in Tier B exactly as Decision Policy's
+  example describes; enabling the flag makes it behave like every other auto-quarantine
+  category. One mental model across all categories, no duplicates-only special case.
+  SafetyValidator gate: `BLOCKED` non-keep member excluded entirely; `REVIEW_ONLY` forced
+  Tier B; `ELIGIBLE` Tier A only if enabled. The "keep" member is never evaluated or output.
+- Hash cache added to `index.py` (`partial_hash`/`full_hash` + `hash_size`/`hash_mtime`
+  columns, invalidated whenever a row's current size/mtime differs from what the hash was
+  computed against) so repeated dedup runs don't re-hash unchanged files — matches spec's
+  Scanner-section intent for a "hash cache" keyed by (path, size, mtime).
+- **Precision = 1.0 proof** (`evals/test_dedup.py`): for every produced cluster, independently
+  re-reads full byte content of every member from disk and asserts pairwise byte-equality —
+  trusts nothing the hash pipeline computed. Adversarial fixture: two 200KB files sharing
+  identical first/last 64KB but different middle bytes — partial hashes collide, full hashes
+  differ, and the test asserts they never cluster (proves the full-hash disambiguation step is
+  doing real work, not just the partial-hash step).
+- Verification (independent Haiku verifier, re-ran everything + a hard `git diff` check):
+  `uv run ruff check .` — pass · `uv run ruff format --check .` — pass (22 files) ·
+  `uv run mypy` — pass (10 source files) · `uv run pytest tests/ -v` — 98 passed ·
+  `uv run pytest evals/ -v` — 6 passed (Stages 1-3 evals still green) ·
+  `uv run pytest --cov` — 83% (80% floor holds) ·
+  `git diff 5dafbc0 -- src/reclaim/safety.py src/reclaim/scanner.py src/reclaim/detectors.py`
+  — empty, confirming those three files are genuinely untouched. Verifier independently
+  quoted the staged-hashing filter logic, the keep-heuristic sort key, the SafetyValidator
+  branch logic, and the hash-cache invalidation check line-by-line.
+- Gotcha (moved to Gotchas section below): pytest's `tmp_path` lives under the OS temp dir,
+  which silently broke the Downloads-vs-Temp keep-heuristic test fixture (both paths counted
+  as "under Temp"). Dedup's eval fixtures root under `data/_test_scratch/<uuid>/` instead
+  (gitignored, torn down after the test) specifically to keep that test meaningful.
+- Next: Stage 5 — Executor + quarantine manifest + batch undo. `send2trash` only, dry-run
+  default, `--apply` explicit. Combine `detectors.py::generate_candidates()` and
+  `dedup.py::generate_duplicate_candidates()` into one candidate list, apply Tier A candidates
+  (or user-selected Tier B ones) via quarantine (send2trash + manifest JSONL: original path,
+  size, category, rationale, batch id), batch undo, and a post-apply report using real
+  filesystem results (files, bytes freed, category breakdown) — never estimates.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
@@ -187,3 +238,6 @@ stage starts. No auto-merge; GG merges.
 - `os.scandir`'s `DirEntry.stat()` does not populate `st_dev`/`st_ino` on Windows — only a
   direct `Path.stat()`/`os.stat()` call does (via `GetFileInformationByHandle`). Anything
   needing hardlink identity must stat the real path, not trust the scandir-cached stat.
+- pytest's `tmp_path` fixture resolves under the OS `%TEMP%` directory — any future eval/test
+  that needs to distinguish "under Temp" from "not under Temp" paths must root its own fixture
+  tree elsewhere (e.g. `data/_test_scratch/`), or every fixture path will spuriously match.

@@ -18,6 +18,11 @@ data/*.sqlite
 data/quarantine/
 data/scan-index/
 
+# evals/test_dedup.py scratch trees — created outside a system Temp dir on purpose (pytest's
+# own tmp_path lives under %TEMP%, which would confound the keep-heuristic's Downloads/Temp
+# fixture cases), cleaned up by the test fixture but ignored as a backstop.
+data/_test_scratch/
+
 # User's real config (may contain personal deny/allow paths) — config.example.toml is committed
 config.toml
 

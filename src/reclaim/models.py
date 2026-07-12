@@ -98,6 +98,27 @@ class RawCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class DuplicateCluster:
+    """A group of byte-identical files (same size + full BLAKE3 hash) found by the Stage 4
+    exact-duplicate pipeline. `keep` is the member chosen by the keep-heuristic and is never
+    itself proposed as a candidate; every other member in `duplicates` becomes one.
+
+    Kept as its own value object (not folded into `Candidate`) so a later stage can attach a
+    per-cluster keep override without re-running clustering: `members` preserves the full
+    original group, so an override just needs to pick a different element from it.
+    """
+
+    full_hash: str
+    size_bytes: int
+    keep: FileRecord
+    duplicates: tuple[FileRecord, ...]
+
+    @property
+    def members(self) -> tuple[FileRecord, ...]:
+        return (self.keep, *self.duplicates)
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     """A `RawCandidate` that has passed through `SafetyValidator.evaluate()` and been assigned
     a final tier — the only shape Stage 4+ (dedup pipeline, executor, UI) should ever consume.
