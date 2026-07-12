@@ -1,0 +1,170 @@
+/*
+ * Reclaim design tokens — single source of truth for color, spacing, radii, and type scale.
+ * Every component references these custom properties; nothing outside this file hardcodes a
+ * hex/px value that has a token here (house rule 15b).
+ *
+ * Visual identity: "excavation / clearing space." Reclaim frees disk space the way digging
+ * clears earth, so the palette runs warm clay/terracotta (occupied, un-cleared ground) against
+ * a reclaimed pine/moss green (space given back) on a warm sand/soil neutral scale — not the
+ * default blue-SaaS-dashboard palette. The 9-hue categorical set below (one fixed hue per
+ * detector category, in a *fixed* order — never cycled/reassigned) was generated and verified
+ * against the dataviz skill's palette validator (OKLCH lightness band, chroma floor, CVD
+ * separation, contrast vs. surface) for both light and dark surfaces; see PLAN.md/the Stage 6
+ * report for the exact validator invocations and output.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --rc-bg: #faf6f0;
+  --rc-surface: #ffffff;
+  --rc-surface-alt: #f2ece2;
+  --rc-border: #ded3c2;
+
+  /* Text */
+  --rc-text: #2a2420;
+  --rc-text-muted: #6b5d52;
+  --rc-text-on-brand: #ffffff;
+
+  /* Brand / semantic */
+  --rc-brand: #2f6b52;
+  --rc-brand-hover: #24543f;
+  --rc-danger: #b3261e;
+  --rc-danger-hover: #8f1e18;
+  --rc-warning: #a6720b;
+  --rc-focus-ring: #1f6f9e;
+
+  /* Fixed categorical palette — order matches `category_group` ids in
+     src/reclaim/api/schemas.py::category_label and must never be reordered/reused. */
+  --rc-cat-dev-artifacts: #c1512b;
+  --rc-cat-package-caches: #a6720b;
+  --rc-cat-temp-browser-caches: #4f7a3a;
+  --rc-cat-crash-dumps: #0f9a92;
+  --rc-cat-old-installers: #8a7a1f;
+  --rc-cat-archive-pairs: #a8412f;
+  --rc-cat-large-logs: #1f6f9e;
+  --rc-cat-duplicates: #954a80;
+  --rc-cat-other: #946218;
+
+  /* Spacing scale */
+  --rc-space-1: 4px;
+  --rc-space-2: 8px;
+  --rc-space-3: 12px;
+  --rc-space-4: 16px;
+  --rc-space-5: 24px;
+  --rc-space-6: 32px;
+  --rc-space-7: 48px;
+
+  /* Radii */
+  --rc-radius-sm: 4px;
+  --rc-radius-md: 8px;
+  --rc-radius-lg: 14px;
+
+  /* Type */
+  --rc-font-sans:
+    "Segoe UI", system-ui, -apple-system, "Inter", "Helvetica Neue", Arial, sans-serif;
+  --rc-font-mono: "Cascadia Code", "Consolas", "SFMono-Regular", Menlo, monospace;
+  --rc-text-xs: 12px;
+  --rc-text-sm: 13px;
+  --rc-text-base: 15px;
+  --rc-text-lg: 18px;
+  --rc-text-xl: 22px;
+  --rc-text-2xl: 28px;
+
+  --rc-shadow-sm: 0 1px 2px rgba(42, 36, 32, 0.08);
+  --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --rc-bg: #1c1815;
+    --rc-surface: #241f1a;
+    --rc-surface-alt: #2c2620;
+    --rc-border: #3c342c;
+
+    --rc-text: #f2ece2;
+    --rc-text-muted: #b8aa9c;
+    --rc-text-on-brand: #10140f;
+
+    --rc-brand: #4fae82;
+    --rc-brand-hover: #6cc79b;
+    --rc-danger: #e0574c;
+    --rc-danger-hover: #ef7a70;
+    --rc-warning: #b87a1f;
+    --rc-focus-ring: #4c90c0;
+
+    --rc-cat-dev-artifacts: #d76b40;
+    --rc-cat-package-caches: #b87a1f;
+    --rc-cat-temp-browser-caches: #6f9a55;
+    --rc-cat-crash-dumps: #1c9f90;
+    --rc-cat-old-installers: #ab8f20;
+    --rc-cat-archive-pairs: #c25a44;
+    --rc-cat-large-logs: #4c90c0;
+    --rc-cat-duplicates: #b56a97;
+    --rc-cat-other: #b87a2f;
+
+    --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --rc-shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* Manual override — the header theme toggle sets this attribute so a user's explicit choice
+   always wins over prefers-color-scheme, and persists via localStorage (see app.js). */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --rc-bg: #faf6f0;
+  --rc-surface: #ffffff;
+  --rc-surface-alt: #f2ece2;
+  --rc-border: #ded3c2;
+  --rc-text: #2a2420;
+  --rc-text-muted: #6b5d52;
+  --rc-text-on-brand: #ffffff;
+  --rc-brand: #2f6b52;
+  --rc-brand-hover: #24543f;
+  --rc-danger: #b3261e;
+  --rc-danger-hover: #8f1e18;
+  --rc-warning: #a6720b;
+  --rc-focus-ring: #1f6f9e;
+  --rc-cat-dev-artifacts: #c1512b;
+  --rc-cat-package-caches: #a6720b;
+  --rc-cat-temp-browser-caches: #4f7a3a;
+  --rc-cat-crash-dumps: #0f9a92;
+  --rc-cat-old-installers: #8a7a1f;
+  --rc-cat-archive-pairs: #a8412f;
+  --rc-cat-large-logs: #1f6f9e;
+  --rc-cat-duplicates: #954a80;
+  --rc-cat-other: #946218;
+  --rc-shadow-sm: 0 1px 2px rgba(42, 36, 32, 0.08);
+  --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --rc-bg: #1c1815;
+  --rc-surface: #241f1a;
+  --rc-surface-alt: #2c2620;
+  --rc-border: #3c342c;
+  --rc-text: #f2ece2;
+  --rc-text-muted: #b8aa9c;
+  --rc-text-on-brand: #10140f;
+  --rc-brand: #4fae82;
+  --rc-brand-hover: #6cc79b;
+  --rc-danger: #e0574c;
+  --rc-danger-hover: #ef7a70;
+  --rc-warning: #b87a1f;
+  --rc-focus-ring: #4c90c0;
+  --rc-cat-dev-artifacts: #d76b40;
+  --rc-cat-package-caches: #b87a1f;
+  --rc-cat-temp-browser-caches: #6f9a55;
+  --rc-cat-crash-dumps: #1c9f90;
+  --rc-cat-old-installers: #ab8f20;
+  --rc-cat-archive-pairs: #c25a44;
+  --rc-cat-large-logs: #4c90c0;
+  --rc-cat-duplicates: #b56a97;
+  --rc-cat-other: #b87a2f;
+  --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --rc-shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);
+}

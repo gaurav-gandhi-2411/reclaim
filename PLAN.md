@@ -26,7 +26,7 @@ stage starts. No auto-merge; GG merges.
 | 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | done | detector fixtures pass, manifest-adjacency check enforced |
 | 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | done | precision = 1.0 on fixtures |
 | 5 | Executor + quarantine manifest + batch undo | done | every quarantined fixture file restorable in tests |
-| 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | not started | dashboard renders against fixture data; no prior-project branding reused |
+| 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | done | dashboard renders against fixture data; no prior-project branding reused |
 
 ## Checkpoints
 
@@ -272,6 +272,90 @@ stage starts. No auto-merge; GG merges.
   Design logo/favicon/visual identity first, distinct from every other project in
   `ml-projects/`. Wires the whole pipeline (scan → candidates → dedup → apply/undo) behind a
   localhost-only web UI.
+
+### 2026-07-13 — Stage 6 complete: FastAPI dashboard + visual identity (Phase 1 done)
+- `src/reclaim/api/`: FastAPI backend (`state.py`/`schemas.py`/`service.py`/`routes.py`/
+  `app.py`) + vanilla JS/HTML/CSS dashboard (no HTMX vendored in — plain `fetch`, avoids a new
+  front-end dependency; spec's "vanilla JS/HTMX" wording treats it as an either/or). Binds
+  `127.0.0.1` by default (verified — the CLI's `--host` default, not `0.0.0.0`). Endpoints:
+  `POST /api/scan` (background task + `GET /api/scan/status` polling), `GET /api/summary`,
+  `GET /api/treemap`, `GET /api/candidates`, `POST /api/apply`, `GET /api/quarantine`,
+  `POST /api/restore/{batch_id}`. `reclaim serve` CLI subcommand added.
+- Visual identity: "excavation/clearing space" theme — terracotta clay (occupied) vs pine
+  green (reclaimed) on a warm sand neutral scale, deliberately not generic blue-SaaS, not
+  shared with any other `ml-projects/` repo. Categorical palette validated via the `dataviz`
+  skill's script for both light and dark surfaces (all PASS except one WARN in the 8-12 CVD
+  floor band, which per the skill's own rule is legal only paired with visible text labels —
+  every swatch always ships with its category label, never color alone).
+- All 4 spec views implemented: Overview (summary stats + category cards, real measured
+  bytes/counts, heuristic items explicitly labeled "heuristic" — no fabricated confidence
+  anywhere), Storage Treemap (self-contained SVG squarified treemap, no chart library),
+  Review Queue (real rationale pulled verbatim from `detectors.py`/`dedup.py`, duplicate
+  clusters shown as a real side-by-side table with keep/removal status), Quarantine & Restore
+  (reads the real manifest, restore-batch action). Dry-run simulation diff is a "1. Preview
+  (dry-run) → 2. Confirm real apply" two-step flow inside Review Queue (reuses `POST
+  /api/apply`'s `dry_run` field rather than a separate tab duplicating the same data).
+- **Browser verification (per house rule — actually drove the running app, not just unit
+  tests)**: started `reclaim serve`, built a disposable demo fixture tree outside the repo
+  (dev artifact + exact duplicates, never GG's real disk), and exercised the full flow in a
+  real Chrome tab via chrome-devtools MCP: empty state → scan → Overview/Treemap/Review Queue
+  render real data → dry-run preview (confirmed via direct filesystem check that nothing was
+  touched) → real apply with a confirm dialog → confirmed on disk the file was genuinely
+  moved out of its original location into the vault → Quarantine & Restore → restore →
+  confirmed on disk the file was genuinely back at its original path. Checked both light and
+  dark themes, accessibility snapshot (skip-link, landmarks, live regions, labeled controls).
+- **Bug found and fixed via this browser verification** (would not have been caught by the
+  127 passing unit/API tests, which only exercise the backend): the scan-form submit handler
+  called `pollScanStatus()` directly, but only `refreshScanStatus()` actually arms the
+  repeating `setInterval` — a single `pollScanStatus()` call checks status once and, if it
+  catches the scan mid-flight, never polls again, freezing the UI on "Scanning…" forever even
+  after the backend finishes. Fixed in `src/reclaim/api/static/app.js` (submit handler now
+  calls `refreshScanStatus()`); re-verified live in the browser that a triggered scan now
+  correctly transitions to "complete" and the button re-enables.
+- **Gitignore gap found and fixed**: `data/*.sqlite3` wasn't covered (only `.sqlite`/`.db`),
+  and `reclaim serve`'s default index path is `data/reclaim_index.sqlite3` — the default
+  runtime index would have been accidentally committable. Added the missing pattern.
+- **Important product-level finding, surfaced honestly rather than papered over**: the
+  post-apply report's `shutil.disk_usage()` delta was `0 bytes` for a real 200KB vault-quarantine
+  in manual testing. This is expected, not a bug — moving a file into `data/quarantine/`
+  keeps it on the same NTFS volume, so no space is actually freed until a human empties
+  it later (same physics applies to Recycle Bin — nothing frees space until "Empty Recycle
+  Bin"). Combined with spec's absolute "no permanent delete in v1" rule, **Phase 1 as built
+  cannot literally satisfy the top-level success criterion "reclaims ≥30GB... verified via
+  before/after disk-free measurement"** — quarantining moves files out of the way and makes
+  them stop counting toward *logical* usage in the dashboard, but real physical disk-free
+  won't move until GG manually empties the vault/Recycle Bin himself. The UI is honest about
+  this (shows the real 0-byte delta separately from the summed candidate size, never
+  conflates them) rather than fabricating a "30GB freed" claim it can't back up. Flagging this
+  for GG's review before calling Phase 1 "done" against its own success criteria — options
+  going forward: (a) accept "queued for reclaim, pending manual empty" as the real v1
+  semantics and reword the success criterion, (b) add an explicit, separately-confirmed
+  "empty the vault" action after the 30-day retention window (a real permanent-delete code
+  path, which is a deliberate scope change from "No permanent delete in v1" and needs an ADR
+  per rule 75), or (c) default new quarantines to `recycle_bin` method for the real-disk run
+  specifically, since Windows still counts Recycle-Bin-held files against free space the same
+  way — that doesn't free space either, so this doesn't actually resolve it; it's the same
+  physics. This needs a decision before the first real-disk dry-run report is presented as
+  progress toward the 30GB goal.
+- Verification (independent Haiku verifier, re-ran everything): `uv run ruff check .` — pass ·
+  `uv run ruff format --check .` — pass (33 files) · `uv run mypy` — pass (18 source files) ·
+  `uv run pytest tests/ -v` — 127 passed · `uv run pytest evals/ -v` — 7 passed (Stages 1-5
+  evals still green) · `uv run pytest --cov` — 95.90% · `git diff c74aa53` on all five
+  untouched pipeline source files — empty. Verifier independently confirmed `dry_run=True`
+  maps to `apply=False` (not inverted) by reading the mapping code and the specific tests.
+- Judgment call: Storage Treemap colors only a top-level child by category if that child
+  itself is a directly-flagged candidate — it does not recursively aggregate category
+  presence from deeper in the subtree (so e.g. a project dir containing a nested
+  `node_modules` shows "Uncategorized" at the top level even though it contains a real
+  candidate). Disclosed by the executor as a time-boxed v1 scope decision, confirmed in manual
+  browsing: honestly labeled "Uncategorized" rather than silently wrong, sizes are still
+  correct. Worth a follow-up pass to recursively roll up category coloring, not blocking.
+- **Phase 1 (Deterministic Engine) is now feature-complete per the spec's stage list.**
+  Outstanding before calling it truly done: (1) the disk-free-delta product question above,
+  (2) the real ≥100K files/min perf number on GG's actual SSD (Stage 2's smoke test only
+  proves the mechanism, not the target), (3) GG's first real-disk run in dry-run mode with a
+  report for review, per the explicit instruction to never scan/modify the real disk without
+  that review step happening first.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub

@@ -15,6 +15,7 @@ htmlcov/
 # Reclaim runtime data — never commit real scan indexes or quarantine manifests
 data/*.db
 data/*.sqlite
+data/*.sqlite3
 data/quarantine/
 data/scan-index/
 

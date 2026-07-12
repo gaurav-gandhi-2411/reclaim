@@ -23,6 +23,8 @@ from reclaim.scanner import scan_tree
 
 _DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
 _DEFAULT_CONFIG_PATH = Path("config.toml")
+_DEFAULT_HOST = "127.0.0.1"
+_DEFAULT_PORT = 8420
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -121,6 +123,45 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
     )
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run the localhost-only FastAPI dashboard (scan/review/apply/undo in a browser).",
+    )
+    serve_parser.add_argument(
+        "--host",
+        default=_DEFAULT_HOST,
+        help=f"Bind host (default: {_DEFAULT_HOST}). This tool moves/deletes files — never bind "
+        "0.0.0.0 or a non-loopback address unless you understand that risk.",
+    )
+    serve_parser.add_argument(
+        "--port", type=int, default=_DEFAULT_PORT, help=f"Bind port (default: {_DEFAULT_PORT})."
+    )
+    serve_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+    )
+    serve_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing).",
+    )
+    serve_parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine).",
+    )
+    serve_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
     return parser
 
 
@@ -213,6 +254,24 @@ def _run_apply(args: argparse.Namespace) -> int:
     return 0 if report.files_failed == 0 else 1
 
 
+def _run_serve(args: argparse.Namespace) -> int:
+    # Imports deferred to inside the function: uvicorn/the FastAPI app are only needed for
+    # `reclaim serve`, so `scan`/`apply`/`undo` (and every existing test importing this module)
+    # never pay the FastAPI/uvicorn import cost.
+    import uvicorn
+
+    from reclaim.api.app import create_app
+
+    config_path: Path = args.config
+    config = load_config(config_path if config_path.exists() else None)
+    app = create_app(
+        db_path=args.db, config=config, vault_dir=args.vault_dir, manifest_path=args.manifest
+    )
+    print(f"reclaim serve: http://{args.host}:{args.port} (Ctrl+C to stop)")  # noqa: T201
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
 def _run_undo(args: argparse.Namespace) -> int:
     try:
         report = restore_batch(args.batch_id, manifest_path=args.manifest)
@@ -240,6 +299,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_apply(args)
     if args.command == "undo":
         return _run_undo(args)
+    if args.command == "serve":
+        return _run_serve(args)
     parser.error(f"unknown command: {args.command}")
     return 1
 

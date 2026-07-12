@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reclaim — Disk Cleanup</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="stylesheet" href="/static/tokens.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <a class="rc-visually-hidden" href="#main-content">Skip to main content</a>
+
+  <header class="rc-header">
+    <a class="rc-brand-mark" href="/" aria-label="Reclaim home">
+      <img src="/static/favicon.svg" alt="" width="28" height="28" />
+      <span class="rc-wordmark">Reclaim</span>
+    </a>
+    <span class="rc-tagline">Rules-first disk cleanup — nothing deleted without review</span>
+    <div class="rc-header-spacer"></div>
+    <button id="theme-toggle" type="button" class="rc-theme-toggle">Switch to dark</button>
+  </header>
+
+  <form id="scan-form" class="rc-scan-bar" aria-label="Scan a directory">
+    <div class="rc-field">
+      <label for="scan-path">Path to scan</label>
+      <input id="scan-path" name="path" type="text" placeholder="C:\Users\you\Downloads" required />
+    </div>
+    <button type="submit" class="rc-btn rc-btn-primary">Scan</button>
+    <p id="scan-status" class="rc-scan-status" role="status" aria-live="polite"></p>
+  </form>
+
+  <nav class="rc-tabs" aria-label="Reclaim views" role="tablist">
+    <button class="rc-tab" role="tab" data-view="overview" id="tab-overview" aria-selected="true" aria-controls="view-overview">Overview</button>
+    <button class="rc-tab" role="tab" data-view="treemap" id="tab-treemap" aria-selected="false" aria-controls="view-treemap">Storage Treemap</button>
+    <button class="rc-tab" role="tab" data-view="review" id="tab-review" aria-selected="false" aria-controls="view-review">Review Queue</button>
+    <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
+  </nav>
+
+  <main id="main-content" class="rc-main">
+    <!-- Overview: summary stats + category cards -->
+    <section id="view-overview" class="rc-view" role="tabpanel" aria-labelledby="tab-overview" data-active="true">
+      <div class="rc-view-header">
+        <div>
+          <h1>Overview</h1>
+          <p>Exact measured totals from the last scan — no estimates.</p>
+        </div>
+      </div>
+      <div id="overview-state"></div>
+      <div id="overview-content" hidden>
+        <dl id="stat-row" class="rc-stat-row"></dl>
+        <h2>Categories</h2>
+        <div id="category-grid" class="rc-card-grid"></div>
+      </div>
+    </section>
+
+    <!-- Storage treemap -->
+    <section id="view-treemap" class="rc-view" role="tabpanel" aria-labelledby="tab-treemap" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>Storage Treemap</h1>
+          <p id="treemap-root-label">Largest directories directly under the scanned root.</p>
+        </div>
+      </div>
+      <div id="treemap-state"></div>
+      <div id="treemap-content" hidden>
+        <div class="rc-treemap-wrap">
+          <svg id="treemap-svg" class="rc-treemap-svg" viewBox="0 0 800 520" role="group" aria-label="Storage treemap"></svg>
+          <div id="treemap-tooltip" class="rc-tooltip" role="tooltip"></div>
+        </div>
+        <div id="treemap-legend" class="rc-treemap-legend"></div>
+      </div>
+    </section>
+
+    <!-- Review queue (Tier B + duplicate clusters) with embedded dry-run preview / apply -->
+    <section id="view-review" class="rc-view" role="tabpanel" aria-labelledby="tab-review" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>Review Queue</h1>
+          <p>Rationale is pulled verbatim from the detector/dedup pipeline — nothing rewritten here.</p>
+        </div>
+      </div>
+
+      <div class="rc-toolbar">
+        <div class="rc-field">
+          <label for="review-tier-filter">Tier</label>
+          <select id="review-tier-filter">
+            <option value="B" selected>B — review queue</option>
+            <option value="A">A — auto-quarantine eligible</option>
+            <option value="both">Both</option>
+          </select>
+        </div>
+        <div class="rc-field">
+          <label for="review-category-filter">Category</label>
+          <select id="review-category-filter">
+            <option value="">All categories</option>
+            <option value="dev_artifacts">Dev Artifacts</option>
+            <option value="package_caches">Package/Model Caches</option>
+            <option value="temp_and_browser_caches">Browser &amp; Temp Caches</option>
+            <option value="crash_dumps">Crash Dumps &amp; WER Reports</option>
+            <option value="old_installers">Old Installers (Downloads)</option>
+            <option value="archive_pairs">Extracted Archive Pairs</option>
+            <option value="large_logs">Large Stale Logs</option>
+            <option value="duplicates">Exact Duplicates</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="review-state"></div>
+      <div id="review-content" hidden>
+        <div id="candidate-list" class="rc-candidate-list"></div>
+
+        <div class="rc-apply-bar">
+          <div class="rc-field">
+            <label for="apply-method">Quarantine method</label>
+            <select id="apply-method">
+              <option value="vault" selected>Vault (restorable)</option>
+              <option value="recycle_bin">Windows Recycle Bin (not auto-restorable)</option>
+            </select>
+          </div>
+          <p>
+            Selected: <span id="apply-selected-count">0</span> item(s),
+            <span id="apply-selected-bytes">0 B</span>
+          </p>
+          <button id="apply-preview-btn" type="button" class="rc-btn rc-btn-secondary" disabled>
+            1. Preview (dry-run)
+          </button>
+          <button id="apply-real-btn" type="button" class="rc-btn rc-btn-danger" disabled>
+            2. Confirm real apply
+          </button>
+        </div>
+        <div id="apply-result"></div>
+      </div>
+    </section>
+
+    <!-- Quarantine / restore -->
+    <section id="view-quarantine" class="rc-view" role="tabpanel" aria-labelledby="tab-quarantine" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>Quarantine &amp; Restore</h1>
+          <p>Every batch here was really quarantined — restore reads the same append-only manifest.</p>
+        </div>
+      </div>
+      <div id="quarantine-state"></div>
+      <div id="quarantine-content" hidden>
+        <div id="batch-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="rc-footer">Reclaim runs entirely on 127.0.0.1 — nothing here leaves your machine.</footer>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

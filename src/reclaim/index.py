@@ -310,6 +310,27 @@ class ScanIndex:
         row = cursor.fetchone()
         return int(row["total"])
 
+    def has_any_records(self) -> bool:
+        """Cheap existence check for the UI's "no scan yet" empty state — `EXISTS(...)` short-
+        circuits on the first row instead of materializing the whole inventory just to check
+        non-emptiness (Stage 6 addition, additive only)."""
+        cursor = self._conn.execute("SELECT EXISTS(SELECT 1 FROM files) AS has_rows")
+        return bool(cursor.fetchone()["has_rows"])
+
+    def direct_children(self, parent: Path) -> list[FileRecord]:
+        """Immediate children of `parent` only (files and directories one level down) — a real
+        SQL prefix query, not a Python filter over `full_inventory`, so the Stage 6 treemap can
+        list a directory's contents without materializing an entire (potentially whole-disk)
+        subtree into memory just to discard everything below the first level. A row is a direct
+        child iff its path starts with `parent/` and contains no further `/` after that prefix.
+        """
+        prefix = _escape_like_prefix(parent.as_posix().rstrip("/"))
+        cursor = self._conn.execute(
+            "SELECT * FROM files WHERE path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\'",
+            (f"{prefix}/%", f"{prefix}/%/%"),
+        )
+        return [_row_to_record(row) for row in cursor]
+
     def full_inventory(self, under: Path | None = None) -> list[FileRecord]:
         """Everything the scanner has seen, including cloud placeholders — for the treemap
         and total-usage display, which must reflect real disk (and cloud-footprint) usage."""

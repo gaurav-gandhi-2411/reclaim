@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
+  <!--
+    Reclaim mark: a rounded square split on the diagonal — clay/terracotta (ground still
+    occupied) against pine green (space given back), separated by a thin excavation "cut" line.
+    Literal hex values here (not CSS custom properties) because a favicon is loaded as a
+    standalone document outside the app's stylesheet cascade; these mirror tokens.css's
+    --rc-cat-dev-artifacts / --rc-brand / --rc-surface values exactly (light mode) with a
+    prefers-color-scheme override for the dark-mode tab-bar case.
+  -->
+  <style>
+    .rc-clay { fill: #c1512b; }
+    .rc-green { fill: #2f6b52; }
+    .rc-gap { stroke: #faf6f0; }
+    @media (prefers-color-scheme: dark) {
+      .rc-clay { fill: #d76b40; }
+      .rc-green { fill: #4fae82; }
+      .rc-gap { stroke: #1c1815; }
+    }
+  </style>
+  <clipPath id="rc-mark-clip">
+    <rect width="32" height="32" rx="7" />
+  </clipPath>
+  <g clip-path="url(#rc-mark-clip)">
+    <polygon class="rc-clay" points="0,0 32,0 0,32" />
+    <polygon class="rc-green" points="32,0 32,32 3,32" />
+    <line class="rc-gap" x1="0" y1="1.6" x2="30.4" y2="32" stroke-width="2.6" />
+  </g>
+</svg>

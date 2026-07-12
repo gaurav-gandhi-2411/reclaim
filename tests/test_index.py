@@ -163,3 +163,34 @@ def test_physical_size_does_not_dedup_zero_sentinel_dev_ino() -> None:
         _record("C:/Data/b.txt", size_bytes=200),
     ]
     assert physical_size_bytes(records) == 300
+
+
+# --- Stage 6 additions: has_any_records / direct_children -----------------------------------
+
+
+def test_has_any_records_false_on_empty_index(index: ScanIndex) -> None:
+    assert index.has_any_records() is False
+
+
+def test_has_any_records_true_after_upsert(index: ScanIndex) -> None:
+    index.upsert_records([_record("C:/Data/a.txt")], scanned_at=1000.0)
+    assert index.has_any_records() is True
+
+
+def test_direct_children_returns_only_one_level_down(index: ScanIndex) -> None:
+    records = [
+        _record("C:/Data", is_dir=True),
+        _record("C:/Data/a.txt"),
+        _record("C:/Data/Sub", is_dir=True),
+        _record("C:/Data/Sub/nested.txt"),
+        _record("C:/Other/b.txt"),
+    ]
+    index.upsert_records(records, scanned_at=1000.0)
+
+    children = index.direct_children(Path("C:/Data"))
+    assert {r.path for r in children} == {Path("C:/Data/a.txt"), Path("C:/Data/Sub")}
+
+
+def test_direct_children_empty_for_leaf_directory(index: ScanIndex) -> None:
+    index.upsert_records([_record("C:/Data", is_dir=True)], scanned_at=1000.0)
+    assert index.direct_children(Path("C:/Data")) == []
