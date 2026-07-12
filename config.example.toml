@@ -32,5 +32,41 @@ allow = []
 
 [categories]
 # Conservative default: node_modules inside a clean git repo is only exempted from the
-# blanket in-repo block when this is explicitly turned on.
+# blanket in-repo block when this is explicitly turned on. Also gates Tier A vs Tier B for
+# every dev-artifact candidate (node_modules, .venv, target/, build/, dist/, .next, .gradle,
+# __pycache__) — disabled means these still surface in the review queue (Tier B), never
+# silently dropped.
 dev_artifacts = false
+# Archive+extracted-directory pairs (e.g. photos.zip next to an extracted photos/) — only the
+# archive is ever proposed, never the extracted directory.
+archive_pairs = false
+
+[categories.package_caches]
+# Global pip/npm/uv/HuggingFace/torch-hub/conda/.m2/.gradle download caches.
+enabled = false
+# Uncomment to override the real default Windows cache locations.
+# paths = ["C:/Users/you/AppData/Local/pip/Cache"]
+
+[categories.temp_and_browser_caches]
+# Browser cache dirs (Chrome/Edge/Firefox), the Explorer thumbnail cache, and direct children
+# of %TEMP%/C:\Windows\Temp (the temp root directories themselves are never deleted).
+enabled = false
+# cache_paths = ["C:/Users/you/AppData/Local/Google/Chrome/User Data/*/Cache"]
+# temp_roots = ["C:/Users/you/AppData/Local/Temp", "C:/Windows/Temp"]
+
+[categories.crash_dumps]
+# .dmp files anywhere, plus direct children of CrashDumps/WER report directories.
+enabled = false
+# paths = ["C:/Users/you/AppData/Local/CrashDumps"]
+
+[categories.old_installers]
+# .exe/.msi/.iso under Downloads older than max_age_days. Spec: review-queue by default —
+# auto-quarantine only if you explicitly enable this category.
+enabled = false
+max_age_days = 90
+
+[categories.large_logs]
+# Log files above min_size_bytes not modified in stale_days.
+enabled = false
+min_size_bytes = 52428800  # 50 MB
+stale_days = 30

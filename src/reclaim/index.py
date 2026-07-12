@@ -198,6 +198,23 @@ class ScanIndex:
             )
         return {row["path"]: StoredStat(size=row["size"], mtime=row["mtime"]) for row in cursor}
 
+    def subtree_size_bytes(self, root: Path) -> int:
+        """Sum of `size` for every non-directory row at or under `root` — the aggregate size a
+        directory-level candidate (e.g. a `node_modules` dir) represents.
+
+        Logical sum (matches `logical_size_bytes` semantics), not hardlink-deduped: package/
+        dependency-cache trees are vanishingly unlikely to contain internal hardlinks, so the
+        simpler prefix-sum SQL query is preferred here over a second physical-size code path.
+        """
+        prefix = _escape_like_prefix(root.as_posix().rstrip("/"))
+        cursor = self._conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS total FROM files "
+            "WHERE (path = ? OR path LIKE ? ESCAPE '\\') AND is_dir = 0",
+            (prefix, f"{prefix}/%"),
+        )
+        row = cursor.fetchone()
+        return int(row["total"])
+
     def full_inventory(self, under: Path | None = None) -> list[FileRecord]:
         """Everything the scanner has seen, including cloud placeholders — for the treemap
         and total-usage display, which must reflect real disk (and cloud-footprint) usage."""

@@ -63,3 +63,53 @@ class SafetyResult:
     verdict: Verdict
     reason_code: str
     rationale: str
+
+
+class Tier(StrEnum):
+    """Final disposition tier for a candidate that has passed `SafetyValidator`.
+
+    Spec: "No Tier for silent permanent deletion. It does not exist in v1" — the corollary
+    (Stage 3) is that nothing non-blocked is ever silently dropped either: every candidate
+    that isn't BLOCKED lands in exactly one of these two tiers.
+    """
+
+    A = "A"  # auto-quarantine eligible
+    B = "B"  # review queue
+
+
+@dataclass(frozen=True, slots=True)
+class RawCandidate:
+    """One rule detector's raw proposal, before `SafetyValidator` has evaluated it.
+
+    `category` is the fine-grained id surfaced in rationale/UI text (e.g.
+    "dev_artifact_node_modules"); `category_group` is the coarser id used to look up the
+    matching `config.categories.*` enable flag (e.g. "dev_artifacts") — kept distinct because
+    several fine-grained categories (node_modules, .venv, target/, ...) share one config
+    toggle.
+    """
+
+    path: Path
+    is_dir: bool
+    category: str
+    category_group: str
+    suggested_tier: Tier
+    rationale: str
+    rebuild_instruction: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    """A `RawCandidate` that has passed through `SafetyValidator.evaluate()` and been assigned
+    a final tier — the only shape Stage 4+ (dedup pipeline, executor, UI) should ever consume.
+    """
+
+    path: Path
+    is_dir: bool
+    category: str
+    category_group: str
+    size_bytes: int
+    tier: Tier
+    rationale: str
+    rebuild_instruction: str | None
+    safety_verdict: Verdict
+    safety_reason_code: str

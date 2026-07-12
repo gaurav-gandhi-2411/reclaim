@@ -23,7 +23,7 @@ stage starts. No auto-merge; GG merges.
 |---|-------|--------|---------|
 | 1 | SafetyValidator + golden fixture tree + hard CI gate | done | zero protected files ever appear in Tier A; build fails on any hit |
 | 2 | Scanner (os.scandir, SQLite index, cloud-placeholder detection) | done | placeholder-exclusion unit test passes; perf budget ≥100K files/min on SSD (real number pending GG's SSD, see checkpoint) |
-| 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | not started | detector fixtures pass, manifest-adjacency check enforced |
+| 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | done | detector fixtures pass, manifest-adjacency check enforced |
 | 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | not started | precision = 1.0 on fixtures |
 | 5 | Executor + quarantine manifest + batch undo | not started | every quarantined fixture file restorable in tests |
 | 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | not started | dashboard renders against fixture data; no prior-project branding reused |
@@ -131,6 +131,52 @@ stage starts. No auto-merge; GG merges.
   crash dumps, old installers, extracted-archive pairs, large logs). Every detector must call
   `SafetyValidator.filter_candidates()` on its output before anything is tagged Tier A/B — this
   is the first stage where that boundary actually gets exercised.
+
+### 2026-07-13 — Stage 3 complete: Rule detectors + SafetyValidator candidate boundary
+- `src/reclaim/detectors.py`: all 7 spec categories (dev artifacts w/ manifest-adjacency,
+  package/model caches, browser/temp/thumbnail caches, crash dumps, old installers,
+  extracted-archive pairs, large logs) plus `generate_candidates()` — the single entry point
+  that runs every detector, drops nested/overlapping proposals, and is the first place
+  `SafetyValidator.evaluate()` actually gets called on detector output before a tier is
+  assigned. `BLOCKED` → excluded entirely (not even Tier B); `REVIEW_ONLY` → forced Tier B;
+  `ELIGIBLE` → Tier A only if `config.categories.*.enabled`, else degrades to Tier B (never
+  silently dropped — matches spec's "no silent permanent deletion" corollary that nothing
+  eligible silently vanishes either).
+- `src/reclaim/models.py` extended additively: `Tier` (A/B), `RawCandidate`, `Candidate`.
+  `src/reclaim/config.py` extended: per-category configs (package caches, temp/browser
+  caches, crash dumps, old installers w/ its own required opt-in per spec, large logs,
+  archive pairs), all defaulting to disabled. `src/reclaim/index.py` extended:
+  `subtree_size_bytes()` for directory-candidate size aggregation.
+  `safety.py`/`scanner.py` confirmed zero-diff from the Stage 2 commit.
+- Manifest-adjacency is absolute: no adjacent manifest = not proposed at all, not even Tier B
+  (node_modules→package.json, venv→pyproject.toml/requirements.txt/setup.py, target/→
+  Cargo.toml/pom.xml, build|dist→JS/Python manifests, .next→package.json,
+  .gradle→build.gradle*). `.m2/repository`/global `.gradle/caches` are package caches
+  (no manifest check), not dev artifacts — coexists cleanly with a project-local `.gradle`
+  dev-artifact match since the two checks look at different things.
+- Extracted-archive pairs: only the archive is ever proposed (≥90% name-overlap via
+  `difflib.SequenceMatcher`); the extracted directory and everything inside it never appears
+  as a candidate — verified end-to-end, not just in unit isolation.
+- Old installers: age checked against `mtime` only (never atime, consistent with Stage 2);
+  defaults to Tier B unless `categories.old_installers.enabled` is explicitly set, per spec's
+  explicit call-out that this category needs its own opt-in.
+- Verification (independent Haiku verifier, re-ran everything): `uv run ruff check .` — pass ·
+  `uv run ruff format --check .` — pass (18 files) · `uv run mypy` — pass (9 source files) ·
+  `uv run pytest tests/ -v` — 83 passed · `uv run pytest evals/ -v` — 5 passed (Stage 1 safety
+  gate + Stage 2 scanner tests still green) · `uv run pytest --cov` — 91%. Verifier
+  independently quoted the exact BLOCKED/REVIEW_ONLY/ELIGIBLE branch logic, confirmed the
+  end-to-end eval case (manifest-valid dev-artifact dir inside a protected root still gets
+  excluded) is a real scanner→index→detector→SafetyValidator run, not mocked, and confirmed
+  `git diff 92cfd62 -- src/reclaim/safety.py src/reclaim/scanner.py` is empty.
+- Judgment call: all detectors suggest `Tier.A` uniformly; `generate_candidates()` is the sole
+  place that decides final A vs. B based on category-enabled state — behaviorally identical
+  to per-detector tier suggestion but avoids duplicated gating logic. Default enable state for
+  every new category is `False` (conservative, matches existing `dev_artifacts` posture).
+- Next: Stage 4 — Exact-duplicate pipeline (size bucket → 64KB partial hash → full BLAKE3),
+  precision = 1.0 required on fixtures (byte-identical check). Duplicate clusters are Tier B
+  (review queue) per spec's Decision Policy, with a keep-heuristic (prefer copy outside
+  Downloads/Temp, oldest path, shortest depth) the user can override per cluster — this also
+  needs to run through `SafetyValidator` before any cluster member is proposed.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub

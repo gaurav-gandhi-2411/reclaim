@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
@@ -60,6 +61,61 @@ DEFAULT_FINANCE_TOKENS: tuple[str, ...] = (
 )
 
 
+def _win_path(env_var: str, fallback: str) -> str:
+    """Resolves a Windows env var to a posix-form path string, falling back to a literal
+    default when the env var is unset (e.g. a CI runner or dev session missing a profile
+    var) so the Stage 3 category defaults are still deterministic in that case."""
+    value = os.environ.get(env_var)
+    return Path(value).as_posix() if value else fallback
+
+
+def _default_package_cache_paths() -> list[str]:
+    """Real default Windows locations for package/model download caches. Global caches, so —
+    unlike dev-artifact directories — these need no project-manifest-adjacency check."""
+    local_appdata = _win_path("LOCALAPPDATA", "C:/Users/Default/AppData/Local")
+    appdata = _win_path("APPDATA", "C:/Users/Default/AppData/Roaming")
+    userprofile = _win_path("USERPROFILE", "C:/Users/Default")
+    return [
+        f"{local_appdata}/pip/Cache",
+        f"{appdata}/npm-cache",
+        f"{local_appdata}/uv/cache",
+        f"{userprofile}/.cache/huggingface/hub",
+        f"{userprofile}/.cache/torch/hub",
+        # Judgment call: only the user-profile conda pkgs cache is covered by default (the
+        # alternative "<conda-install>/pkgs" location can't be derived without querying a
+        # running conda installation) — a user can add it via [categories.package_caches.paths]
+        # in config.toml if their conda install lives elsewhere.
+        f"{userprofile}/.conda/pkgs",
+        # Global caches, not project-adjacent dev artifacts (see the [categories] docstring on
+        # `.gradle`/`.m2` in the spec for why these two live here, not in dev-artifact detection).
+        f"{userprofile}/.m2/repository",
+        f"{userprofile}/.gradle/caches",
+    ]
+
+
+def _default_browser_and_thumbnail_cache_paths() -> list[str]:
+    local_appdata = _win_path("LOCALAPPDATA", "C:/Users/Default/AppData/Local")
+    return [
+        f"{local_appdata}/Google/Chrome/User Data/*/Cache",
+        f"{local_appdata}/Microsoft/Edge/User Data/*/Cache",
+        f"{local_appdata}/Mozilla/Firefox/Profiles/*/cache2",
+        f"{local_appdata}/Microsoft/Windows/Explorer/thumbcache_*.db",
+    ]
+
+
+def _default_temp_roots() -> list[str]:
+    temp = _win_path("TEMP", "C:/Users/Default/AppData/Local/Temp")
+    return [temp, "C:/Windows/Temp"]
+
+
+def _default_crash_dump_paths() -> list[str]:
+    local_appdata = _win_path("LOCALAPPDATA", "C:/Users/Default/AppData/Local")
+    return [
+        f"{local_appdata}/CrashDumps",
+        "C:/ProgramData/Microsoft/Windows/WER",
+    ]
+
+
 class SafetyConfig(BaseModel):
     model_config = SettingsConfigDict(extra="forbid")
 
@@ -77,12 +133,59 @@ class SafetyConfig(BaseModel):
     finance_tokens: list[str] = Field(default_factory=lambda: list(DEFAULT_FINANCE_TOKENS))
 
 
+class PackageCachesConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    paths: list[str] = Field(default_factory=_default_package_cache_paths)
+
+
+class TempAndBrowserCachesConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    cache_paths: list[str] = Field(default_factory=_default_browser_and_thumbnail_cache_paths)
+    temp_roots: list[str] = Field(default_factory=_default_temp_roots)
+
+
+class CrashDumpsConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    paths: list[str] = Field(default_factory=_default_crash_dump_paths)
+
+
+class OldInstallersConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    # Spec: review-queue by default, auto-quarantine only if the user explicitly opts in.
+    enabled: bool = False
+    max_age_days: int = 90
+
+
+class LargeLogsConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    min_size_bytes: int = 50 * 1024 * 1024
+    stale_days: int = 30
+
+
 class CategoriesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="forbid")
 
     # Conservative default: the node_modules-in-clean-repo exemption requires this to be
-    # explicitly turned on (spec: "category explicitly enabled").
+    # explicitly turned on (spec: "category explicitly enabled"). Stage 3 also uses this flag
+    # to decide Tier A vs Tier B for every dev-artifact candidate, not just the git exemption.
     dev_artifacts: bool = False
+    package_caches: PackageCachesConfig = Field(default_factory=PackageCachesConfig)
+    temp_and_browser_caches: TempAndBrowserCachesConfig = Field(
+        default_factory=TempAndBrowserCachesConfig
+    )
+    crash_dumps: CrashDumpsConfig = Field(default_factory=CrashDumpsConfig)
+    old_installers: OldInstallersConfig = Field(default_factory=OldInstallersConfig)
+    archive_pairs: bool = False
+    large_logs: LargeLogsConfig = Field(default_factory=LargeLogsConfig)
 
 
 class Config(BaseSettings):
