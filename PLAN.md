@@ -22,7 +22,7 @@ stage starts. No auto-merge; GG merges.
 | # | Stage | Status | CI gate |
 |---|-------|--------|---------|
 | 1 | SafetyValidator + golden fixture tree + hard CI gate | done | zero protected files ever appear in Tier A; build fails on any hit |
-| 2 | Scanner (os.scandir, SQLite index, cloud-placeholder detection) | not started | placeholder-exclusion unit test passes; perf budget ≥100K files/min on SSD |
+| 2 | Scanner (os.scandir, SQLite index, cloud-placeholder detection) | done | placeholder-exclusion unit test passes; perf budget ≥100K files/min on SSD (real number pending GG's SSD, see checkpoint) |
 | 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | not started | detector fixtures pass, manifest-adjacency check enforced |
 | 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | not started | precision = 1.0 on fixtures |
 | 5 | Executor + quarantine manifest + batch undo | not started | every quarantined fixture file restorable in tests |
@@ -77,12 +77,60 @@ stage starts. No auto-merge; GG merges.
   (not settable without a real cloud filter driver — `SafetyValidator` never touches disk
   itself, so this doesn't weaken the gate); `expected_reason_contains` checked against the
   human-readable rationale (the UI-facing string), not the reason code.
-- Next: Stage 2 — Scanner (os.scandir multi-threaded walk, SQLite index, mtime incremental
-  rescan, reparse-point safety, hardlink dedup, cloud-placeholder detection via
-  `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` with a unit test proving placeholders are excluded).
-  Scanner must populate `FileRecord.git_repo_root`/`git_repo_clean`/`attributes` for real and
-  run every record through `SafetyValidator.filter_candidates()` before anything reaches the
-  candidate pipeline.
+- **Correction to the note above**: the scanner does NOT call `SafetyValidator` itself — that
+  boundary sits between the scan index and Stage 3's candidate generation, not inside the
+  scanner. The scanner's job is a complete, honest inventory (protected files included — they
+  still take up disk space and belong in the treemap); `FileRecord.attributes`/
+  `git_repo_root`/`git_repo_clean` are populated for real so Stage 3 can run
+  `filter_candidates()` before emitting anything to Tier A/B.
+
+### 2026-07-13 — Stage 2 complete: Scanner + SQLite index
+- `src/reclaim/index.py`: `ScanIndex` (SQLite schema/CRUD), `StoredStat`, `is_unchanged`
+  (size+mtime only — NTFS atime is explicitly never consulted, per spec), `physical_size_bytes`
+  (dedups by `(dev, ino)`, first-seen wins) vs `logical_size_bytes` (sums all paths, double-
+  counts hardlinks), `prune_missing`, two distinct inventory queries — `full_inventory`
+  (includes cloud placeholders, for treemap/total-usage accounting) and `candidate_inventory`
+  (excludes them — nothing downstream should ever see a placeholder as candidate-eligible).
+- `src/reclaim/scanner.py`: `scan_tree` — `ThreadPoolExecutor`, one unit of work per top-level
+  dir. Recursion into any entry is gated strictly on the `FILE_ATTRIBUTE_REPARSE_POINT` (0x400)
+  bit from a real `stat()` call, never on `DirEntry.is_dir()` (which is unreliable for Windows
+  junctions). Git-repo root detection walks upward with per-directory memoization;
+  `git status --porcelain` runs at most once per distinct repo root per scan (cached), and
+  defaults `git_repo_clean = False` (fail-closed) if `git` is missing or the call fails.
+  Cloud-placeholder bit (`FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`, 0x400000) plus a best-effort,
+  explicitly-labeled-heuristic cloud-sync-root detector (OneDrive/Dropbox/Google Drive).
+- `src/reclaim/models.py::FileRecord` extended (additive, all new fields defaulted) with
+  `mtime`, `ctime`, `dev`, `ino`, `is_reparse_point` — Stage 1 call sites (`safety.py`,
+  `build_golden_tree.py`) untouched; Stage 1's hard gate re-verified still green.
+  `dev`/`ino` require a real `Path.stat()` call — `DirEntry.stat()`'s cached result does not
+  populate them on Windows (empirically confirmed; the original brief assumed it would).
+- `src/reclaim/cli.py`: real `reclaim scan <path> [--db] [--full] [--workers]` subcommand.
+- Verification (independent Haiku verifier, re-ran everything itself):
+  `uv run ruff check .` — pass · `uv run ruff format --check .` — pass (14 files) ·
+  `uv run mypy` — pass (8 source files) · `uv run pytest tests/ -v` — 49 passed ·
+  `uv run pytest evals/ -v` — 4 passed, **including Stage 1's safety gate still green** ·
+  `uv run pytest --cov` — 94% (80% floor holds). Verifier independently created a real
+  hardlink via `os.link()` and confirmed `physical_size_bytes`/`logical_size_bytes` numbers by
+  hand (150 vs 250 bytes on a 100B+50B pair); confirmed the reparse-point recursion gate reads
+  the attribute bit, not `is_dir()`, by quoting the actual line; confirmed cloud-placeholder
+  exclusion has two distinct, separately-tested query paths.
+- **Perf budget honesty (rule 65b — metric provenance)**: `evals/test_scanner_perf.py` is an
+  explicitly-labeled CI smoke test, not a validation of the spec's real ≥100K files/min number.
+  Measured on this dev machine (not GG's target SSD, not the real target tree size): full scan
+  ~10,500–15,000 files/sec on ~4,000 synthetic files (command:
+  `uv run pytest evals/test_scanner_perf.py -v`, 3 runs). The smoke floor asserted in CI is
+  150 files/sec (~11x below spec target) specifically so it can't flake on a loaded runner.
+  **The real ≥100K files/min number is still unmeasured and must come from a dry-run scan of
+  GG's actual disk before Phase 1 is considered complete** — flagging this explicitly rather
+  than letting the dev-machine number stand in for it.
+- Judgment call requiring a decision later: cloud-sync-root heuristic (`is_cloud_sync_root`)
+  is implemented and tested but not yet wired into any filtering decision — available for
+  Stage 3 detectors to consult if useful, not authoritative on its own (soft heuristic, not a
+  built-in deny signal like the placeholder attribute bit).
+- Next: Stage 3 — Rule detectors (dev artifacts w/ manifest-adjacency check, caches, temp,
+  crash dumps, old installers, extracted-archive pairs, large logs). Every detector must call
+  `SafetyValidator.filter_candidates()` on its output before anything is tagged Tier A/B — this
+  is the first stage where that boundary actually gets exercised.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
@@ -90,3 +138,6 @@ stage starts. No auto-merge; GG merges.
   CLI surface.
 - Default git branch from this git version is `master`; renamed to `main` before first
   commit per house rule 35 (only needed once, first commit hadn't landed yet).
+- `os.scandir`'s `DirEntry.stat()` does not populate `st_dev`/`st_ino` on Windows — only a
+  direct `Path.stat()`/`os.stat()` call does (via `GetFileInformationByHandle`). Anything
+  needing hardlink identity must stat the real path, not trust the scandir-cached stat.

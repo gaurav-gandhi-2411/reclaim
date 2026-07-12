@@ -8,6 +8,11 @@ from pathlib import Path
 # (OneDrive/Dropbox/Google Drive) on files that are placeholders only, not synced locally.
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
+# Windows FILE_ATTRIBUTE_REPARSE_POINT — junctions/symlinks. The scanner gates recursion on
+# this bit alone (never on DirEntry.is_dir()), since junctions carry FILE_ATTRIBUTE_DIRECTORY
+# alongside this bit and some Python/Windows combinations still report them as traversable.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
 
 class Verdict(StrEnum):
     """Outcome of a SafetyValidator evaluation. Only ELIGIBLE files may ever reach Tier A."""
@@ -33,10 +38,21 @@ class FileRecord:
     ext: str
     git_repo_root: Path | None
     git_repo_clean: bool
+    # Stage 2 additions (scanner-populated; default to 0 so Stage 1 call sites that predate
+    # the scanner — SafetyValidator tests, the golden-tree fixture builder — keep working
+    # unchanged, since none of them need real dev/ino/mtime/ctime values).
+    mtime: float = 0.0
+    ctime: float = 0.0
+    dev: int = 0
+    ino: int = 0
 
     @property
     def is_cloud_placeholder(self) -> bool:
         return bool(self.attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+
+    @property
+    def is_reparse_point(self) -> bool:
+        return bool(self.attributes & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 @dataclass(frozen=True, slots=True)
