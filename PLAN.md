@@ -25,7 +25,7 @@ stage starts. No auto-merge; GG merges.
 | 2 | Scanner (os.scandir, SQLite index, cloud-placeholder detection) | done | placeholder-exclusion unit test passes; perf budget ≥100K files/min on SSD (real number pending GG's SSD, see checkpoint) |
 | 3 | Rule detectors (dev artifacts, caches, temp, dumps, installers, archive pairs, logs) | done | detector fixtures pass, manifest-adjacency check enforced |
 | 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | done | precision = 1.0 on fixtures |
-| 5 | Executor + quarantine manifest + batch undo | not started | every quarantined fixture file restorable in tests |
+| 5 | Executor + quarantine manifest + batch undo | done | every quarantined fixture file restorable in tests |
 | 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | not started | dashboard renders against fixture data; no prior-project branding reused |
 
 ## Checkpoints
@@ -228,6 +228,50 @@ stage starts. No auto-merge; GG merges.
   (or user-selected Tier B ones) via quarantine (send2trash + manifest JSONL: original path,
   size, category, rationale, batch id), batch undo, and a post-apply report using real
   filesystem results (files, bytes freed, category breakdown) — never estimates.
+
+### 2026-07-13 — Stage 5 complete: Executor + quarantine + batch undo
+- `src/reclaim/executor.py`: `apply_batch()`/`restore_batch()`, `QuarantineManifestEntry`
+  (JSONL, append-only, `data/quarantine/manifest.jsonl`), `BatchApplyReport`/`RestoreReport`.
+  Dry-run (`apply=False`, the default) is a true no-op — no `shutil.move`, no
+  `send2trash.send2trash`, no manifest write; verified independently by the verifier
+  monkeypatching all three to raise-if-called and confirming dry-run still succeeds.
+- **Quarantine method decision** (judgment call, made explicitly rather than left ambiguous):
+  default method is the **vault** (move into `data/quarantine/<batch_id>/` + manifest), not
+  `send2trash`/Recycle Bin — because `send2trash` gives no programmatic handle to restore a
+  file later, so it cannot honestly satisfy the spec's "every quarantined file restorable;
+  restore verified in tests" success criterion without a new heavy dependency (pywin32 shell
+  API) that isn't in spec's Stack. `method="recycle_bin"` is still supported (spec lists it
+  explicitly) but `restore_batch()` refuses a batch containing recycle-bin entries with a
+  clear, honest error directing the user to Windows Explorer's native restore — never
+  fabricates a restore capability it doesn't have.
+- Defense-in-depth: `apply_batch` independently re-checks `candidate.safety_verdict !=
+  Verdict.BLOCKED` for every item and raises (does not silently skip) if violated — a last
+  line of defense even though every candidate should already be safety-filtered upstream.
+- No permanent delete anywhere in this stage (confirmed by verifier grep: no `os.remove`,
+  `Path.unlink`, `shutil.rmtree` used destructively). `retention_until` is recorded on
+  manifest entries as metadata only — nothing in v1 acts on it to purge anything, per spec's
+  repeated "No permanent delete in v1" / "No Tier for silent permanent deletion" invariants.
+  Partial-batch failures (one item fails) are recorded per-item and surfaced in the report,
+  never silently swallowed or allowed to abort the rest of the batch.
+  `bytes_freed` sums real measured `Candidate.size_bytes` from succeeded items only;
+  `shutil.disk_usage()` before/after is captured only when `apply=True`, never fabricated
+  during dry-run — directly serves the top-level "reclaims ≥30GB, verified via before/after
+  disk-free measurement" success criterion.
+- CLI: `reclaim apply <path> [--apply] [--tier A|B|both] [--method vault|recycle_bin]` (Tier A
+  only by default — Tier B requires explicit `--tier B`/`--tier both` since those are
+  review-queue items the user hasn't actually reviewed via CLI) and `reclaim undo <batch_id>`.
+- Verification (independent Haiku verifier, wrote its own standalone checks rather than
+  trusting the executor's tests): `uv run ruff check .` — pass · `uv run ruff format --check .`
+  — pass (26 files) · `uv run mypy` — pass (11 source files) · `uv run pytest tests/ -v` — 110
+  passed · `uv run pytest evals/ -v` — 7 passed (Stages 1-4 evals still green) ·
+  `uv run pytest --cov` — 85.08% · `git diff 0e44383` on all seven Stage 1-4 source files —
+  empty. Verifier independently constructed a real file, quarantined it via vault, and
+  confirmed byte-identical restore by reading fresh from disk (not trusting the manifest);
+  independently confirmed a BLOCKED candidate raises rather than proceeding.
+- Next: Stage 6 — FastAPI + dashboard (treemap, category cards, review queue, restore view).
+  Design logo/favicon/visual identity first, distinct from every other project in
+  `ml-projects/`. Wires the whole pipeline (scan → candidates → dedup → apply/undo) behind a
+  localhost-only web UI.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub

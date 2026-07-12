@@ -5,10 +5,24 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from reclaim.config import load_config
+from reclaim.dedup import generate_duplicate_candidates
+from reclaim.detectors import generate_candidates
+from reclaim.executor import (
+    BatchNotFoundError,
+    QuarantineMethod,
+    RecycleBinRestoreUnsupportedError,
+    SafetyInvariantError,
+    apply_batch,
+    restore_batch,
+)
 from reclaim.index import ScanIndex
+from reclaim.models import Candidate, Tier
+from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
 _DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
+_DEFAULT_CONFIG_PATH = Path("config.toml")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,6 +50,77 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Thread pool size for the per-top-level-directory walk (default: cpu-based).",
     )
+
+    apply_parser = subparsers.add_parser(
+        "apply",
+        help="Generate candidates from a scan index and quarantine the selected tier "
+        "(dry-run by default; pass --apply to actually act).",
+    )
+    apply_parser.add_argument(
+        "path", type=Path, help="Root directory to scope candidates to (must be under this path)."
+    )
+    apply_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually quarantine files. Without this flag, nothing on disk is touched — a "
+        "full simulated report is produced instead (dry-run is the default mode).",
+    )
+    apply_parser.add_argument(
+        "--tier",
+        choices=("A", "B", "both"),
+        default="A",
+        help="Which candidate tier(s) to apply. Default A only: Tier B is review-queue-only "
+        "and is never silently auto-applied without an explicit --tier B/both.",
+    )
+    apply_parser.add_argument(
+        "--method",
+        choices=("vault", "recycle_bin"),
+        default="vault",
+        help="Quarantine method. vault (default) is the only method with guaranteed, "
+        "automated restore-by-batch; recycle_bin sends to the Windows Recycle Bin and cannot "
+        "be restored by this tool.",
+    )
+    apply_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+    )
+    apply_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing).",
+    )
+    apply_parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine).",
+    )
+    apply_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+
+    undo_parser = subparsers.add_parser("undo", help="Restore a previously quarantined batch.")
+    undo_parser.add_argument("batch_id", help="Batch id printed by a prior 'reclaim apply' run.")
+    undo_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help="Accepted for CLI symmetry with 'scan'/'apply'; unused — restore_batch only reads "
+        "the quarantine manifest, never the scan index.",
+    )
+    undo_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
     return parser
 
 
@@ -58,11 +143,103 @@ def _run_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+_TIER_SELECTIONS: dict[str, frozenset[Tier]] = {
+    "A": frozenset({Tier.A}),
+    "B": frozenset({Tier.B}),
+    "both": frozenset({Tier.A, Tier.B}),
+}
+
+
+def _under_root(candidate_path: Path, root: Path) -> bool:
+    """True if `candidate_path` is `root` itself or a descendant of it. `resolve()` doesn't
+    require the path to exist, so this works for candidates the index recorded even if the
+    filesystem has changed since the last scan."""
+    resolved_root = root.resolve()
+    resolved_candidate = candidate_path.resolve()
+    return resolved_candidate == resolved_root or resolved_root in resolved_candidate.parents
+
+
+def _run_apply(args: argparse.Namespace) -> int:
+    root: Path = args.path
+    if not root.is_dir():
+        print(f"reclaim: apply path does not exist or is not a directory: {root}", file=sys.stderr)  # noqa: T201
+        return 1
+    if not args.db.exists():
+        print(f"reclaim: index not found at {args.db} — run 'reclaim scan' first", file=sys.stderr)  # noqa: T201
+        return 1
+
+    config_path: Path = args.config
+    config = load_config(config_path if config_path.exists() else None)
+
+    with ScanIndex(args.db) as index:
+        safety = SafetyValidator(config)
+        candidates: list[Candidate] = generate_candidates(index, config, safety)
+        candidates += generate_duplicate_candidates(index, config, safety)
+
+    tiers = _TIER_SELECTIONS[args.tier]
+    selected = [c for c in candidates if c.tier in tiers and _under_root(c.path, root)]
+
+    method: QuarantineMethod = args.method
+    try:
+        report = apply_batch(
+            selected,
+            apply=args.apply,
+            method=method,
+            vault_dir=args.vault_dir,
+            manifest_path=args.manifest,
+        )
+    except SafetyInvariantError as exc:
+        print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(  # noqa: T201
+        f"reclaim apply [{mode}] batch={report.batch_id} method={report.method} "
+        f"processed={report.files_processed} succeeded={report.files_succeeded} "
+        f"failed={report.files_failed} bytes_freed={report.bytes_freed}"
+    )
+    if report.disk_free_delta_bytes is not None:
+        print(  # noqa: T201
+            f"reclaim apply: disk free before={report.disk_free_before_bytes} "
+            f"after={report.disk_free_after_bytes} delta={report.disk_free_delta_bytes}"
+        )
+    for category, breakdown in sorted(report.category_breakdown.items()):
+        print(  # noqa: T201
+            f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}"
+        )
+    for item in report.items:
+        if not item.succeeded:
+            print(f"  FAILED: {item.path} — {item.error}", file=sys.stderr)  # noqa: T201
+    return 0 if report.files_failed == 0 else 1
+
+
+def _run_undo(args: argparse.Namespace) -> int:
+    try:
+        report = restore_batch(args.batch_id, manifest_path=args.manifest)
+    except (BatchNotFoundError, RecycleBinRestoreUnsupportedError) as exc:
+        print(f"reclaim undo: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    print(  # noqa: T201
+        f"reclaim undo: batch={report.batch_id} processed={report.files_processed} "
+        f"succeeded={report.files_succeeded} failed={report.files_failed} "
+        f"bytes_restored={report.bytes_restored}"
+    )
+    for item in report.items:
+        if not item.succeeded:
+            print(f"  FAILED: {item.original_path} — {item.error}", file=sys.stderr)  # noqa: T201
+    return 0 if report.files_failed == 0 else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "scan":
         return _run_scan(args)
+    if args.command == "apply":
+        return _run_apply(args)
+    if args.command == "undo":
+        return _run_undo(args)
     parser.error(f"unknown command: {args.command}")
     return 1
 

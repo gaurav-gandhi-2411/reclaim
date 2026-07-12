@@ -56,6 +56,12 @@ strict = true
 packages = ["reclaim"]
 mypy_path = "src"
 
+# send2trash ships no py.typed/stub package (unlike blake3, which does) — ignoring missing
+# imports for just this module rather than installing a types-Send2Trash dev dependency.
+[[tool.mypy.overrides]]
+module = "send2trash.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
