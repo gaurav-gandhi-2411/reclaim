@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
@@ -9,9 +10,9 @@ import pytest
 import reclaim.dedup as dedup_module
 from reclaim.config import CategoriesConfig, Config, DuplicatesConfig
 from reclaim.dedup import find_duplicate_clusters, generate_duplicate_candidates
-from reclaim.detectors import generate_candidates
+from reclaim.detectors import _drop_nested_candidates, generate_candidates
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, FileRecord
+from reclaim.models import Candidate, FileRecord, RawCandidate, Tier
 from reclaim.safety import SafetyValidator
 
 # Regression eval for the real-disk-run memory incident: `generate_candidates()` and
@@ -208,4 +209,85 @@ def test_find_duplicate_clusters_memory_bounded_by_largest_bucket_not_total_cand
         f"~{_SHARED_SIZE_ROW_COUNT // len(_COMMON_SIZES)} records each — expected bounded by "
         "one bucket's worth, not the full candidate set (a regression back to collecting every "
         "bucket before hashing any of them would show up here as multiples of this ceiling)"
+    )
+
+
+# --- The third real-disk finding: _drop_nested_candidates was O(candidates * kept_dirs * depth) -
+#
+# After the SQL-pushdown and materiality fixes, the real-disk run's candidate-generation phase
+# still stalled — this time in pure Python. `_run_all_detectors` found 42,185 raw candidates in
+# 3.42s (dominated by many sibling, non-nested `__pycache__`/dev-artifact directories from a
+# heavily-used Python dev machine — packages don't nest their bytecode caches inside each
+# other), but `_drop_nested_candidates` then ran for 3.5+ minutes without finishing, versus
+# milliseconds in every existing test fixture (all of which used at most a few dozen
+# candidates). Root cause: `any(directory in candidate.path.parents for directory in
+# kept_dirs)` re-scanned the *entire* `kept_dirs` list for every candidate — an
+# O(candidates * kept_dirs * depth) blow-up that only shows up once `kept_dirs` itself grows
+# large (which requires many non-nested directory candidates, exactly this real-disk shape).
+# Fixed by making `kept_dirs` a `set` (O(1) ancestor lookup instead of an O(kept_dirs) scan),
+# measured against the real 3.1M-row disk index: 3.5+ minutes (never finished) -> 1.55s.
+
+_LARGE_SIBLING_CANDIDATE_COUNT = 40_000
+# Generous but decisive: the old algorithm's growth was severe enough that it hadn't finished
+# in over 3.5 minutes (210+ seconds) for a comparable candidate count on the real disk.
+_DROP_NESTED_TIME_CEILING_SECONDS = 5.0
+
+
+def test_drop_nested_candidates_scales_with_candidates_not_kept_dirs_squared() -> None:
+    """Worst-case shape for the old algorithm: every candidate is its own kept directory (none
+    nested under another), so `kept_dirs` grows to the full candidate count — exactly what
+    `__pycache__` directories from thousands of independent packages look like on a real dev
+    machine. Mixed in: a genuinely nested case, proving the set-based rewrite didn't trade
+    correctness for speed.
+    """
+    raw: list[RawCandidate] = [
+        RawCandidate(
+            path=Path(f"C:/proj{i}/__pycache__"),
+            is_dir=True,
+            category="dev_artifact_pycache",
+            category_group="dev_artifacts",
+            suggested_tier=Tier.A,
+            rationale="test",
+        )
+        for i in range(_LARGE_SIBLING_CANDIDATE_COUNT)
+    ]
+    raw.append(
+        RawCandidate(
+            path=Path("C:/proj0/node_modules"),
+            is_dir=True,
+            category="dev_artifact_node_modules",
+            category_group="dev_artifacts",
+            suggested_tier=Tier.A,
+            rationale="test",
+        )
+    )
+    raw.append(
+        RawCandidate(
+            path=Path("C:/proj0/node_modules/pkg/file.js"),
+            is_dir=False,
+            category="dev_artifact_node_modules",
+            category_group="dev_artifacts",
+            suggested_tier=Tier.A,
+            rationale="test",
+        )
+    )
+
+    start = time.monotonic()
+    kept = _drop_nested_candidates(raw)
+    elapsed = time.monotonic() - start
+    print(  # noqa: T201 -- perf smoke number; run with `pytest -s` to see it
+        f"\n[drop-nested-candidates perf smoke] candidates={len(raw)} kept={len(kept)} "
+        f"elapsed={elapsed:.3f}s"
+    )
+
+    kept_paths = {c.path for c in kept}
+    assert Path("C:/proj0/node_modules") in kept_paths
+    assert Path("C:/proj0/node_modules/pkg/file.js") not in kept_paths  # correctly dropped
+    assert len(kept) == _LARGE_SIBLING_CANDIDATE_COUNT + 1  # all pycache siblings + node_modules
+
+    assert elapsed < _DROP_NESTED_TIME_CEILING_SECONDS, (
+        f"_drop_nested_candidates took {elapsed:.3f}s for {len(raw)} mostly-non-nested "
+        f"candidates — expected well under {_DROP_NESTED_TIME_CEILING_SECONDS}s with the "
+        "set-based lookup; a regression back to the list-based O(candidates * kept_dirs * "
+        "depth) scan would show up here as many seconds to minutes, not a fraction of one"
     )

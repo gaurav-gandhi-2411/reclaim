@@ -642,6 +642,38 @@ retention + restore, now with an explicit `purge` command for expired entries.
 - Next: still waiting on the real-disk re-run from the previous checkpoint (unaffected by this
   test-only change — background process confirmed untouched throughout).
 
+### 2026-07-17 — Fifth stall: `_drop_nested_candidates` was O(candidates * kept_dirs * depth)
+- Checked on the still-running real-disk apply (unrelated to the mechanical-guard work above):
+  still 0 rows hashed after 1h35m. A diagnostic script timing each stage of
+  `generate_candidates()` found `_run_all_detectors` completes in 3.42s with 42,185 raw
+  candidates (dominated by many sibling, non-nested `__pycache__`/dev-artifact directories —
+  separate Python packages don't nest their bytecode caches inside each other), but the very
+  next stage, `_drop_nested_candidates` — pure Python, no SQL at all — ran 3.5+ minutes without
+  finishing (confirmed alive via `tasklist`: climbing CPU, not hung).
+- Root cause: `any(directory in candidate.path.parents for directory in kept_dirs)` re-scanned
+  the *entire* `kept_dirs` list for every candidate — O(candidates * kept_dirs * depth). This
+  only shows up once `kept_dirs` itself grows large (many non-nested directory candidates,
+  exactly this real-disk shape); no prior test/eval fixture ever used more than a few dozen
+  candidates.
+- Fix: `kept_dirs` is now a `set[Path]` (not `list[Path]`); the check inverts to
+  `any(ancestor in kept_dirs for ancestor in candidate.path.parents)` — O(1) hash lookup per
+  ancestor instead of an O(kept_dirs) scan, making the whole pass O(candidates * depth).
+  `Path.__eq__`/`__hash__` is case-insensitive on Windows (`os.path.normcase`), so the `set`
+  preserves the exact equality semantics the old `list`-based `in` check had. New eval
+  (`evals/test_candidate_generation_perf.py`) constructs 40,000 non-nested sibling directories
+  (the old algorithm's worst case) plus a genuinely-nested pair, asserting both correctness and
+  a <5s ceiling. Measured against the real disk: 3.5+ minutes (never finished) -> 1.55s; full
+  candidate generation (detectors + drop-nested + per-candidate safety/size lookups) now totals
+  ~12.4s end to end.
+- Verifier independently constructed two of its own adversarial cases (a 20-level-deep chain
+  mixed with 5,000 siblings; a single 30-level chain) neither of which was in the delivered
+  test, confirming both correctness and speed under stress the specific test didn't cover.
+  213 tests + 2 intentional skips pass, ruff/mypy clean.
+- Next: re-run the real-disk dry run a fifth time. Five real bottlenecks found and fixed in
+  this chain now (whole-table materialization, whole-candidate-set materialization before
+  hashing, an O(n) materiality-blind hash pass, ESCAPE-defeated indexes, and this O(n²) nested-
+  candidate pass) — each only became visible at real-disk scale, never at fixture scale.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

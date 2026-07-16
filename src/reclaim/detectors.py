@@ -503,16 +503,27 @@ def _drop_nested_candidates(raw: Sequence[RawCandidate]) -> list[RawCandidate]:
     Operates on the raw candidate list every detector above already narrowed via an indexed
     query — bounded by the real number of candidates found, not by total inventory size, so
     this stays a plain in-memory pass (no SQL needed here).
+
+    `kept_dirs` is a `set`, not a list: real-disk finding (2026-07-17) — with 42,185 raw
+    candidates (dominated by many sibling, non-nested `__pycache__`/dev-artifact directories
+    from a heavily-used Python dev machine), the original `any(directory in
+    candidate.path.parents for directory in kept_dirs)` re-scanned the *entire* `kept_dirs`
+    list for every candidate (each comparison itself re-scanning `candidate.path.parents`),
+    an O(candidates * kept_dirs * depth) blow-up that made this the next real-disk stall after
+    every earlier fix in this chain landed. No test/eval fixture had ever used more than a few
+    dozen candidates, so the quadratic-ish growth was invisible until this scale. A `set` turns
+    "is this ancestor a kept directory" into an O(1) hash lookup, making the whole pass
+    O(candidates * depth) regardless of how many directories end up kept.
     """
     ordered = sorted(raw, key=lambda c: len(c.path.parts))
     kept: list[RawCandidate] = []
-    kept_dirs: list[Path] = []
+    kept_dirs: set[Path] = set()
     for candidate in ordered:
-        if any(directory in candidate.path.parents for directory in kept_dirs):
+        if any(ancestor in kept_dirs for ancestor in candidate.path.parents):
             continue
         kept.append(candidate)
         if candidate.is_dir:
-            kept_dirs.append(candidate.path)
+            kept_dirs.add(candidate.path)
     return kept
 
 
