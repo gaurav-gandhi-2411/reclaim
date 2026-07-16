@@ -573,6 +573,42 @@ retention + restore, now with an explicit `purge` command for expired entries.
   potential — `report.txt` should show the materiality-excluded stats plus whatever real
   duplicate clusters exist above the 1MB floor.
 
+### 2026-07-17 — Fourth stall: `direct_children()`'s LIKE query was a full scan all along
+- Re-run still took ~80 minutes of CPU with a single thread, zero disk I/O, flat ~78MB memory
+  — not the memory-scaling bug (already fixed), something else CPU-bound. Wrote a diagnostic
+  script that directly timed each of the 7 rule detectors + the 2 materiality queries against
+  a read-only copy of the live 3.1M-row index: `detect_archive_pairs` alone took **1309.19s
+  (21.8 min)**; everything else combined took under 7s.
+- Root cause: `detect_archive_pairs` calls `ScanIndex.direct_children(parent)` once per
+  archive-extension file (6,793 of them on this disk, many sharing parents — e.g. 455 files in
+  one `gradio/.../chunks` dir from various venvs/uv caches) to find sibling directories for the
+  fuzzy-match check. `direct_children()`'s SQL used `path LIKE ? ESCAPE '\'` — and an `ESCAPE`
+  clause unconditionally defeats SQLite's LIKE-to-index-range-scan optimization (the same
+  SQLite behavior already found and documented for `files_matching_path_pattern` — confirmed
+  again via `EXPLAIN QUERY PLAN`: bare `SCAN files`, not `SEARCH ... USING INDEX`). Every call
+  was a full 3.1M-row scan, measured at ~1.5s each.
+- Fix: new `_prefix_range(prefix)` helper returns `(prefix + "/", prefix + "0")` as
+  `(lower, upper)` bounds for `path >= lower AND path < upper` — `'0'` (0x30) is the ASCII code
+  point immediately after `'/'` (0x2F), a standard index-friendly prefix-range trick needing
+  *no escaping at all* (a plain BINARY-collation range comparison treats every character
+  literally). Rewrote `direct_children`/`subtree_size_bytes`/`_query_inventory`/
+  `load_stat_cache`/`load_hash_cache` to use it for their primary "under this path" bound.
+  `direct_children`'s residual "exclude grandchildren" check stays LIKE-based (no clean range
+  equivalent) but now only filters the already-narrowed range-scanned rows. A latent
+  pre-existing bug fixed as a side effect: these methods previously passed the *escaped*
+  prefix to both the exact-match (`path = ?`) and the LIKE pattern, meaning an exact match
+  would never have worked for a real path containing literal `%`/`_` (which this disk has:
+  `.../immutable/_app`) — now both use the plain unescaped prefix, correctly.
+  `tests/test_index.py` gained EXPLAIN QUERY PLAN tests for all 5 rewritten methods plus a
+  correctness regression test reproducing the exact real-disk `_app` scenario.
+  Measured against the real index: `detect_archive_pairs` 1309.19s -> 3.78s (346x); all 7
+  detectors + 2 materiality queries now complete in well under 15s combined. Verifier signed
+  off, specifically re-deriving the prefix-range boundary math (confirmed `/` = 0x2F, `0` =
+  0x30) rather than trusting the claim.
+- Next: re-run the real-disk dry run a fourth time. Candidate generation should now be fast
+  (~15s); the dedup hash pass (137,001 files after the materiality gate) is genuine disk-I/O-
+  bound work — the heartbeat is what to watch, not a specific expected duration.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

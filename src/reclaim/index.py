@@ -152,6 +152,29 @@ def _escape_like_prefix(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _prefix_range(prefix: str) -> tuple[str, str]:
+    """Returns `(lower, upper)` bounds for an indexed range scan matching every `path` that
+    starts with `prefix + '/'` — the fix for a real performance bug found on the actual
+    real-disk run: `LIKE 'prefix/%' ESCAPE '\\'` can *never* become an index range scan once an
+    ESCAPE clause is present (confirmed empirically — same query, same index, only the ESCAPE
+    clause differs, and the plan degrades from an index `SEARCH` to a full `SCAN`). On a
+    3.1M-row real index, `direct_children()` alone was measured at ~1.5 seconds *per call*
+    doing a full scan — and `detect_archive_pairs` calls it once per archive file (thousands on
+    a real disk), which is what turned "candidate generation is fast" into a 20+ minute stall.
+
+    `'0'` (0x30) is the next ASCII code point after `'/'` (0x2F), so `prefix + '0'` is a tight
+    exclusive upper bound: any real path starting with `prefix + '/'` compares less than it
+    (the strings first differ at the character right after `prefix`, where `/` < `0`),
+    regardless of what follows. Unlike the LIKE-based approach, this needs no escaping *for the
+    range bounds themselves* — a plain `BINARY`-collation range comparison treats every
+    character literally, including a literal `%`/`_` in a real directory name (which a real
+    disk has: e.g. `.../immutable/_app`) — `_escape_like_prefix` is still used for any
+    *residual* LIKE clause layered on top of this range (see `direct_children`), since that one
+    isn't a range comparison and still needs its wildcards escaped.
+    """
+    return f"{prefix}/", f"{prefix}0"
+
+
 def _row_to_record(row: sqlite3.Row) -> FileRecord:
     git_repo_root = row["git_repo_root"]
     return FileRecord(
@@ -301,10 +324,11 @@ class ScanIndex:
         if root is None:
             cursor = self._conn.execute("SELECT path, size, mtime FROM files")
         else:
-            prefix = _escape_like_prefix(root.as_posix().rstrip("/"))
+            prefix = root.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
             cursor = self._conn.execute(
-                "SELECT path, size, mtime FROM files WHERE path = ? OR path LIKE ? ESCAPE '\\'",
-                (prefix, f"{prefix}/%"),
+                "SELECT path, size, mtime FROM files WHERE path = ? OR (path >= ? AND path < ?)",
+                (prefix, lower, upper),
             )
         return {row["path"]: StoredStat(size=row["size"], mtime=row["mtime"]) for row in cursor}
 
@@ -315,10 +339,11 @@ class ScanIndex:
         if root is None:
             cursor = self._conn.execute(f"{base} WHERE hash_size IS NOT NULL")
         else:
-            prefix = _escape_like_prefix(root.as_posix().rstrip("/"))
+            prefix = root.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
             cursor = self._conn.execute(
-                f"{base} WHERE hash_size IS NOT NULL AND (path = ? OR path LIKE ? ESCAPE '\\')",
-                (prefix, f"{prefix}/%"),
+                f"{base} WHERE hash_size IS NOT NULL AND (path = ? OR (path >= ? AND path < ?))",
+                (prefix, lower, upper),
             )
         return {
             row["path"]: HashCacheEntry(
@@ -528,11 +553,12 @@ class ScanIndex:
         dependency-cache trees are vanishingly unlikely to contain internal hardlinks, so the
         simpler prefix-sum SQL query is preferred here over a second physical-size code path.
         """
-        prefix = _escape_like_prefix(root.as_posix().rstrip("/"))
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
             "SELECT COALESCE(SUM(size), 0) AS total FROM files "
-            "WHERE (path = ? OR path LIKE ? ESCAPE '\\') AND is_dir = 0",
-            (prefix, f"{prefix}/%"),
+            "WHERE (path = ? OR (path >= ? AND path < ?)) AND is_dir = 0",
+            (prefix, lower, upper),
         )
         row = cursor.fetchone()
         return int(row["total"])
@@ -551,10 +577,17 @@ class ScanIndex:
         subtree into memory just to discard everything below the first level. A row is a direct
         child iff its path starts with `parent/` and contains no further `/` after that prefix.
         """
-        prefix = _escape_like_prefix(parent.as_posix().rstrip("/"))
+        prefix = parent.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        # The primary bound (an indexed range scan) needs no escaping — see _prefix_range's
+        # docstring. The residual "exclude grandchildren" check is still a LIKE clause (there's
+        # no clean range-comparison equivalent for "contains another '/' after this point"), so
+        # it still needs `_escape_like_prefix` for a `prefix` containing a literal `%`/`_`
+        # (which real directory names have — e.g. `.../immutable/_app` on a real disk).
+        escaped_prefix = _escape_like_prefix(prefix)
         cursor = self._conn.execute(
-            "SELECT * FROM files WHERE path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\'",
-            (f"{prefix}/%", f"{prefix}/%/%"),
+            "SELECT * FROM files WHERE path >= ? AND path < ? AND path NOT LIKE ? ESCAPE '\\'",
+            (lower, upper, f"{escaped_prefix}/%/%"),
         )
         return [_row_to_record(row) for row in cursor]
 
@@ -583,9 +616,10 @@ class ScanIndex:
         clauses: list[str] = []
         params: list[object] = []
         if under is not None:
-            prefix = _escape_like_prefix(under.as_posix().rstrip("/"))
-            clauses.append("(path = ? OR path LIKE ? ESCAPE '\\')")
-            params.extend([prefix, f"{prefix}/%"])
+            prefix = under.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            clauses.append("(path = ? OR (path >= ? AND path < ?))")
+            params.extend([prefix, lower, upper])
         if candidates_only:
             clauses.append("is_cloud_placeholder = 0")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""

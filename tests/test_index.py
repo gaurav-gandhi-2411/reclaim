@@ -508,3 +508,76 @@ def test_duplicate_size_candidates_materiality_gated_query_plan_uses_an_index(
         lambda: list(indexed_bulk.duplicate_size_candidates(min_reclaim_bytes=1024 * 1024)),
     )
     _assert_query_uses_index(indexed_bulk, sql)
+
+
+# --- Prefix-range queries: the real-disk regression -------------------------------------------
+#
+# `direct_children`/`subtree_size_bytes`/`_query_inventory`/`load_stat_cache`/`load_hash_cache`
+# all used `path LIKE 'prefix/%' ESCAPE '\'` for "everything under this directory" — and an
+# ESCAPE clause defeats SQLite's LIKE-to-index-range-scan optimization unconditionally
+# (confirmed empirically for `files_matching_path_pattern` earlier, and it turned out to apply
+# here too). On the real disk, `direct_children` alone measured ~1.5 *seconds* per call (a full
+# 3.1M-row scan every time) — and `detect_archive_pairs` calls it once per archive file
+# (thousands on a real disk with `.tar.gz` sdist caches), which is what turned "candidate
+# generation is fast" into a second real 20+ minute stall, measured directly: 1309s for
+# `detect_archive_pairs` alone before this fix, 3.78s after. These queries were rewritten to use
+# a plain indexed range scan (`path >= lower AND path < upper`, see `_prefix_range`) for the
+# primary bound instead.
+
+
+def test_direct_children_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
+    sql = _captured_sql(indexed_bulk, lambda: indexed_bulk.direct_children(Path("C:/Data/dir1")))
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_subtree_size_bytes_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
+    sql = _captured_sql(indexed_bulk, lambda: indexed_bulk.subtree_size_bytes(Path("C:/Data/dir1")))
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_full_inventory_under_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
+    sql = _captured_sql(
+        indexed_bulk, lambda: indexed_bulk.full_inventory(under=Path("C:/Data/dir1"))
+    )
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_load_stat_cache_scoped_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
+    sql = _captured_sql(
+        indexed_bulk, lambda: indexed_bulk.load_stat_cache(root=Path("C:/Data/dir1"))
+    )
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_load_hash_cache_scoped_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
+    sql = _captured_sql(
+        indexed_bulk, lambda: indexed_bulk.load_hash_cache(root=Path("C:/Data/dir1"))
+    )
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_direct_children_handles_literal_underscore_in_parent_name(index: ScanIndex) -> None:
+    """Regression fixture matching a real path found on the real disk
+    (`.../immutable/_app`): a parent directory name containing a literal `_` must not have that
+    character misinterpreted as a LIKE single-character wildcard — the range-based primary
+    bound needs no escaping at all (unlike the old LIKE-based query), so this is correct by
+    construction, not by a special-cased escape."""
+    index.upsert_records(
+        [
+            _record("C:/Data/target/_app", is_dir=True),
+            _record("C:/Data/target/_app/child1.txt"),
+            _record("C:/Data/target/_app/child2.txt"),
+            _record("C:/Data/target/_app/nested", is_dir=True),
+            _record("C:/Data/target/_app/nested/deep.txt"),
+            # A sibling name that an unescaped '_' wildcard could spuriously match against if
+            # querying children of "_app" ever degraded back to a naive LIKE pattern.
+            _record("C:/Data/target/Xapp/should_not_match.txt"),
+        ],
+        scanned_at=1000.0,
+    )
+    children = index.direct_children(Path("C:/Data/target/_app"))
+    assert {r.path for r in children} == {
+        Path("C:/Data/target/_app/child1.txt"),
+        Path("C:/Data/target/_app/child2.txt"),
+        Path("C:/Data/target/_app/nested"),
+    }
