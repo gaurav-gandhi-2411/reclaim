@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from reclaim.config import CategoriesConfig, Config, SafetyConfig
+from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, SafetyConfig
 from reclaim.models import FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FileRecord, Verdict
 from reclaim.safety import SafetyValidator
 
@@ -39,7 +39,7 @@ def validator() -> SafetyValidator:
                 deny=["*/deny-me/*"],
                 allow=["*/allow-me/*"],
             ),
-            categories=CategoriesConfig(dev_artifacts=True),
+            categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=True)),
         )
     )
 
@@ -113,7 +113,9 @@ def test_node_modules_blocked_when_repo_dirty(validator: SafetyValidator) -> Non
 
 
 def test_node_modules_blocked_when_category_disabled() -> None:
-    disabled_validator = SafetyValidator(Config(categories=CategoriesConfig(dev_artifacts=False)))
+    disabled_validator = SafetyValidator(
+        Config(categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=False)))
+    )
     record = _record(
         "C:/Data/repo/node_modules/pkg/index.js",
         git_repo_root=Path("C:/Data/repo"),

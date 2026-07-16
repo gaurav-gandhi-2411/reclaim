@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 from fixtures.build_executor_tree import build_executor_fixture_tree
 
-from reclaim.config import CategoriesConfig, Config, LargeLogsConfig, SafetyConfig
+from reclaim.config import (
+    CategoriesConfig,
+    Config,
+    DevArtifactsConfig,
+    LargeLogsConfig,
+    SafetyConfig,
+)
 from reclaim.dedup import generate_duplicate_candidates
 from reclaim.detectors import generate_candidates
 from reclaim.executor import apply_batch, restore_batch
@@ -23,12 +29,19 @@ def _config(root: Path) -> Config:
     """Fixture-relative protected roots — same pattern as test_candidate_generation.py's
     `_config` — so real C:\\Windows is never touched during development/CI. Threshold override
     on large_logs keeps the fixture fast (real 50MB writes aren't needed to exercise the
-    detector -> SafetyValidator -> executor pipeline)."""
+    detector -> SafetyValidator -> executor pipeline).
+
+    ADR-0001 changed `dev_artifacts`'s default retention to `None` (direct permanent delete),
+    which would make this Stage 5 CI gate's whole-batch vault+restore round-trip proof
+    impossible (a `direct_delete` entry can never be restored). This eval's purpose is proving
+    the vault+restore mechanics work end-to-end, not pinning `dev_artifacts`' retention default
+    — so `retention_days=30` is set explicitly here to keep that proof intact.
+    """
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"]),
         categories=CategoriesConfig(
-            dev_artifacts=True,
+            dev_artifacts=DevArtifactsConfig(enabled=True, retention_days=30),
             large_logs=LargeLogsConfig(enabled=True, min_size_bytes=1_000, stale_days=30),
         ),
     )
@@ -81,6 +94,7 @@ def test_executor_end_to_end_real_scan_apply_restore(tmp_path: Path) -> None:
 
     apply_report = apply_batch(
         tier_a_candidates,
+        safety=safety,
         apply=True,
         method="vault",
         vault_dir=vault_dir,

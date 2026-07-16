@@ -64,7 +64,7 @@ class SafetyValidator:
 
     def __init__(self, config: Config) -> None:
         self._safety = config.safety
-        self._dev_artifacts_enabled = config.categories.dev_artifacts
+        self._dev_artifacts_enabled = config.categories.dev_artifacts.enabled
 
     def evaluate(self, record: FileRecord) -> SafetyResult:
         blocked, exemption = self._builtin_deny(record)

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fixtures.build_dedup_tree import build_dedup_fixture_tree
 
-from reclaim.config import CategoriesConfig, Config, SafetyConfig
+from reclaim.config import CategoriesConfig, Config, DuplicatesConfig, SafetyConfig
 from reclaim.dedup import find_duplicate_clusters, generate_duplicate_candidates
 from reclaim.index import ScanIndex
 from reclaim.models import Candidate, DuplicateCluster, Tier
@@ -40,7 +40,7 @@ def _config(root: Path, *, duplicates_enabled: bool) -> Config:
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"]),
-        categories=CategoriesConfig(duplicates=duplicates_enabled),
+        categories=CategoriesConfig(duplicates=DuplicatesConfig(enabled=duplicates_enabled)),
     )
 
 

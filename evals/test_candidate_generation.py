@@ -8,8 +8,10 @@ import pytest
 from fixtures.build_detector_tree import build_detector_fixture_tree
 
 from reclaim.config import (
+    ArchivePairsConfig,
     CategoriesConfig,
     Config,
+    DevArtifactsConfig,
     LargeLogsConfig,
     OldInstallersConfig,
     SafetyConfig,
@@ -60,8 +62,8 @@ def test_candidate_generation_end_to_end(tmp_path: Path) -> None:
         enabled_config = _config(
             tree.root,
             categories=CategoriesConfig(
-                dev_artifacts=True,
-                archive_pairs=True,
+                dev_artifacts=DevArtifactsConfig(enabled=True),
+                archive_pairs=ArchivePairsConfig(enabled=True),
                 old_installers=OldInstallersConfig(enabled=True, max_age_days=90),
                 large_logs=LargeLogsConfig(enabled=True),
             ),

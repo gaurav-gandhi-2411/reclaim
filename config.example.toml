@@ -30,22 +30,31 @@ allow = []
 # finance_tokens = ["tax", "1099", "w2", "w-2", "invoice", "receipt", "statement",
 #                    "contract", "agreement", "legal", "irs"]
 
-[categories]
+# ADR-0001: every [categories.*] group now carries its own `retention_days`. `retention_days
+# = <unset>` (i.e. `None`/omitted) means direct PERMANENT delete on apply — no vault, no
+# Recycle Bin, unrecoverable except by re-running the category's rebuild command. An integer
+# means the original vault + manifest + restore behavior, plus `purge`-eligibility once that
+# many days have passed.
+
 # Conservative default: node_modules inside a clean git repo is only exempted from the
 # blanket in-repo block when this is explicitly turned on. Also gates Tier A vs Tier B for
 # every dev-artifact candidate (node_modules, .venv, target/, build/, dist/, .next, .gradle,
 # __pycache__) — disabled means these still surface in the review queue (Tier B), never
 # silently dropped.
-dev_artifacts = false
-# Archive+extracted-directory pairs (e.g. photos.zip next to an extracted photos/) — only the
-# archive is ever proposed, never the extracted directory.
-archive_pairs = false
+[categories.dev_artifacts]
+enabled = false
+# Unset (None) by default: rebuildable from an adjacent manifest (package.json, etc.), so
+# apply permanently deletes rather than vaulting. Uncomment to vault + allow restore instead.
+# retention_days = 30
 
 [categories.package_caches]
 # Global pip/npm/uv/HuggingFace/torch-hub/conda/.m2/.gradle download caches.
 enabled = false
 # Uncomment to override the real default Windows cache locations.
 # paths = ["C:/Users/you/AppData/Local/pip/Cache"]
+# Unset (None) by default: the owning tool redownloads these deterministically, so apply
+# permanently deletes rather than vaulting. Uncomment to vault + allow restore instead.
+# retention_days = 30
 
 [categories.temp_and_browser_caches]
 # Browser cache dirs (Chrome/Edge/Firefox), the Explorer thumbnail cache, and direct children
@@ -53,20 +62,47 @@ enabled = false
 enabled = false
 # cache_paths = ["C:/Users/you/AppData/Local/Google/Chrome/User Data/*/Cache"]
 # temp_roots = ["C:/Users/you/AppData/Local/Temp", "C:/Windows/Temp"]
+# Unset (None) by default: regenerated automatically on next use, so apply permanently
+# deletes rather than vaulting. Uncomment to vault + allow restore instead.
+# retention_days = 30
 
 [categories.crash_dumps]
 # .dmp files anywhere, plus direct children of CrashDumps/WER report directories.
 enabled = false
 # paths = ["C:/Users/you/AppData/Local/CrashDumps"]
+# Unset (None) by default: diagnostic-only, regenerated as needed, so apply permanently
+# deletes rather than vaulting. Uncomment to vault + allow restore instead.
+# retention_days = 30
 
 [categories.old_installers]
 # .exe/.msi/.iso under Downloads older than max_age_days. Spec: review-queue by default —
 # auto-quarantine only if you explicitly enable this category.
 enabled = false
 max_age_days = 90
+# Default 30: not deterministically rebuildable (may need a re-download), so apply vaults +
+# allows restore for 30 days; `reclaim purge` then permanently deletes past that window.
+# Set to an unset/commented value for direct permanent delete instead.
+retention_days = 30
+
+[categories.archive_pairs]
+# Archive+extracted-directory pairs (e.g. photos.zip next to an extracted photos/) — only the
+# archive is ever proposed, never the extracted directory.
+enabled = false
+# Default 30: the archive isn't reconstructable from anything else, so apply vaults + allows
+# restore for 30 days; `reclaim purge` then permanently deletes past that window.
+retention_days = 30
 
 [categories.large_logs]
 # Log files above min_size_bytes not modified in stale_days.
 enabled = false
 min_size_bytes = 52428800  # 50 MB
 stale_days = 30
+# Default 30: no rebuild command for a log file, so apply vaults + allows restore for 30 days;
+# `reclaim purge` then permanently deletes past that window.
+retention_days = 30
+
+[categories.duplicates]
+enabled = false
+# Default 30: the duplicate's bytes only survive in the kept copy elsewhere, so apply vaults +
+# allows restore for 30 days; `reclaim purge` then permanently deletes past that window.
+retention_days = 30

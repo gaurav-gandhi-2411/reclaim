@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fixtures.build_golden_tree import FixtureCase, build_golden_tree
 
-from reclaim.config import CategoriesConfig, Config, SafetyConfig
+from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, SafetyConfig
 from reclaim.models import Verdict
 from reclaim.safety import SafetyValidator
 
@@ -64,7 +64,7 @@ def golden_tree_config(tmp_path: Path) -> Config:
             deny=["*/Random/blocked_by_policy.tmp"],
             allow=["*/old_invoice_2019.pdf"],
         ),
-        categories=CategoriesConfig(dev_artifacts=True),
+        categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=True)),
     )
 
 

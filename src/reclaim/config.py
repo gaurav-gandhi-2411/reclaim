@@ -138,6 +138,10 @@ class PackageCachesConfig(BaseModel):
 
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_package_cache_paths)
+    # ADR-0001: `None` -> direct permanent delete on apply (no vault, no send2trash); an int ->
+    # vault + manifest + restore, with `purge` eligible once that many days have passed.
+    # Package/model caches redownload deterministically, so they default to `None`.
+    retention_days: int | None = None
 
 
 class TempAndBrowserCachesConfig(BaseModel):
@@ -146,6 +150,9 @@ class TempAndBrowserCachesConfig(BaseModel):
     enabled: bool = False
     cache_paths: list[str] = Field(default_factory=_default_browser_and_thumbnail_cache_paths)
     temp_roots: list[str] = Field(default_factory=_default_temp_roots)
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
+    # Browser/temp caches regenerate automatically, so they default to `None`.
+    retention_days: int | None = None
 
 
 class CrashDumpsConfig(BaseModel):
@@ -153,6 +160,9 @@ class CrashDumpsConfig(BaseModel):
 
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_crash_dump_paths)
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
+    # Crash dumps/WER reports are diagnostic-only, so they default to `None`.
+    retention_days: int | None = None
 
 
 class OldInstallersConfig(BaseModel):
@@ -161,6 +171,10 @@ class OldInstallersConfig(BaseModel):
     # Spec: review-queue by default, auto-quarantine only if the user explicitly opts in.
     enabled: bool = False
     max_age_days: int = 90
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
+    # `purge`-eligible after that many days. Installers aren't deterministically rebuildable
+    # (may need a re-download), so they default to the 30-day vaulted retention.
+    retention_days: int | None = 30
 
 
 class LargeLogsConfig(BaseModel):
@@ -169,28 +183,62 @@ class LargeLogsConfig(BaseModel):
     enabled: bool = False
     min_size_bytes: int = 50 * 1024 * 1024
     stale_days: int = 30
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
+    # `purge`-eligible after that many days. Logs have no rebuild command, so they default to
+    # the 30-day vaulted retention.
+    retention_days: int | None = 30
 
 
-class CategoriesConfig(BaseModel):
+class DevArtifactsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="forbid")
 
     # Conservative default: the node_modules-in-clean-repo exemption requires this to be
     # explicitly turned on (spec: "category explicitly enabled"). Stage 3 also uses this flag
     # to decide Tier A vs Tier B for every dev-artifact candidate, not just the git exemption.
-    dev_artifacts: bool = False
+    enabled: bool = False
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
+    # Dev artifacts (node_modules, .venv, target/, ...) are rebuildable from an adjacent
+    # manifest, so they default to `None`.
+    retention_days: int | None = None
+
+
+class ArchivePairsConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
+    # `purge`-eligible after that many days. The archive itself isn't reconstructable from
+    # anything else, so it defaults to the 30-day vaulted retention.
+    retention_days: int | None = 30
+
+
+class DuplicatesConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
+    # `purge`-eligible after that many days. A duplicate's bytes only exist in the kept copy
+    # elsewhere, so it defaults to the 30-day vaulted retention.
+    retention_days: int | None = 30
+
+
+class CategoriesConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    dev_artifacts: DevArtifactsConfig = Field(default_factory=DevArtifactsConfig)
     package_caches: PackageCachesConfig = Field(default_factory=PackageCachesConfig)
     temp_and_browser_caches: TempAndBrowserCachesConfig = Field(
         default_factory=TempAndBrowserCachesConfig
     )
     crash_dumps: CrashDumpsConfig = Field(default_factory=CrashDumpsConfig)
     old_installers: OldInstallersConfig = Field(default_factory=OldInstallersConfig)
-    archive_pairs: bool = False
+    archive_pairs: ArchivePairsConfig = Field(default_factory=ArchivePairsConfig)
     large_logs: LargeLogsConfig = Field(default_factory=LargeLogsConfig)
     # Spec lists exact duplicates under "auto-quarantine eligible" (Tier-A-capable, gated like
     # every other category) but the Decision Policy's Tier B example also names "duplicate
     # clusters" — resolved the same way as every other category: Tier-A-capable, default off,
     # so by default duplicates land in Tier B exactly as that example describes.
-    duplicates: bool = False
+    duplicates: DuplicatesConfig = Field(default_factory=DuplicatesConfig)
 
 
 class Config(BaseSettings):

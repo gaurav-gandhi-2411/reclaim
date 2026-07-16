@@ -174,7 +174,7 @@ def generate_duplicate_candidates(
             if result.verdict == Verdict.REVIEW_ONLY:
                 tier = Tier.B
             else:
-                tier = Tier.A if config.categories.duplicates else Tier.B
+                tier = Tier.A if config.categories.duplicates.enabled else Tier.B
             candidates.append(
                 Candidate(
                     path=duplicate.path,
@@ -187,6 +187,7 @@ def generate_duplicate_candidates(
                     rebuild_instruction=None,
                     safety_verdict=result.verdict,
                     safety_reason_code=result.reason_code,
+                    retention_days=config.categories.duplicates.retention_days,
                 )
             )
     return candidates

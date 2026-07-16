@@ -487,12 +487,12 @@ def _drop_nested_candidates(raw: Sequence[RawCandidate]) -> list[RawCandidate]:
 # --- The SafetyValidator integration boundary ---------------------------------------------
 
 _CATEGORY_GROUP_ENABLED_GETTERS: dict[str, Callable[[Config], bool]] = {
-    _GROUP_DEV_ARTIFACTS: lambda c: c.categories.dev_artifacts,
+    _GROUP_DEV_ARTIFACTS: lambda c: c.categories.dev_artifacts.enabled,
     _GROUP_PACKAGE_CACHES: lambda c: c.categories.package_caches.enabled,
     _GROUP_TEMP_AND_BROWSER_CACHES: lambda c: c.categories.temp_and_browser_caches.enabled,
     _GROUP_CRASH_DUMPS: lambda c: c.categories.crash_dumps.enabled,
     _GROUP_OLD_INSTALLERS: lambda c: c.categories.old_installers.enabled,
-    _GROUP_ARCHIVE_PAIRS: lambda c: c.categories.archive_pairs,
+    _GROUP_ARCHIVE_PAIRS: lambda c: c.categories.archive_pairs.enabled,
     _GROUP_LARGE_LOGS: lambda c: c.categories.large_logs.enabled,
 }
 
@@ -500,6 +500,29 @@ _CATEGORY_GROUP_ENABLED_GETTERS: dict[str, Callable[[Config], bool]] = {
 def _category_enabled(category_group: str, config: Config) -> bool:
     try:
         getter = _CATEGORY_GROUP_ENABLED_GETTERS[category_group]
+    except KeyError as exc:
+        raise ValueError(f"unknown candidate category_group: {category_group!r}") from exc
+    return getter(config)
+
+
+# ADR-0001: mirrors `_category_enabled`'s exact dict-of-lambdas shape/error behavior — one
+# getter per category group, resolving `config.categories.<group>.retention_days` instead of
+# `.enabled`. Kept as a separate dict/function (not folded into the enabled-check) since a
+# category's retention window is an independent axis from whether it's Tier-A-capable.
+_CATEGORY_GROUP_RETENTION_GETTERS: dict[str, Callable[[Config], int | None]] = {
+    _GROUP_DEV_ARTIFACTS: lambda c: c.categories.dev_artifacts.retention_days,
+    _GROUP_PACKAGE_CACHES: lambda c: c.categories.package_caches.retention_days,
+    _GROUP_TEMP_AND_BROWSER_CACHES: lambda c: c.categories.temp_and_browser_caches.retention_days,
+    _GROUP_CRASH_DUMPS: lambda c: c.categories.crash_dumps.retention_days,
+    _GROUP_OLD_INSTALLERS: lambda c: c.categories.old_installers.retention_days,
+    _GROUP_ARCHIVE_PAIRS: lambda c: c.categories.archive_pairs.retention_days,
+    _GROUP_LARGE_LOGS: lambda c: c.categories.large_logs.retention_days,
+}
+
+
+def _category_retention_days(category_group: str, config: Config) -> int | None:
+    try:
+        getter = _CATEGORY_GROUP_RETENTION_GETTERS[category_group]
     except KeyError as exc:
         raise ValueError(f"unknown candidate category_group: {category_group!r}") from exc
     return getter(config)
@@ -585,6 +608,7 @@ def generate_candidates(
                 rebuild_instruction=rc.rebuild_instruction,
                 safety_verdict=result.verdict,
                 safety_reason_code=result.reason_code,
+                retention_days=_category_retention_days(rc.category_group, config),
             )
         )
     return candidates

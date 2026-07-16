@@ -11,11 +11,18 @@ stage starts. No auto-merge; GG merges.
 - Rules-first, no ML in Phase 1.
 - SafetyValidator runs BEFORE candidate generation, every stage.
 - Dry-run is the default; `--apply` is explicit and opt-in.
-- `send2trash` only — no permanent deletes anywhere in v1.
 - No fabricated confidence scores in code or UI copy (hash match = exact, pHash = a
   reported Hamming distance, heuristics labeled "heuristic").
-- Never scan or modify GG's real disk during development — fixtures only. First real-disk
-  run is dry-run mode, output a report for GG's review before anything is queued for apply.
+- Never scan or modify GG's real disk without explicit sign-off. First real-disk run is
+  dry-run mode, output a report for GG's review before anything is queued for apply.
+
+**Superseded by ADR-0001 (2026-07-16), documented not silently drifted:** "`send2trash`
+only — no permanent deletes anywhere in v1" no longer holds project-wide. Rebuildable
+categories (`dev_artifacts`, `package_caches`, `temp_and_browser_caches`, `crash_dumps`) now
+permanently delete on apply (`retention_days=None`) because their real recovery mechanism was
+always the rebuild command, never the vault — see the ADR for the full rationale and the
+defense-in-depth re-checks that gate this. Every other category is unchanged: vault + 30-day
+retention + restore, now with an explicit `purge` command for expired entries.
 
 ## Stage order (riskiest assumption first)
 
@@ -27,6 +34,7 @@ stage starts. No auto-merge; GG merges.
 | 4 | Exact-duplicate pipeline (size bucket -> 64KB partial hash -> BLAKE3) | done | precision = 1.0 on fixtures |
 | 5 | Executor + quarantine manifest + batch undo | done | every quarantined fixture file restorable in tests |
 | 6 | FastAPI + dashboard (treemap, category cards, review queue, restore view) + visual identity | done | dashboard renders against fixture data; no prior-project branding reused |
+| 7 | ADR-0001 category-tiered retention: direct-delete + purge | done | zero protected files ever reach direct-delete or purge, even adversarially |
 
 ## Checkpoints
 
@@ -356,6 +364,74 @@ stage starts. No auto-merge; GG merges.
   proves the mechanism, not the target), (3) GG's first real-disk run in dry-run mode with a
   report for review, per the explicit instruction to never scan/modify the real disk without
   that review step happening first.
+
+### 2026-07-16 — Stage 7 complete: ADR-0001 category-tiered retention (resolves the disk-free-delta finding)
+- `docs/architecture/adr/0001-category-tiered-retention.md`: the disk-free-delta finding from
+  Stage 6 (vaulting on the same NTFS volume frees nothing) is resolved by making retention a
+  per-category-group property instead of a project-wide policy. `dev_artifacts`,
+  `package_caches`, `temp_and_browser_caches`, `crash_dumps` → `retention_days=None` (permanent
+  delete on apply — their real recovery mechanism was always the rebuild command, never the
+  vault). `old_installers`, `archive_pairs`, `large_logs`, `duplicates` → `retention_days=30`
+  (unchanged vault+restore behavior, plus a new explicit `purge` command for expired entries).
+- `src/reclaim/config.py`: `retention_days: int | None` added to every category-group config;
+  `dev_artifacts`/`archive_pairs`/`duplicates` converted from bare `bool` to their own config
+  models (`enabled` + `retention_days`) — a breaking schema change fixed at its 4 call sites
+  (`safety.py`, 2 in `detectors.py`, 1 in `dedup.py`).
+- `src/reclaim/executor.py`: `apply_batch` now branches **per-candidate** on
+  `candidate.retention_days is None` — permanent `Path.unlink()`/`shutil.rmtree()` (no vault,
+  no Recycle Bin) regardless of the batch's requested `method`. **Mandatory pre-delete safety
+  re-check**: before deleting anything, every direct-delete candidate in the batch is
+  re-evaluated against a *freshly reconstructed* `FileRecord` (live stat + live git-repo state,
+  via `scanner.py`'s newly-exposed `build_record_for_path`) using the current config — any
+  single fresh `BLOCKED` verdict aborts the **entire batch**, deleting nothing, mirroring the
+  existing upstream `SafetyInvariantError` philosophy rather than skip-and-continue. Manifest
+  gains `is_dir`, `rebuild_instruction`, `retention_days`, `purged`/`purged_at`; a
+  `direct_delete` entry still records everything needed for audit (category, rationale,
+  rebuild instruction) with `vault_path=None`/`retention_until=None` since nothing was vaulted.
+  `restore_batch` refuses a `direct_delete` batch with a new, distinct
+  `DirectDeleteRestoreImpossibleError` ("nothing to restore," not reused Recycle-Bin wording).
+  `apply_batch(method="direct_delete")` is rejected outright — that value is only ever derived
+  per-candidate from `Candidate.retention_days`, never requested for a whole batch.
+- `src/reclaim/purge.py` (new): `purge_expired()` permanently deletes vaulted items whose
+  `retention_until` has passed — a hard boundary, not a soft default; there is no parameter
+  that can force an unexpired entry to purge. Dry-run by default. Pre-purge safety re-check
+  mirrors the direct-delete one but is necessarily weaker (documented honestly, not
+  overclaimed): by purge time the original path is long gone, so the re-check reconstructs a
+  `FileRecord` from the manifest's own recorded fields (catches config drift — a newly
+  tightened deny pattern or protected extension — but cannot detect that the original location
+  became a git repo since vaulting, since that path no longer exists to check). Same
+  whole-run-abort-on-any-BLOCKED philosophy. Real `shutil.disk_usage()` before/after against
+  the vault drive — this delta is expected to be genuinely non-zero, unlike vaulting's.
+  `reclaim purge [--apply] [--config] [--db] [--manifest] [--vault-dir]` CLI subcommand added.
+- Verification (independent Haiku verifier — re-derived everything with its own standalone
+  adversarial scripts, not just re-running the executor's tests): all 7 command-line checks
+  pass (`ruff`, `format`, `mypy`, 151 unit tests, 10 evals, 95.36% coverage, and a full manual
+  read of the diff on every "narrowly-scoped" file confirming no scope creep). Adversarial
+  scenarios A-G independently constructed and confirmed: (A) a forged-ELIGIBLE protected `.pem`
+  file survives a direct-delete attempt, batch aborts; (B) a **time-of-check-to-time-of-use**
+  case — a candidate that was safe at generation time but had a git repo `git init`'d around it
+  before apply — is caught by the *live* re-check and the batch aborts (proves the re-check
+  derives current state, not cached state); (C) a not-yet-expired vault entry is never purged
+  even with `apply=True`; (D) a protected-pattern vault entry past its retention window is
+  refused by the purge safety re-check; (E) a mixed batch (one `retention_days=None` + one
+  `retention_days=30` candidate) correctly permanently-deletes the first and vaults the second,
+  with per-item `method` reported correctly; (F) restoring a `direct_delete` batch raises the
+  new distinct error; (G) requesting `method="direct_delete"` at the batch level is rejected.
+- This is the first stage where "verify + commit" itself carried real risk — treated
+  accordingly: I personally read the full diff on `safety.py`/`detectors.py`/`dedup.py`/
+  `scanner.py` before dispatching the verifier (confirmed each change matched the ADR's
+  narrowly-scoped list exactly), then had the verifier independently re-derive all 7
+  adversarial scenarios with its own scripts rather than trusting the executor's test suite.
+- Judgment calls (executor's, accepted): `scanner.py`'s sanctioned exception extended to one
+  small additive `build_record_for_path` wrapper (needed since `_build_record` requires a live
+  `os.DirEntry`, which a `Path`-only caller like `executor.py` doesn't have — re-derives it via
+  a parent-directory `scandir` lookup rather than duplicating stat/git logic); existing
+  vault-round-trip tests that used `dev_artifacts` fixtures were updated to `retention_days=30`
+  overrides so they can still demonstrate vault+restore mechanics now that `dev_artifacts`
+  defaults to direct-delete; `api/routes.py`/`api/service.py` updated so the Stage 6 dashboard
+  doesn't claim a direct-delete batch is restorable.
+- Next: first real-disk dry run (Task #12) — `C:\` scan, `--apply` forbidden this run, report
+  for GG's review before anything is queued for apply.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub

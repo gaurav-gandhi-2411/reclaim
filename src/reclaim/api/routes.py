@@ -20,6 +20,7 @@ from reclaim.api.schemas import (
 from reclaim.api.state import AppState, ScanStatus
 from reclaim.executor import (
     BatchNotFoundError,
+    DirectDeleteRestoreImpossibleError,
     RecycleBinRestoreUnsupportedError,
     SafetyInvariantError,
     restore_batch,
@@ -117,6 +118,6 @@ def restore(batch_id: str, request: Request) -> RestoreResponse:
         report = restore_batch(batch_id, manifest_path=state.manifest_path)
     except BatchNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RecycleBinRestoreUnsupportedError as exc:
+    except (RecycleBinRestoreUnsupportedError, DirectDeleteRestoreImpossibleError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return service.restore_response(report)

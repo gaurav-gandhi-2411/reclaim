@@ -59,7 +59,7 @@ class ScanStats:
     elapsed_seconds: float
 
 
-class _GitRepoCache:
+class GitRepoCache:
     """Memoizes directory -> git repo root, and repo root -> clean status, for one scan
     worker. Scoped to a single top-level-directory worker rather than shared across threads:
     every directory under a given top-level directory is, by construction, only ever walked
@@ -130,8 +130,8 @@ def _query_git_clean(repo_root: Path) -> bool:
     return result.stdout.strip() == ""
 
 
-def _build_record(
-    entry: os.DirEntry[str], current_dir: Path, git_cache: _GitRepoCache
+def build_record(
+    entry: os.DirEntry[str], current_dir: Path, git_cache: GitRepoCache
 ) -> tuple[FileRecord, bool] | None:
     """Builds a FileRecord for one os.scandir entry.
 
@@ -182,6 +182,26 @@ def _build_record(
     return record, (is_dir_entry and not is_reparse_point)
 
 
+def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | None:
+    """Reconstructs a fresh `FileRecord` for one already-known path outside of an in-progress
+    `scan_tree` walk (`build_record` needs a live `os.DirEntry`, which callers here don't have)
+    by re-`scandir`-ing the parent directory and delegating to `build_record` — reuses the
+    exact same stat/reparse-point/git-repo logic the scanner itself uses rather than
+    duplicating it. Used by `executor.py`'s pre-delete safety re-check (ADR-0001), which only
+    ever has a `Path` from a `Candidate`, never a live scan in progress. Returns `None` if
+    `path` no longer exists or its parent can't be listed.
+    """
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                if entry.name == path.name:
+                    built = build_record(entry, path.parent, git_cache)
+                    return built[0] if built is not None else None
+    except OSError:
+        return None
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class _SubtreeResult:
     records: list[FileRecord]
@@ -192,7 +212,7 @@ def _walk_subtree(start: Path) -> _SubtreeResult:
     """Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
     """
-    git_cache = _GitRepoCache()
+    git_cache = GitRepoCache()
     records: list[FileRecord] = []
     dirs_visited = 0
     stack = [start]
@@ -206,7 +226,7 @@ def _walk_subtree(start: Path) -> _SubtreeResult:
             continue
 
         for entry in entries:
-            built = _build_record(entry, current_dir, git_cache)
+            built = build_record(entry, current_dir, git_cache)
             if built is None:
                 continue
             record, should_recurse = built
@@ -243,11 +263,11 @@ def scan_tree(
         logger.warning("scan.root_unreadable", path=str(root), error=str(exc))
         top_level_entries = []
 
-    root_git_cache = _GitRepoCache()
+    root_git_cache = GitRepoCache()
     top_level_records: list[FileRecord] = []
     recurse_into: list[Path] = []
     for entry in top_level_entries:
-        built = _build_record(entry, root, root_git_cache)
+        built = build_record(entry, root, root_git_cache)
         if built is None:
             continue
         record, should_recurse = built

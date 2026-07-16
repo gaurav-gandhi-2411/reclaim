@@ -134,3 +134,8 @@ class Candidate:
     rebuild_instruction: str | None
     safety_verdict: Verdict
     safety_reason_code: str
+    # ADR-0001: resolved from `config.categories.<group>.retention_days` at the same point
+    # `_category_enabled`/`Tier.A` gating already happens. `None` -> `apply_batch` permanently
+    # deletes this item on apply (no vault); an int -> vault + manifest + restore as before,
+    # `purge`-eligible once that many days have passed.
+    retention_days: int | None

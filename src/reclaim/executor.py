@@ -13,26 +13,28 @@ import structlog
 from pydantic import BaseModel, ConfigDict
 
 from reclaim.models import Candidate, Tier, Verdict
+from reclaim.safety import SafetyValidator
+from reclaim.scanner import GitRepoCache, build_record_for_path
 
 logger = structlog.get_logger(__name__)
 
-# Design principle 4 / spec Executor section offers two quarantine methods. `vault` (move into
+# Design principle 4 / spec Executor section offers two *quarantine* methods (real recoverability
+# via a vault or the Recycle Bin); ADR-0001 adds a third, non-quarantine outcome, `direct_delete`
+# (permanent, no vault, no Recycle Bin), assigned per-candidate from `Candidate.retention_days`
+# rather than requested for a whole batch — see `_effective_method`. `vault` (move into
 # `data/quarantine/<batch_id>/` + manifest JSONL) is the default because it is the only method
 # this tool can honestly guarantee restore for: `send2trash` moves a file into the Windows
 # Recycle Bin but returns no programmatic handle back to it, so there is no reliable,
 # dependency-free way to implement automated batch undo for a Recycle-Bin-quarantined file.
 # `recycle_bin` is still offered (spec explicitly lists it), but `restore_batch` refuses to
 # fabricate a restore capability it cannot deliver for those entries — see
-# `RecycleBinRestoreUnsupportedError`.
-QuarantineMethod = Literal["vault", "recycle_bin"]
+# `RecycleBinRestoreUnsupportedError`. `restore_batch` refuses `direct_delete` entries too, for
+# the stronger reason that no bytes survive anywhere to restore — see
+# `DirectDeleteRestoreImpossibleError`.
+QuarantineMethod = Literal["vault", "recycle_bin", "direct_delete"]
 
-_DEFAULT_VAULT_DIR = Path("data/quarantine")
-_DEFAULT_MANIFEST_PATH = _DEFAULT_VAULT_DIR / "manifest.jsonl"
-# Spec: "Retention default 30 days." Stored on every manifest entry as metadata only — no code
-# path in this module (or anywhere else in v1) ever reads `retention_until` to purge a file.
-# Spec, twice: "No permanent delete in v1" / "No Tier for silent permanent deletion. It does
-# not exist in v1."
-_RETENTION_DAYS = 30
+DEFAULT_VAULT_DIR = Path("data/quarantine")
+DEFAULT_MANIFEST_PATH = DEFAULT_VAULT_DIR / "manifest.jsonl"
 _SECONDS_PER_DAY = 86400.0
 
 
@@ -59,14 +61,25 @@ class RecycleBinRestoreUnsupportedError(RuntimeError):
     """
 
 
+class DirectDeleteRestoreImpossibleError(RuntimeError):
+    """Raised by `restore_batch` when any entry in the batch was permanently deleted via
+    `retention_days=None` (ADR-0001).
+
+    Distinct from `RecycleBinRestoreUnsupportedError`: a Recycle-Bin item is still recoverable
+    by hand via Windows Explorer, and merely unsupported *by this tool*. A `direct_delete`
+    entry has no surviving bytes anywhere — restoring it isn't unsupported, it's impossible by
+    construction, and the message says so plainly rather than reusing the Recycle-Bin wording.
+    """
+
+
 class QuarantineManifestEntry(BaseModel):
     """One line in the append-only `data/quarantine/manifest.jsonl` log.
 
     The manifest is an event log, not a snapshot table: `apply_batch` appends one entry per
-    quarantined item, and `restore_batch` appends a second entry per restored item (same
-    `batch_id`/`original_path` key, `restored=True`/`restored_at` set) rather than rewriting
-    history in place. Readers fold to "current state" by taking the last entry per
-    `(batch_id, original_path)` key — see `_latest_entries_for_batch`.
+    quarantined item, and `restore_batch`/`purge_expired` append a second entry per updated
+    item (same `batch_id`/`original_path` key, `restored`/`purged` fields set) rather than
+    rewriting history in place. Readers fold to "current state" by taking the last entry per
+    `(batch_id, original_path)` key — see `fold_latest_manifest_entries`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -74,16 +87,33 @@ class QuarantineManifestEntry(BaseModel):
     batch_id: str
     original_path: Path
     size_bytes: int
+    # ADR-0001: `purge_expired` needs to know whether a purge target is a file or a directory
+    # (`Path.unlink()` vs `shutil.rmtree()`) without re-stat'ing `original_path`, which by the
+    # time an entry is purge-eligible no longer exists.
+    is_dir: bool
     category: str
     category_group: str
     rationale: str
+    # ADR-0001: the only "recovery" a direct-deleted (or later-purged) item has — recorded for
+    # every entry, not just direct-delete ones, so the manifest stays one uniform shape.
+    rebuild_instruction: str | None
     tier: Tier
     method: QuarantineMethod
     vault_path: Path | None
+    # ADR-0001: resolved from `Candidate.retention_days` at quarantine time. `None` for a
+    # `direct_delete` entry (there is no retention window; nothing was vaulted).
+    retention_days: int | None
     quarantined_at: float
-    retention_until: float
+    # ADR-0001: `None` for a `direct_delete` entry (no retention window applies) — was
+    # previously always populated from a single project-wide 30-day default; now derived
+    # per-entry from `retention_days` at quarantine time.
+    retention_until: float | None
     restored: bool = False
     restored_at: float | None = None
+    # ADR-0001: `purge_expired` marks a vaulted entry purged once its vault copy is permanently
+    # deleted past its retention window — same append-only-event-log pattern as `restored`.
+    purged: bool = False
+    purged_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,9 +238,11 @@ def _category_breakdown(items: Sequence[ItemApplyResult]) -> dict[str, CategoryB
     return breakdown
 
 
-def _append_manifest_entries(
+def append_manifest_entries(
     manifest_path: Path, entries: Iterable[QuarantineManifestEntry]
 ) -> None:
+    """Public: reused by `purge.py`, which appends `purged=True` update entries the same
+    append-only way `apply_batch`/`restore_batch` already append `restored=True` ones."""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with manifest_path.open("a", encoding="utf-8") as fh:
         for entry in entries:
@@ -218,7 +250,8 @@ def _append_manifest_entries(
             fh.write("\n")
 
 
-def _read_all_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
+def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
+    """Public: reused by `purge.py` (via `fold_latest_manifest_entries`) and the API layer."""
     if not manifest_path.exists():
         return []
     entries: list[QuarantineManifestEntry] = []
@@ -231,43 +264,125 @@ def _read_all_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEn
     return entries
 
 
-def _latest_entries_for_batch(manifest_path: Path, batch_id: str) -> list[QuarantineManifestEntry]:
+def fold_latest_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
     """Folds the append-only event log to current state per `(batch_id, original_path)` — a
-    later line (e.g. a restore update) supersedes an earlier one for the same key — then
-    returns only the entries belonging to `batch_id`.
+    later line (e.g. a restore or purge update) supersedes an earlier one for the same key.
+    Public: `purge_expired` reuses this exact fold rule across the *whole* manifest (every
+    batch), not just one `batch_id` — see `_latest_entries_for_batch` for the batch-scoped use.
     """
     latest: dict[tuple[str, str], QuarantineManifestEntry] = {}
-    for entry in _read_all_manifest_entries(manifest_path):
+    for entry in read_manifest_entries(manifest_path):
         latest[(entry.batch_id, entry.original_path.as_posix())] = entry
-    return [entry for entry in latest.values() if entry.batch_id == batch_id]
+    return list(latest.values())
+
+
+def _latest_entries_for_batch(manifest_path: Path, batch_id: str) -> list[QuarantineManifestEntry]:
+    return [
+        entry for entry in fold_latest_manifest_entries(manifest_path) if entry.batch_id == batch_id
+    ]
+
+
+def _effective_method(candidate: Candidate, method: QuarantineMethod) -> QuarantineMethod:
+    """A batch's `method` parameter only governs candidates whose category has a real
+    retention window; permanent deletion is a property of the *category* (ADR-0001), not a
+    per-run choice, so a `retention_days is None` candidate always direct-deletes regardless of
+    what the caller requested for the rest of the batch."""
+    return "direct_delete" if candidate.retention_days is None else method
+
+
+def _reverify_direct_delete_candidates(
+    candidates: Sequence[Candidate], safety: SafetyValidator
+) -> None:
+    """ADR-0001's mandatory pre-delete safety re-check: before anything in the batch is
+    permanently deleted, every `retention_days is None` candidate is re-evaluated against a
+    *freshly reconstructed* `FileRecord` — real current stat + git-repo state via
+    `scanner.build_record_for_path`, not whatever the possibly-stale `Candidate` carried from
+    whenever candidate generation ran (a bug, a tampered config, or a time-of-check-to-time-of-
+    use change like the file having moved into a git repo since it was scanned).
+
+    Any single fresh `Verdict.BLOCKED` aborts the *entire* batch (not just the offending item),
+    mirroring the existing BLOCKED-batch-refusal philosophy above: something is fundamentally
+    wrong, and the correct response is "stop everything, delete nothing" — not "skip the one
+    bad item and proceed with the rest."
+
+    A candidate whose path can no longer be found on disk (already deleted by something else
+    between candidate generation and apply) is *not* treated as a safety failure — that's an
+    unrelated, already-handled race the per-item try/except in `apply_batch`'s second pass
+    naturally reports as a failed item, not a reason to abort every other item in the batch.
+    """
+    direct_delete = [c for c in candidates if c.retention_days is None]
+    if not direct_delete:
+        return
+
+    git_cache = GitRepoCache()
+    blocked: list[str] = []
+    for candidate in direct_delete:
+        fresh_record = build_record_for_path(candidate.path, git_cache)
+        if fresh_record is None:
+            logger.warning("executor.direct_delete_recheck_path_missing", path=str(candidate.path))
+            continue
+        result = safety.evaluate(fresh_record)
+        if result.verdict == Verdict.BLOCKED:
+            blocked.append(f"{candidate.path} ({result.reason_code})")
+
+    if blocked:
+        raise SafetyInvariantError(
+            f"apply_batch's pre-delete safety re-check found {len(blocked)} direct-delete "
+            "candidate(s) that fail a FRESH SafetyValidator evaluation against the live "
+            f"config — refusing the entire batch, deleting nothing: {blocked[:5]}"
+        )
 
 
 def apply_batch(
     candidates: list[Candidate],
     *,
+    safety: SafetyValidator,
     apply: bool = False,
     method: QuarantineMethod = "vault",
     vault_dir: Path | None = None,
     manifest_path: Path | None = None,
     now: float | None = None,
 ) -> BatchApplyReport:
-    """Quarantines every candidate in one batch.
+    """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
+    candidate in one batch.
 
-    Dry-run is the default (`apply=False`, spec design principle 5): makes zero filesystem
-    calls — no moves, no `send2trash` calls, no manifest writes, no disk-usage measurement —
-    and returns a report with the same shape as a real run, every item simulated as
-    "would succeed", clearly labeled `apply=False`.
+    Dry-run is the default (`apply=False`, spec design principle 5): makes zero mutating
+    filesystem calls — no moves, no `send2trash`/`unlink`/`rmtree` calls, no manifest writes,
+    no disk-usage measurement — and returns a report with the same shape as a real run, every
+    item simulated as "would succeed", clearly labeled `apply=False`.
 
-    `apply=True` actually moves/trashes each file and appends one manifest entry per
-    successfully-quarantined item. A single item's failure (file already gone, permission
-    error, ...) is caught, recorded, and does not abort the rest of the batch (house rule 104:
-    errors are part of the API, not silent).
+    `apply=True` actually moves/trashes/permanently-deletes each file and appends one manifest
+    entry per successfully-processed item. A single item's failure (file already gone,
+    permission error, ...) is caught, recorded, and does not abort the rest of the batch (house
+    rule 104: errors are part of the API, not silent) — *except* for the pre-delete safety
+    re-check below, which is a whole-batch abort by design.
 
-    Defense in depth: raises `SafetyInvariantError` and refuses the *entire* batch if any
-    candidate's `safety_verdict` is `Verdict.BLOCKED` — every candidate reaching this function
-    should already have passed `SafetyValidator` upstream, so this should never trigger in
-    practice.
+    `method` (`"vault"`/`"recycle_bin"`) only governs candidates whose category has a real
+    retention window; a candidate with `retention_days is None` always direct-deletes
+    regardless of `method` (ADR-0001) — see `_effective_method`. A single batch may therefore
+    mix direct-delete and vaulted/recycle-binned items; `item.method` on each `ItemApplyResult`
+    records which one actually applied to that item, not just the batch-level `method` param.
+
+    Defense in depth, in two layers:
+    1. Raises `SafetyInvariantError` and refuses the *entire* batch if any candidate's
+       `safety_verdict` is `Verdict.BLOCKED` — every candidate reaching this function should
+       already have passed `SafetyValidator` upstream, so this should never trigger in practice.
+    2. ADR-0001, permanent-delete-specific: before deleting anything, every `retention_days is
+       None` candidate is re-verified against a *freshly reconstructed* `FileRecord` (real
+       current stat + git-repo state, not the possibly-stale `Candidate` fields from whenever
+       candidate generation ran) using `safety` (which must be built from the *live* config —
+       there is no default, a stale/default validator would make this check meaningless). Any
+       single BLOCKED re-verification aborts the whole batch immediately, deleting nothing —
+       not even the items that passed — because a bug or a tampered config letting one
+       protected file slip through means everything else in the batch is now suspect too.
     """
+    if method not in ("vault", "recycle_bin"):
+        raise ValueError(
+            "apply_batch's method parameter must be 'vault' or 'recycle_bin' — "
+            "'direct_delete' is only ever derived per-candidate from Candidate.retention_days, "
+            f"never requested for a whole batch: got {method!r}"
+        )
+
     blocked = [c for c in candidates if c.safety_verdict == Verdict.BLOCKED]
     if blocked:
         raise SafetyInvariantError(
@@ -276,11 +391,13 @@ def apply_batch(
             f"executor: {[str(c.path) for c in blocked[:5]]}"
         )
 
-    resolved_vault_dir = vault_dir if vault_dir is not None else _DEFAULT_VAULT_DIR
-    resolved_manifest_path = manifest_path if manifest_path is not None else _DEFAULT_MANIFEST_PATH
+    resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
+    resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
     now_ts = now if now is not None else time.time()
     batch_id = f"batch_{int(now_ts)}_{uuid.uuid4().hex[:8]}"
-    retention_until = now_ts + _RETENTION_DAYS * _SECONDS_PER_DAY
+
+    if apply:
+        _reverify_direct_delete_candidates(candidates, safety)
 
     disk_free_before = (
         _measure_disk_free(_disk_usage_anchor(resolved_vault_dir, candidates)) if apply else None
@@ -289,10 +406,17 @@ def apply_batch(
     items: list[ItemApplyResult] = []
     manifest_entries: list[QuarantineManifestEntry] = []
     for candidate in candidates:
+        item_method = _effective_method(candidate, method)
+        item_retention_until = (
+            now_ts + candidate.retention_days * _SECONDS_PER_DAY
+            if candidate.retention_days is not None
+            else None
+        )
+
         if not apply:
             vault_path = (
                 _compute_vault_path(resolved_vault_dir, batch_id, candidate.path)
-                if method == "vault"
+                if item_method == "vault"
                 else None
             )
             items.append(
@@ -302,7 +426,7 @@ def apply_batch(
                     category_group=candidate.category_group,
                     size_bytes=candidate.size_bytes,
                     tier=candidate.tier,
-                    method=method,
+                    method=item_method,
                     succeeded=True,
                     error=None,
                     vault_path=vault_path,
@@ -311,18 +435,24 @@ def apply_batch(
             continue
 
         try:
-            if method == "vault":
+            if item_method == "vault":
                 vault_path = _compute_vault_path(resolved_vault_dir, batch_id, candidate.path)
                 vault_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(candidate.path), str(vault_path))
-            else:
+            elif item_method == "recycle_bin":
                 send2trash.send2trash(str(candidate.path))
+                vault_path = None
+            else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
+                if candidate.is_dir:
+                    shutil.rmtree(candidate.path)
+                else:
+                    candidate.path.unlink()
                 vault_path = None
         except Exception as exc:  # broad on purpose: isolates one item's failure from the batch
             logger.warning(
                 "executor.apply_item_failed",
                 path=str(candidate.path),
-                method=method,
+                method=item_method,
                 error=str(exc),
             )
             items.append(
@@ -332,7 +462,7 @@ def apply_batch(
                     category_group=candidate.category_group,
                     size_bytes=candidate.size_bytes,
                     tier=candidate.tier,
-                    method=method,
+                    method=item_method,
                     succeeded=False,
                     error=str(exc),
                     vault_path=None,
@@ -347,7 +477,7 @@ def apply_batch(
                 category_group=candidate.category_group,
                 size_bytes=candidate.size_bytes,
                 tier=candidate.tier,
-                method=method,
+                method=item_method,
                 succeeded=True,
                 error=None,
                 vault_path=vault_path,
@@ -358,19 +488,22 @@ def apply_batch(
                 batch_id=batch_id,
                 original_path=candidate.path,
                 size_bytes=candidate.size_bytes,
+                is_dir=candidate.is_dir,
                 category=candidate.category,
                 category_group=candidate.category_group,
                 rationale=candidate.rationale,
+                rebuild_instruction=candidate.rebuild_instruction,
                 tier=candidate.tier,
-                method=method,
+                method=item_method,
                 vault_path=vault_path,
+                retention_days=candidate.retention_days,
                 quarantined_at=now_ts,
-                retention_until=retention_until,
+                retention_until=item_retention_until,
             )
         )
 
     if manifest_entries:
-        _append_manifest_entries(resolved_manifest_path, manifest_entries)
+        append_manifest_entries(resolved_manifest_path, manifest_entries)
 
     disk_free_after = (
         _measure_disk_free(_disk_usage_anchor(resolved_vault_dir, candidates)) if apply else None
@@ -410,23 +543,36 @@ def restore_batch(
     """Restores every item in `batch_id` back to its exact original path.
 
     Reads current state from the manifest (see `_latest_entries_for_batch`). Refuses the whole
-    batch loudly (`RecycleBinRestoreUnsupportedError`) if any entry in it was quarantined via
-    `send2trash` — there is no programmatic handle back to a Recycle-Bin item, so this never
-    fabricates a restore capability it cannot deliver. A batch's entries always share one
-    `method` (set once per `apply_batch` call), so in practice this means "all or nothing" per
-    batch, not a silent partial restore.
+    batch loudly if any entry in it cannot honestly be restored:
+    - `DirectDeleteRestoreImpossibleError` for `direct_delete` entries (ADR-0001) — no bytes
+      survive anywhere for these, restoring them isn't merely unsupported, it's impossible.
+    - `RecycleBinRestoreUnsupportedError` for `recycle_bin` entries — there is no programmatic
+      handle back to a Recycle-Bin item, so this never fabricates a restore capability it
+      cannot deliver.
+    A batch's entries always share one requested `method` per `apply_batch` call, but ADR-0001
+    means a single batch can still mix `vault`/`recycle_bin` entries with `direct_delete` ones
+    (candidates with `retention_days is None` always direct-delete regardless of the batch's
+    requested method) — either refusal check can therefore fire independently of the other.
 
     Never overwrites an existing file at the destination — an item whose original path is
     occupied by something else now fails loudly (recorded in the report) rather than silently
     clobbering it. Idempotent: an item already marked `restored=True` is reported as
     `already_restored` and left untouched, so restoring the same batch twice is safe.
     """
-    resolved_manifest_path = manifest_path if manifest_path is not None else _DEFAULT_MANIFEST_PATH
+    resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
     now_ts = now if now is not None else time.time()
 
     entries = _latest_entries_for_batch(resolved_manifest_path, batch_id)
     if not entries:
         raise BatchNotFoundError(f"no manifest entries found for batch_id={batch_id!r}")
+
+    direct_delete_entries = [entry for entry in entries if entry.method == "direct_delete"]
+    if direct_delete_entries:
+        raise DirectDeleteRestoreImpossibleError(
+            f"this batch contains {len(direct_delete_entries)} permanently-deleted file(s) "
+            "(retention=none for their category) — there is nothing to restore, they were "
+            "not quarantined"
+        )
 
     recycle_bin_entries = [entry for entry in entries if entry.method == "recycle_bin"]
     if recycle_bin_entries:
@@ -513,7 +659,7 @@ def restore_batch(
         updated_entries.append(entry.model_copy(update={"restored": True, "restored_at": now_ts}))
 
     if updated_entries:
-        _append_manifest_entries(resolved_manifest_path, updated_entries)
+        append_manifest_entries(resolved_manifest_path, updated_entries)
 
     succeeded_items = [item for item in items if item.succeeded]
     failed_items = [item for item in items if not item.succeeded]

@@ -10,6 +10,7 @@ from reclaim.dedup import generate_duplicate_candidates
 from reclaim.detectors import generate_candidates
 from reclaim.executor import (
     BatchNotFoundError,
+    DirectDeleteRestoreImpossibleError,
     QuarantineMethod,
     RecycleBinRestoreUnsupportedError,
     SafetyInvariantError,
@@ -18,6 +19,7 @@ from reclaim.executor import (
 )
 from reclaim.index import ScanIndex
 from reclaim.models import Candidate, Tier
+from reclaim.purge import purge_expired
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
@@ -106,6 +108,45 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+
+    purge_parser = subparsers.add_parser(
+        "purge",
+        help="Permanently delete vaulted items whose retention window has passed "
+        "(dry-run by default; pass --apply to actually delete).",
+    )
+    purge_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete expired vault entries. Without this flag, nothing on disk is "
+        "touched — a full simulated report is produced instead (dry-run is the default mode).",
+    )
+    purge_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing) — used to build the live SafetyValidator the pre-purge re-check runs "
+        "against.",
+    )
+    purge_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help="Accepted for CLI symmetry with 'scan'/'apply'; unused — purge_expired only reads "
+        "the quarantine manifest, never the scan index.",
+    )
+    purge_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+    purge_parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine).",
     )
 
     undo_parser = subparsers.add_parser("undo", help="Restore a previously quarantined batch.")
@@ -224,6 +265,7 @@ def _run_apply(args: argparse.Namespace) -> int:
     try:
         report = apply_batch(
             selected,
+            safety=safety,
             apply=args.apply,
             method=method,
             vault_dir=args.vault_dir,
@@ -275,7 +317,11 @@ def _run_serve(args: argparse.Namespace) -> int:
 def _run_undo(args: argparse.Namespace) -> int:
     try:
         report = restore_batch(args.batch_id, manifest_path=args.manifest)
-    except (BatchNotFoundError, RecycleBinRestoreUnsupportedError) as exc:
+    except (
+        BatchNotFoundError,
+        RecycleBinRestoreUnsupportedError,
+        DirectDeleteRestoreImpossibleError,
+    ) as exc:
         print(f"reclaim undo: {exc}", file=sys.stderr)  # noqa: T201
         return 1
 
@@ -284,6 +330,41 @@ def _run_undo(args: argparse.Namespace) -> int:
         f"succeeded={report.files_succeeded} failed={report.files_failed} "
         f"bytes_restored={report.bytes_restored}"
     )
+    for item in report.items:
+        if not item.succeeded:
+            print(f"  FAILED: {item.original_path} — {item.error}", file=sys.stderr)  # noqa: T201
+    return 0 if report.files_failed == 0 else 1
+
+
+def _run_purge(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    config = load_config(config_path if config_path.exists() else None)
+    safety = SafetyValidator(config)
+
+    try:
+        report = purge_expired(
+            apply=args.apply,
+            manifest_path=args.manifest,
+            vault_dir=args.vault_dir,
+            safety=safety,
+        )
+    except SafetyInvariantError as exc:
+        print(f"reclaim purge: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(  # noqa: T201
+        f"reclaim purge [{mode}] processed={report.files_processed} "
+        f"succeeded={report.files_succeeded} failed={report.files_failed} "
+        f"bytes_freed={report.bytes_freed}"
+    )
+    if report.disk_free_delta_bytes is not None:
+        print(  # noqa: T201
+            f"reclaim purge: disk free before={report.disk_free_before_bytes} "
+            f"after={report.disk_free_after_bytes} delta={report.disk_free_delta_bytes}"
+        )
+    for category, breakdown in sorted(report.category_breakdown.items()):
+        print(f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}")  # noqa: T201
     for item in report.items:
         if not item.succeeded:
             print(f"  FAILED: {item.original_path} — {item.error}", file=sys.stderr)  # noqa: T201
@@ -299,6 +380,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_apply(args)
     if args.command == "undo":
         return _run_undo(args)
+    if args.command == "purge":
+        return _run_purge(args)
     if args.command == "serve":
         return _run_serve(args)
     parser.error(f"unknown command: {args.command}")

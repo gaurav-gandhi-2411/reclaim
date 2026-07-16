@@ -8,7 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from reclaim.api.app import create_app
-from reclaim.config import CategoriesConfig, Config, LargeLogsConfig, SafetyConfig
+from reclaim.config import (
+    CategoriesConfig,
+    Config,
+    DevArtifactsConfig,
+    DuplicatesConfig,
+    LargeLogsConfig,
+    SafetyConfig,
+)
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -18,14 +25,22 @@ _OLD_LOG_AGE_DAYS = 45
 
 def _config(root: Path, *, duplicates_enabled: bool = False) -> Config:
     """Fixture-relative protected roots (same pattern as the other stages' tests) so real
-    C:\\Windows is never touched; a low `large_logs` threshold keeps the fixture small."""
+    C:\\Windows is never touched; a low `large_logs` threshold keeps the fixture small.
+
+    ADR-0001 changed `dev_artifacts`'s default retention to `None` (direct permanent delete),
+    which would make this file's whole-batch vault+restore round-trip tests (see
+    `test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips`) impossible — a
+    `direct_delete` entry can never be restored. Those tests exist to prove the API's
+    apply/restore wiring, not to pin `dev_artifacts`' retention default, so `retention_days=30`
+    is set explicitly here to keep that proof intact.
+    """
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"]),
         categories=CategoriesConfig(
-            dev_artifacts=True,
+            dev_artifacts=DevArtifactsConfig(enabled=True, retention_days=30),
             large_logs=LargeLogsConfig(enabled=True, min_size_bytes=1_000, stale_days=30),
-            duplicates=duplicates_enabled,
+            duplicates=DuplicatesConfig(enabled=duplicates_enabled),
         ),
     )
 

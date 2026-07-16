@@ -4,10 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from reclaim.config import Config
+from reclaim.config import ArchivePairsConfig, CategoriesConfig, Config, DevArtifactsConfig
 from reclaim.detectors import (
     InventoryContext,
     _category_enabled,
+    _category_retention_days,
     _drop_nested_candidates,
     build_inventory_context,
     detect_archive_pairs,
@@ -324,3 +325,39 @@ def test_category_enabled_reflects_config_flags() -> None:
 def test_category_enabled_rejects_unknown_group() -> None:
     with pytest.raises(ValueError, match="unknown candidate category_group"):
         _category_enabled("not_a_real_category", Config())
+
+
+# --- Category-group -> config retention_days mapping (ADR-0001) -------------------------------
+
+
+def test_category_retention_days_reflects_config_defaults() -> None:
+    """Mirrors ADR-0001's default table: direct-delete (`None`) for dev_artifacts,
+    package_caches, temp_and_browser_caches, crash_dumps; 30-day vaulted retention for
+    old_installers, archive_pairs, large_logs (duplicates' default lives in dedup.py, not
+    detectors.py's getter table)."""
+    config = Config()
+    assert _category_retention_days("dev_artifacts", config) is None
+    assert _category_retention_days("package_caches", config) is None
+    assert _category_retention_days("temp_and_browser_caches", config) is None
+    assert _category_retention_days("crash_dumps", config) is None
+    assert _category_retention_days("old_installers", config) == 30
+    assert _category_retention_days("archive_pairs", config) == 30
+    assert _category_retention_days("large_logs", config) == 30
+
+
+def test_category_retention_days_reflects_explicit_override() -> None:
+    config = Config(
+        categories=CategoriesConfig(
+            dev_artifacts=DevArtifactsConfig(enabled=True, retention_days=14),
+            archive_pairs=ArchivePairsConfig(retention_days=None),
+        )
+    )
+    assert _category_retention_days("dev_artifacts", config) == 14
+    assert _category_retention_days("archive_pairs", config) is None
+
+
+def test_category_retention_days_rejects_unknown_group() -> None:
+    """Mirrors `_category_enabled`'s exact error behavior — same dict-of-lambdas shape, same
+    `ValueError` on an unknown group."""
+    with pytest.raises(ValueError, match="unknown candidate category_group"):
+        _category_retention_days("not_a_real_category", Config())

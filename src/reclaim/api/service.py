@@ -389,6 +389,7 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
 
     report = apply_batch(
         selected,
+        safety=state.safety,
         apply=not request.dry_run,  # `dry_run=True` (the default) => `apply=False` (executor's
         # own default) — the two defaults agree on "touch nothing", which is the invariant that
         # actually matters; see `ApplyRequest.dry_run`'s docstring for why this is not an
@@ -426,6 +427,17 @@ def _recycle_bin_restore_message(count: int) -> str:
     return (
         f"this batch contains {count} Recycle-Bin-quarantined file(s); restore them manually "
         "via Windows Explorer's Recycle Bin — automated restore isn't supported for this method"
+    )
+
+
+def _direct_delete_restore_message(count: int) -> str:
+    """Verbatim wording from `executor.DirectDeleteRestoreImpossibleError`'s message — same
+    display-only-preview relationship to the real exception as `_recycle_bin_restore_message`
+    above, kept distinct (never reworded to match) per ADR-0001: a direct-delete entry's
+    situation is more final than a Recycle-Bin one, and the message says so."""
+    return (
+        f"this batch contains {count} permanently-deleted file(s) (retention=none for their "
+        "category) — there is nothing to restore, they were not quarantined"
     )
 
 
@@ -468,7 +480,17 @@ def list_quarantine_batches(state: AppState) -> QuarantineListResponse:
     for batch_id, batch_entries in by_batch.items():
         batch_entries.sort(key=lambda e: e.original_path.as_posix())
         recycle_bin_entries = [e for e in batch_entries if e.method == "recycle_bin"]
+        direct_delete_entries = [e for e in batch_entries if e.method == "direct_delete"]
         bytes_total = sum(e.size_bytes for e in batch_entries)
+        if direct_delete_entries:
+            # ADR-0001: checked first — a more final situation than a recycle-bin entry, and
+            # `restore_batch` itself refuses on direct-delete entries before it ever reaches its
+            # recycle-bin check, so the listing view's blocked-reason ordering matches that.
+            restore_blocked_reason = _direct_delete_restore_message(len(direct_delete_entries))
+        elif recycle_bin_entries:
+            restore_blocked_reason = _recycle_bin_restore_message(len(recycle_bin_entries))
+        else:
+            restore_blocked_reason = None
         batches.append(
             QuarantineBatchOut(
                 batch_id=batch_id,
@@ -478,12 +500,8 @@ def list_quarantine_batches(state: AppState) -> QuarantineListResponse:
                 bytes_total=bytes_total,
                 bytes_total_human=format_bytes(bytes_total),
                 restored_count=sum(1 for e in batch_entries if e.restored),
-                can_restore=not recycle_bin_entries,
-                restore_blocked_reason=(
-                    _recycle_bin_restore_message(len(recycle_bin_entries))
-                    if recycle_bin_entries
-                    else None
-                ),
+                can_restore=restore_blocked_reason is None,
+                restore_blocked_reason=restore_blocked_reason,
                 items=[_quarantine_item_out(e) for e in batch_entries],
             )
         )
