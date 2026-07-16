@@ -585,6 +585,12 @@ class ScanIndex:
         # it still needs `_escape_like_prefix` for a `prefix` containing a literal `%`/`_`
         # (which real directory names have — e.g. `.../immutable/_app` on a real disk).
         escaped_prefix = _escape_like_prefix(prefix)
+        # LIKE-ESCAPE-OK: residual per-row filter over rows the range scan above already
+        # narrowed to `parent`'s subtree — not a primary lookup, so the ESCAPE-defeats-index
+        # cost doesn't apply here (there's nothing left to scan a full table for). Any *new*
+        # `LIKE ... ESCAPE` used as a primary filter should use `_prefix_range` instead — see
+        # `tests/test_query_plan_coverage.py`, which greps for unmarked occurrences of this
+        # pattern in CI.
         cursor = self._conn.execute(
             "SELECT * FROM files WHERE path >= ? AND path < ? AND path NOT LIKE ? ESCAPE '\\'",
             (lower, upper, f"{escaped_prefix}/%/%"),

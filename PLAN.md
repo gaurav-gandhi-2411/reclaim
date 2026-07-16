@@ -609,6 +609,39 @@ retention + restore, now with an explicit `purge` command for expired entries.
   (~15s); the dedup hash pass (137,001 files after the materiality gate) is genuine disk-I/O-
   bound work — the heartbeat is what to watch, not a specific expected duration.
 
+### 2026-07-17 — Mechanical guard against the ESCAPE-defeats-index bug recurring
+- The `LIKE ... ESCAPE`-unconditionally-defeats-index bug hit twice (once caught at design time
+  for `files_matching_path_pattern`, once shipped and measured on the real disk for
+  `direct_children`) — added a guard so a third occurrence can't ship silently.
+- New `tests/test_query_plan_coverage.py`: discovers every `ScanIndex` method whose source
+  references `self._conn.execute` via `inspect.getsource` (not a hand-maintained list), and
+  `test_every_sql_issuing_method_is_classified` fails if any discovered method has no entry in
+  a `_CASES` registry — so a *new* query method with the bug baked in fails CI immediately
+  (forced to be classified, which forces the SCAN-vs-SEARCH question to be asked), rather than
+  silently shipping uncovered. Each entry is `expect_index=True` (must show
+  `SEARCH ... USING INDEX`/index-assisted `SCAN ... USING (COVERING) INDEX`, never a bare
+  `SCAN files`) or `expect_index=False` with a named justification, itself verified to still
+  show a genuine bare scan (catches a stale exception left over from a design that's since
+  been fixed and should be promoted). A second check, `test_no_unmarked_like_escape_in_query_
+  layer`, statically greps `index.py` for the executable pattern `LIKE\s*\?\s*ESCAPE` (tuned to
+  avoid false-positiving on this file's own docstrings discussing the bug) and fails unless a
+  `LIKE-ESCAPE-OK:` marker comment justifies it — added to `direct_children`'s one remaining
+  legitimate use (a residual filter over an already-range-scanned row set).
+- Validated both checks actually catch the bug: temporarily reintroduced the exact regression
+  (`files_by_ext` switched from indexed `IN (...)` to `LIKE ? ESCAPE`), confirmed both new tests
+  failed as expected, then restored from a backup and reran clean. Along the way, corrected two
+  of my own initial classifications after seeing the *real* query plans rather than assuming:
+  `candidate_inventory()` (even with `under=None`) and `_backfill_name_and_path_lower`'s
+  `IS NULL` check both turned out to already use an index (`is_cloud_placeholder`/name+
+  path_lower respectively) — SQLite is more capable here than the naive assumption "no WHERE
+  clause or IS NULL means no index can help."
+- Verifier independently re-ran EXPLAIN QUERY PLAN itself (not just trusted the claim) for the
+  trickiest cases (`has_any_records`'s COVERING INDEX scan, `immaterial_duplicate_bucket_stats`'s
+  subquery scan) and confirmed the marker/lookback-window math. 213 tests + 2 intentional skips
+  pass, ruff/mypy clean.
+- Next: still waiting on the real-disk re-run from the previous checkpoint (unaffected by this
+  test-only change — background process confirmed untouched throughout).
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
