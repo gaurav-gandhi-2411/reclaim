@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import reclaim.dedup as dedup_module
-from reclaim.config import Config
+from reclaim.config import CategoriesConfig, Config, DuplicatesConfig
 from reclaim.dedup import find_duplicate_clusters, generate_duplicate_candidates
 from reclaim.detectors import generate_candidates
 from reclaim.index import ScanIndex
@@ -79,7 +79,13 @@ def test_candidate_generation_memory_does_not_scale_with_row_count(tmp_path: Pat
         if batch:
             index.upsert_records(batch, scanned_at=1000.0)
 
-        config = Config()
+        # min_reclaim_bytes=0: the dup pair here is 123,456 bytes (below the real 1MB
+        # materiality default) by design, to keep this eval's fixture-writing fast — this test
+        # is about memory scaling with row count, not materiality (tested separately in
+        # test_index.py/test_dedup.py).
+        config = Config(
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0))
+        )
         safety = SafetyValidator(config)
 
         tracemalloc.start()
@@ -177,7 +183,10 @@ def test_find_duplicate_clusters_memory_bounded_by_largest_bucket_not_total_cand
 
         tracemalloc.start()
         baseline, _ = tracemalloc.get_traced_memory()
-        clusters = find_duplicate_clusters(index)
+        # min_reclaim_bytes=0: this test is about bucket-streaming memory bounds, not
+        # materiality (the common sizes here are large enough to clear the real 1MB default
+        # anyway, but 0 keeps that an explicit non-concern rather than an implicit coincidence).
+        clusters = find_duplicate_clusters(index, min_reclaim_bytes=0)
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
 

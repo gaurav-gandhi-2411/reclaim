@@ -533,6 +533,46 @@ retention + restore, now with an explicit `purge` command for expired entries.
   hash pass itself to take a genuinely long time (this is real disk-I/O-bound work now, not an
   artifact of a bug) — the heartbeat is the thing to watch, not a specific expected duration.
 
+### 2026-07-17 — Materiality gate: the 80% collision finding was mostly noise
+- Checked the live index during the third re-run per the debug playbook (`SELECT size,
+  COUNT(*) ... GROUP BY size ORDER BY c DESC LIMIT 20`): the collision list was dominated by
+  333,135 zero-byte files, 144,734 files at 4096 bytes, then a long tail of tiny sizes (17,
+  110, 4, 111, 41, 83, 2 bytes). Even in the best case (every member an exact duplicate), a
+  bucket of e.g. 11,018 files at 17 bytes could only ever reclaim ~183KB — and for files under
+  the partial-hash whole-file threshold (128KB), a "partial" hash reads the entire file
+  anyway, so there's no cheap-peek savings for tiny files either. The pipeline was about to
+  spend real disk I/O on millions of files that could never yield material savings.
+- Fix: a materiality gate on duplicate detection. `config.categories.duplicates
+  .min_reclaim_bytes` (default 1MB) — a size bucket's theoretical best-case reclaim,
+  `(member_count - 1) * size`, must clear this floor before a single file in it is even
+  queried, let alone hashed. Pushed into the SQL itself (`index.py`'s
+  `duplicate_size_candidates()`/`duplicate_size_candidate_count()` gained a required
+  `min_reclaim_bytes` param, added to the existing `HAVING COUNT(*) >= 2` clause — confirmed
+  via EXPLAIN QUERY PLAN to still hit `SEARCH ... USING INDEX`, never `SCAN`, with the
+  materiality arithmetic present). New `immaterial_duplicate_bucket_stats()` reports what was
+  excluded and its *theoretical* (never measured — labeled as an upper bound, not a real
+  number) reclaim size, surfaced in the CLI report rather than silently dropped.
+- Real bug found and fixed along the way: `api/service.py` had two separate call sites to
+  `find_duplicate_clusters`/`generate_duplicate_candidates` (one for the candidate list, one
+  for the UI's cluster-detail view) — only one was config-driven before this change forced the
+  question. Both now pass `state.config.categories.duplicates.min_reclaim_bytes` explicitly, a
+  latent inconsistency that would have surfaced as "candidate is Tier B duplicate but its
+  detail view shows no cluster" the moment materiality gating existed.
+- `ScanIndex`-level methods take `min_reclaim_bytes` as a *required* keyword-only param (no
+  default) — policy value belongs in `dedup.py`/`config.py`, not silently defaulted in the
+  data-access layer. Every existing small-fixture test that exercises dedup correctness
+  (not materiality itself) now explicitly passes `min_reclaim_bytes=0` to opt out, rather than
+  silently breaking against the new 1MB default — touched `test_dedup.py`, `test_api.py`,
+  `test_cli.py`, `evals/test_dedup.py`, `evals/test_candidate_generation_perf.py`.
+- Verifier specifically checked the reclaim-bytes arithmetic (`(member_count - 1) * size`, not
+  `member_count * size` — the kept copy's own size is never "reclaimable") and the
+  `api/service.py` dual-call-site fix against `git diff`, not just the claim. 184 tests + 6
+  evals pass, ruff/mypy clean.
+- Next: re-run the real-disk dry run a fourth time. Expect the hash pass to now skip the huge
+  zero-byte/tiny-file noise entirely and spend its time only on buckets with real reclaim
+  potential — `report.txt` should show the materiality-excluded stats plus whatever real
+  duplicate clusters exist above the 1MB floor.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

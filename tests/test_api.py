@@ -40,7 +40,10 @@ def _config(root: Path, *, duplicates_enabled: bool = False) -> Config:
         categories=CategoriesConfig(
             dev_artifacts=DevArtifactsConfig(enabled=True, retention_days=30),
             large_logs=LargeLogsConfig(enabled=True, min_size_bytes=1_000, stale_days=30),
-            duplicates=DuplicatesConfig(enabled=duplicates_enabled),
+            # min_reclaim_bytes=0: this fixture's duplicate pair is a 4KB file (kept small
+            # deliberately, same reasoning as large_logs' low threshold above) — the real
+            # default (1MB) materiality gate is tested in isolation in test_index.py, not here.
+            duplicates=DuplicatesConfig(enabled=duplicates_enabled, min_reclaim_bytes=0),
         ),
     )
 

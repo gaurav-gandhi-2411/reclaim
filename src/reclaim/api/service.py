@@ -309,7 +309,11 @@ def list_candidates(
             c.category_group == "duplicates" for c in candidates
         )
         cluster_by_path = (
-            _index_clusters_by_duplicate_path(find_duplicate_clusters(index))
+            _index_clusters_by_duplicate_path(
+                find_duplicate_clusters(
+                    index, min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes
+                )
+            )
             if needs_cluster_info
             else {}
         )

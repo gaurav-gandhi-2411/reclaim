@@ -132,6 +132,19 @@ class HashSkip:
 
 
 @dataclass(frozen=True, slots=True)
+class MaterialityExclusionStats:
+    """How many duplicate-size buckets were excluded by the materiality gate
+    (`config.categories.duplicates.min_reclaim_bytes`) before any hashing ran, and their
+    summed *theoretical* best-case reclaim — every member of every excluded bucket turning out
+    to be an exact duplicate. Labeled "theoretical" deliberately: these buckets were never
+    hashed, so this is an upper bound, never a claim about real, measured reclaim (spec: no
+    fabricated confidence). Surfaced to the report so the exclusion is visible, not silent."""
+
+    excluded_bucket_count: int
+    theoretical_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     """A `RawCandidate` that has passed through `SafetyValidator.evaluate()` and been assigned
     a final tier — the only shape Stage 4+ (dedup pipeline, executor, UI) should ever consume.

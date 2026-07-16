@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from reclaim.config import load_config
-from reclaim.dedup import generate_duplicate_candidates
+from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
 from reclaim.executor import (
     BatchNotFoundError,
@@ -18,7 +18,7 @@ from reclaim.executor import (
     restore_batch,
 )
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, HashSkip, Tier
+from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Tier
 from reclaim.purge import purge_expired
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
@@ -272,6 +272,20 @@ def _print_hash_skips(skips: Sequence[HashSkip]) -> None:
         print(f"    ... and {len(skips) - _REPORT_TOP_N} more")  # noqa: T201
 
 
+def _print_materiality_exclusion(
+    stats: MaterialityExclusionStats, *, min_reclaim_bytes: int
+) -> None:
+    if stats.excluded_bucket_count == 0:
+        return
+    print(  # noqa: T201
+        f"  duplicate detection: {stats.excluded_bucket_count} size bucket(s) excluded as "
+        f"immaterial (below config.categories.duplicates.min_reclaim_bytes floor of "
+        f"{min_reclaim_bytes:,} bytes), theoretical best-case size "
+        f"{stats.theoretical_bytes:,} bytes (never hashed, so this is an upper bound, not a "
+        "measured number)"
+    )
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     root: Path = args.path
     if not root.is_dir():
@@ -285,11 +299,14 @@ def _run_apply(args: argparse.Namespace) -> int:
     config = load_config(config_path if config_path.exists() else None)
 
     hash_skips: list[HashSkip] = []
+    materiality: MaterialityExclusionStats | None = None
+    min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
     with ScanIndex(args.db) as index:
         safety = SafetyValidator(config)
         candidates: list[Candidate] = generate_candidates(index, config, safety)
         if args.include_duplicates:
             candidates += generate_duplicate_candidates(index, config, safety, skips=hash_skips)
+            materiality = materiality_exclusion_stats(index, min_reclaim_bytes=min_reclaim_bytes)
         else:
             print(  # noqa: T201
                 "reclaim apply: duplicate detection skipped (pass --include-duplicates to "
@@ -330,6 +347,8 @@ def _run_apply(args: argparse.Namespace) -> int:
         )
     _print_top_n_largest(selected)
     _print_hash_skips(hash_skips)
+    if materiality is not None:
+        _print_materiality_exclusion(materiality, min_reclaim_bytes=min_reclaim_bytes)
     for item in report.items:
         if not item.succeeded:
             print(f"  FAILED: {item.path} — {item.error}", file=sys.stderr)  # noqa: T201

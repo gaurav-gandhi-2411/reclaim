@@ -220,6 +220,16 @@ class DuplicatesConfig(BaseModel):
     # `purge`-eligible after that many days. A duplicate's bytes only exist in the kept copy
     # elsewhere, so it defaults to the 30-day vaulted retention.
     retention_days: int | None = 30
+    # Materiality gate (2026-07-17 real-disk finding): a size bucket is only ever hashed if its
+    # *theoretical* best-case reclaim — (member_count - 1) * size, i.e. every non-kept member
+    # turning out to be an exact duplicate — clears this floor. On one real `C:\`, 80% of files
+    # shared a size with another file, but the collision list was dominated by empty/near-empty
+    # files (333K zero-byte files, thousands of 2/4/17/41/83/110-byte files) whose full bucket
+    # could never reclaim anything material even in the best case. Hashing them wasted I/O for
+    # zero possible benefit. Default 1MB: generous enough not to skip any bucket with real
+    # reclaim potential, strict enough to skip the tiny-file noise that dominated collision
+    # counts without dominating collision bytes.
+    min_reclaim_bytes: int = 1024 * 1024
 
 
 class CategoriesConfig(BaseModel):

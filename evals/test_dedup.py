@@ -36,11 +36,17 @@ def dedup_root() -> Iterator[Path]:
 
 def _config(root: Path, *, duplicates_enabled: bool) -> Config:
     """Fixture-relative protected roots — same pattern as test_candidate_generation.py's
-    `_config` — so real C:\\Windows is never touched during development/CI."""
+    `_config` — so real C:\\Windows is never touched during development/CI.
+
+    `min_reclaim_bytes=0`: this golden-fixture tree uses small test files by design (fast,
+    deterministic byte content); the real 1MB materiality-gate default is tested in isolation
+    in `test_index.py`, not conflated with this pipeline-correctness fixture."""
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"]),
-        categories=CategoriesConfig(duplicates=DuplicatesConfig(enabled=duplicates_enabled)),
+        categories=CategoriesConfig(
+            duplicates=DuplicatesConfig(enabled=duplicates_enabled, min_reclaim_bytes=0)
+        ),
     )
 
 
@@ -67,7 +73,8 @@ def test_dedup_pipeline_end_to_end(dedup_root: Path) -> None:
     with ScanIndex(db_path) as index:
         tree = build_dedup_fixture_tree(tree_root, index, now=now)
 
-        clusters = find_duplicate_clusters(index)
+        # min_reclaim_bytes=0: see _config()'s docstring above.
+        clusters = find_duplicate_clusters(index, min_reclaim_bytes=0)
 
         # --- Ground-truth precision proof: independently re-read every cluster member's bytes
         # off disk and assert pairwise byte-equality — trusts nothing the hash-based pipeline

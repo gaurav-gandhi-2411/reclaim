@@ -446,20 +446,30 @@ class ScanIndex:
         for row in self._conn.execute(sql, params):
             yield _row_to_record(row)
 
-    def duplicate_size_candidates(self) -> Iterator[FileRecord]:
+    def duplicate_size_candidates(self, *, min_reclaim_bytes: int) -> Iterator[FileRecord]:
         """Streams every non-directory, non-empty, non-cloud-placeholder file whose `size`
-        collides with at least one other such file — the SQL-pushed equivalent of the old
-        in-memory `_size_buckets()` prefilter in `dedup.py`. A unique-size file is never
-        selected by this query, let alone loaded into a Python `FileRecord`.
+        collides with at least one other such file *and* whose bucket clears the materiality
+        floor — the SQL-pushed equivalent of the old in-memory `_size_buckets()` prefilter in
+        `dedup.py`. A unique-size file is never selected by this query, let alone loaded into a
+        Python `FileRecord`.
+
+        `min_reclaim_bytes` is the materiality gate (2026-07-17 real-disk finding): a bucket's
+        *theoretical* best-case reclaim is `(member_count - 1) * size` (every non-kept member
+        turning out to be an exact duplicate) — below `min_reclaim_bytes`, the bucket is
+        excluded from this stream entirely, before a single byte is read. On one real `C:\\`,
+        80% of files shared a size with another file, but the collision list was dominated by
+        empty/near-empty files (333K zero-byte, thousands of 2/4/17-byte files) whose full
+        bucket could never reclaim anything material even in the best case — hashing them
+        wasted I/O for zero possible benefit. `size > 0` alone (already present below) already
+        excludes zero-byte files; `min_reclaim_bytes` extends the same idea to any bucket whose
+        upper-bound reclaim is still negligible. See `immaterial_duplicate_bucket_stats` for the
+        excluded side of this filter, surfaced to the report rather than silently dropped.
 
         `ORDER BY size` costs nothing extra here (confirmed via `EXPLAIN QUERY PLAN`: no
         separate "USE TEMP B-TREE FOR ORDER BY" step appears, since scanning `idx_files_size`
         already visits rows in size order) and lets `dedup.py` consume this stream one size
         bucket at a time (`itertools.groupby`) instead of collecting every candidate row into
-        memory before processing any of them — the fix for a real disk where a size-uniqueness
-        prefilter alone barely narrows anything (measured: 80% of files on one real `C:\\`
-        shared a size with at least one other file, making "the whole candidate set" a
-        multi-million-row materialization if it were ever held all at once).
+        memory before processing any of them.
         """
         sql = """
             SELECT * FROM files
@@ -467,14 +477,14 @@ class ScanIndex:
             AND size IN (
                 SELECT size FROM files
                 WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-                GROUP BY size HAVING COUNT(*) >= 2
+                GROUP BY size HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size >= ?
             )
             ORDER BY size
         """
-        for row in self._conn.execute(sql):
+        for row in self._conn.execute(sql, (min_reclaim_bytes,)):
             yield _row_to_record(row)
 
-    def duplicate_size_candidate_count(self) -> int:
+    def duplicate_size_candidate_count(self, *, min_reclaim_bytes: int) -> int:
         """A cheap `COUNT(*)` over the same filter `duplicate_size_candidates()` streams —
         logged once up front so a heartbeat can report "N of M processed" instead of just a
         running count with no sense of how much work remains."""
@@ -484,11 +494,31 @@ class ScanIndex:
             AND size IN (
                 SELECT size FROM files
                 WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-                GROUP BY size HAVING COUNT(*) >= 2
+                GROUP BY size HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size >= ?
             )
         """
-        row = self._conn.execute(sql).fetchone()
+        row = self._conn.execute(sql, (min_reclaim_bytes,)).fetchone()
         return int(row["total"])
+
+    def immaterial_duplicate_bucket_stats(self, *, min_reclaim_bytes: int) -> tuple[int, int]:
+        """Returns `(bucket_count, theoretical_bytes)` for size buckets that collide (>= 2
+        members) but were excluded from `duplicate_size_candidates()` for falling below
+        `min_reclaim_bytes` — surfaced so the report can show what was skipped and why, rather
+        than the exclusion being silent. `theoretical_bytes` is a labeled upper bound (every
+        member turning out to be an exact duplicate), never a claim about real measured
+        reclaim — this tool never fabricates confidence it hasn't earned by actually hashing.
+        """
+        sql = """
+            SELECT COUNT(*) AS bucket_count, COALESCE(SUM((c - 1) * size), 0) AS theoretical_bytes
+            FROM (
+                SELECT size, COUNT(*) AS c FROM files
+                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+                GROUP BY size
+                HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size < ?
+            )
+        """
+        row = self._conn.execute(sql, (min_reclaim_bytes,)).fetchone()
+        return int(row["bucket_count"]), int(row["theoretical_bytes"])
 
     def subtree_size_bytes(self, root: Path) -> int:
         """Sum of `size` for every non-directory row at or under `root` — the aggregate size a

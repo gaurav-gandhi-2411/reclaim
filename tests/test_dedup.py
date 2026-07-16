@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import reclaim.dedup as dedup_module
+from reclaim.config import DuplicatesConfig
 from reclaim.dedup import (
     _HEARTBEAT_INTERVAL_SECONDS,
     _PARTIAL_HASH_CHUNK_BYTES,
@@ -17,6 +18,7 @@ from reclaim.dedup import (
     _hash_with_guard,
     _is_downloads_or_temp,
     find_duplicate_clusters,
+    materiality_exclusion_stats,
     select_keep,
 )
 from reclaim.index import ScanIndex
@@ -277,7 +279,8 @@ def test_find_duplicate_clusters_skips_locked_file_instead_of_crashing(
             scanned_at=1000.0,
         )
         skips: list[HashSkip] = []
-        clusters = find_duplicate_clusters(index, skips=skips)
+        # min_reclaim_bytes=0: this test is about the hang guard, not materiality gating.
+        clusters = find_duplicate_clusters(index, min_reclaim_bytes=0, skips=skips)
 
     # The one surviving (successfully hashed) member has no partner left to cluster with.
     assert clusters == []
@@ -297,3 +300,78 @@ def test_find_duplicate_clusters_default_skips_param_collects_nothing(tmp_path: 
         )
         clusters = find_duplicate_clusters(index)
     assert clusters == []
+
+
+# --- Materiality gate: 2026-07-17 real-disk finding ------------------------------------------
+#
+# The 80%-size-collision finding on the real disk was dominated by tiny/near-empty files (333K
+# zero-byte, thousands of 2/4/17-byte files) whose full bucket could never reclaim anything
+# material even in the best case, and for files under the partial-hash whole-file threshold
+# (128KB) a "partial" hash reads the entire file anyway — no cheap-peek advantage at all. These
+# tests prove the materiality gate keeps such buckets from ever reaching a hash function.
+
+
+def test_find_duplicate_clusters_never_hashes_immaterial_buckets_but_finds_real_large_dups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large empty-file cohort, a tiny immaterial duplicate-size bucket, and a real large
+    (2MB) duplicate pair in the same index: only the large pair may ever reach a hash
+    function."""
+    hashed_paths: list[Path] = []
+
+    def _tracking_hash(path: Path, *args: object) -> str:
+        hashed_paths.append(path)
+        return "shared-digest" if "large" in path.name else f"unique-{path.name}"
+
+    monkeypatch.setattr(dedup_module, "_compute_partial_hash", _tracking_hash)
+    monkeypatch.setattr(dedup_module, "_compute_full_hash", _tracking_hash)
+
+    records = [
+        # A large empty-file cohort: size=0 is excluded outright (regardless of materiality).
+        *(_index_record(f"C:/Data/empty_{i}.bin", size_bytes=0) for i in range(200)),
+        # A tiny duplicate-size bucket: (5 - 1) * 8 = 32 bytes theoretical -- immaterial at a
+        # 1MB floor even though all 5 genuinely share a size.
+        *(_index_record(f"C:/Data/tiny_{i}.bin", size_bytes=8) for i in range(5)),
+        # A real duplicate pair large enough to clear the materiality floor.
+        _index_record("C:/Data/large_a.bin", size_bytes=2 * 1024 * 1024),
+        _index_record("C:/Data/large_b.bin", size_bytes=2 * 1024 * 1024),
+    ]
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(records, scanned_at=1000.0)
+        clusters = find_duplicate_clusters(index, min_reclaim_bytes=1024 * 1024)
+
+    # Both the partial- and full-hash stages call the (mocked) hash function once per member,
+    # so the two large files appear twice each here -- the point is that only they appear at
+    # all, never any of the 200 empty files or the 5 tiny immaterial-bucket files.
+    assert set(hashed_paths) == {Path("C:/Data/large_a.bin"), Path("C:/Data/large_b.bin")}
+    assert len(hashed_paths) == 4
+    assert len(clusters) == 1
+    assert clusters[0].size_bytes == 2 * 1024 * 1024
+    assert len(clusters[0].duplicates) == 1
+
+
+def test_materiality_exclusion_stats_matches_find_duplicate_clusters_behavior(
+    tmp_path: Path,
+) -> None:
+    """`materiality_exclusion_stats` (the reporting counterpart) must agree with what
+    `find_duplicate_clusters` actually excluded, for the same `min_reclaim_bytes`."""
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                *(_index_record(f"C:/Data/tiny_{i}.bin", size_bytes=8) for i in range(5)),
+                _index_record("C:/Data/large_a.bin", size_bytes=2 * 1024 * 1024),
+                _index_record("C:/Data/large_b.bin", size_bytes=2 * 1024 * 1024),
+            ],
+            scanned_at=1000.0,
+        )
+        stats = materiality_exclusion_stats(index, min_reclaim_bytes=1024 * 1024)
+
+    assert stats.excluded_bucket_count == 1
+    assert stats.theoretical_bytes == 32  # (5 - 1) * 8 bytes
+
+
+def test_materiality_exclusion_stats_default_matches_config_default() -> None:
+    """The dedup-module default must match `DuplicatesConfig.min_reclaim_bytes`'s default, so a
+    caller invoking either without a config (evals, direct API service calls) gets the same
+    real-world-tuned floor, not a silent "hash everything" fallback."""
+    assert DuplicatesConfig().min_reclaim_bytes == dedup_module._DEFAULT_MIN_RECLAIM_BYTES

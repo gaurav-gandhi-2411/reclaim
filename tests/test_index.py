@@ -307,8 +307,67 @@ def test_duplicate_size_candidates_excludes_unique_sizes_dirs_zero_and_placehold
         ],
         scanned_at=1000.0,
     )
-    matches = {r.path for r in index.duplicate_size_candidates()}
+    # min_reclaim_bytes=0: this test is about the unique-size/dir/zero/placeholder filters,
+    # not the materiality gate (covered separately below) — disable it here.
+    matches = {r.path for r in index.duplicate_size_candidates(min_reclaim_bytes=0)}
     assert matches == {Path("C:/Data/dup_a.bin"), Path("C:/Data/dup_b.bin")}
+
+
+def test_duplicate_size_candidates_materiality_gate_excludes_low_value_buckets(
+    index: ScanIndex,
+) -> None:
+    """A bucket whose theoretical best-case reclaim — (member_count - 1) * size — falls below
+    `min_reclaim_bytes` is excluded entirely, even though it has >= 2 same-size members and
+    would otherwise qualify. Regression test for the real-disk finding: the collision list was
+    dominated by tiny/near-empty files (333K zero-byte, thousands of 2/4/17-byte files) whose
+    full bucket could never reclaim anything material."""
+    index.upsert_records(
+        [
+            # 3 members * 100 bytes: (3-1)*100 = 200 bytes theoretical -- immaterial at a 1MB floor.
+            _record("C:/Data/tiny_a.bin", size_bytes=100),
+            _record("C:/Data/tiny_b.bin", size_bytes=100),
+            _record("C:/Data/tiny_c.bin", size_bytes=100),
+            # 2 members * 2MB: (2-1)*2MB = 2MB theoretical -- material at a 1MB floor.
+            _record("C:/Data/large_a.bin", size_bytes=2 * 1024 * 1024),
+            _record("C:/Data/large_b.bin", size_bytes=2 * 1024 * 1024),
+        ],
+        scanned_at=1000.0,
+    )
+    matches = {r.path for r in index.duplicate_size_candidates(min_reclaim_bytes=1024 * 1024)}
+    assert matches == {Path("C:/Data/large_a.bin"), Path("C:/Data/large_b.bin")}
+
+
+def test_immaterial_duplicate_bucket_stats_reports_excluded_buckets(index: ScanIndex) -> None:
+    index.upsert_records(
+        [
+            _record("C:/Data/tiny_a.bin", size_bytes=100),
+            _record("C:/Data/tiny_b.bin", size_bytes=100),
+            _record("C:/Data/tiny_c.bin", size_bytes=100),
+            _record("C:/Data/large_a.bin", size_bytes=2 * 1024 * 1024),
+            _record("C:/Data/large_b.bin", size_bytes=2 * 1024 * 1024),
+        ],
+        scanned_at=1000.0,
+    )
+    bucket_count, theoretical_bytes = index.immaterial_duplicate_bucket_stats(
+        min_reclaim_bytes=1024 * 1024
+    )
+    assert bucket_count == 1  # only the tiny_* bucket is excluded
+    assert theoretical_bytes == 200  # (3 - 1) * 100 bytes
+
+
+def test_immaterial_duplicate_bucket_stats_empty_when_nothing_excluded(index: ScanIndex) -> None:
+    index.upsert_records(
+        [
+            _record("C:/Data/large_a.bin", size_bytes=2 * 1024 * 1024),
+            _record("C:/Data/large_b.bin", size_bytes=2 * 1024 * 1024),
+        ],
+        scanned_at=1000.0,
+    )
+    bucket_count, theoretical_bytes = index.immaterial_duplicate_bucket_stats(
+        min_reclaim_bytes=1024 * 1024
+    )
+    assert bucket_count == 0
+    assert theoretical_bytes == 0
 
 
 # --- Migration: name/path_lower backfill for a pre-existing (pre-schema-change) index --------
@@ -431,5 +490,21 @@ def test_files_matching_path_pattern_query_plan_uses_path_lower_index(
 
 
 def test_duplicate_size_candidates_query_plan_uses_an_index(indexed_bulk: ScanIndex) -> None:
-    sql = _captured_sql(indexed_bulk, lambda: list(indexed_bulk.duplicate_size_candidates()))
+    sql = _captured_sql(
+        indexed_bulk, lambda: list(indexed_bulk.duplicate_size_candidates(min_reclaim_bytes=0))
+    )
+    _assert_query_uses_index(indexed_bulk, sql)
+
+
+def test_duplicate_size_candidates_materiality_gated_query_plan_uses_an_index(
+    indexed_bulk: ScanIndex,
+) -> None:
+    """Same query shape with the materiality `HAVING` arithmetic present (the actual production
+    default) — confirmed separately since an added `HAVING` clause is exactly the kind of
+    change that could silently defeat an index (verified empirically it doesn't, but this test
+    is the tripwire if a future edit changes that)."""
+    sql = _captured_sql(
+        indexed_bulk,
+        lambda: list(indexed_bulk.duplicate_size_candidates(min_reclaim_bytes=1024 * 1024)),
+    )
     _assert_query_uses_index(indexed_bulk, sql)

@@ -14,7 +14,15 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import HashCacheEntry, ScanIndex, cached_full_hash, cached_partial_hash
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, HashSkip, Tier, Verdict
+from reclaim.models import (
+    Candidate,
+    DuplicateCluster,
+    FileRecord,
+    HashSkip,
+    MaterialityExclusionStats,
+    Tier,
+    Verdict,
+)
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -48,6 +56,14 @@ _WRITE_BATCH_SIZE = 500
 # to preempt a blocked `read()`, so a timed-out thread is abandoned, not killed.
 _HASH_READ_TIMEOUT_SECONDS = 30.0
 _HASH_TIMEOUT_WORKERS = 8
+
+# Mirrors `config.DuplicatesConfig.min_reclaim_bytes`'s default — the value real callers
+# (`generate_duplicate_candidates`, driven by `config.categories.duplicates.min_reclaim_bytes`)
+# actually use. Kept as a literal default here too so `find_duplicate_clusters`/
+# `materiality_exclusion_stats` stay usable without a `Config` object (evals, the API service
+# layer's direct `find_duplicate_clusters` call) without silently reverting to "hash
+# everything" if a caller forgets to pass it.
+_DEFAULT_MIN_RECLAIM_BYTES = 1024 * 1024
 
 
 def _is_downloads_or_temp(path: Path) -> bool:
@@ -155,8 +171,26 @@ def _hash_member(
     return digest
 
 
+def materiality_exclusion_stats(
+    index: ScanIndex, *, min_reclaim_bytes: int = _DEFAULT_MIN_RECLAIM_BYTES
+) -> MaterialityExclusionStats:
+    """How many duplicate-size buckets `find_duplicate_clusters` will skip for falling below
+    `min_reclaim_bytes`, and their summed theoretical (never measured, always labeled as an
+    upper bound) reclaim — a cheap, independent SQL aggregate query, safe to call any time
+    (e.g. from the CLI report) without running the hash pass itself."""
+    bucket_count, theoretical_bytes = index.immaterial_duplicate_bucket_stats(
+        min_reclaim_bytes=min_reclaim_bytes
+    )
+    return MaterialityExclusionStats(
+        excluded_bucket_count=bucket_count, theoretical_bytes=theoretical_bytes
+    )
+
+
 def find_duplicate_clusters(
-    index: ScanIndex, *, skips: list[HashSkip] | None = None
+    index: ScanIndex,
+    *,
+    min_reclaim_bytes: int = _DEFAULT_MIN_RECLAIM_BYTES,
+    skips: list[HashSkip] | None = None,
 ) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
     cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
@@ -166,6 +200,12 @@ def find_duplicate_clusters(
     the API service layer, evals) keep working unchanged against the plain
     `list[DuplicateCluster]` return type; callers that care about the skipped/unreadable files
     pass their own list and read it back after the call.
+
+    `min_reclaim_bytes` is the materiality gate (2026-07-17 real-disk finding): a bucket whose
+    theoretical best-case reclaim — `(member_count - 1) * size` — falls below this floor is
+    never even queried for its members, let alone hashed. See
+    `ScanIndex.duplicate_size_candidates`'s docstring and `materiality_exclusion_stats` (the
+    reporting counterpart of this same filter).
 
     SQL-pushdown, streamed one size bucket at a time: `index.duplicate_size_candidates()`
     returns rows in size order (see its docstring), so `itertools.groupby` groups each size
@@ -178,12 +218,19 @@ def find_duplicate_clusters(
     them all at once — before a single hash ran. Peak memory here is bounded by the *largest
     single size bucket*, not the total candidate count.
     """
-    candidate_count = index.duplicate_size_candidate_count()
+    candidate_count = index.duplicate_size_candidate_count(min_reclaim_bytes=min_reclaim_bytes)
     if candidate_count == 0:
         return []
 
     hash_cache = index.load_hash_cache()
-    logger.info("dedup.start", candidate_files=candidate_count)
+    excluded = materiality_exclusion_stats(index, min_reclaim_bytes=min_reclaim_bytes)
+    logger.info(
+        "dedup.start",
+        candidate_files=candidate_count,
+        min_reclaim_bytes=min_reclaim_bytes,
+        materiality_excluded_buckets=excluded.excluded_bucket_count,
+        materiality_excluded_theoretical_bytes=excluded.theoretical_bytes,
+    )
 
     clusters: list[DuplicateCluster] = []
     partial_writes: list[tuple[Path, int, float, str]] = []
@@ -195,7 +242,8 @@ def find_duplicate_clusters(
 
     with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
         for size, members_iter in itertools.groupby(
-            index.duplicate_size_candidates(), key=lambda record: record.size_bytes
+            index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes),
+            key=lambda record: record.size_bytes,
         ):
             buckets_seen += 1
             members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
@@ -326,9 +374,12 @@ def generate_duplicate_candidates(
     never evaluated and never appears in the output — it isn't being proposed for any action.
 
     `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
+    `min_reclaim_bytes` comes from `config.categories.duplicates.min_reclaim_bytes` — the
+    materiality gate is config-driven, not hardcoded, same as every other category threshold.
     """
     candidates: list[Candidate] = []
-    for cluster in find_duplicate_clusters(index, skips=skips):
+    min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
+    for cluster in find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips):
         rationale = _keep_rationale(cluster)
         for duplicate in cluster.duplicates:
             result = safety.evaluate(duplicate)
