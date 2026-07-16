@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
 from reclaim.models import FileRecord
+
+# Migration/backfill batch size for `_backfill_name_and_path_lower` — streamed via
+# `fetchmany`/`executemany` in chunks rather than loading every legacy row at once, so
+# backfilling a multi-million-row pre-existing index doesn't itself materialize the whole
+# table into memory (the exact anti-pattern this schema change exists to eliminate elsewhere).
+_MIGRATION_BATCH_SIZE = 5000
 
 # Column order shared by the CREATE TABLE, INSERT, and row-reconstruction code so the three
 # stay in sync by construction rather than by three separately-maintained lists.
@@ -25,6 +31,8 @@ _COLUMNS = (
     "git_repo_root",
     "git_repo_clean",
     "last_scanned",
+    "name",
+    "path_lower",
 )
 
 _SCHEMA = """
@@ -46,9 +54,19 @@ CREATE TABLE IF NOT EXISTS files (
     hash_size INTEGER,
     hash_mtime REAL,
     partial_hash TEXT,
-    full_hash TEXT
+    full_hash TEXT,
+    name TEXT,
+    path_lower TEXT
 );
 """
+# `name` (lowercased basename) and `path_lower` (lowercased posix path) exist purely so Stage
+# 3/4 candidate generation can query for matches via an index instead of materializing every
+# row into a Python `FileRecord` and filtering in-process (see `files_by_name`,
+# `files_matching_path_pattern`, `duplicate_size_candidates` below). Nullable, like the hash
+# columns above: a pre-existing index created before this schema version starts with both NULL
+# and gets backfilled once by `_backfill_name_and_path_lower` (SQLite's `ALTER TABLE ADD COLUMN`
+# can't retroactively populate a NOT NULL column on a non-empty table without a fixed default,
+# and a fixed default here would be wrong for every existing row).
 # hash_size/hash_mtime record the (size, mtime) a row's hash columns were computed against —
 # the Stage 4 dedup pipeline's cache-validity check (`cached_partial_hash`/`cached_full_hash`)
 # compares them to the row's *current* size/mtime, same invalidation logic as `is_unchanged`.
@@ -62,6 +80,14 @@ CREATE TABLE IF NOT EXISTS files (
 _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_files_dev_ino ON files(dev, ino);",
     "CREATE INDEX IF NOT EXISTS idx_files_is_cloud_placeholder ON files(is_cloud_placeholder);",
+    "CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);",
+    "CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);",
+    "CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);",
+    # COLLATE NOCASE lets SQLite's LIKE-to-index-range-scan optimization fire under the
+    # default case-insensitive LIKE semantics (empirically confirmed: without this collation,
+    # SQLite falls back to a full `SCAN files` for every `path_lower LIKE ?` query, even though
+    # both sides are already lowercased) — see `files_matching_path_pattern`.
+    "CREATE INDEX IF NOT EXISTS idx_files_path_lower ON files(path_lower COLLATE NOCASE);",
 )
 
 
@@ -144,8 +170,9 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
 
 
 def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
+    posix_path = record.path.as_posix()
     return (
-        record.path.as_posix(),
+        posix_path,
         record.size_bytes,
         record.mtime,
         record.ctime,
@@ -159,6 +186,8 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
         record.git_repo_root.as_posix() if record.git_repo_root is not None else None,
         int(record.git_repo_clean),
         scanned_at,
+        record.path.name.lower(),
+        posix_path.lower(),
     )
 
 
@@ -175,9 +204,44 @@ class ScanIndex:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(_SCHEMA)
+        self._ensure_name_and_path_lower_columns()
         for statement in _INDEXES:
             self._conn.execute(statement)
         self._conn.commit()
+
+    def _ensure_name_and_path_lower_columns(self) -> None:
+        """Migration for an index created before `name`/`path_lower` existed: `_SCHEMA`'s
+        `CREATE TABLE IF NOT EXISTS` is a no-op against an already-existing `files` table, so a
+        pre-existing DB needs an explicit `ALTER TABLE` + one-time backfill. A brand-new DB
+        already has both columns from `_SCHEMA` and this returns immediately."""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(files)")}
+        if "name" in columns and "path_lower" in columns:
+            return
+        if "name" not in columns:
+            self._conn.execute("ALTER TABLE files ADD COLUMN name TEXT")
+        if "path_lower" not in columns:
+            self._conn.execute("ALTER TABLE files ADD COLUMN path_lower TEXT")
+        self._conn.commit()
+        self._backfill_name_and_path_lower()
+
+    def _backfill_name_and_path_lower(self) -> None:
+        """Streams every row missing `name`/`path_lower` via `fetchmany` (never `fetchall`) and
+        writes the backfill in batches — a multi-million-row legacy index must not be
+        materialized into memory just to migrate it, which would defeat the entire point of
+        this schema change before a single detector query even runs."""
+        select_cursor = self._conn.execute(
+            "SELECT rowid, path FROM files WHERE name IS NULL OR path_lower IS NULL"
+        )
+        batch = select_cursor.fetchmany(_MIGRATION_BATCH_SIZE)
+        while batch:
+            updates = [
+                (Path(row["path"]).name.lower(), row["path"].lower(), row["rowid"]) for row in batch
+            ]
+            self._conn.executemany(
+                "UPDATE files SET name = ?, path_lower = ? WHERE rowid = ?", updates
+            )
+            self._conn.commit()
+            batch = select_cursor.fetchmany(_MIGRATION_BATCH_SIZE)
 
     def __enter__(self) -> ScanIndex:
         return self
@@ -293,6 +357,112 @@ class ScanIndex:
         self._conn.commit()
         return len(rows)
 
+    def get_record(self, path: Path) -> FileRecord | None:
+        """Single indexed point lookup on the primary key. The SQL-pushdown replacement for
+        looking a path up in an in-memory `{path: FileRecord}` dict built from a full-table
+        load — used once a detector has already decided, from its own narrow indexed query, to
+        propose a path, and just needs the full record back to build a `Candidate` from it."""
+        cursor = self._conn.execute("SELECT * FROM files WHERE path = ?", (path.as_posix(),))
+        row = cursor.fetchone()
+        return _row_to_record(row) if row is not None else None
+
+    def record_exists(self, path: Path) -> bool:
+        """Cheap existence check (e.g. "is there a `package.json` at this exact parent
+        directory") without even reconstructing a `FileRecord` — the point-lookup replacement
+        for `path in ctx.by_path`."""
+        cursor = self._conn.execute(
+            "SELECT 1 FROM files WHERE path = ? LIMIT 1", (path.as_posix(),)
+        )
+        return cursor.fetchone() is not None
+
+    def files_by_name(
+        self, names: Sequence[str], *, is_dir: bool | None = None
+    ) -> Iterator[FileRecord]:
+        """Streams every row whose lowercased basename is in `names` via the indexed `name`
+        column — O(matches), never a full-table load. Case-insensitive, matching the
+        directory-name-keyed dev-artifact detectors (`node_modules`, `.venv`, ...)."""
+        if not names:
+            return
+        placeholders = ", ".join("?" for _ in names)
+        # S608: placeholders are `?` markers only; every value is bound as a parameter below.
+        sql = f"SELECT * FROM files WHERE name IN ({placeholders})"  # noqa: S608
+        params: list[object] = [name.lower() for name in names]
+        if is_dir is not None:
+            sql += " AND is_dir = ?"
+            params.append(int(is_dir))
+        for row in self._conn.execute(sql, params):
+            yield _row_to_record(row)
+
+    def files_by_ext(
+        self, exts: Sequence[str], *, is_dir: bool | None = None
+    ) -> Iterator[FileRecord]:
+        """Streams every row whose extension is in `exts` via the indexed `ext` column."""
+        if not exts:
+            return
+        placeholders = ", ".join("?" for _ in exts)
+        sql = f"SELECT * FROM files WHERE ext IN ({placeholders})"  # noqa: S608
+        params: list[object] = [ext.lower() for ext in exts]
+        if is_dir is not None:
+            sql += " AND is_dir = ?"
+            params.append(int(is_dir))
+        for row in self._conn.execute(sql, params):
+            yield _row_to_record(row)
+
+    def files_larger_than(
+        self, min_size_bytes: int, *, is_dir: bool = False
+    ) -> Iterator[FileRecord]:
+        """Streams every row at or above `min_size_bytes` via the indexed `size` column — most
+        files on a real disk are far smaller than a large-log threshold (default 50MB), so this
+        narrows a whole-index scan down to a small minority before any Python-side filtering."""
+        cursor = self._conn.execute(
+            "SELECT * FROM files WHERE size >= ? AND is_dir = ?", (min_size_bytes, int(is_dir))
+        )
+        for row in cursor:
+            yield _row_to_record(row)
+
+    def files_matching_path_pattern(
+        self, glob_pattern: str, *, is_dir: bool | None = None
+    ) -> Iterator[FileRecord]:
+        """Streams rows whose posix path matches `glob_pattern` (an `fnmatch`-style pattern
+        with `*`/`?` wildcards — the same patterns `config.categories.*.paths`/`cache_paths`/
+        `temp_roots` already use), translated to a SQL `LIKE` pattern against the indexed
+        `path_lower COLLATE NOCASE` column.
+
+        Deliberately does *not* escape a literal `%`/`_` in the pattern before translating:
+        SQLite disables its LIKE-to-index-range-scan optimization the moment an `ESCAPE` clause
+        is present, even on this exact index (confirmed empirically — identical query and
+        index, only the `ESCAPE` clause differs, and the plan degrades from
+        `SEARCH ... USING INDEX` to a full `SCAN`). None of this project's actual category-config
+        patterns contain a literal `%`/`_` that would need escaping, and `fnmatch` itself has no
+        escape mechanism for its own `*`/`?`/`[]` metacharacters either — this is a different
+        instance of the same pre-existing class of limitation, not a new regression.
+        """
+        like_pattern = glob_pattern.lower().replace("*", "%").replace("?", "_")
+        sql = "SELECT * FROM files WHERE path_lower LIKE ?"
+        params: list[object] = [like_pattern]
+        if is_dir is not None:
+            sql += " AND is_dir = ?"
+            params.append(int(is_dir))
+        for row in self._conn.execute(sql, params):
+            yield _row_to_record(row)
+
+    def duplicate_size_candidates(self) -> Iterator[FileRecord]:
+        """Streams every non-directory, non-empty, non-cloud-placeholder file whose `size`
+        collides with at least one other such file — the SQL-pushed equivalent of the old
+        in-memory `_size_buckets()` prefilter in `dedup.py`. A unique-size file is never
+        selected by this query, let alone loaded into a Python `FileRecord`."""
+        sql = """
+            SELECT * FROM files
+            WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+            AND size IN (
+                SELECT size FROM files
+                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+                GROUP BY size HAVING COUNT(*) >= 2
+            )
+        """
+        for row in self._conn.execute(sql):
+            yield _row_to_record(row)
+
     def subtree_size_bytes(self, root: Path) -> int:
         """Sum of `size` for every non-directory row at or under `root` — the aggregate size a
         directory-level candidate (e.g. a `node_modules` dir) represents.
@@ -337,8 +507,19 @@ class ScanIndex:
         return self._query_inventory(under, candidates_only=False)
 
     def candidate_inventory(self, under: Path | None = None) -> list[FileRecord]:
-        """Everything except cloud placeholders — the only inventory Stage 3's candidate
-        generation should ever read from."""
+        """Everything except cloud placeholders, fully materialized into a `list[FileRecord]`.
+
+        Deprecated for whole-index candidate generation: `detectors.py`/`dedup.py` used to call
+        this with `under=None` to load the *entire* inventory into memory before running any
+        detector — on a real disk-scale index (millions of rows) that means materializing
+        millions of Python objects before a single candidate is proposed, which is exactly the
+        cost this method's callers were redesigned to avoid (see `files_by_name`/`files_by_ext`/
+        `files_larger_than`/`files_matching_path_pattern`/`duplicate_size_candidates` — narrow,
+        indexed queries that return only actual matches). No detector or dedup code may call
+        this with `under=None` again. Still legitimate for the dashboard's already
+        directory-scoped views (`under=<specific subdirectory>`), where the result is bounded by
+        that subdirectory's size, not the whole index.
+        """
         return self._query_inventory(under, candidates_only=True)
 
     def _query_inventory(self, under: Path | None, *, candidates_only: bool) -> list[FileRecord]:

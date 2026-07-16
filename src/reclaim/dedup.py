@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
@@ -54,17 +54,23 @@ def _is_downloads_or_temp(path: Path) -> bool:
     return any(part.lower() in _KEEP_HEURISTIC_LOCATION_SEGMENTS for part in path.parts)
 
 
-def _size_buckets(records: Sequence[FileRecord]) -> dict[int, list[FileRecord]]:
-    """Groups non-directory, non-empty files by `size_bytes`, dropping singleton buckets —
-    only files sharing a size with at least one other file are ever hash candidates, which is
-    what keeps the pipeline from hashing the whole index. 0-byte files are skipped entirely:
-    deduping them reclaims no space."""
+def _group_by_size(records: Iterable[FileRecord]) -> dict[int, list[FileRecord]]:
+    """Groups an already-narrowed iterable of records by `size_bytes`.
+
+    Deliberately does no filtering itself (no `is_dir`/`size == 0`/singleton-bucket check):
+    `records` is expected to already be `ScanIndex.duplicate_size_candidates()`'s output, which
+    pushes that filtering into a SQL `GROUP BY size HAVING COUNT(*) >= 2` query — only files
+    sharing a size with at least one other file are ever selected in the first place, so a
+    unique-size file is never loaded into a Python `FileRecord` at all, let alone hashed. This
+    replaced an earlier in-memory `_size_buckets(records: Sequence[FileRecord])` that received
+    the *entire* inventory and filtered it in Python — correct, but on a real disk-scale index
+    that meant materializing millions of rows before this function ever got to discard most of
+    them.
+    """
     buckets: dict[int, list[FileRecord]] = defaultdict(list)
     for record in records:
-        if record.is_dir or record.size_bytes == 0:
-            continue
         buckets[record.size_bytes].append(record)
-    return {size: members for size, members in buckets.items() if len(members) >= 2}
+    return dict(buckets)
 
 
 def _compute_partial_hash(path: Path, size_bytes: int) -> str:
@@ -140,9 +146,14 @@ def find_duplicate_clusters(
     the API service layer, evals) keep working unchanged against the plain
     `list[DuplicateCluster]` return type; callers that care about the skipped/unreadable files
     pass their own list and read it back after the call.
+
+    SQL-pushdown: `index.duplicate_size_candidates()` runs the whole "does this file's size
+    collide with another file's size" prefilter as one indexed `GROUP BY`/`IN` query — a
+    unique-size file is never loaded into a Python `FileRecord`, versus the earlier design that
+    called `index.candidate_inventory()` (a full-table load of every row) and filtered in
+    Python via `_size_buckets`.
     """
-    records = index.candidate_inventory()
-    size_groups = _size_buckets(records)
+    size_groups = _group_by_size(index.duplicate_size_candidates())
     if not size_groups:
         return []
 

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import fnmatch
 import time
-from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -12,7 +10,7 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, FileRecord, RawCandidate, Tier, Verdict
+from reclaim.models import Candidate, RawCandidate, Tier, Verdict
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -29,27 +27,22 @@ _GROUP_OLD_INSTALLERS = "old_installers"
 _GROUP_ARCHIVE_PAIRS = "archive_pairs"
 _GROUP_LARGE_LOGS = "large_logs"
 
-
-@dataclass(frozen=True, slots=True)
-class InventoryContext:
-    """Detector working set, built once per `generate_candidates` run so every detector
-    shares the same in-memory index instead of each re-scanning `ScanIndex` output."""
-
-    by_path: dict[Path, FileRecord]
-    children_by_dir: dict[Path, list[FileRecord]]
-
-
-def build_inventory_context(records: Sequence[FileRecord]) -> InventoryContext:
-    by_path: dict[Path, FileRecord] = {record.path: record for record in records}
-    children_by_dir: dict[Path, list[FileRecord]] = defaultdict(list)
-    for record in records:
-        children_by_dir[record.path.parent].append(record)
-    return InventoryContext(by_path=by_path, children_by_dir=dict(children_by_dir))
-
-
-def _matches_any_pattern(path: Path, patterns: Sequence[str]) -> bool:
-    candidate = path.as_posix().lower()
-    return any(fnmatch.fnmatch(candidate, pattern.lower()) for pattern in patterns)
+# --- SQL-pushdown note ----------------------------------------------------------------------
+#
+# Every detector below queries `ScanIndex` directly through a narrow, indexed method
+# (`files_by_name`/`files_by_ext`/`files_larger_than`/`files_matching_path_pattern`/
+# `direct_children`/`record_exists`) instead of iterating an in-memory copy of the whole
+# inventory. This replaced an earlier `InventoryContext`/`build_inventory_context()` design
+# that loaded every row into a `{path: FileRecord}` dict up front — correct, but it meant a
+# 3.1M-file real-disk index cost ~5GB of RAM and 20+ minutes just to materialize Python objects
+# before a single detector ran. No detector here may call `ScanIndex.candidate_inventory()`
+# (or any other whole-table load) again — see that method's docstring in `index.py`.
+#
+# A few checks genuinely cannot be pushed into a SQL `WHERE` clause without losing correctness
+# (see `detect_archive_pairs`'s fuzzy sibling-name match, and the "downloads"/"log" substring
+# checks in `detect_old_installers`/`detect_large_logs`) — those still run in Python, but only
+# over the small, already-indexed-narrowed candidate set each detector's SQL query returns, not
+# over the whole table. ADR-0002 documents this trade-off and why it's the honest option.
 
 
 def _has_path_segment(path: Path, segment: str) -> bool:
@@ -130,27 +123,31 @@ _DEV_ARTIFACT_SPECS: tuple[_DevArtifactSpec, ...] = (
 _DEV_ARTIFACT_SPECS_BY_NAME: dict[str, _DevArtifactSpec] = {
     spec.dir_name.lower(): spec for spec in _DEV_ARTIFACT_SPECS
 }
+_PYCACHE_NAME = "__pycache__"
+# The full set of directory basenames `detect_dev_artifacts` cares about — passed to
+# `files_by_name` as a single indexed IN (...) query rather than one query per name.
+_DEV_ARTIFACT_NAMES: tuple[str, ...] = (
+    *_DEV_ARTIFACT_SPECS_BY_NAME.keys(),
+    _PYCACHE_NAME,
+)
 
 
-def _has_sibling_manifest(
-    ctx: InventoryContext, parent: Path, manifest_names: Sequence[str]
-) -> bool:
-    return any((parent / name) in ctx.by_path for name in manifest_names)
-
-
-def detect_dev_artifacts(ctx: InventoryContext) -> list[RawCandidate]:
+def detect_dev_artifacts(index: ScanIndex) -> list[RawCandidate]:
     """Dev-artifact directories, gated on manifest adjacency: a rebuildable-cache directory is
     only ever proposed when a manifest proving rebuildability sits in its parent directory —
     no manifest adjacent means the path is never proposed, not even as a Tier B candidate
     (spec invariant, absolute). `__pycache__` is the one exception: unconditionally
     regeneratable bytecode, so it needs no manifest check at all.
+
+    SQL-pushdown: `files_by_name` narrows the whole index down to just directories named one of
+    the fixed dev-artifact names via the indexed `name` column — millions of unrelated rows are
+    never touched. The manifest-adjacency check is one indexed point lookup
+    (`record_exists`) per candidate, not a full-table scan.
     """
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if not record.is_dir:
-            continue
+    for record in index.files_by_name(_DEV_ARTIFACT_NAMES, is_dir=True):
         name_lower = record.path.name.lower()
-        if name_lower == "__pycache__":
+        if name_lower == _PYCACHE_NAME:
             candidates.append(
                 RawCandidate(
                     path=record.path,
@@ -168,8 +165,11 @@ def detect_dev_artifacts(ctx: InventoryContext) -> list[RawCandidate]:
             continue
         spec = _DEV_ARTIFACT_SPECS_BY_NAME.get(name_lower)
         if spec is None:
-            continue
-        if not _has_sibling_manifest(ctx, record.path.parent, spec.manifest_names):
+            continue  # defensive: files_by_name only returns names we asked for
+        if not any(
+            index.record_exists(record.path.parent / manifest_name)
+            for manifest_name in spec.manifest_names
+        ):
             continue  # no manifest adjacent: never proposed, not even Tier B
         candidates.append(
             RawCandidate(
@@ -191,32 +191,39 @@ def detect_dev_artifacts(ctx: InventoryContext) -> list[RawCandidate]:
 # --- Package/model caches -----------------------------------------------------------------
 
 
-def detect_package_caches(ctx: InventoryContext, cache_paths: Sequence[str]) -> list[RawCandidate]:
+def detect_package_caches(index: ScanIndex, cache_paths: Sequence[str]) -> list[RawCandidate]:
     """Global package/model download caches (pip, npm, uv, HuggingFace hub, torch hub, conda
     pkgs, .m2/.gradle) — no manifest-adjacency check, matched purely by configured path
     patterns (`config.categories.package_caches.paths`, defaulting to the real Windows
-    locations)."""
+    locations).
+
+    SQL-pushdown: each configured pattern is one `files_matching_path_pattern` query against
+    the indexed `path_lower` column, not a Python-side `fnmatch` over every row.
+    """
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if not record.is_dir or not _matches_any_pattern(record.path, cache_paths):
-            continue
-        candidates.append(
-            RawCandidate(
-                path=record.path,
-                is_dir=True,
-                category="package_cache",
-                category_group=_GROUP_PACKAGE_CACHES,
-                suggested_tier=Tier.A,
-                rationale=(
-                    "Package/model download cache — the owning tool re-downloads artifacts "
-                    "into this directory automatically on next use."
-                ),
-                rebuild_instruction=(
-                    "Re-run the package manager or model download; the cache repopulates "
-                    "automatically."
-                ),
+    seen: set[Path] = set()
+    for pattern in cache_paths:
+        for record in index.files_matching_path_pattern(pattern, is_dir=True):
+            if record.path in seen:
+                continue
+            seen.add(record.path)
+            candidates.append(
+                RawCandidate(
+                    path=record.path,
+                    is_dir=True,
+                    category="package_cache",
+                    category_group=_GROUP_PACKAGE_CACHES,
+                    suggested_tier=Tier.A,
+                    rationale=(
+                        "Package/model download cache — the owning tool re-downloads "
+                        "artifacts into this directory automatically on next use."
+                    ),
+                    rebuild_instruction=(
+                        "Re-run the package manager or model download; the cache repopulates "
+                        "automatically."
+                    ),
+                )
             )
-        )
     return candidates
 
 
@@ -224,7 +231,7 @@ def detect_package_caches(ctx: InventoryContext, cache_paths: Sequence[str]) -> 
 
 
 def detect_temp_and_browser_caches(
-    ctx: InventoryContext, cache_paths: Sequence[str], temp_roots: Sequence[str]
+    index: ScanIndex, cache_paths: Sequence[str], temp_roots: Sequence[str]
 ) -> list[RawCandidate]:
     """Browser cache directories and the Explorer thumbnail cache are proposed whole (matched
     by pattern); `%TEMP%`/`C:\\Windows\\Temp` are never proposed as a whole directory — only
@@ -236,58 +243,64 @@ def detect_temp_and_browser_caches(
     authoritative here, the detector doesn't special-case it away).
     """
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if not _matches_any_pattern(record.path, cache_paths):
-            continue
-        is_thumbnail = record.path.name.lower().startswith("thumbcache_")
-        candidates.append(
-            RawCandidate(
-                path=record.path,
-                is_dir=record.is_dir,
-                category="thumbnail_cache" if is_thumbnail else "browser_cache",
-                category_group=_GROUP_TEMP_AND_BROWSER_CACHES,
-                suggested_tier=Tier.A,
-                rationale=(
-                    "Windows Explorer thumbnail cache — regenerated automatically as folders "
-                    "are browsed."
-                    if is_thumbnail
-                    else "Browser cache directory — regenerated automatically by the browser."
-                ),
-                rebuild_instruction="Regenerates automatically on next use; no manual step.",
-            )
-        )
-
-    for record in ctx.by_path.values():
-        if not record.is_dir or not _matches_any_pattern(record.path, temp_roots):
-            continue
-        for child in ctx.children_by_dir.get(record.path, []):
+    seen: set[Path] = set()
+    for pattern in cache_paths:
+        for record in index.files_matching_path_pattern(pattern):
+            if record.path in seen:
+                continue
+            seen.add(record.path)
+            is_thumbnail = record.path.name.lower().startswith("thumbcache_")
             candidates.append(
                 RawCandidate(
-                    path=child.path,
-                    is_dir=child.is_dir,
-                    category="windows_temp",
+                    path=record.path,
+                    is_dir=record.is_dir,
+                    category="thumbnail_cache" if is_thumbnail else "browser_cache",
                     category_group=_GROUP_TEMP_AND_BROWSER_CACHES,
                     suggested_tier=Tier.A,
                     rationale=(
-                        f"Item in the Windows temp directory ('{record.path}') — temp files "
-                        "are transient by design and safe to remove."
+                        "Windows Explorer thumbnail cache — regenerated automatically as "
+                        "folders are browsed."
+                        if is_thumbnail
+                        else "Browser cache directory — regenerated automatically by the browser."
                     ),
-                    rebuild_instruction=None,
+                    rebuild_instruction="Regenerates automatically on next use; no manual step.",
                 )
             )
+
+    seen_roots: set[Path] = set()
+    for pattern in temp_roots:
+        for root_record in index.files_matching_path_pattern(pattern, is_dir=True):
+            if root_record.path in seen_roots:
+                continue
+            seen_roots.add(root_record.path)
+            for child in index.direct_children(root_record.path):
+                candidates.append(
+                    RawCandidate(
+                        path=child.path,
+                        is_dir=child.is_dir,
+                        category="windows_temp",
+                        category_group=_GROUP_TEMP_AND_BROWSER_CACHES,
+                        suggested_tier=Tier.A,
+                        rationale=(
+                            f"Item in the Windows temp directory ('{root_record.path}') — temp "
+                            "files are transient by design and safe to remove."
+                        ),
+                        rebuild_instruction=None,
+                    )
+                )
     return candidates
 
 
 # --- Crash dumps ---------------------------------------------------------------------------
 
+_CRASH_DUMP_EXT = (".dmp",)
 
-def detect_crash_dumps(ctx: InventoryContext, root_paths: Sequence[str]) -> list[RawCandidate]:
+
+def detect_crash_dumps(index: ScanIndex, root_paths: Sequence[str]) -> list[RawCandidate]:
     """`.dmp` files anywhere in the inventory, plus every direct child of the configured
     CrashDumps/WER report root directories (never the root directories themselves)."""
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if record.is_dir or record.ext != ".dmp":
-            continue
+    for record in index.files_by_ext(_CRASH_DUMP_EXT, is_dir=False):
         candidates.append(
             RawCandidate(
                 path=record.path,
@@ -303,46 +316,50 @@ def detect_crash_dumps(ctx: InventoryContext, root_paths: Sequence[str]) -> list
             )
         )
 
-    for record in ctx.by_path.values():
-        if not record.is_dir or not _matches_any_pattern(record.path, root_paths):
-            continue
-        for child in ctx.children_by_dir.get(record.path, []):
-            candidates.append(
-                RawCandidate(
-                    path=child.path,
-                    is_dir=child.is_dir,
-                    category="crash_dump_wer_report",
-                    category_group=_GROUP_CRASH_DUMPS,
-                    suggested_tier=Tier.A,
-                    rationale=(
-                        f"Windows Error Reporting artifact under '{record.path}' — diagnostic "
-                        "data from a past crash, regenerated automatically as needed."
-                    ),
-                    rebuild_instruction=None,
+    seen_roots: set[Path] = set()
+    for pattern in root_paths:
+        for root_record in index.files_matching_path_pattern(pattern, is_dir=True):
+            if root_record.path in seen_roots:
+                continue
+            seen_roots.add(root_record.path)
+            for child in index.direct_children(root_record.path):
+                candidates.append(
+                    RawCandidate(
+                        path=child.path,
+                        is_dir=child.is_dir,
+                        category="crash_dump_wer_report",
+                        category_group=_GROUP_CRASH_DUMPS,
+                        suggested_tier=Tier.A,
+                        rationale=(
+                            "Windows Error Reporting artifact under "
+                            f"'{root_record.path}' — diagnostic data from a past crash, "
+                            "regenerated automatically as needed."
+                        ),
+                        rebuild_instruction=None,
+                    )
                 )
-            )
     return candidates
 
 
 # --- Old installers --------------------------------------------------------------------------
 
-_INSTALLER_EXTENSIONS = frozenset({".exe", ".msi", ".iso"})
+_INSTALLER_EXTENSIONS = (".exe", ".msi", ".iso")
 
 
-def detect_old_installers(
-    ctx: InventoryContext, *, max_age_days: int, now: float
-) -> list[RawCandidate]:
+def detect_old_installers(index: ScanIndex, *, max_age_days: int, now: float) -> list[RawCandidate]:
     """Installer files (`.exe`/`.msi`/`.iso`) under a `Downloads` directory older than
     `max_age_days` (by mtime). Every detector in this module suggests Tier A uniformly —
     whether an old-installer candidate actually reaches Tier A or degrades to Tier B (spec:
     review-queue by default) is decided once, centrally, in `generate_candidates`, based on
     `config.categories.old_installers.enabled`.
+
+    SQL-pushdown: `files_by_ext` narrows to installer-extension files via the indexed `ext`
+    column first; the "is it under a Downloads directory" segment check and the age threshold
+    only ever run against that already-small subset, never the whole table.
     """
     threshold_seconds = max_age_days * _SECONDS_PER_DAY
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if record.is_dir or record.ext not in _INSTALLER_EXTENSIONS:
-            continue
+    for record in index.files_by_ext(_INSTALLER_EXTENSIONS, is_dir=False):
         if not _has_path_segment(record.path, "downloads"):
             continue
         age_seconds = now - record.mtime
@@ -372,6 +389,12 @@ def detect_old_installers(
 # Longest-suffix-first so ".tar.gz" matches before the plain ".gz"/".tar" would.
 _ARCHIVE_SUFFIXES: tuple[str, ...] = (".tar.gz", ".zip", ".rar", ".7z", ".tar")
 _ARCHIVE_OVERLAP_THRESHOLD = 0.90
+# `ScanIndex.ext` stores `Path.suffix` — the *last* suffix component only, so a "backup.tar.gz"
+# file is stored with ext=".gz", not ".tar.gz". This prefilter set includes ".gz" for exactly
+# that reason; `_archive_stem` below still requires the full ".tar.gz" suffix before treating a
+# ".gz" file as an archive-pair candidate, so a bare (non-tar) ".gz" file is correctly rejected
+# after the indexed narrowing, not before it.
+_ARCHIVE_EXTS_FOR_PREFILTER: tuple[str, ...] = (".gz", ".zip", ".rar", ".7z", ".tar")
 
 
 def _archive_stem(name: str) -> str | None:
@@ -382,22 +405,25 @@ def _archive_stem(name: str) -> str | None:
     return None
 
 
-def detect_archive_pairs(ctx: InventoryContext) -> list[RawCandidate]:
+def detect_archive_pairs(index: ScanIndex) -> list[RawCandidate]:
     """An archive file with a sibling directory whose name has >=90% overlap with the
     archive's stem (`difflib.SequenceMatcher` ratio, case-insensitive) proposes deleting
     *only* the archive — the extracted directory (and everything inside it) is never proposed
     by this detector, since it's explicitly the copy being kept.
+
+    SQL-pushdown: `files_by_ext` narrows to archive-extension files first (indexed); the fuzzy
+    name-overlap ratio itself has no SQL equivalent, so it still runs in Python — but only
+    between one archive file and its own directory's siblings (`direct_children`, an indexed
+    prefix query), never against the whole inventory.
     """
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if record.is_dir:
-            continue
+    for record in index.files_by_ext(_ARCHIVE_EXTS_FOR_PREFILTER, is_dir=False):
         stem = _archive_stem(record.path.name)
         if stem is None:
             continue
         best_match: str | None = None
         best_ratio = 0.0
-        for sibling in ctx.children_by_dir.get(record.path.parent, []):
+        for sibling in index.direct_children(record.path.parent):
             if not sibling.is_dir:
                 continue
             ratio = SequenceMatcher(None, stem.lower(), sibling.path.name.lower()).ratio()
@@ -427,17 +453,19 @@ def detect_archive_pairs(ctx: InventoryContext) -> list[RawCandidate]:
 
 
 def detect_large_logs(
-    ctx: InventoryContext, *, min_size_bytes: int, stale_days: int, now: float
+    index: ScanIndex, *, min_size_bytes: int, stale_days: int, now: float
 ) -> list[RawCandidate]:
+    """SQL-pushdown: `files_larger_than` narrows to files at/above the size threshold via the
+    indexed `size` column first — on a typical disk the overwhelming majority of files are far
+    smaller than a 50MB default threshold, so this alone eliminates most rows before the
+    ext/name-substring/age checks (none of which are cleanly SQL-expressible as a single
+    indexed predicate) ever run.
+    """
     threshold_seconds = stale_days * _SECONDS_PER_DAY
     candidates: list[RawCandidate] = []
-    for record in ctx.by_path.values():
-        if record.is_dir:
-            continue
+    for record in index.files_larger_than(min_size_bytes, is_dir=False):
         name_lower = record.path.name.lower()
         if record.ext != ".log" and "log" not in name_lower:
-            continue
-        if record.size_bytes < min_size_bytes:
             continue
         age_seconds = now - record.mtime
         if age_seconds < threshold_seconds:
@@ -471,6 +499,10 @@ def _drop_nested_candidates(raw: Sequence[RawCandidate]) -> list[RawCandidate]:
     candidate — deleting the ancestor directory already removes everything under it, so a
     nested proposal would double-count size and clutter the review queue with redundant
     entries.
+
+    Operates on the raw candidate list every detector above already narrowed via an indexed
+    query — bounded by the real number of candidates found, not by total inventory size, so
+    this stays a plain in-memory pass (no SQL needed here).
     """
     ordered = sorted(raw, key=lambda c: len(c.path.parts))
     kept: list[RawCandidate] = []
@@ -528,26 +560,26 @@ def _category_retention_days(category_group: str, config: Config) -> int | None:
     return getter(config)
 
 
-def _run_all_detectors(ctx: InventoryContext, config: Config, now: float) -> list[RawCandidate]:
+def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[RawCandidate]:
     categories = config.categories
     raw: list[RawCandidate] = []
-    raw.extend(detect_dev_artifacts(ctx))
-    raw.extend(detect_package_caches(ctx, categories.package_caches.paths))
+    raw.extend(detect_dev_artifacts(index))
+    raw.extend(detect_package_caches(index, categories.package_caches.paths))
     raw.extend(
         detect_temp_and_browser_caches(
-            ctx,
+            index,
             categories.temp_and_browser_caches.cache_paths,
             categories.temp_and_browser_caches.temp_roots,
         )
     )
-    raw.extend(detect_crash_dumps(ctx, categories.crash_dumps.paths))
+    raw.extend(detect_crash_dumps(index, categories.crash_dumps.paths))
     raw.extend(
-        detect_old_installers(ctx, max_age_days=categories.old_installers.max_age_days, now=now)
+        detect_old_installers(index, max_age_days=categories.old_installers.max_age_days, now=now)
     )
-    raw.extend(detect_archive_pairs(ctx))
+    raw.extend(detect_archive_pairs(index))
     raw.extend(
         detect_large_logs(
-            ctx,
+            index,
             min_size_bytes=categories.large_logs.min_size_bytes,
             stale_days=categories.large_logs.stale_days,
             now=now,
@@ -559,31 +591,32 @@ def _run_all_detectors(ctx: InventoryContext, config: Config, now: float) -> lis
 def generate_candidates(
     index: ScanIndex, config: Config, safety: SafetyValidator, *, now: float | None = None
 ) -> list[Candidate]:
-    """Runs every rule detector against `index`'s candidate-eligible inventory, then routes
-    every raw proposal through `safety.evaluate()` before it is ever tagged Tier A or Tier B —
-    the boundary the spec means by "SafetyValidator filters files before they enter the
-    candidate pipeline" (design principle 3).
+    """Runs every rule detector against `index`, then routes every raw proposal through
+    `safety.evaluate()` before it is ever tagged Tier A or Tier B — the boundary the spec means
+    by "SafetyValidator filters files before they enter the candidate pipeline" (design
+    principle 3).
 
     `Verdict.BLOCKED` -> excluded entirely, does not appear anywhere (not even Tier B).
     `Verdict.REVIEW_ONLY` -> forced into Tier B regardless of what the detector suggested.
     `Verdict.ELIGIBLE` -> the detector's suggested tier, but only if the matching
     `config.categories.*` group is enabled; otherwise it degrades to Tier B. Nothing
     non-blocked is ever silently dropped — every surviving candidate lands in Tier A or B.
+
+    Never materializes the whole inventory: each detector queries `index` directly for only
+    the rows it needs, and the one `index.get_record()` call per surviving raw candidate below
+    is a single indexed point lookup, not a re-scan.
     """
     now_ts = now if now is not None else time.time()
-    records = index.candidate_inventory()
-    ctx = build_inventory_context(records)
-
-    raw = _run_all_detectors(ctx, config, now_ts)
+    raw = _run_all_detectors(index, config, now_ts)
     raw = _drop_nested_candidates(raw)
 
     candidates: list[Candidate] = []
     for rc in raw:
-        record = ctx.by_path.get(rc.path)
+        record = index.get_record(rc.path)
         if record is None:
-            # Defensive: every raw candidate is sourced directly from `ctx.by_path`/
-            # `ctx.children_by_dir` entries by construction, so this should be unreachable —
-            # logged and skipped rather than crashing the whole run on a future detector bug.
+            # Defensive: every raw candidate is sourced directly from an `index` query by
+            # construction, so this should be unreachable — logged and skipped rather than
+            # crashing the whole run on a future detector bug.
             logger.warning("candidates.raw_path_not_in_inventory", path=str(rc.path))
             continue
 

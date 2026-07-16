@@ -433,6 +433,68 @@ retention + restore, now with an explicit `purge` command for expired entries.
 - Next: first real-disk dry run (Task #12) — `C:\` scan, `--apply` forbidden this run, report
   for GG's review before anything is queued for apply.
 
+### 2026-07-16 — First real-disk dry run stalled; dedup pipeline hardened
+- First attempt: `reclaim scan C:\` completed cleanly (3,139,595 entries, 454,330 dirs,
+  708.83s), but the follow-on `apply` dry-run (redirected to `report.txt`) stalled with zero
+  output — `report.txt` stayed 0 bytes, `index.sqlite3`'s `partial_hash`/`full_hash` columns
+  stayed at 0 rows, and no `reclaim` process was left running when checked. Root cause: the
+  exact-duplicate hash pass (`dedup.py::find_duplicate_clusters`) had no progress logging and
+  batched every `store_partial_hashes`/`store_full_hashes` SQLite write to the very end of each
+  pass — so a long hash pass was genuinely indistinguishable from a hang, even by directly
+  querying the index — plus no per-file read timeout, so one locked/slow file could wedge the
+  whole run. The size-uniqueness prefilter (`_size_buckets` dropping singleton-size groups) was
+  already correct and already in place; it was not the cause.
+- Fix (commit `80344a2`): heartbeat log every ~5s during both hash passes; hash writes flushed
+  every 500 files instead of one batch at the end; a `ThreadPoolExecutor`-based 30s per-file
+  read timeout (`_hash_with_guard`) that turns a timeout or `OSError` into a recorded
+  `HashSkip` instead of hanging or crashing; `apply` gained `--include-duplicates` (opt-in,
+  default off) so the fast rule-detector report never has to pay for the hash pass unless
+  explicitly requested. 10 new tests (`tests/test_dedup.py`, `tests/test_cli.py`); 161 unit
+  tests + 2 evals pass; ruff/format/mypy clean.
+- `.gitignore` gap closed: `data/*.sqlite3` doesn't reach nested subdirectories, so
+  `data/real-disk-run/` (this run's 1.3GB index) wasn't actually ignored — added
+  `data/real-disk-run/` explicitly before it could get committed by accident.
+- Next: re-run the real-disk dry run with the fixed pipeline; watch for `dedup.progress`
+  heartbeat lines and confirm `SELECT COUNT(*) FROM files WHERE partial_hash IS NOT NULL`
+  actually increments during the run.
+
+### 2026-07-16 — Second stall: candidate generation doesn't scale; SQL-pushdown rewrite
+- Re-run hung again, this time *before* the hash pass: `tasklist` showed the `apply` process
+  alive and burning CPU (21+ min, ~4.9GB RSS) with 0 rows written to `partial_hash`/`full_hash`.
+  Root cause: `detectors.py::generate_candidates()` and `dedup.py::generate_duplicate_candidates()`
+  each independently called `ScanIndex.candidate_inventory()` — a full-table load materializing
+  every one of 3.1M rows into a `FileRecord` object (and two whole-inventory dicts,
+  `InventoryContext`) before any detector or the dedup size-prefilter ran.
+- Fix (ADR-0002, `docs/architecture/adr/0002-sql-pushdown-candidate-generation.md`): every rule
+  detector and the dedup size-bucket prefilter now query `ScanIndex` directly via narrow,
+  indexed methods (`get_record`/`record_exists`/`files_by_name`/`files_by_ext`/
+  `files_larger_than`/`files_matching_path_pattern`/`duplicate_size_candidates`) instead of
+  iterating an in-memory copy of the whole table. New `name`/`path_lower` indexed columns +
+  migration for pre-existing DBs (streamed backfill, never `fetchall`). `InventoryContext`/
+  `build_inventory_context` deleted outright (dead code once nothing called them).
+  `generate_candidates()`/`generate_duplicate_candidates()` kept their exact external
+  signatures — `cli.py`/`api/service.py` needed zero changes.
+- Verified: every hot query hits `SEARCH ... USING INDEX` (never `SCAN`) via `EXPLAIN QUERY
+  PLAN` tests that capture the *actual* SQL each method issues
+  (`sqlite3.Connection.set_trace_callback`), so the test can't drift from the implementation.
+  A 500K-row synthetic-index eval (`evals/test_candidate_generation_perf.py`) measured peak
+  Python memory delta at **1.16MB** (vs. several hundred MB a full materialization would cost).
+  The pre-existing golden-fixture eval (`evals/test_candidate_generation.py`, written and
+  passing against the old `InventoryContext` implementation) passes unmodified — parity
+  evidence without needing to keep the deleted implementation around to diff against.
+- Independent Haiku verifier re-ran everything from scratch (178 unit tests, 11 evals,
+  ruff/format/mypy, grepped for lingering `candidate_inventory()`/`full_inventory()` calls in
+  detectors/dedup, spot-checked the `.tar.gz`-vs-bare-`.gz` archive-pair edge case by reading
+  code) — all pass, sign-off clean.
+- Honest limits (documented in ADR-0002, not silently swept under the rug): archive-pair fuzzy
+  matching and the downloads/log substring checks still run in Python (over the already-SQL-
+  narrowed set only); `files_matching_path_pattern` doesn't escape literal `%`/`_` in patterns
+  because an `ESCAPE` clause empirically kills SQLite's LIKE-index optimization — mirrors
+  `fnmatch`'s own lack of an escape mechanism, not a new regression against default config.
+- Next: re-run the real-disk dry run again with both fixes in place; this time watch process
+  CPU *and* `partial_hash`/`full_hash` row counts together to confirm progress through both
+  candidate generation and the hash pass.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
