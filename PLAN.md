@@ -495,6 +495,44 @@ retention + restore, now with an explicit `purge` command for expired entries.
   CPU *and* `partial_hash`/`full_hash` row counts together to confirm progress through both
   candidate generation and the hash pass.
 
+### 2026-07-17 — Third stall: dedup still collected every candidate before hashing any
+- Re-run hung a third time, now inside `find_duplicate_clusters` itself. Diagnosis via
+  `Get-Process`/`tasklist`: single thread, zero disk I/O, ~78MB flat memory, climbing CPU — it
+  hadn't reached the multi-threaded hashing loop at all. Root cause, confirmed by directly
+  querying the live index: **2,485,410 of 3,116,478 files (80%!) share a size with at least one
+  other file** on this real `C:\`. The size-uniqueness prefilter (correctly SQL-pushed per
+  ADR-0002) barely narrows anything in practice here — `find_duplicate_clusters` still
+  collected the *entire* `duplicate_size_candidates()` stream into one
+  `dict[size, list[FileRecord]]` (via `_group_by_size`) before hashing a single file, so Python
+  object materialization cost simply moved from "the whole index" to "the whole duplicate-size
+  candidate set" (millions either way).
+- Fix: `index.py`'s `duplicate_size_candidates()` gained `ORDER BY size` (confirmed via EXPLAIN
+  QUERY PLAN to cost nothing extra — the size index already visits rows in that order) plus a
+  cheap `duplicate_size_candidate_count()` for an up-front heartbeat total. `dedup.py`'s
+  `find_duplicate_clusters` now processes one size bucket at a time via
+  `itertools.groupby(index.duplicate_size_candidates(), key=...)` — partial-hash, then
+  full-hash the survivors, immediately per bucket — so peak memory is bounded by the *largest
+  single bucket*, not the total candidate count. `_group_by_size` (now dead) deleted along with
+  its 2 tests.
+- First eval draft (every file in a bucket sharing one fake hash) failed at 335MB — a genuinely
+  useful failure: it revealed the draft was measuring "cost of returning every true duplicate
+  found" (legitimate, unavoidable), not "cost of collecting a bucket before hashing it" (the
+  actual bug). Redesigned with exactly one real duplicate pair per ~80K-record bucket (matching
+  how same-size-but-different-content files actually fragment on a real disk) — passes at
+  119.39MB against a 150MB ceiling, with `dedup.progress` heartbeat lines confirmed visibly
+  incrementing (`buckets_seen`/`partial_hashed`/`full_hashed`/`clusters_found`) throughout the
+  run.
+- Independent Haiku verifier re-ran everything, and specifically checked the one correctness
+  risk this refactor could have silently introduced: `itertools.groupby` only groups
+  *contiguous* equal keys, so it's only correct if its input is sorted by size — confirmed
+  `ORDER BY size` is really in the SQL text (not just assumed), which is what makes the
+  groupby-based bucketing behaviorally identical to the old whole-table version rather than a
+  silent correctness bug (splitting one true size-group into two if rows ever arrived
+  non-contiguously).
+- Next: re-run the real-disk dry run a third time. Given the 80% collision finding, expect the
+  hash pass itself to take a genuinely long time (this is real disk-I/O-bound work now, not an
+  artifact of a bug) — the heartbeat is the thing to watch, not a specific expected duration.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

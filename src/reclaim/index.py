@@ -450,7 +450,17 @@ class ScanIndex:
         """Streams every non-directory, non-empty, non-cloud-placeholder file whose `size`
         collides with at least one other such file — the SQL-pushed equivalent of the old
         in-memory `_size_buckets()` prefilter in `dedup.py`. A unique-size file is never
-        selected by this query, let alone loaded into a Python `FileRecord`."""
+        selected by this query, let alone loaded into a Python `FileRecord`.
+
+        `ORDER BY size` costs nothing extra here (confirmed via `EXPLAIN QUERY PLAN`: no
+        separate "USE TEMP B-TREE FOR ORDER BY" step appears, since scanning `idx_files_size`
+        already visits rows in size order) and lets `dedup.py` consume this stream one size
+        bucket at a time (`itertools.groupby`) instead of collecting every candidate row into
+        memory before processing any of them — the fix for a real disk where a size-uniqueness
+        prefilter alone barely narrows anything (measured: 80% of files on one real `C:\\`
+        shared a size with at least one other file, making "the whole candidate set" a
+        multi-million-row materialization if it were ever held all at once).
+        """
         sql = """
             SELECT * FROM files
             WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
@@ -459,9 +469,26 @@ class ScanIndex:
                 WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
                 GROUP BY size HAVING COUNT(*) >= 2
             )
+            ORDER BY size
         """
         for row in self._conn.execute(sql):
             yield _row_to_record(row)
+
+    def duplicate_size_candidate_count(self) -> int:
+        """A cheap `COUNT(*)` over the same filter `duplicate_size_candidates()` streams —
+        logged once up front so a heartbeat can report "N of M processed" instead of just a
+        running count with no sense of how much work remains."""
+        sql = """
+            SELECT COUNT(*) AS total FROM files
+            WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+            AND size IN (
+                SELECT size FROM files
+                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+                GROUP BY size HAVING COUNT(*) >= 2
+            )
+        """
+        row = self._conn.execute(sql).fetchone()
+        return int(row["total"])
 
     def subtree_size_bytes(self, root: Path) -> int:
         """Sum of `size` for every non-directory row at or under `root` — the aggregate size a

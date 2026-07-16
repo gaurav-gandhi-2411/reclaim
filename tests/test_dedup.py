@@ -14,7 +14,6 @@ from reclaim.dedup import (
     _compute_full_hash,
     _compute_partial_hash,
     _due,
-    _group_by_size,
     _hash_with_guard,
     _is_downloads_or_temp,
     find_duplicate_clusters,
@@ -45,33 +44,6 @@ def _record(
         mtime=ctime,
         ctime=ctime,
     )
-
-
-# --- Size grouping ---------------------------------------------------------------------------
-#
-# The old `_size_buckets()` filtered (dropped singleton buckets, zero-byte files, directories)
-# *and* grouped an in-memory `Sequence[FileRecord]` — it was replaced by
-# `ScanIndex.duplicate_size_candidates()` (a SQL `GROUP BY size HAVING COUNT(*) >= 2` query,
-# tested in `test_index.py` alongside its EXPLAIN QUERY PLAN assertion) doing the filtering,
-# and `_group_by_size()` doing only the grouping over that already-narrowed iterable. These
-# tests cover the grouping half; `test_find_duplicate_clusters_never_hashes_unique_size_files`
-# below covers the end-to-end prefilter guarantee.
-
-
-def test_group_by_size_groups_matching_sizes_together() -> None:
-    records = [
-        _record("C:/Data/a.txt", size_bytes=100),
-        _record("C:/Data/b.txt", size_bytes=100),
-        _record("C:/Data/c.txt", size_bytes=200),
-    ]
-    groups = _group_by_size(records)
-    assert set(groups.keys()) == {100, 200}
-    assert {r.path for r in groups[100]} == {Path("C:/Data/a.txt"), Path("C:/Data/b.txt")}
-    assert {r.path for r in groups[200]} == {Path("C:/Data/c.txt")}
-
-
-def test_group_by_size_of_empty_iterable_is_empty() -> None:
-    assert _group_by_size([]) == {}
 
 
 # --- Partial/full hash computation -----------------------------------------------------------
