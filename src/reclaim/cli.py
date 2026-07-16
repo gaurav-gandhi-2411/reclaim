@@ -18,7 +18,7 @@ from reclaim.executor import (
     restore_batch,
 )
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, Tier
+from reclaim.models import Candidate, HashSkip, Tier
 from reclaim.purge import purge_expired
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
@@ -75,6 +75,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="A",
         help="Which candidate tier(s) to apply. Default A only: Tier B is review-queue-only "
         "and is never silently auto-applied without an explicit --tier B/both.",
+    )
+    apply_parser.add_argument(
+        "--include-duplicates",
+        action="store_true",
+        help="Also run the exact-duplicate pipeline (size bucket -> partial hash -> full "
+        "BLAKE3 hash over every file on disk in a size-collision group). Opt-in and off by "
+        "default: on a large/whole-disk index this pass can take a long time, so the fast, "
+        "hashing-free report (rule detectors only) is always available without it — request "
+        "this flag once you're ready to pay for duplicate detection too.",
     )
     apply_parser.add_argument(
         "--method",
@@ -241,6 +250,28 @@ def _under_root(candidate_path: Path, root: Path) -> bool:
     return resolved_candidate == resolved_root or resolved_root in resolved_candidate.parents
 
 
+_REPORT_TOP_N = 10
+
+
+def _print_top_n_largest(selected: Sequence[Candidate]) -> None:
+    largest = sorted(selected, key=lambda c: c.size_bytes, reverse=True)[:_REPORT_TOP_N]
+    if not largest:
+        return
+    print(f"  top {len(largest)} largest candidates:")  # noqa: T201
+    for candidate in largest:
+        print(f"    {candidate.size_bytes:>14,} bytes  {candidate.path}")  # noqa: T201
+
+
+def _print_hash_skips(skips: Sequence[HashSkip]) -> None:
+    if not skips:
+        return
+    print(f"  skipped/unreadable during duplicate hashing: {len(skips)}")  # noqa: T201
+    for skip in skips[:_REPORT_TOP_N]:
+        print(f"    [{skip.stage}] {skip.path} — {skip.reason}")  # noqa: T201
+    if len(skips) > _REPORT_TOP_N:
+        print(f"    ... and {len(skips) - _REPORT_TOP_N} more")  # noqa: T201
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     root: Path = args.path
     if not root.is_dir():
@@ -253,10 +284,17 @@ def _run_apply(args: argparse.Namespace) -> int:
     config_path: Path = args.config
     config = load_config(config_path if config_path.exists() else None)
 
+    hash_skips: list[HashSkip] = []
     with ScanIndex(args.db) as index:
         safety = SafetyValidator(config)
         candidates: list[Candidate] = generate_candidates(index, config, safety)
-        candidates += generate_duplicate_candidates(index, config, safety)
+        if args.include_duplicates:
+            candidates += generate_duplicate_candidates(index, config, safety, skips=hash_skips)
+        else:
+            print(  # noqa: T201
+                "reclaim apply: duplicate detection skipped (pass --include-duplicates to "
+                "also run the size/hash-based exact-duplicate pipeline)."
+            )
 
     tiers = _TIER_SELECTIONS[args.tier]
     selected = [c for c in candidates if c.tier in tiers and _under_root(c.path, root)]
@@ -290,6 +328,8 @@ def _run_apply(args: argparse.Namespace) -> int:
         print(  # noqa: T201
             f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}"
         )
+    _print_top_n_largest(selected)
+    _print_hash_skips(hash_skips)
     for item in report.items:
         if not item.succeeded:
             print(f"  FAILED: {item.path} — {item.error}", file=sys.stderr)  # noqa: T201

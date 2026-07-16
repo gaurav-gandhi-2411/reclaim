@@ -18,6 +18,9 @@ data/*.sqlite
 data/*.sqlite3
 data/quarantine/
 data/scan-index/
+# Real-disk dry-run output (index + logs against GG's actual C:\) — the top-level data/*.sqlite3
+# pattern above doesn't reach nested subdirectories, so this run's own folder needs its own entry.
+data/real-disk-run/
 
 # evals/test_dedup.py scratch trees — created outside a system Temp dir on purpose (pytest's
 # own tmp_path lives under %TEMP%, which would confound the keep-heuristic's Downloads/Temp

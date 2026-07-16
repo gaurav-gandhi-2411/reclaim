@@ -119,6 +119,19 @@ class DuplicateCluster:
 
 
 @dataclass(frozen=True, slots=True)
+class HashSkip:
+    """One file the Stage 4 dedup pipeline could not hash — read timed out (hang guard) or
+    raised `OSError` (locked file, permission denied, vanished mid-scan). Recorded rather than
+    silently dropped or allowed to wedge the whole pipeline: the file is simply excluded from
+    duplicate-cluster consideration, and the skip is surfaced to the caller so a report can show
+    it under "skipped/unreadable" instead of the run just looking incomplete."""
+
+    path: Path
+    stage: str  # "partial" | "full"
+    reason: str  # "timeout" or str(OSError)
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     """A `RawCandidate` that has passed through `SafetyValidator.evaluate()` and been assigned
     a final tier — the only shape Stage 4+ (dedup pipeline, executor, UI) should ever consume.

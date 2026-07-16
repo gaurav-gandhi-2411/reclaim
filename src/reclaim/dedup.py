@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
 
 import blake3
+import structlog
 
 from reclaim.config import Config
 from reclaim.index import ScanIndex, cached_full_hash, cached_partial_hash
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, Tier, Verdict
+from reclaim.models import Candidate, DuplicateCluster, FileRecord, HashSkip, Tier, Verdict
 from reclaim.safety import SafetyValidator
+
+logger = structlog.get_logger(__name__)
 
 _PARTIAL_HASH_CHUNK_BYTES = 64 * 1024
 # Files at or below this size are hashed whole in one read rather than as two 64KB chunks —
@@ -23,6 +29,24 @@ _KEEP_HEURISTIC_LOCATION_SEGMENTS = frozenset({"downloads", "temp"})
 
 _CATEGORY = "exact_duplicate"
 _CATEGORY_GROUP = "duplicates"
+
+# Observability: a multi-hour hash pass that prints nothing is indistinguishable from a hang
+# (the real-disk-run incident this guards against — a 3.1M-file scan whose hash stage produced
+# zero output and zero incrementing SQLite rows for as long as anyone watched it). One heartbeat
+# line at most every this many seconds, plus flushing hash writes in batches rather than one
+# giant commit at the very end, so `SELECT COUNT(*) FROM files WHERE partial_hash IS NOT NULL`
+# actually moves while a run is in progress.
+_HEARTBEAT_INTERVAL_SECONDS = 5.0
+_WRITE_BATCH_SIZE = 500
+
+# Per-file hang guard: a locked system file or a pathological read must never wedge the whole
+# pipeline (known cloud-placeholder files are already excluded upstream by
+# `ScanIndex.candidate_inventory()`'s `is_cloud_placeholder` filter, but this is the backstop
+# for everything that filter doesn't catch). The read runs on a worker thread so a stuck
+# syscall only costs one pool slot, not the calling thread — Python has no cross-platform way
+# to preempt a blocked `read()`, so a timed-out thread is abandoned, not killed.
+_HASH_READ_TIMEOUT_SECONDS = 30.0
+_HASH_TIMEOUT_WORKERS = 8
 
 
 def _is_downloads_or_temp(path: Path) -> bool:
@@ -63,6 +87,31 @@ def _compute_full_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _due(*, last: float, now: float, interval: float) -> bool:
+    """Pure predicate behind the heartbeat gate — split out from the hashing loops so the
+    timing logic itself is unit-testable without needing a multi-second real sleep."""
+    return (now - last) >= interval
+
+
+def _hash_with_guard(
+    executor: ThreadPoolExecutor,
+    fn: Callable[..., str],
+    path: Path,
+    *args: object,
+    timeout_seconds: float = _HASH_READ_TIMEOUT_SECONDS,
+) -> tuple[str | None, str | None]:
+    """Runs `fn(path, *args)` on `executor` and returns `(digest, skip_reason)` — exactly one
+    is `None`. Never raises: a timeout or `OSError` both become a skip reason instead of
+    propagating and killing the whole dedup run over one bad file."""
+    future = executor.submit(fn, path, *args)
+    try:
+        return future.result(timeout=timeout_seconds), None
+    except FutureTimeoutError:
+        return None, "timeout"
+    except OSError as exc:
+        return None, str(exc)
+
+
 def select_keep(members: Sequence[FileRecord]) -> FileRecord:
     """Picks the one cluster member to keep. Ranking, in order: (1) prefer a path not under a
     Downloads/Temp directory, (2) oldest `ctime` — Windows creation time, the "which copy
@@ -80,28 +129,73 @@ def select_keep(members: Sequence[FileRecord]) -> FileRecord:
     )
 
 
-def find_duplicate_clusters(index: ScanIndex) -> list[DuplicateCluster]:
+def find_duplicate_clusters(
+    index: ScanIndex, *, skips: list[HashSkip] | None = None
+) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
-    cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since."""
+    cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
+
+    `skips` is an optional out-param (append-to list, default `None` = don't bother collecting)
+    rather than a second return value, so existing callers (`generate_duplicate_candidates`,
+    the API service layer, evals) keep working unchanged against the plain
+    `list[DuplicateCluster]` return type; callers that care about the skipped/unreadable files
+    pass their own list and read it back after the call.
+    """
     records = index.candidate_inventory()
     size_groups = _size_buckets(records)
     if not size_groups:
         return []
 
     hash_cache = index.load_hash_cache()
+    total_partial_candidates = sum(len(members) for members in size_groups.values())
+    logger.info(
+        "dedup.partial_hash_start",
+        size_groups=len(size_groups),
+        candidate_files=total_partial_candidates,
+    )
 
     partial_groups: dict[tuple[int, str], list[FileRecord]] = defaultdict(list)
     partial_writes: list[tuple[Path, int, float, str]] = []
-    for size, members in size_groups.items():
-        for record in members:
-            entry = hash_cache.get(record.path.as_posix())
-            digest = cached_partial_hash(
-                entry, current_size=record.size_bytes, current_mtime=record.mtime
-            )
-            if digest is None:
-                digest = _compute_partial_hash(record.path, record.size_bytes)
-                partial_writes.append((record.path, record.size_bytes, record.mtime, digest))
-            partial_groups[(size, digest)].append(record)
+    hashed = 0
+    last_heartbeat = time.monotonic()
+    with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
+        for size, members in size_groups.items():
+            for record in members:
+                entry = hash_cache.get(record.path.as_posix())
+                digest = cached_partial_hash(
+                    entry, current_size=record.size_bytes, current_mtime=record.mtime
+                )
+                if digest is None:
+                    digest, reason = _hash_with_guard(
+                        executor, _compute_partial_hash, record.path, record.size_bytes
+                    )
+                    if digest is None:
+                        logger.warning(
+                            "dedup.hash_unreadable",
+                            stage="partial",
+                            path=str(record.path),
+                            reason=reason,
+                        )
+                        if skips is not None:
+                            skips.append(
+                                HashSkip(path=record.path, stage="partial", reason=reason or "")
+                            )
+                        continue
+                    partial_writes.append((record.path, record.size_bytes, record.mtime, digest))
+                    if len(partial_writes) >= _WRITE_BATCH_SIZE:
+                        index.store_partial_hashes(partial_writes)
+                        partial_writes.clear()
+                partial_groups[(size, digest)].append(record)
+                hashed += 1
+                now = time.monotonic()
+                if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                    logger.info(
+                        "dedup.progress",
+                        stage="partial_hash",
+                        hashed=hashed,
+                        total=total_partial_candidates,
+                    )
+                    last_heartbeat = now
     if partial_writes:
         index.store_partial_hashes(partial_writes)
 
@@ -109,18 +203,49 @@ def find_duplicate_clusters(index: ScanIndex) -> list[DuplicateCluster]:
     if not survivors:
         return []
 
+    total_full_candidates = sum(len(members) for members in survivors.values())
+    logger.info("dedup.full_hash_start", candidate_files=total_full_candidates)
+
     full_groups: dict[tuple[int, str], list[FileRecord]] = defaultdict(list)
     full_writes: list[tuple[Path, int, float, str]] = []
-    for members in survivors.values():
-        for record in members:
-            entry = hash_cache.get(record.path.as_posix())
-            digest = cached_full_hash(
-                entry, current_size=record.size_bytes, current_mtime=record.mtime
-            )
-            if digest is None:
-                digest = _compute_full_hash(record.path)
-                full_writes.append((record.path, record.size_bytes, record.mtime, digest))
-            full_groups[(record.size_bytes, digest)].append(record)
+    hashed = 0
+    last_heartbeat = time.monotonic()
+    with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
+        for members in survivors.values():
+            for record in members:
+                entry = hash_cache.get(record.path.as_posix())
+                digest = cached_full_hash(
+                    entry, current_size=record.size_bytes, current_mtime=record.mtime
+                )
+                if digest is None:
+                    digest, reason = _hash_with_guard(executor, _compute_full_hash, record.path)
+                    if digest is None:
+                        logger.warning(
+                            "dedup.hash_unreadable",
+                            stage="full",
+                            path=str(record.path),
+                            reason=reason,
+                        )
+                        if skips is not None:
+                            skips.append(
+                                HashSkip(path=record.path, stage="full", reason=reason or "")
+                            )
+                        continue
+                    full_writes.append((record.path, record.size_bytes, record.mtime, digest))
+                    if len(full_writes) >= _WRITE_BATCH_SIZE:
+                        index.store_full_hashes(full_writes)
+                        full_writes.clear()
+                full_groups[(record.size_bytes, digest)].append(record)
+                hashed += 1
+                now = time.monotonic()
+                if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                    logger.info(
+                        "dedup.progress",
+                        stage="full_hash",
+                        hashed=hashed,
+                        total=total_full_candidates,
+                    )
+                    last_heartbeat = now
     if full_writes:
         index.store_full_hashes(full_writes)
 
@@ -133,6 +258,9 @@ def find_duplicate_clusters(index: ScanIndex) -> list[DuplicateCluster]:
         clusters.append(
             DuplicateCluster(full_hash=full_hash, size_bytes=size, keep=keep, duplicates=duplicates)
         )
+    logger.info(
+        "dedup.done", clusters=len(clusters), skipped=len(skips) if skips is not None else 0
+    )
     return clusters
 
 
@@ -156,16 +284,22 @@ def _keep_rationale(cluster: DuplicateCluster) -> str:
 
 
 def generate_duplicate_candidates(
-    index: ScanIndex, config: Config, safety: SafetyValidator
+    index: ScanIndex,
+    config: Config,
+    safety: SafetyValidator,
+    *,
+    skips: list[HashSkip] | None = None,
 ) -> list[Candidate]:
     """Mirrors `detectors.py::generate_candidates()`'s contract/shape: runs every non-keep
     cluster member through `SafetyValidator.evaluate()` before it is ever tagged a tier.
     `BLOCKED` -> excluded entirely; `REVIEW_ONLY` -> forced Tier B; `ELIGIBLE` -> Tier A only if
     `config.categories.duplicates` is enabled, else Tier B. The kept member of a cluster is
     never evaluated and never appears in the output — it isn't being proposed for any action.
+
+    `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
     """
     candidates: list[Candidate] = []
-    for cluster in find_duplicate_clusters(index):
+    for cluster in find_duplicate_clusters(index, skips=skips):
         rationale = _keep_rationale(cluster)
         for duplicate in cluster.duplicates:
             result = safety.evaluate(duplicate)

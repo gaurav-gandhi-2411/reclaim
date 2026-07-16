@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+import reclaim.dedup as dedup_module
 from reclaim.dedup import (
+    _HEARTBEAT_INTERVAL_SECONDS,
     _PARTIAL_HASH_CHUNK_BYTES,
     _PARTIAL_HASH_WHOLE_FILE_THRESHOLD,
     _compute_full_hash,
     _compute_partial_hash,
+    _due,
+    _hash_with_guard,
     _is_downloads_or_temp,
     _size_buckets,
+    find_duplicate_clusters,
     select_keep,
 )
-from reclaim.models import FileRecord
+from reclaim.index import ScanIndex
+from reclaim.models import FileRecord, HashSkip
 
 _NOW = 1_700_000_000.0
 
@@ -168,3 +178,161 @@ def test_select_keep_is_order_independent() -> None:
     downloads = _record("C:/Users/gg/Downloads/file.bin", ctime=_NOW - 100)
     documents = _record("C:/Users/gg/Documents/file.bin", ctime=_NOW - 1)
     assert select_keep([downloads, documents]) is select_keep([documents, downloads])
+
+
+# --- Observability / hang-guard regression tests -------------------------------------------
+#
+# Root cause of the real-disk-run stall (3.1M-file `C:\` scan): the hash pass had zero
+# progress output and batched every DB write until the very end, so it was indistinguishable
+# from a hang. These tests pin down the fix: (1) the heartbeat gate is a pure, fast-testable
+# predicate rather than a real multi-second wait, (2) a per-file read timeout is enforced via
+# a worker thread rather than blocking the caller indefinitely, and (3) the pipeline degrades
+# to a recorded skip — never a crash or a wedge — on an unreadable file.
+
+
+def test_due_is_false_before_the_interval_elapses() -> None:
+    assert (
+        _due(
+            last=100.0,
+            now=100.0 + _HEARTBEAT_INTERVAL_SECONDS - 0.001,
+            interval=_HEARTBEAT_INTERVAL_SECONDS,
+        )
+        is False
+    )
+
+
+def test_due_is_true_once_the_interval_elapses() -> None:
+    assert (
+        _due(
+            last=100.0,
+            now=100.0 + _HEARTBEAT_INTERVAL_SECONDS,
+            interval=_HEARTBEAT_INTERVAL_SECONDS,
+        )
+        is True
+    )
+
+
+def test_hash_with_guard_returns_digest_on_success() -> None:
+    def _ok(path: Path, *args: object) -> str:
+        return "digest"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        digest, reason = _hash_with_guard(executor, _ok, Path("C:/unused"))
+    assert digest == "digest"
+    assert reason is None
+
+
+def test_hash_with_guard_reports_timeout_for_a_slow_read() -> None:
+    """The hang guard itself: a read blocked past its timeout is abandoned (Python has no
+    cross-platform way to preempt a blocked syscall) and reported as a timeout skip rather than
+    hanging the caller — this is what the dedup loop relies on to never wedge on one bad file."""
+
+    def _slow(path: Path, *args: object) -> str:
+        time.sleep(0.2)
+        return "unreachable"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        digest, reason = _hash_with_guard(executor, _slow, Path("C:/unused"), timeout_seconds=0.02)
+    assert digest is None
+    assert reason == "timeout"
+
+
+def test_hash_with_guard_reports_oserror_reason() -> None:
+    def _locked(path: Path, *args: object) -> str:
+        raise PermissionError("[WinError 32] file in use by another process")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        digest, reason = _hash_with_guard(executor, _locked, Path("C:/unused"))
+    assert digest is None
+    assert reason == "[WinError 32] file in use by another process"
+
+
+def _index_record(
+    path: str, *, size_bytes: int, mtime: float = 100.0, ctime: float = 100.0
+) -> FileRecord:
+    p = Path(path)
+    return FileRecord(
+        path=p,
+        is_dir=False,
+        size_bytes=size_bytes,
+        attributes=0,
+        ext=p.suffix.lower(),
+        git_repo_root=None,
+        git_repo_clean=False,
+        mtime=mtime,
+        ctime=ctime,
+    )
+
+
+def test_find_duplicate_clusters_never_hashes_unique_size_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression fixture for the stall: every file below has a unique size, so the
+    size-uniqueness prefilter must exclude all of them before any hashing is attempted — hashing
+    files with no possible duplicate is exactly the wasted, silent work that made a 3.1M-file
+    scan look hung."""
+
+    def _must_not_be_called(*args: object, **kwargs: object) -> str:
+        raise AssertionError("hash function called on a unique-size file")
+
+    monkeypatch.setattr(dedup_module, "_compute_partial_hash", _must_not_be_called)
+    monkeypatch.setattr(dedup_module, "_compute_full_hash", _must_not_be_called)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record("C:/Data/a.bin", size_bytes=100),
+                _index_record("C:/Data/b.bin", size_bytes=200),
+                _index_record("C:/Data/c.bin", size_bytes=300),
+            ],
+            scanned_at=1000.0,
+        )
+        clusters = find_duplicate_clusters(index)
+
+    assert clusters == []
+
+
+def test_find_duplicate_clusters_skips_locked_file_instead_of_crashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-size pair where one member raises `PermissionError` on read (simulating a
+    locked/in-use file) must be recorded as a skip and excluded from clustering — 'one bad file
+    must never wedge the whole scan' — not crash the whole dedup run."""
+    locked_path = Path("C:/Data/locked.bin")
+
+    def _partial_hash_with_lock(path: Path, size_bytes: int) -> str:
+        if path == locked_path:
+            raise PermissionError("[WinError 32] file in use by another process")
+        return "ok-digest"
+
+    monkeypatch.setattr(dedup_module, "_compute_partial_hash", _partial_hash_with_lock)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record("C:/Data/ok.bin", size_bytes=100),
+                _index_record(str(locked_path), size_bytes=100),
+            ],
+            scanned_at=1000.0,
+        )
+        skips: list[HashSkip] = []
+        clusters = find_duplicate_clusters(index, skips=skips)
+
+    # The one surviving (successfully hashed) member has no partner left to cluster with.
+    assert clusters == []
+    assert len(skips) == 1
+    assert skips[0].path == locked_path
+    assert skips[0].stage == "partial"
+    assert "file in use" in skips[0].reason
+
+
+def test_find_duplicate_clusters_default_skips_param_collects_nothing(tmp_path: Path) -> None:
+    """Callers that don't pass `skips=` (every pre-existing caller) must keep working exactly
+    as before — the out-param is additive, not a breaking change to the return contract."""
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [_index_record("C:/Data/a.bin", size_bytes=100)],
+            scanned_at=1000.0,
+        )
+        clusters = find_duplicate_clusters(index)
+    assert clusters == []
