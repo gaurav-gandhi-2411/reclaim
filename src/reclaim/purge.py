@@ -16,6 +16,9 @@ from reclaim.executor import (
     SafetyInvariantError,
     append_manifest_entries,
     fold_latest_manifest_entries,
+    long_path,
+    rmtree_clear_readonly,
+    unlink_clear_readonly,
 )
 from reclaim.models import FileRecord, Verdict
 from reclaim.safety import SafetyValidator
@@ -232,9 +235,9 @@ def purge_expired(
 
         try:
             if entry.is_dir:
-                shutil.rmtree(vault_path)
+                shutil.rmtree(long_path(vault_path), onexc=rmtree_clear_readonly)
             else:
-                vault_path.unlink()
+                unlink_clear_readonly(long_path(vault_path))
         except OSError as exc:
             logger.warning("purge.item_failed", path=str(vault_path), error=str(exc))
             items.append(

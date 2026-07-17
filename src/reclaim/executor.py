@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import time
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -262,7 +263,7 @@ def _measure_disk_free(anchor: Path | None) -> int | None:
 _LONG_PATH_PREFIX = "\\\\?\\"
 
 
-def _long_path(path: Path) -> str:
+def long_path(path: Path) -> str:
     r"""Returns an absolute, `\\?\`-prefixed path string so the Win32 APIs behind `os`/`shutil`
     bypass the legacy 260-character MAX_PATH limit (this tool targets Windows/NTFS exclusively —
     see `pytestmark` in the test suite).
@@ -300,6 +301,38 @@ def _tree_stats(long_path_root: str) -> tuple[int, int]:
     return count, total
 
 
+def rmtree_clear_readonly(func: Callable[[str], object], path: str, exc: BaseException) -> None:
+    """`shutil.rmtree`'s `onexc` callback: clears the read-only attribute on `path` and retries
+    the operation that failed (ADR-0004 addendum, discovered in production).
+
+    Git deliberately marks every packfile/loose-object file read-only on disk — a real vaulted
+    directory containing so much as one `.git` directory (the 2026-07-17 re-apply's `Temp\\
+    claude` scratch tree, itself full of cloned repos, is exactly this shape) hits Windows'
+    "Access is denied" when `shutil.rmtree` tries to `os.unlink`/`os.rmdir` a read-only file
+    without this handler — a well-known Python stdlib gotcha on Windows, not exotic to this
+    codebase. Silently swallowing this with `ignore_errors=True` (the first version of this
+    fix) left up to dozens of read-only git-object files behind as genuinely orphaned vault
+    debris after a real production run — exactly the failure mode ADR-0004 exists to prevent.
+    Every `shutil.rmtree` call in this module (and `purge.py`'s) uses this `onexc` handler.
+    """
+    os.chmod(path, stat.S_IWRITE)  # noqa: PTH101 -- \\?\ str, not Path; see module note above
+    func(path)
+
+
+def unlink_clear_readonly(path: str) -> None:
+    """Deletes a single file, clearing the read-only attribute first on retry if needed (ADR-0004
+    addendum) — the same read-only-file gotcha `rmtree_clear_readonly` handles for directory
+    trees (git packfiles/loose objects, but any read-only file hits this identically), just for
+    a standalone `os.unlink` call, which has no built-in `onexc`/retry hook of its own to hang a
+    handler off of the way `shutil.rmtree` does — so this wraps the retry manually instead.
+    """
+    try:
+        os.unlink(path)  # noqa: PTH108 -- \\?\ str, not Path; see module note above
+    except PermissionError:
+        os.chmod(path, stat.S_IWRITE)  # noqa: PTH101
+        os.unlink(path)  # noqa: PTH108
+
+
 def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     r"""Moves `src` to `dst` with an "either fully succeeds, or `src` is left completely
     untouched with zero orphaned debris at `dst`" guarantee — never a partial state, and never
@@ -322,24 +355,34 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     shouldn't outlive that item's failure as debris, but a parent shared with other already-
     vaulted siblings in the same batch is left alone (only removed if it's actually empty).
     """
-    long_src = _long_path(src)
-    long_dst = _long_path(dst)
+    long_src = long_path(src)
+    long_dst = long_path(dst)
     dst_parent = os.path.dirname(long_dst)  # noqa: PTH120 -- str, not Path; see module note above
     parent_already_existed = os.path.isdir(dst_parent)  # noqa: PTH112
     os.makedirs(dst_parent, exist_ok=True)  # noqa: PTH103
 
     def _cleanup_dst_and_empty_parent() -> None:
-        if os.path.exists(long_dst):  # noqa: PTH110
-            if os.path.isdir(long_dst):  # noqa: PTH112
-                shutil.rmtree(long_dst, ignore_errors=True)
-            else:
-                os.unlink(long_dst)  # noqa: PTH108
-        if (
-            not parent_already_existed
-            and os.path.isdir(dst_parent)  # noqa: PTH112
-            and not os.listdir(dst_parent)  # noqa: PTH208
-        ):
-            os.rmdir(dst_parent)  # noqa: PTH106
+        try:
+            if os.path.exists(long_dst):  # noqa: PTH110
+                if os.path.isdir(long_dst):  # noqa: PTH112
+                    shutil.rmtree(long_dst, onexc=rmtree_clear_readonly)
+                else:
+                    unlink_clear_readonly(long_dst)
+            if (
+                not parent_already_existed
+                and os.path.isdir(dst_parent)  # noqa: PTH112
+                and not os.listdir(dst_parent)  # noqa: PTH208
+            ):
+                os.rmdir(dst_parent)  # noqa: PTH106
+        except OSError as cleanup_exc:
+            # Cleanup best-effort beyond the read-only-file retry above: a file genuinely
+            # locked by another live process (rather than merely read-only) can still make
+            # cleanup incomplete. Logged loudly rather than silently swallowed (the original
+            # `ignore_errors=True` design this replaces) so leftover vault debris is at least
+            # discoverable, never silent.
+            logger.warning(
+                "executor.vault_cleanup_incomplete", path=long_dst, error=str(cleanup_exc)
+            )
 
     try:
         os.rename(long_src, long_dst)  # noqa: PTH104
@@ -363,7 +406,7 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
                 f"{pre_stats[0]} files/{pre_stats[1]} bytes, destination has "
                 f"{post_stats[0]} files/{post_stats[1]} bytes"
             )
-        shutil.rmtree(long_src)
+        shutil.rmtree(long_src, onexc=rmtree_clear_readonly)
     else:
         pre_size = os.path.getsize(long_src)  # noqa: PTH202
         try:
@@ -378,7 +421,7 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
                 f"copy size mismatch moving {src} -> {dst}: source {pre_size} bytes, "
                 f"destination {post_size} bytes"
             )
-        os.unlink(long_src)  # noqa: PTH108
+        unlink_clear_readonly(long_src)
 
 
 def _category_breakdown(items: Sequence[ItemApplyResult]) -> dict[str, CategoryBreakdown]:
@@ -650,9 +693,9 @@ def apply_batch(
                 vault_path = None
             else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
                 if candidate.is_dir:
-                    shutil.rmtree(_long_path(candidate.path))
+                    shutil.rmtree(long_path(candidate.path), onexc=rmtree_clear_readonly)
                 else:
-                    os.unlink(_long_path(candidate.path))  # noqa: PTH108 -- \\?\ str, not Path
+                    unlink_clear_readonly(long_path(candidate.path))
                 vault_path = None
         except Exception as exc:  # broad on purpose: isolates one item's failure from the batch
             logger.warning(
@@ -857,7 +900,7 @@ def restore_batch(
             )
             continue
 
-        if os.path.exists(_long_path(entry.original_path)):  # noqa: PTH110 -- \\?\ str, not Path
+        if os.path.exists(long_path(entry.original_path)):  # noqa: PTH110 -- \\?\ str, not Path
             items.append(
                 RestoreItemResult(
                     original_path=entry.original_path,

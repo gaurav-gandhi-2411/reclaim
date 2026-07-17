@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,8 @@ from reclaim.executor import (
     RecycleBinRestoreUnsupportedError,
     SafetyInvariantError,
     _latest_entries_for_batch,
-    _long_path,
     apply_batch,
+    long_path,
     restore_batch,
 )
 from reclaim.models import Candidate, Tier, Verdict
@@ -32,7 +33,7 @@ def _make_deep_tree(root: Path, *, depth: int = 15, segment_len: int = 20) -> Pa
     current = root
     for i in range(depth):
         current = current / (f"seg_{i:03d}_" + "x" * segment_len)
-        os.makedirs(_long_path(current), exist_ok=True)  # noqa: PTH103
+        os.makedirs(long_path(current), exist_ok=True)  # noqa: PTH103
     assert len(str(current)) > 260, f"fixture path too short: {len(str(current))} chars"
     return current
 
@@ -40,7 +41,7 @@ def _make_deep_tree(root: Path, *, depth: int = 15, segment_len: int = 20) -> Pa
 def _long_read_bytes(path: Path) -> bytes:
     r"""Reads a file via its `\\?\`-prefixed path — the test's own read must be long-path-safe
     too, independent of whether the production code under test got it right."""
-    with open(_long_path(path), "rb") as fh:  # noqa: PTH123
+    with open(long_path(path), "rb") as fh:  # noqa: PTH123
         return fh.read()
 
 
@@ -252,7 +253,7 @@ def test_vault_move_and_restore_survive_path_past_max_path(tmp_path: Path) -> No
     leaf = _make_deep_tree(top)
     content = b"deep-path-payload-content-" * 200
     payload_rel = Path("payload.bin")
-    with open(_long_path(leaf / payload_rel), "wb") as fh:  # noqa: PTH123 -- \\?\ str, not Path
+    with open(long_path(leaf / payload_rel), "wb") as fh:  # noqa: PTH123 -- \\?\ str, not Path
         fh.write(content)
 
     manifest_path = tmp_path / "manifest.jsonl"
@@ -270,7 +271,7 @@ def test_vault_move_and_restore_survive_path_past_max_path(tmp_path: Path) -> No
 
     assert apply_report.files_succeeded == 1, apply_report.items
     # The per-line ignores below are all `\?\`-str paths, not Path -- see module docstring above.
-    assert not os.path.exists(_long_path(top))  # noqa: PTH110 -- source fully gone
+    assert not os.path.exists(long_path(top))  # noqa: PTH110 -- source fully gone
 
     entries = _latest_entries_for_batch(manifest_path, apply_report.batch_id)
     vault_path = entries[0].vault_path
@@ -281,10 +282,10 @@ def test_vault_move_and_restore_survive_path_past_max_path(tmp_path: Path) -> No
 
     restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
     assert restore_report.files_succeeded == 1, restore_report.items
-    assert os.path.exists(_long_path(top))  # noqa: PTH110
+    assert os.path.exists(long_path(top))  # noqa: PTH110
     restored_payload = top / rel_from_top
     assert _long_read_bytes(restored_payload) == content
-    assert not os.path.exists(_long_path(vault_path))  # noqa: PTH110 -- moved out, not copied
+    assert not os.path.exists(long_path(vault_path))  # noqa: PTH110 -- moved out, not copied
 
 
 def test_vault_move_cleans_up_partial_copy_on_injected_failure(
@@ -381,6 +382,96 @@ def test_vault_move_detects_and_cleans_up_incomplete_copy(
     leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
     assert leftover == [], f"orphaned vault debris: {leftover}"
     assert _latest_entries_for_batch(manifest_path, report.batch_id) == []
+
+
+def test_vault_move_succeeds_when_source_contains_readonly_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real-disk regression (2026-07-17): a vaulted directory containing a `.git` directory
+    (packfiles/loose objects are read-only by git's own design) must vault successfully — the
+    fallback copy-then-remove-source path must be able to remove read-only files from the
+    source, not fail or silently leave them behind. Forces the copytree fallback (rather than
+    the atomic os.rename fast path) so the read-only removal logic is actually exercised; the
+    copy itself is real, not mocked, so the read-only attribute genuinely propagates to the
+    destination too."""
+    src = tmp_path / "source_dir"
+    src.mkdir()
+    readonly_file = src / "packed-object.pack"
+    readonly_file.write_bytes(b"git-object-content")
+    readonly_file.chmod(stat.S_IREAD)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copytree fallback path")
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+
+    report = apply_batch(
+        [_candidate(src, is_dir=True, size_bytes=18, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1, report.items
+    assert not src.exists()  # source (including the read-only file) fully removed
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    vault_path = entries[0].vault_path
+    assert vault_path is not None
+    assert (vault_path / "packed-object.pack").read_bytes() == b"git-object-content"
+
+
+def test_vault_move_cleanup_removes_readonly_files_from_partial_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real-disk regression (2026-07-17): the first version of this fix used
+    `shutil.rmtree(..., ignore_errors=True)` for cleanup, which silently left read-only
+    git-object files behind as orphaned vault debris after a parity-mismatch failure — exactly
+    the failure mode ADR-0004 exists to prevent. Cleanup must actually remove read-only files,
+    not swallow the permission error and give up partway."""
+    src = tmp_path / "source_dir"
+    src.mkdir()
+    (src / "file_a.bin").write_bytes(b"a" * 100)
+    (src / "file_b.bin").write_bytes(b"b" * 100)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copytree fallback path")
+
+    def _fake_copytree(_src_path: str, dst_path: str, **_kwargs: object) -> str:
+        Path(dst_path).mkdir(parents=True, exist_ok=True)
+        readonly_copy = Path(dst_path) / "file_a.bin"
+        readonly_copy.write_bytes(b"a" * 100)
+        readonly_copy.chmod(stat.S_IREAD)  # mirrors a real read-only git-object copy
+        return dst_path  # file_b never copied -> parity check below must catch this
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.shutil, "copytree", _fake_copytree)
+
+    report = apply_batch(
+        [_candidate(src, is_dir=True, size_bytes=200, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 0
+    assert report.files_failed == 1
+    assert "parity mismatch" in (report.items[0].error or "")
+    leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
+    assert leftover == [], f"orphaned read-only vault debris: {leftover}"
 
 
 # --- Recycle-bin method: send2trash called, restore refused ------------------------------------
@@ -588,6 +679,30 @@ def test_direct_delete_apply_permanently_removes_file(tmp_path: Path) -> None:
     assert entries[0].vault_path is None
     assert entries[0].retention_days is None
     assert entries[0].retention_until is None
+
+
+def test_direct_delete_removes_readonly_file(tmp_path: Path) -> None:
+    """ADR-0004 addendum (2026-07-17): the direct_delete path's single-file branch must clear
+    the read-only attribute before unlink, same as the directory/rmtree branch — a lone
+    read-only file (a git loose object sitting directly in a candidate directory, for example)
+    must not silently fail to delete."""
+    target = tmp_path / "cache" / "readonly_file.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"readonly-content")
+    target.chmod(stat.S_IREAD)
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=17, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert report.files_failed == 0
+    assert not target.exists()
 
 
 def test_direct_delete_apply_permanently_removes_directory(tmp_path: Path) -> None:

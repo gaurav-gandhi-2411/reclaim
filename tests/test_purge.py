@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,30 @@ def test_purge_apply_deletes_vault_copy_and_marks_purged(tmp_path: Path) -> None
     assert latest[entry.original_path].purged_at == _NOW
 
 
+def test_purge_deletes_readonly_vault_file(tmp_path: Path) -> None:
+    """ADR-0004 addendum (2026-07-17): a single vaulted read-only FILE (e.g. a lone git loose
+    object, not inside a whole directory) must also purge — the non-directory branch needs the
+    same chmod-before-unlink handling as the directory/rmtree branch, not just the directory
+    case (`test_purge_deletes_vault_directory_containing_readonly_files`)."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(tmp_path, size_bytes=42)
+    assert entry.vault_path is not None
+    entry.vault_path.chmod(stat.S_IREAD)
+    append_manifest_entries(manifest_path, [entry])
+
+    report = purge_expired(
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert report.files_failed == 0
+    assert not entry.vault_path.exists()
+
+
 def test_purge_apply_deletes_vault_directory_via_rmtree(tmp_path: Path) -> None:
     manifest_path = tmp_path / "manifest.jsonl"
     entry = _vault_entry(tmp_path, is_dir=True, vault_path=tmp_path / "vault" / "dir_item")
@@ -123,6 +148,32 @@ def test_purge_apply_deletes_vault_directory_via_rmtree(tmp_path: Path) -> None:
     )
 
     assert report.files_succeeded == 1
+    assert not entry.vault_path.exists()
+
+
+def test_purge_deletes_vault_directory_containing_readonly_files(tmp_path: Path) -> None:
+    """ADR-0004 addendum (2026-07-17): a vaulted directory containing read-only files (e.g. a
+    `.git` directory — git marks packfiles/loose objects read-only by design) must actually
+    purge, not fail with a permission error on the first read-only file it hits."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_path = tmp_path / "vault" / "dir_item"
+    entry = _vault_entry(tmp_path, is_dir=True, vault_path=vault_path)
+    readonly_file = vault_path / "inner" / "packed-object.pack"
+    readonly_file.write_bytes(b"git-object-content")
+    readonly_file.chmod(stat.S_IREAD)
+    append_manifest_entries(manifest_path, [entry])
+    assert entry.vault_path is not None
+
+    report = purge_expired(
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert report.files_failed == 0
     assert not entry.vault_path.exists()
 
 
