@@ -10,7 +10,7 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, RawCandidate, Tier, Verdict
+from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, Candidate, RawCandidate, Tier, Verdict
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -802,6 +802,7 @@ def generate_candidates(
                 retention_days=_category_retention_days(rc.category_group, config),
                 recovery_cost_note=rc.recovery_cost_note,
                 size_guard_exempt=_category_size_guard_exempt(rc.category_group, config),
+                rebuildable=rc.category_group in REBUILDABLE_CATEGORY_GROUPS,
             )
         )
     return candidates

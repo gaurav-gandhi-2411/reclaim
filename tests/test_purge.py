@@ -31,10 +31,13 @@ def _vault_entry(
     vault_path: Path | None = None,
     quarantined_at: float = _NOW - 40 * _DAY,
     retention_until: float | None = _NOW - 10 * _DAY,
+    retention_days: int = 30,
     restored: bool = False,
     purged: bool = False,
     size_bytes: int = 100,
     is_dir: bool = False,
+    category: str = "old_installer",
+    category_group: str = "old_installers",
 ) -> QuarantineManifestEntry:
     resolved_vault_path = vault_path if vault_path is not None else tmp_path / "vault" / "item.bin"
     if not is_dir:
@@ -49,14 +52,14 @@ def _vault_entry(
         original_path=original_path if original_path is not None else tmp_path / "gone.bin",
         size_bytes=size_bytes,
         is_dir=is_dir,
-        category="old_installer",
-        category_group="old_installers",
+        category=category,
+        category_group=category_group,
         rationale="test rationale",
         rebuild_instruction="Re-download from the original source if needed again.",
         tier=Tier.A,
         method="vault",
         vault_path=resolved_vault_path,
-        retention_days=30,
+        retention_days=retention_days,
         quarantined_at=quarantined_at,
         retention_until=retention_until,
         restored=restored,
@@ -324,3 +327,142 @@ def test_purge_refuses_whole_run_even_in_dry_run_mode(tmp_path: Path) -> None:
             safety=safety,
             now=_NOW,
         )
+
+
+# --- ADR-0005: rebuildable retention_days=0 / stale-original-reoccupied -----------------------
+
+
+def test_rebuildable_vault_entry_with_zero_retention_is_immediately_purge_eligible(
+    tmp_path: Path,
+) -> None:
+    """A rebuildable-category vault entry quarantined with `retention_days=0` (the
+    guard-downgrade override — see test_executor.py's
+    `test_rebuildable_guard_downgraded_candidate_gets_zero_retention`) is purge-eligible the
+    instant it's quarantined, not after any waiting period."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(
+        tmp_path,
+        category="windows_temp",
+        category_group="temp_and_browser_caches",
+        retention_days=0,
+        quarantined_at=_NOW,
+        retention_until=_NOW,  # 0-day window from quarantine time -> already due
+        size_bytes=64,
+    )
+    append_manifest_entries(manifest_path, [entry])
+
+    report = purge_expired(
+        apply=False,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,  # same instant as quarantine — no waiting period at all
+    )
+
+    assert report.files_processed == 1
+    assert report.files_succeeded == 1
+    assert report.items[0].stale is False  # eligible via retention, not the stale path
+
+
+def test_stale_vault_entry_with_reoccupied_original_path_is_flagged_and_purge_eligible(
+    tmp_path: Path,
+) -> None:
+    """ADR-0005: a vault entry whose `original_path` is now occupied again (the real uv/cache
+    case — the tool regenerated its own cache at the original location) is purge-eligible
+    immediately, regardless of `retention_until` still being far in the future, and is flagged
+    `stale=True` so the report never conflates it with a genuinely-expired entry."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    original_path = tmp_path / "uv_cache_original"
+    original_path.mkdir()
+    (original_path / "regenerated.bin").write_bytes(b"freshly rebuilt content")
+
+    entry = _vault_entry(
+        tmp_path,
+        original_path=original_path,
+        category="package_cache",
+        category_group="package_caches",
+        is_dir=True,
+        retention_days=30,
+        quarantined_at=_NOW - 1 * _DAY,
+        retention_until=_NOW + 29 * _DAY,  # nowhere near expired
+    )
+    append_manifest_entries(manifest_path, [entry])
+
+    report = purge_expired(
+        apply=False,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_processed == 1
+    assert report.files_succeeded == 1
+    assert report.items[0].stale is True
+    assert report.stale_count == 1
+    assert report.stale_bytes == entry.size_bytes
+    assert original_path.exists()  # purge (dry-run) never touches original_path itself
+
+
+def test_model_cache_vault_entry_not_purge_eligible_before_30_days(tmp_path: Path) -> None:
+    """A model_caches vault entry (30-day retention, ADR-0003) with its original path still
+    genuinely gone (not stale) and retention_until still in the future must NOT be
+    purge-eligible — the rebuildable/stale fast paths never apply to non-rebuildable
+    categories with a normal, un-reoccupied original path."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(
+        tmp_path,
+        category="model_cache",
+        category_group="model_caches",
+        retention_days=30,
+        quarantined_at=_NOW - 5 * _DAY,
+        retention_until=_NOW + 25 * _DAY,
+    )
+    append_manifest_entries(manifest_path, [entry])
+
+    report = purge_expired(
+        apply=False,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_processed == 0
+    assert entry.vault_path is not None
+    assert entry.vault_path.exists()  # untouched
+
+
+def test_purge_rebuildable_only_skips_non_rebuildable_eligible_entries(tmp_path: Path) -> None:
+    """`only_rebuildable=True` scopes purge to REBUILDABLE_CATEGORY_GROUPS even when a
+    non-rebuildable entry is ALSO genuinely purge-eligible — a model_caches/duplicates vault
+    entry is never touched by a rebuildable-scoped purge run."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    rebuildable_entry = _vault_entry(
+        tmp_path,
+        vault_path=tmp_path / "vault" / "rebuildable_item.bin",
+        category="windows_temp",
+        category_group="temp_and_browser_caches",
+    )
+    non_rebuildable_entry = _vault_entry(
+        tmp_path,
+        vault_path=tmp_path / "vault" / "model_item.bin",
+        original_path=tmp_path / "model_gone.bin",
+        category="model_cache",
+        category_group="model_caches",
+    )
+    append_manifest_entries(manifest_path, [rebuildable_entry, non_rebuildable_entry])
+
+    report = purge_expired(
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+        only_rebuildable=True,
+    )
+
+    assert report.files_processed == 1
+    assert report.files_succeeded == 1
+    assert not rebuildable_entry.vault_path.exists()  # type: ignore[union-attr]
+    assert non_rebuildable_entry.vault_path.exists()  # type: ignore[union-attr]

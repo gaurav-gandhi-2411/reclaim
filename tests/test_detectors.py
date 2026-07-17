@@ -591,3 +591,26 @@ def test_generate_candidates_resolves_size_guard_exempt_for_package_cache(
     package_candidates = [c for c in candidates if c.category_group == "package_caches"]
     assert len(package_candidates) == 1
     assert package_candidates[0].size_guard_exempt is True
+
+
+def test_generate_candidates_resolves_rebuildable_flag(tmp_path: Path, index: ScanIndex) -> None:
+    """ADR-0005: dev_artifacts/package_caches/temp_and_browser_caches/crash_dumps candidates
+    resolve `rebuildable=True`; everything else (model_caches here) resolves `False`."""
+    pycache_dir = tmp_path / "proj" / "__pycache__"
+    model_dir = tmp_path / "hf_hub"
+    _seed(
+        index,
+        _record(pycache_dir.as_posix(), is_dir=True),
+        _record(model_dir.as_posix(), is_dir=True, size_bytes=5 * 1024 * 1024 * 1024),
+    )
+    config = Config(
+        safety=SafetyConfig(protected_roots=[]),
+        categories=CategoriesConfig(
+            dev_artifacts=DevArtifactsConfig(enabled=True),
+            model_caches=ModelCachesConfig(enabled=True, paths=[model_dir.as_posix()]),
+        ),
+    )
+    candidates = generate_candidates(index, config, SafetyValidator(config), now=_NOW)
+    by_group = {c.category_group: c for c in candidates}
+    assert by_group["dev_artifacts"].rebuildable is True
+    assert by_group["model_caches"].rebuildable is False

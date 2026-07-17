@@ -64,6 +64,7 @@ def _candidate(
     safety_verdict: Verdict = Verdict.ELIGIBLE,
     retention_days: int | None = 30,
     size_guard_exempt: bool = False,
+    rebuildable: bool = False,
 ) -> Candidate:
     return Candidate(
         path=path,
@@ -78,6 +79,7 @@ def _candidate(
         safety_reason_code="TEST_REASON",
         retention_days=retention_days,
         size_guard_exempt=size_guard_exempt,
+        rebuildable=rebuildable,
     )
 
 
@@ -916,6 +918,72 @@ def test_non_exempt_oversized_candidate_still_vaults_despite_similar_size(tmp_pa
     assert report.items[0].vault_path is not None
     assert report.items[0].vault_path.exists()
     assert not target.exists()
+
+
+def test_rebuildable_guard_downgraded_candidate_gets_zero_retention(tmp_path: Path) -> None:
+    """ADR-0005: a rebuildable-category candidate (e.g. windows_temp) that the size guard
+    downgrades to vault gets `retention_days=0` — immediately purge-eligible, not held for the
+    normal 30-day window — since regret is impossible for a category whose only recovery path
+    was always "rebuild it"."""
+    target = tmp_path / "big_temp_dir"
+    target.mkdir()
+    (target / "file.bin").write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [
+            _candidate(
+                target,
+                is_dir=True,
+                size_bytes=2 * 1024 * 1024 * 1024,
+                category="windows_temp",
+                retention_days=None,
+                rebuildable=True,
+            )
+        ],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.items[0].method == "vault"
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].retention_days == 0
+    assert entries[0].retention_until == _NOW  # already due — 0-day window from quarantine time
+
+
+def test_non_rebuildable_guard_downgraded_candidate_keeps_default_retention(
+    tmp_path: Path,
+) -> None:
+    """A guard-downgraded candidate that is NOT rebuildable (the default) keeps the normal
+    `size_guard_retention_days` window — the zero-retention override is scoped to rebuildable
+    categories only, not a blanket change to the guard's behavior."""
+    target = tmp_path / "huge_model.safetensors"
+    target.write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [
+            _candidate(
+                target,
+                size_bytes=5 * 1024 * 1024 * 1024,
+                category="model_cache",
+                retention_days=None,
+                rebuildable=False,
+            )
+        ],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.items[0].method == "vault"
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].retention_days == 30
 
 
 def test_mixed_batch_vault_and_direct_delete_processes_both(tmp_path: Path) -> None:

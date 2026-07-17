@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from collections.abc import Sequence
@@ -20,7 +21,7 @@ from reclaim.executor import (
     rmtree_clear_readonly,
     unlink_clear_readonly,
 )
-from reclaim.models import FileRecord, Verdict
+from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, FileRecord, Verdict
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -37,6 +38,11 @@ class PurgeItemResult:
     size_bytes: int
     succeeded: bool
     error: str | None
+    # ADR-0005: `True` when this entry became purge-eligible because its `original_path` is
+    # now re-occupied (a stale vault copy that can never be usefully restored), rather than
+    # via genuine `retention_until` expiry. Surfaced so a report never conflates "this expired
+    # normally" with "this was dead weight from the moment something else took its place."
+    stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,23 +61,51 @@ class PurgeReport:
     files_succeeded: int
     files_failed: int
     bytes_freed: int
+    # ADR-0005: subset of `files_succeeded`/`bytes_freed` selected via the stale-original-
+    # reoccupied path rather than genuine retention expiry — reported separately so "the vault
+    # copy was pure dead weight" is visible, not folded silently into the normal purge count.
+    stale_count: int
+    stale_bytes: int
     category_breakdown: dict[str, CategoryBreakdown]
     disk_free_before_bytes: int | None
     disk_free_after_bytes: int | None
     disk_free_delta_bytes: int | None
 
 
-def _purge_eligible_entries(manifest_path: Path, now_ts: float) -> list[QuarantineManifestEntry]:
-    """Selects vault entries whose retention window has passed: `method == "vault"`, not
-    restored, not already purged, and `retention_until <= now`. A vault entry whose
-    `retention_until` is still in the future is never selected — this is a hard boundary, not
-    a soft default, and there is no parameter anywhere in this module that can force it.
+def _is_stale_original_reoccupied(entry: QuarantineManifestEntry) -> bool:
+    """True if a vaulted entry's `original_path` is occupied again — almost always a
+    regenerated cache (uv/pip/npm/gradle redownload their own cache directory automatically,
+    exactly as their `rebuild_instruction` already promises), never a human restore (a real
+    restore updates this same entry's `restored=True`, already excluded upstream by the
+    `entry.restored` check). Restoring a stale entry would refuse — "destination already
+    exists" — regardless of `retention_until`, so continuing to hold the vault copy for the
+    rest of its retention window serves no purpose (ADR-0005): it can never be usefully
+    restored, only ever purged.
     """
-    eligible: list[QuarantineManifestEntry] = []
+    return os.path.exists(long_path(entry.original_path))  # noqa: PTH110 -- \\?\ str, not Path
+
+
+def _purge_eligible_entries(
+    manifest_path: Path, now_ts: float
+) -> list[tuple[QuarantineManifestEntry, bool]]:
+    """Selects purge-eligible vault entries, paired with whether each is eligible via genuine
+    retention expiry (`False`) or ADR-0005's stale-original-reoccupied check (`True`).
+
+    Two independent eligibility paths, either sufficient on its own:
+    1. `retention_until <= now` — the original ADR-0001 hard boundary. A vault entry whose
+       `retention_until` is still in the future is never selected via this path alone — there
+       is no parameter anywhere in this module that can force it early.
+    2. `original_path` re-occupied (ADR-0005) — independent of category and of
+       `retention_until`, since a stale vault copy can never be usefully restored either way.
+    """
+    eligible: list[tuple[QuarantineManifestEntry, bool]] = []
     for entry in fold_latest_manifest_entries(manifest_path):
         if entry.method != "vault":
             continue
         if entry.restored or entry.purged:
+            continue
+        if _is_stale_original_reoccupied(entry):
+            eligible.append((entry, True))
             continue
         if entry.retention_until is None:
             # Defensive: every `method="vault"` entry should carry a real `retention_until`
@@ -83,7 +117,7 @@ def _purge_eligible_entries(manifest_path: Path, now_ts: float) -> list[Quaranti
             continue
         if entry.retention_until > now_ts:
             continue
-        eligible.append(entry)
+        eligible.append((entry, False))
     return eligible
 
 
@@ -154,19 +188,26 @@ def purge_expired(
     vault_dir: Path | None = None,
     safety: SafetyValidator,
     now: float | None = None,
+    only_rebuildable: bool = False,
 ) -> PurgeReport:
     """Permanently deletes vaulted items (`method="vault"` manifest entries) whose retention
-    window has passed. Never touches anything at an entry's `original_path` — by the time
-    retention expires, that path is long gone; the vaulted copy under `vault_path` is the only
-    thing left to purge (ADR-0001).
+    window has passed, OR whose `original_path` is now stale (ADR-0005: re-occupied by
+    something else, almost always a regenerated cache — see `_is_stale_original_reoccupied`).
+    Never touches anything at an entry's `original_path` itself — by the time an entry is
+    purge-eligible via either path, that vaulted copy is the only thing left to purge (ADR-0001).
 
     Dry-run is the default (`apply=False`): makes zero mutating filesystem calls — no
     `unlink`/`rmtree`, no manifest writes, no disk-usage measurement — and reports what would
     be purged without touching anything.
 
-    Hard boundary, unconditional regardless of `apply`: an entry whose `retention_until` is
-    still in the future is never selected as purge-eligible in the first place — there is no
-    parameter that can force it.
+    Hard boundary for the retention-expiry path, unconditional regardless of `apply`: an entry
+    whose `retention_until` is still in the future is never selected via that path alone — there
+    is no parameter that can force it. The stale-original-reoccupied path (ADR-0005) is
+    independent of `retention_until` by design (see `_purge_eligible_entries`).
+
+    `only_rebuildable=True` further restricts eligibility to entries whose `category_group` is
+    in `REBUILDABLE_CATEGORY_GROUPS` (ADR-0005) — a scoped purge that never touches a
+    `model_caches`/`duplicates`/other vault entry even if one happened to also be eligible.
 
     Mandatory pre-purge safety re-check (ADR-0001, same whole-run-abort philosophy as
     `executor.apply_batch`'s direct-delete re-check): every purge-eligible entry is re-evaluated
@@ -180,9 +221,15 @@ def purge_expired(
     now_ts = now if now is not None else time.time()
 
     eligible = _purge_eligible_entries(resolved_manifest_path, now_ts)
+    if only_rebuildable:
+        eligible = [
+            (entry, stale)
+            for entry, stale in eligible
+            if entry.category_group in REBUILDABLE_CATEGORY_GROUPS
+        ]
 
     blocked: list[str] = []
-    for entry in eligible:
+    for entry, _stale in eligible:
         result = safety.evaluate(_fresh_record_for_purge(entry))
         if result.verdict == Verdict.BLOCKED:
             blocked.append(f"{entry.original_path} ({result.reason_code})")
@@ -199,7 +246,7 @@ def purge_expired(
 
     items: list[PurgeItemResult] = []
     updated_entries: list[QuarantineManifestEntry] = []
-    for entry in eligible:
+    for entry, stale in eligible:
         if entry.vault_path is None:
             # Unreachable in practice: `_purge_eligible_entries` only ever selects
             # `method="vault"` entries, which always carry a `vault_path`. Guards mypy's None
@@ -214,6 +261,7 @@ def purge_expired(
                     size_bytes=entry.size_bytes,
                     succeeded=False,
                     error="manifest entry has method=vault but no vault_path recorded",
+                    stale=stale,
                 )
             )
             continue
@@ -229,6 +277,7 @@ def purge_expired(
                     size_bytes=entry.size_bytes,
                     succeeded=True,
                     error=None,
+                    stale=stale,
                 )
             )
             continue
@@ -249,6 +298,7 @@ def purge_expired(
                     size_bytes=entry.size_bytes,
                     succeeded=False,
                     error=str(exc),
+                    stale=stale,
                 )
             )
             continue
@@ -262,6 +312,7 @@ def purge_expired(
                 size_bytes=entry.size_bytes,
                 succeeded=True,
                 error=None,
+                stale=stale,
             )
         )
         updated_entries.append(entry.model_copy(update={"purged": True, "purged_at": now_ts}))
@@ -280,6 +331,7 @@ def purge_expired(
 
     succeeded_items = [item for item in items if item.succeeded]
     failed_items = [item for item in items if not item.succeeded]
+    stale_succeeded_items = [item for item in succeeded_items if item.stale]
     return PurgeReport(
         apply=apply,
         started_at=now_ts,
@@ -288,6 +340,8 @@ def purge_expired(
         files_processed=len(items),
         files_succeeded=len(succeeded_items),
         files_failed=len(failed_items),
+        stale_count=len(stale_succeeded_items),
+        stale_bytes=sum(item.size_bytes for item in stale_succeeded_items),
         bytes_freed=sum(item.size_bytes for item in succeeded_items),
         category_breakdown=_category_breakdown(items),
         disk_free_before_bytes=disk_free_before,

@@ -509,17 +509,29 @@ def _effective_method_and_retention_days(
     recover* items; a large pip/uv/npm/gradle/yarn cache is exactly as cheap to rebuild at 20GB
     as it is at 20MB (re-fetch public artifacts on the next build), so gating its permanence on
     size alone was penalizing the wrong axis.
+
+    ADR-0005: a guard-downgraded candidate that IS `rebuildable` (`category_group in
+    REBUILDABLE_CATEGORY_GROUPS` — dev_artifacts/package_caches/temp_and_browser_caches/
+    crash_dumps, the same categories `retention_days=None` already exists for) gets
+    `retention_days=0` instead of `size_guard_retention_days` — immediately purge-eligible, not
+    held for the normal 30-day window. Regret is impossible for these categories: their only
+    recovery path was always "rebuild it," which the vault copy adds nothing to. Every other
+    guard-downgraded candidate (a hypothetical misconfigured category with `retention_days=None`
+    that isn't one of the four known-rebuildable groups) keeps the safer `size_guard_retention_
+    days` default.
     """
     if candidate.retention_days is None:
         if candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt:
+            retention_days = 0 if candidate.rebuildable else size_guard_retention_days
             logger.info(
                 "executor.retention_size_guard_downgrade",
                 path=str(candidate.path),
                 size_bytes=candidate.size_bytes,
                 category=candidate.category,
                 size_guard_bytes=size_guard_bytes,
+                retention_days=retention_days,
             )
-            return "vault", size_guard_retention_days
+            return "vault", retention_days
         return "direct_delete", None
     return method, candidate.retention_days
 

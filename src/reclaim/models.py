@@ -77,6 +77,22 @@ class Tier(StrEnum):
     B = "B"  # review queue
 
 
+# ADR-0005: the category groups whose `retention_days` defaults to `None` (direct-delete,
+# ADR-0001) precisely because the owning tool redownloads/regenerates them deterministically —
+# `dev_artifacts`, `package_caches`, `temp_and_browser_caches`, `crash_dumps`. Shared between
+# `detectors.py` (resolves `Candidate.rebuildable` at candidate-generation time) and `purge.py`
+# (scopes a `--rebuildable-only` purge to just these categories) so the "is this category
+# deterministically rebuildable" concept has exactly one definition, not two that could drift.
+# `model_caches`/`duplicates`/`old_installers`/`archive_pairs`/`large_logs` are deliberately
+# excluded: each either isn't reliably rebuildable (a duplicate's bytes exist nowhere else once
+# the kept copy is gone; an old installer or archive may need a fresh download; a log has no
+# rebuild command at all) or is already vaulted-by-default specifically because of that
+# (model_caches: ADR-0003 — a 100+GB, possibly gated/unrecoverable checkpoint).
+REBUILDABLE_CATEGORY_GROUPS = frozenset(
+    {"dev_artifacts", "package_caches", "temp_and_browser_caches", "crash_dumps"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RawCandidate:
     """One rule detector's raw proposal, before `SafetyValidator` has evaluated it.
@@ -180,3 +196,9 @@ class Candidate:
     # sizes (package manager caches: re-fetching public artifacts on the next build), never for
     # categories where size correlates with real recovery risk (model caches, duplicates).
     size_guard_exempt: bool = False
+    # ADR-0005: `category_group in REBUILDABLE_CATEGORY_GROUPS`, resolved at the same point as
+    # the other category-derived fields above. When a rebuildable candidate is guard-downgraded
+    # to vault (ADR-0003) anyway, the executor gives it `retention_days=0` instead of the
+    # guard's normal default — regret is impossible for a category whose only recovery path was
+    # already "rebuild it," so there is no reason to hold the vault copy hostage for 30 days.
+    rebuildable: bool = False

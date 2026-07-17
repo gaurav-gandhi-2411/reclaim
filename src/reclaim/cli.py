@@ -168,6 +168,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the vault directory (default: data/quarantine).",
     )
+    purge_parser.add_argument(
+        "--rebuildable-only",
+        action="store_true",
+        help="Restrict this purge to entries whose category is deterministically rebuildable "
+        "(dev_artifacts/package_caches/temp_and_browser_caches/crash_dumps) — never touches a "
+        "model_caches/duplicates/other vault entry even if one happened to also be eligible.",
+    )
 
     undo_parser = subparsers.add_parser("undo", help="Restore a previously quarantined batch.")
     undo_parser.add_argument("batch_id", help="Batch id printed by a prior 'reclaim apply' run.")
@@ -437,6 +444,7 @@ def _run_purge(args: argparse.Namespace) -> int:
             manifest_path=args.manifest,
             vault_dir=args.vault_dir,
             safety=safety,
+            only_rebuildable=args.rebuildable_only,
         )
     except SafetyInvariantError as exc:
         print(f"reclaim purge: {exc}", file=sys.stderr)  # noqa: T201
@@ -448,6 +456,11 @@ def _run_purge(args: argparse.Namespace) -> int:
         f"succeeded={report.files_succeeded} failed={report.files_failed} "
         f"bytes_freed={report.bytes_freed}"
     )
+    if report.stale_count > 0:
+        print(  # noqa: T201
+            f"  stale (original path re-occupied, never restorable): "
+            f"count={report.stale_count} bytes={report.stale_bytes}"
+        )
     if report.disk_free_delta_bytes is not None:
         print(  # noqa: T201
             f"reclaim purge: disk free before={report.disk_free_before_bytes} "
@@ -456,7 +469,9 @@ def _run_purge(args: argparse.Namespace) -> int:
     for category, breakdown in sorted(report.category_breakdown.items()):
         print(f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}")  # noqa: T201
     for item in report.items:
-        if not item.succeeded:
+        if item.succeeded and item.stale:
+            print(f"  STALE: {item.original_path} (original path re-occupied)")  # noqa: T201
+        elif not item.succeeded:
             print(f"  FAILED: {item.original_path} — {item.error}", file=sys.stderr)  # noqa: T201
     return 0 if report.files_failed == 0 else 1
 
