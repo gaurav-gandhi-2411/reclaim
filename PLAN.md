@@ -771,6 +771,96 @@ retention + restore, now with an explicit `purge` command for expired entries.
   node_modules`, `dist_output`, `archive_pairs`) get their own reviewed, scoped apply — now with
   the vault-move robustness fix in place before the 124.9GB HuggingFace hub tree goes through it.
 
+### 2026-07-17 — restore_batch's whole-batch-refusal blocked the exemption from being usable
+- Tried to re-apply `package_cache` alone with the exemption in place; the pip/uv/gradle
+  vault copies from the prior scoped apply were still parked in the vault (not restored, not
+  purge-eligible for ~30 days), so a plain re-scan found nothing there to re-detect — only
+  `uv/cache`'s own auto-regenerated 175MB (real, working as advertised) showed up.
+- Tried `reclaim undo` on the prior batch to bring the 3 package_cache + 4 windows_temp vault
+  entries back to their original locations so the fixed pipeline could re-process them —
+  `restore_batch` refused the WHOLE call, because that batch_id also has 23,565
+  `direct_delete` entries sharing it (one `apply_batch` call, ADR-0001's per-candidate
+  retention override), and the function raised `DirectDeleteRestoreImpossibleError` for the
+  entire batch_id the instant ANY entry in it was `direct_delete` — not just the ones that
+  are actually unrestorable. This made restoring vault entries from a mixed batch structurally
+  impossible with the tool as built, independent of anything about package_cache specifically.
+- Fix: `restore_batch` now partitions entries into vault/direct_delete/recycle_bin. Zero vault
+  entries (pure non-vault batch) still raises the same loud whole-call refusal as before —
+  unaffected, still tested. At least one vault entry restores every vault entry normally and
+  reports each direct_delete/recycle_bin entry per-item as `restore_unsupported=True` with a
+  descriptive message, never raising for those. New `RestoreReport.files_unsupported`;
+  `files_failed` redefined to mean "genuinely attempted and failed," not "didn't succeed for
+  any reason" — a mixed batch where everything restorable succeeds now reports
+  `files_failed=0`/exit 0. CLI/API updated to match (`can_restore` in the quarantine listing
+  now only blocks when there are zero vault entries, not whenever there's any non-vault one).
+  Verifier (after one retry due to a mid-run session token-limit reset) confirmed 236 tests
+  pass, all three method combinations (pure direct_delete, pure recycle_bin, every mixed
+  combination including all-three-at-once) behave correctly, idempotency holds, and
+  `files_failed`/`files_unsupported` never conflate a real failure with a clean skip. Committed
+  `49d2e2b`.
+- Real restore: 6 of 7 vault entries restored (`uv/cache` correctly refused — its own
+  auto-regenerated copy already occupies the original path, never clobbered). Rescan, dry-run
+  confirmed 0 size-guard downgrades for `package_cache` (exemption verified working against
+  real data), real apply: `package_cache` 3/3 items succeeded via `direct_delete`, 19.2GB
+  (pip 11.8GB + gradle 7.2GB + uv 175MB). Overall batch: processed=992, succeeded=762,
+  failed=230, bytes_freed=25.9GB. Real measured disk-free delta: 20.3GB (this apply) — total
+  since the original 6-category apply began: independently measured before=178.17GiB,
+  final=190.82GiB, net +12.6GiB freed across the whole restore+redo sequence (on top of the
+  10.8GB already freed by the first apply, since some of what's freed now was already
+  vaulted-not-deleted before and is now genuinely gone).
+
+### 2026-07-17 — ADR-0004 addendum: read-only git-object files broke rmtree/unlink cleanup
+- The real re-apply above hit ANOTHER new bug live: `Temp\claude` (this session's own
+  actively-in-use scratch directory, full of cloned git repos) failed with a genuine
+  parity-mismatch (a real concurrent-modification race — the tree changed mid-copy, since it
+  was being actively written to by this very session throughout the run; unrelated to
+  path-length or read-only files) — but the ADR-0004 cleanup that ran afterward left 42
+  files/41MB of read-only git packfiles/loose-objects behind as genuinely orphaned vault
+  debris, because `shutil.rmtree(..., ignore_errors=True)` silently gives up on read-only
+  files on Windows instead of raising or retrying (a well-known stdlib gotcha, not exotic to
+  this codebase) — exactly the failure mode ADR-0004 was written to prevent, just via a
+  different root cause (read-only attribute, not MAX_PATH) than the one it originally fixed.
+- Fix: `rmtree_clear_readonly` (a `shutil.rmtree` `onexc` callback, Python 3.12+) clears the
+  read-only attribute and retries; used by every `shutil.rmtree` call in executor.py and
+  purge.py instead of `ignore_errors=True`. Cleanup now logs a warning
+  (`executor.vault_cleanup_incomplete`) if it's still incomplete afterward (e.g. a genuinely
+  locked file from another live process) rather than silently swallowing. A first verifier
+  pass caught a second instance of the SAME defect class I'd missed: `purge.py`'s
+  non-directory (single-file) branch had NO error handling at all for a read-only vaulted
+  file. Fixed with a parallel `unlink_clear_readonly` helper (no `onexc`-style hook exists for
+  a standalone `os.unlink`, so the retry is wrapped manually) applied to every single-file
+  deletion across `_atomic_move`'s cleanup and success paths, `apply_batch`'s direct_delete
+  branch, and `purge.py`'s single-file branch. purge.py also gained the same long-path
+  prefixing (`_long_path` made public as `long_path`) every other vault operation already had
+  — it had none before, same MAX_PATH exposure as the original bug.
+- Two independent verifier passes: the first found the purge.py single-file gap; the second
+  (after the fix) confirmed all 4 affected call sites handle read-only files correctly, with
+  Windows-empirically-confirmed `PermissionError` semantics, and re-ran every original
+  ADR-0004 regression test to confirm no disturbance. Manually cleaned up the real 41MB
+  orphaned debris this bug had left behind (safe: unlinked from any manifest entry, source
+  fully intact). 241 tests pass, ruff/mypy clean. Committed `6ea84be`.
+- `Temp\claude` itself remains un-vaulted (2.37GB) — its failure this run was a genuine
+  concurrent-modification race (the directory is this session's own live scratch space, still
+  being written to throughout this very conversation), not a defect this fix addresses; not
+  re-attempted this session since doing so carries the same race risk while this session
+  remains active.
+- Next: the deferred categories (`exact_duplicate`, `model_caches`, `dev_artifact_
+  node_modules`, `dist_output`, `archive_pairs`) get their own reviewed, scoped apply — the
+  vault mechanism has now been hardened against MAX_PATH, atomicity/parity, and read-only-file
+  failures across two rounds of real-production-data discovery before the 124.9GB HuggingFace
+  hub tree (blobs/snapshots symlink structure — ADR-0004 follow-up still needed, see the
+  explicit hold below) goes anywhere near it.
+- **Hold, explicit user instruction:** do NOT run the `model_cache`/HuggingFace-hub apply
+  until link-structure handling (symlinks/hardlinks in `blobs/`/`snapshots/`) is verified —
+  a copytree-based vault move may dereference links (inflating far past 124.9GB) or flatten
+  the link topology (restore yields a tree the HF library can't load), and byte/count parity
+  alone can pass while the result is functionally broken. Required before that apply: detect
+  the real link type on this machine, decide a preserve-links policy, extend the parity check
+  to assert link-structure (not just bytes), and a deep+linked fixture proving a vault→restore
+  round-trip reproduces the topology (a smoke check resolving one snapshot file through its
+  link to its blob). Not started — model_cache stays review-only, never applied, until this
+  lands.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
