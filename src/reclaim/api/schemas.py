@@ -279,6 +279,7 @@ class RestoreItemOut(BaseModel):
     succeeded: bool
     already_restored: bool
     error: str | None
+    restore_unsupported: bool = False
 
 
 class RestoreResponse(BaseModel):
@@ -289,5 +290,6 @@ class RestoreResponse(BaseModel):
     files_processed: int
     files_succeeded: int
     files_failed: int
+    files_unsupported: int
     bytes_restored: int
     bytes_restored_human: str

@@ -851,7 +851,14 @@ def test_restore_refuses_direct_delete_batch_with_distinct_message(tmp_path: Pat
         restore_batch(report.batch_id, manifest_path=manifest_path)
 
 
-def test_restore_refuses_mixed_batch_containing_direct_delete_entry(tmp_path: Path) -> None:
+def test_restore_mixed_batch_restores_vault_entry_and_skips_direct_delete_entry(
+    tmp_path: Path,
+) -> None:
+    """ADR-0004: a batch mixing vault and direct_delete entries (the real shape of the
+    2026-07-17 scoped apply — 23,565 direct_delete entries alongside 7 vault ones under one
+    batch_id) must restore what's restorable rather than refusing the whole batch. The
+    direct_delete entry is reported per-item as `restore_unsupported`, not a whole-call
+    exception."""
     vaulted = tmp_path / "vaulted.bin"
     vaulted.write_bytes(b"vault-me")
     deleted = tmp_path / "cache" / "deleted.bin"
@@ -869,8 +876,82 @@ def test_restore_refuses_mixed_batch_containing_direct_delete_entry(tmp_path: Pa
         now=_NOW,
     )
 
-    with pytest.raises(DirectDeleteRestoreImpossibleError):
-        restore_batch(report.batch_id, manifest_path=manifest_path)
+    restore_report = restore_batch(report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+
+    assert restore_report.files_processed == 2
+    assert restore_report.files_succeeded == 1
+    assert restore_report.files_failed == 0
+    assert restore_report.files_unsupported == 1
+    assert vaulted.exists()
+    assert vaulted.read_bytes() == b"vault-me"
+    assert not deleted.exists()  # genuinely gone, never quarantined, never restorable
+
+    by_path = {item.original_path: item for item in restore_report.items}
+    assert by_path[vaulted].succeeded is True
+    assert by_path[vaulted].restore_unsupported is False
+    assert by_path[deleted].succeeded is False
+    assert by_path[deleted].restore_unsupported is True
+    assert "nothing to restore" in (by_path[deleted].error or "")
+
+
+def test_restore_mixed_batch_with_recycle_bin_entry_also_partially_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same partial-restore behavior for a vault+recycle_bin mix, not just vault+direct_delete."""
+    import reclaim.executor as executor_module
+
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: None)
+
+    vaulted = tmp_path / "vaulted.bin"
+    vaulted.write_bytes(b"vault-me")
+    trashed = tmp_path / "trashed.bin"
+    trashed.write_bytes(b"trash-me")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    apply_report = apply_batch(
+        [_candidate(vaulted, retention_days=30, category_group="a")],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+    # Same batch_id reused deliberately: manually append a recycle_bin entry sharing the batch,
+    # since apply_batch's `method` param is batch-wide and can't itself produce a vault+
+    # recycle_bin mix in one call (only vault+direct_delete, via retention_days=None).
+    from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
+
+    append_manifest_entries(
+        manifest_path,
+        [
+            QuarantineManifestEntry(
+                batch_id=apply_report.batch_id,
+                original_path=trashed,
+                size_bytes=8,
+                is_dir=False,
+                category="test_category",
+                category_group="a",
+                rationale="test",
+                rebuild_instruction=None,
+                tier=Tier.A,
+                method="recycle_bin",
+                vault_path=None,
+                retention_days=None,
+                quarantined_at=_NOW,
+                retention_until=None,
+            )
+        ],
+    )
+
+    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+
+    assert restore_report.files_succeeded == 1
+    assert restore_report.files_unsupported == 1
+    assert vaulted.read_bytes() == b"vault-me"
+    by_path = {item.original_path: item for item in restore_report.items}
+    assert by_path[trashed].restore_unsupported is True
+    assert "Recycle Bin" in (by_path[trashed].error or "")
 
 
 # --- ADR-0001: mandatory pre-delete safety re-check ----------------------------------------------

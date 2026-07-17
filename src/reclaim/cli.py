@@ -416,10 +416,12 @@ def _run_undo(args: argparse.Namespace) -> int:
     print(  # noqa: T201
         f"reclaim undo: batch={report.batch_id} processed={report.files_processed} "
         f"succeeded={report.files_succeeded} failed={report.files_failed} "
-        f"bytes_restored={report.bytes_restored}"
+        f"unsupported={report.files_unsupported} bytes_restored={report.bytes_restored}"
     )
     for item in report.items:
-        if not item.succeeded:
+        if item.restore_unsupported:
+            print(f"  SKIPPED (not restorable): {item.original_path} — {item.error}")  # noqa: T201
+        elif not item.succeeded:
             print(f"  FAILED: {item.original_path} — {item.error}", file=sys.stderr)  # noqa: T201
     return 0 if report.files_failed == 0 else 1
 

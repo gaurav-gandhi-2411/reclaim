@@ -186,6 +186,12 @@ class RestoreItemResult:
     succeeded: bool
     already_restored: bool
     error: str | None
+    # True for a `direct_delete`/`recycle_bin` entry sharing a batch_id with at least one
+    # restorable `vault` entry — this item was never going to be restorable regardless of what
+    # else happens in the batch, distinct from a genuine operational failure (a permission
+    # error, a destination collision) that's actually worth investigating. Always `False` when
+    # `succeeded` is `True`.
+    restore_unsupported: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +202,11 @@ class RestoreReport:
     items: tuple[RestoreItemResult, ...]
     files_processed: int
     files_succeeded: int
+    # Count of entries where restore was attempted and genuinely failed (a real operational
+    # problem) — deliberately excludes `restore_unsupported` items, which never had a restore
+    # attempted at all. See `files_unsupported`.
     files_failed: int
+    files_unsupported: int
     bytes_restored: int
 
 
@@ -736,19 +746,23 @@ def restore_batch(
     manifest_path: Path | None = None,
     now: float | None = None,
 ) -> RestoreReport:
-    """Restores every item in `batch_id` back to its exact original path.
+    """Restores every *restorable* item in `batch_id` back to its exact original path.
 
-    Reads current state from the manifest (see `_latest_entries_for_batch`). Refuses the whole
-    batch loudly if any entry in it cannot honestly be restored:
-    - `DirectDeleteRestoreImpossibleError` for `direct_delete` entries (ADR-0001) — no bytes
-      survive anywhere for these, restoring them isn't merely unsupported, it's impossible.
-    - `RecycleBinRestoreUnsupportedError` for `recycle_bin` entries — there is no programmatic
-      handle back to a Recycle-Bin item, so this never fabricates a restore capability it
-      cannot deliver.
-    A batch's entries always share one requested `method` per `apply_batch` call, but ADR-0001
-    means a single batch can still mix `vault`/`recycle_bin` entries with `direct_delete` ones
-    (candidates with `retention_days is None` always direct-delete regardless of the batch's
-    requested method) — either refusal check can therefore fire independently of the other.
+    Reads current state from the manifest (see `_latest_entries_for_batch`). A single
+    `apply_batch` call always shares one requested `method` param, but ADR-0001's per-candidate
+    `retention_days` override means a real batch routinely mixes `vault` entries with
+    `direct_delete` ones (and, less commonly, `recycle_bin` ones) — the 6-category scoped
+    real-disk apply from 2026-07-17 is exactly this shape: 23,565 `direct_delete` entries
+    alongside 7 `vault` ones, all sharing one `batch_id`.
+
+    `direct_delete`/`recycle_bin` entries in a batch that also contains at least one restorable
+    `vault` entry are reported per-item as `restore_unsupported=True` (see `RestoreItemResult`)
+    — never restored, never silently retried, but no longer blocking the vault entries in the
+    same batch from restoring. Only when a batch has NO restorable `vault` entry at all (a pure
+    `direct_delete` batch, or a pure `recycle_bin` batch) does this still refuse the whole call
+    loudly, since a report with everything skipped and nothing attempted would be misleading —
+    `DirectDeleteRestoreImpossibleError`/`RecycleBinRestoreUnsupportedError` unchanged for that
+    case.
 
     Never overwrites an existing file at the destination — an item whose original path is
     occupied by something else now fails loudly (recorded in the report) rather than silently
@@ -762,25 +776,59 @@ def restore_batch(
     if not entries:
         raise BatchNotFoundError(f"no manifest entries found for batch_id={batch_id!r}")
 
+    vault_entries = [entry for entry in entries if entry.method == "vault"]
     direct_delete_entries = [entry for entry in entries if entry.method == "direct_delete"]
-    if direct_delete_entries:
-        raise DirectDeleteRestoreImpossibleError(
-            f"this batch contains {len(direct_delete_entries)} permanently-deleted file(s) "
-            "(retention=none for their category) — there is nothing to restore, they were "
-            "not quarantined"
-        )
-
     recycle_bin_entries = [entry for entry in entries if entry.method == "recycle_bin"]
-    if recycle_bin_entries:
-        raise RecycleBinRestoreUnsupportedError(
-            f"this batch contains {len(recycle_bin_entries)} Recycle-Bin-quarantined file(s); "
-            "restore them manually via Windows Explorer's Recycle Bin — automated restore "
-            "isn't supported for this method"
-        )
+
+    if not vault_entries:
+        # Nothing restorable at all in this batch — preserve the loud, whole-call refusal
+        # rather than silently returning an all-skipped report that looks like it did nothing.
+        if direct_delete_entries:
+            raise DirectDeleteRestoreImpossibleError(
+                f"this batch contains {len(direct_delete_entries)} permanently-deleted file(s) "
+                "(retention=none for their category) — there is nothing to restore, they were "
+                "not quarantined"
+            )
+        if recycle_bin_entries:
+            raise RecycleBinRestoreUnsupportedError(
+                f"this batch contains {len(recycle_bin_entries)} Recycle-Bin-quarantined "
+                "file(s); restore them manually via Windows Explorer's Recycle Bin — automated "
+                "restore isn't supported for this method"
+            )
 
     items: list[RestoreItemResult] = []
     updated_entries: list[QuarantineManifestEntry] = []
-    for entry in entries:
+
+    for entry in direct_delete_entries:
+        items.append(
+            RestoreItemResult(
+                original_path=entry.original_path,
+                size_bytes=entry.size_bytes,
+                succeeded=False,
+                already_restored=False,
+                error=(
+                    "permanently-deleted (retention=none for its category) — there is nothing "
+                    "to restore, it was not quarantined"
+                ),
+                restore_unsupported=True,
+            )
+        )
+    for entry in recycle_bin_entries:
+        items.append(
+            RestoreItemResult(
+                original_path=entry.original_path,
+                size_bytes=entry.size_bytes,
+                succeeded=False,
+                already_restored=False,
+                error=(
+                    "Recycle-Bin-quarantined; restore manually via Windows Explorer's Recycle "
+                    "Bin — automated restore isn't supported for this method"
+                ),
+                restore_unsupported=True,
+            )
+        )
+
+    for entry in vault_entries:
         if entry.restored:
             items.append(
                 RestoreItemResult(
@@ -794,10 +842,10 @@ def restore_batch(
             continue
 
         if entry.vault_path is None:
-            # Unreachable in practice: the recycle_bin check above already excludes every
-            # method that can reach this point without a vault_path. Guards mypy's None
-            # narrowing and, if manifest data were ever corrupted, fails loudly per-item rather
-            # than crashing the whole restore.
+            # Unreachable in practice: this loop only ever iterates `vault_entries`, which by
+            # construction always carries a `vault_path` (set by `apply_batch` whenever
+            # `method="vault"`). Guards mypy's None narrowing and, if manifest data were ever
+            # corrupted, fails loudly per-item rather than crashing the whole restore.
             items.append(
                 RestoreItemResult(
                     original_path=entry.original_path,
@@ -857,7 +905,8 @@ def restore_batch(
         append_manifest_entries(resolved_manifest_path, updated_entries)
 
     succeeded_items = [item for item in items if item.succeeded]
-    failed_items = [item for item in items if not item.succeeded]
+    unsupported_items = [item for item in items if item.restore_unsupported]
+    failed_items = [item for item in items if not item.succeeded and not item.restore_unsupported]
     return RestoreReport(
         batch_id=batch_id,
         started_at=now_ts,
@@ -866,6 +915,7 @@ def restore_batch(
         files_processed=len(items),
         files_succeeded=len(succeeded_items),
         files_failed=len(failed_items),
+        files_unsupported=len(unsupported_items),
         bytes_restored=sum(
             item.size_bytes for item in succeeded_items if not item.already_restored
         ),

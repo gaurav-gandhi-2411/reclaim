@@ -488,10 +488,17 @@ def list_quarantine_batches(state: AppState) -> QuarantineListResponse:
     batches: list[QuarantineBatchOut] = []
     for batch_id, batch_entries in by_batch.items():
         batch_entries.sort(key=lambda e: e.original_path.as_posix())
+        vault_entries = [e for e in batch_entries if e.method == "vault"]
         recycle_bin_entries = [e for e in batch_entries if e.method == "recycle_bin"]
         direct_delete_entries = [e for e in batch_entries if e.method == "direct_delete"]
         bytes_total = sum(e.size_bytes for e in batch_entries)
-        if direct_delete_entries:
+        if vault_entries:
+            # `restore_batch` (ADR-0004) restores every vault entry in a batch even if it also
+            # contains direct_delete/recycle_bin entries — those are reported per-item as
+            # restore_unsupported rather than blocking the whole batch, so the listing view only
+            # blocks restore entirely when there is NOTHING restorable at all (below).
+            restore_blocked_reason = None
+        elif direct_delete_entries:
             # ADR-0001: checked first — a more final situation than a recycle-bin entry, and
             # `restore_batch` itself refuses on direct-delete entries before it ever reaches its
             # recycle-bin check, so the listing view's blocked-reason ordering matches that.
@@ -526,6 +533,7 @@ def restore_response(report: RestoreReport) -> RestoreResponse:
             succeeded=item.succeeded,
             already_restored=item.already_restored,
             error=item.error,
+            restore_unsupported=item.restore_unsupported,
         )
         for item in report.items
     ]
@@ -535,6 +543,7 @@ def restore_response(report: RestoreReport) -> RestoreResponse:
         files_processed=report.files_processed,
         files_succeeded=report.files_succeeded,
         files_failed=report.files_failed,
+        files_unsupported=report.files_unsupported,
         bytes_restored=report.bytes_restored,
         bytes_restored_human=format_bytes(report.bytes_restored),
     )
