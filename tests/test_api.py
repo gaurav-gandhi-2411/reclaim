@@ -152,6 +152,12 @@ def test_apply_bad_tier_returns_400(tmp_path: Path) -> None:
     assert response.status_code == 400
 
 
+def test_duplicate_cluster_review_bad_limit_returns_400(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/duplicate-clusters/review?limit=0")
+    assert response.status_code == 400
+
+
 # --- Fixture tree used by the full-pipeline tests below ----------------------------------------
 
 
@@ -242,6 +248,40 @@ def test_full_pipeline_scan_summary_treemap_candidates(tmp_path: Path) -> None:
     keep_members = [m for m in cluster["members"] if m["is_keep"]]
     assert len(keep_members) == 1
     assert keep_members[0]["path"] == paths["dup_original"].as_posix()
+
+
+def test_duplicate_cluster_review_shows_keep_vs_delete_side_by_side(tmp_path: Path) -> None:
+    """ADR-0007: the dashboard's review endpoint for the largest duplicate clusters — GG's
+    "eyeball the survivor before applying" gate. `_build_tree`'s one duplicate pair
+    (Archive/report.bin kept, Downloads/report_copy.bin proposed for deletion) is unaffected by
+    hardlinks (both written independently, no shared inode), so reclaimable_bytes == size."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.get("/api/duplicate-clusters/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_scan"] is True
+    assert len(body["clusters"]) == 1
+
+    row = body["clusters"][0]
+    assert row["needs_review"] is False
+    assert row["reclaimable_bytes"] == 4_096
+    member_paths = {m["path"] for m in row["cluster"]["members"]}
+    assert member_paths == {paths["dup_original"].as_posix(), paths["dup_copy"].as_posix()}
+    keep_members = [m for m in row["cluster"]["members"] if m["is_keep"]]
+    assert len(keep_members) == 1
+    assert keep_members[0]["path"] == paths["dup_original"].as_posix()
+
+
+def test_duplicate_cluster_review_empty_before_any_scan(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/duplicate-clusters/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"has_scan": False, "clusters": []}
 
 
 def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:

@@ -527,6 +527,29 @@ button {
   background: color-mix(in srgb, var(--rc-brand) 10%, transparent);
 }
 
+.rc-duplicate-review {
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+  margin-bottom: var(--rc-space-4);
+  background: var(--rc-surface-alt);
+}
+
+.rc-duplicate-review h2 {
+  margin: 0 0 var(--rc-space-1);
+  font-size: var(--rc-text-lg, 1.1rem);
+}
+
+.rc-duplicate-review > p {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+  margin: 0 0 var(--rc-space-3);
+}
+
+.rc-duplicate-review .rc-candidate-card + .rc-candidate-card {
+  margin-top: var(--rc-space-3);
+}
+
 .rc-checkbox-row {
   display: flex;
   align-items: center;

@@ -368,6 +368,8 @@ const selectedPaths = new Set();
 let lastCandidates = [];
 
 async function loadReviewQueue() {
+  loadDuplicateClusterReview();
+
   const stateEl = document.getElementById("review-state");
   const contentEl = document.getElementById("review-content");
   contentEl.hidden = true;
@@ -406,6 +408,69 @@ async function loadReviewQueue() {
       actionLabel: "Retry",
       onAction: loadReviewQueue,
     });
+  }
+}
+
+async function loadDuplicateClusterReview() {
+  const stateEl = document.getElementById("duplicate-review-state");
+  const contentEl = document.getElementById("duplicate-review-content");
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Loading largest duplicate clusters…" });
+
+  try {
+    const data = await api("/api/duplicate-clusters/review");
+    if (!data.has_scan) {
+      renderState(stateEl, "empty", {
+        title: "No scan yet",
+        message: "Run a scan from the bar above to see the largest duplicate clusters.",
+      });
+      return;
+    }
+    if (data.clusters.length === 0) {
+      renderState(stateEl, "empty", {
+        title: "No duplicate clusters to review",
+        message: "Either no exact duplicates were found, or every cluster was excluded because a member sits under a protected path.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    renderDuplicateClusterReview(contentEl, data.clusters);
+  } catch (err) {
+    renderState(stateEl, "error", {
+      title: "Could not load the largest duplicate clusters",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadDuplicateClusterReview,
+    });
+  }
+}
+
+function renderDuplicateClusterReview(container, rows) {
+  container.innerHTML = "";
+  for (const row of rows) {
+    const card = document.createElement("article");
+    card.className = "rc-candidate-card";
+
+    const head = document.createElement("div");
+    head.className = "rc-candidate-card-head";
+    head.innerHTML = `
+      <span class="rc-candidate-path">${row.reclaimable_bytes_human} reclaimable (${row.reclaimable_bytes.toLocaleString()} bytes)</span>
+      ${
+        row.needs_review
+          ? '<span class="rc-badge" data-tier="B" title="The kept copy sits in a less durable location than a copy being deleted">Flagged for review</span>'
+          : ""
+      }
+    `;
+    card.appendChild(head);
+
+    const rationale = document.createElement("p");
+    rationale.className = "rc-candidate-rationale";
+    rationale.textContent = row.rationale;
+    card.appendChild(rationale);
+
+    card.appendChild(renderClusterTable(row.cluster));
+    container.appendChild(card);
   }
 }
 

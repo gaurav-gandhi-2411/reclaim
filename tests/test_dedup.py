@@ -18,13 +18,21 @@ from reclaim.dedup import (
     _due,
     _hash_with_guard,
     _is_downloads_or_temp,
+    _is_risky_sole_survivor_location,
+    _location_rank,
+    cluster_needs_manual_review,
     find_duplicate_clusters,
     generate_duplicate_candidates,
     materiality_exclusion_stats,
     select_keep,
 )
 from reclaim.index import ScanIndex
-from reclaim.models import FileRecord, HashSkip
+from reclaim.models import (
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    DuplicateCluster,
+    FileRecord,
+    HashSkip,
+)
 from reclaim.safety import SafetyValidator
 
 _NOW = 1_700_000_000.0
@@ -36,16 +44,19 @@ def _record(
     is_dir: bool = False,
     size_bytes: int = 1024,
     ctime: float = _NOW,
+    git_repo_root: Path | None = None,
+    git_repo_clean: bool = False,
+    attributes: int = 0,
 ) -> FileRecord:
     p = Path(path)
     return FileRecord(
         path=p,
         is_dir=is_dir,
         size_bytes=size_bytes,
-        attributes=0,
+        attributes=attributes,
         ext=p.suffix.lower() if not is_dir else "",
-        git_repo_root=None,
-        git_repo_clean=False,
+        git_repo_root=git_repo_root,
+        git_repo_clean=git_repo_clean,
         mtime=ctime,
         ctime=ctime,
     )
@@ -122,22 +133,100 @@ def test_select_keep_prefers_path_outside_downloads_over_older_ctime() -> None:
     assert select_keep([downloads, documents]) is documents
 
 
-def test_select_keep_falls_back_to_oldest_ctime_when_location_ties() -> None:
+def test_select_keep_falls_back_to_oldest_ctime_when_location_and_depth_tie() -> None:
+    """ADR-0007: ctime is the THIRD-level tiebreak, only reached once location rank and path
+    depth both tie (both fixtures below are non-git, non-Downloads/Temp, and same depth)."""
     older = _record("C:/Data/a/file.bin", ctime=_NOW - 100)
     newer = _record("C:/Data/b/file.bin", ctime=_NOW - 1)
     assert select_keep([older, newer]) is older
 
 
-def test_select_keep_falls_back_to_shortest_depth_when_location_and_ctime_tie() -> None:
-    shallow = _record("C:/Data/file.bin", ctime=_NOW)
-    deep = _record("C:/Data/nested/deeper/file.bin", ctime=_NOW)
-    assert select_keep([deep, shallow]) is shallow
+def test_select_keep_prefers_shorter_depth_over_older_ctime() -> None:
+    """ADR-0007: path depth is checked BEFORE ctime — a shallower copy created LATER must still
+    beat a deeper copy created earlier, the reverse of the pre-ADR-0007 order."""
+    shallow_but_newer = _record("C:/Data/file.bin", ctime=_NOW - 1)
+    deep_but_older = _record("C:/Data/nested/deeper/file.bin", ctime=_NOW - 100)
+    assert select_keep([deep_but_older, shallow_but_newer]) is shallow_but_newer
 
 
 def test_select_keep_falls_back_to_lexicographic_path_when_fully_tied() -> None:
     a = _record("C:/Data/a.bin", ctime=_NOW)
     b = _record("C:/Data/b.bin", ctime=_NOW)
     assert select_keep([b, a]) is a
+
+
+def test_location_rank_orders_git_repo_below_neither_below_downloads_temp() -> None:
+    """ADR-0007: the three-way rank underlying `select_keep` — git-repo membership is rank 0
+    (best), a location that's neither git-repo nor Downloads/Temp is rank 1, and Downloads/Temp
+    is rank 2 (worst)."""
+    in_repo = _record("C:/Proj/file.bin", git_repo_root=Path("C:/Proj"))
+    neither = _record("C:/Users/gg/Documents/file.bin")
+    downloads = _record("C:/Users/gg/Downloads/file.bin")
+    assert _location_rank(in_repo) == 0
+    assert _location_rank(neither) == 1
+    assert _location_rank(downloads) == 2
+
+
+def test_select_keep_prefers_git_repo_over_downloads() -> None:
+    """The exact required scenario: a cluster with one copy inside a git repo and one in
+    Downloads — the repo copy must be kept regardless of ctime/depth."""
+    in_repo = _record(
+        "C:/Proj/deeply/nested/file.bin", git_repo_root=Path("C:/Proj"), ctime=_NOW - 1
+    )
+    downloads = _record("C:/Users/gg/Downloads/file.bin", ctime=_NOW - 100)  # older, shallower
+    assert select_keep([in_repo, downloads]) is in_repo
+    assert select_keep([downloads, in_repo]) is in_repo  # order-independent
+
+
+def test_select_keep_prefers_git_repo_over_neither_location() -> None:
+    """A git-repo member must also beat a "neither" (non-Downloads/Temp, non-git) member — the
+    failure mode a plain "not Downloads/Temp" boolean alone couldn't distinguish, since both
+    would tie on that check and fall through to ctime/depth."""
+    in_repo = _record(
+        "C:/Proj/deeply/nested/file.bin", git_repo_root=Path("C:/Proj"), ctime=_NOW - 1
+    )
+    documents = _record("C:/Users/gg/Documents/file.bin", ctime=_NOW - 100)  # older, shallower
+    assert select_keep([in_repo, documents]) is in_repo
+
+
+def test_is_risky_sole_survivor_location_matches_downloads_temp_and_cloud_placeholder() -> None:
+    downloads = _record("C:/Users/gg/Downloads/file.bin")
+    cloud_placeholder = _record(
+        "C:/Users/gg/OneDrive/file.bin", attributes=FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+    )
+    stable = _record("C:/Users/gg/Documents/file.bin")
+    assert _is_risky_sole_survivor_location(downloads) is True
+    assert _is_risky_sole_survivor_location(cloud_placeholder) is True
+    assert _is_risky_sole_survivor_location(stable) is False
+
+
+def test_cluster_needs_manual_review_when_keep_is_risky_and_a_deleted_copy_is_stable() -> None:
+    keep_in_temp = _record("C:/Users/gg/AppData/Local/Temp/file.bin")
+    deleted_stable = _record("C:/Users/gg/Documents/file.bin")
+    cluster = DuplicateCluster(
+        full_hash="abc", size_bytes=100, keep=keep_in_temp, duplicates=(deleted_stable,)
+    )
+    assert cluster_needs_manual_review(cluster) is True
+
+
+def test_cluster_does_not_need_review_when_keep_is_stable() -> None:
+    keep_stable = _record("C:/Users/gg/Documents/file.bin")
+    deleted_in_temp = _record("C:/Users/gg/AppData/Local/Temp/file.bin")
+    cluster = DuplicateCluster(
+        full_hash="abc", size_bytes=100, keep=keep_stable, duplicates=(deleted_in_temp,)
+    )
+    assert cluster_needs_manual_review(cluster) is False
+
+
+def test_cluster_does_not_need_review_when_every_member_is_risky() -> None:
+    """If every member — kept and deleted alike — is in a risky location, there's no more
+    durable copy being thrown away, so nothing is actually being stranded."""
+    keep_in_temp = _record("C:/Users/gg/AppData/Local/Temp/a.bin")
+    deleted_in_downloads = _record("C:/Users/gg/Downloads/b.bin")
+    cluster = DuplicateCluster(
+        full_hash="abc", size_bytes=100, keep=keep_in_temp, duplicates=(deleted_in_downloads,)
+    )
+    assert cluster_needs_manual_review(cluster) is False
 
 
 def test_select_keep_is_order_independent() -> None:
@@ -214,17 +303,24 @@ def test_hash_with_guard_reports_oserror_reason() -> None:
 
 
 def _index_record(
-    path: str, *, size_bytes: int, mtime: float = 100.0, ctime: float = 100.0
+    path: str,
+    *,
+    size_bytes: int,
+    mtime: float = 100.0,
+    ctime: float = 100.0,
+    git_repo_root: Path | None = None,
+    git_repo_clean: bool = False,
+    attributes: int = 0,
 ) -> FileRecord:
     p = Path(path)
     return FileRecord(
         path=p,
         is_dir=False,
         size_bytes=size_bytes,
-        attributes=0,
+        attributes=attributes,
         ext=p.suffix.lower(),
-        git_repo_root=None,
-        git_repo_clean=False,
+        git_repo_root=git_repo_root,
+        git_repo_clean=git_repo_clean,
         mtime=mtime,
         ctime=ctime,
     )
@@ -446,3 +542,124 @@ def test_generate_duplicate_candidates_reports_full_reclaimable_for_genuine_copi
 
     assert len(candidates) == 1
     assert candidates[0].reclaimable_bytes == size
+
+
+# --- ADR-0007: keep-heuristic safety (git-repo preference, risky-survivor review, protected --
+# --- non-kept member exclusion), full pipeline -------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_keeps_git_repo_copy_over_downloads(tmp_path: Path) -> None:
+    """The exact required scenario, through the full pipeline: a cluster with one copy inside a
+    git repo and one in Downloads — the repo copy must be kept, the Downloads copy proposed for
+    deletion."""
+    repo_root = tmp_path / "proj"
+    repo_root.mkdir()
+    repo_path = repo_root / "file.bin"
+    repo_path.write_bytes(b"identical-content-" * 10_000)
+    downloads_dir = tmp_path / "Downloads"
+    downloads_dir.mkdir()
+    downloads_path = downloads_dir / "file.bin"
+    downloads_path.write_bytes(repo_path.read_bytes())
+    size = repo_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(
+                    str(repo_path),
+                    size_bytes=size,
+                    ctime=200.0,  # newer than the Downloads copy -- location still wins
+                    git_repo_root=repo_root,
+                    git_repo_clean=True,
+                ),
+                _index_record(str(downloads_path), size_bytes=size, ctime=100.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert len(candidates) == 1
+    assert candidates[0].path == downloads_path
+    assert "git repository" in candidates[0].rationale.lower()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_cloud_placeholder_never_reaches_a_duplicate_cluster(tmp_path: Path) -> None:
+    """Honest boundary check for `cluster_needs_manual_review`'s cloud-placeholder branch:
+    `ScanIndex.duplicate_size_candidates` already filters `is_cloud_placeholder = 0` (a
+    pre-existing, unrelated filter — index.py), so a cloud-placeholder file never becomes a
+    cluster member (keep OR duplicate) through the real pipeline at all. The review-flag logic
+    for this case is proven correct at the unit level instead
+    (`test_cluster_needs_manual_review_when_keep_is_risky_and_a_deleted_copy_is_stable`, against
+    a hand-built `DuplicateCluster`), since it isn't reachable end-to-end today given this
+    upstream filter — kept as defense-in-depth, not dead code: if the SQL filter is ever
+    loosened, the review-flag mechanism is already there to catch it. This test documents WHY
+    an end-to-end version of that scenario can't be written today, rather than silently omitting
+    it."""
+    placeholder_path = tmp_path / "file.bin"
+    placeholder_path.write_bytes(b"identical-content-" * 10_000)
+    stable_path = tmp_path / "nested" / "deeper" / "file.bin"
+    stable_path.parent.mkdir(parents=True)
+    stable_path.write_bytes(placeholder_path.read_bytes())
+    size = placeholder_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(
+                    str(placeholder_path),
+                    size_bytes=size,
+                    ctime=100.0,
+                    attributes=FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+                ),
+                _index_record(str(stable_path), size_bytes=size, ctime=100.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    # No cluster forms at all: the placeholder was never a candidate, so the one remaining
+    # file has no pair to be a "duplicate" of — not a review-flagged cluster, no cluster.
+    assert candidates == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_whole_cluster_when_non_kept_member_is_blocked(
+    tmp_path: Path,
+) -> None:
+    """ADR-0007: a cluster with a protected non-kept member must be excluded ENTIRELY — not
+    just that one member silently dropped while the rest of the (byte-identical) cluster is
+    proposed as if nothing were unusual."""
+    protected_dir = tmp_path / "protected_root"
+    protected_dir.mkdir()
+    protected_path = protected_dir / "file.bin"
+    protected_path.write_bytes(b"identical-content-" * 10_000)
+    ordinary_path = tmp_path / "ordinary" / "file.bin"
+    ordinary_path.parent.mkdir(parents=True)
+    ordinary_path.write_bytes(protected_path.read_bytes())
+    size = protected_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(protected_path), size_bytes=size, ctime=200.0),  # not kept
+                _index_record(str(ordinary_path), size_bytes=size, ctime=100.0),  # kept (older)
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[f"{protected_dir.as_posix()}/*"]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert candidates == []  # whole cluster excluded, not just the protected member

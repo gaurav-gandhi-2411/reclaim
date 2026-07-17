@@ -16,6 +16,8 @@ from reclaim.api.schemas import (
     CategoryBreakdownOut,
     CategoryCardOut,
     DuplicateClusterOut,
+    DuplicateClusterReviewOut,
+    DuplicateClusterReviewResponse,
     DuplicateMemberOut,
     ItemApplyResultOut,
     QuarantineBatchOut,
@@ -31,7 +33,11 @@ from reclaim.api.schemas import (
     format_bytes,
 )
 from reclaim.api.state import AppState, ScanStatus
-from reclaim.dedup import find_duplicate_clusters, generate_duplicate_candidates
+from reclaim.dedup import (
+    cluster_needs_manual_review,
+    find_duplicate_clusters,
+    generate_duplicate_candidates,
+)
 from reclaim.detectors import generate_candidates
 from reclaim.executor import (
     BatchApplyReport,
@@ -334,6 +340,56 @@ def list_candidates(
         total_bytes=total_bytes,
         total_bytes_human=format_bytes(total_bytes),
     )
+
+
+_DUPLICATE_CLUSTER_REVIEW_LIMIT = 15
+
+
+def list_duplicate_cluster_review(
+    state: AppState, *, limit: int = _DUPLICATE_CLUSTER_REVIEW_LIMIT
+) -> DuplicateClusterReviewResponse:
+    """ADR-0007: the `limit` largest exact-duplicate clusters by hardlink-aware reclaimable
+    bytes, keep-vs-delete paths shown side by side — so a human eyeballs the survivor before any
+    apply, not just the biggest logical-size candidates. Reuses `generate_duplicate_candidates`'s
+    own safety filtering (whole-cluster exclusion on a BLOCKED non-kept member) rather than
+    recomputing it, so this view can never show a cluster the apply pipeline itself would refuse
+    to touch."""
+    with ScanIndex(state.db_path) as index:
+        if not index.has_any_records():
+            return DuplicateClusterReviewResponse(has_scan=False, clusters=[])
+
+        duplicate_candidates = generate_duplicate_candidates(index, state.config, state.safety)
+        candidate_by_path = {c.path: c for c in duplicate_candidates}
+        clusters = find_duplicate_clusters(
+            index, min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes
+        )
+
+    rows: list[DuplicateClusterReviewOut] = []
+    for cluster in clusters:
+        member_candidates = [
+            candidate_by_path[d.path] for d in cluster.duplicates if d.path in candidate_by_path
+        ]
+        if not member_candidates:
+            # Every non-kept member is missing from the candidate list — either the whole
+            # cluster was excluded (a member is SafetyValidator-BLOCKED) or it fell below the
+            # materiality floor. Either way there's nothing here to review.
+            continue
+        reclaimable_total = sum(
+            c.reclaimable_bytes if c.reclaimable_bytes is not None else c.size_bytes
+            for c in member_candidates
+        )
+        rows.append(
+            DuplicateClusterReviewOut(
+                cluster=_duplicate_cluster_out(cluster),
+                reclaimable_bytes=reclaimable_total,
+                reclaimable_bytes_human=format_bytes(reclaimable_total),
+                needs_review=cluster_needs_manual_review(cluster),
+                rationale=member_candidates[0].rationale,
+            )
+        )
+
+    rows.sort(key=lambda row: row.reclaimable_bytes, reverse=True)
+    return DuplicateClusterReviewResponse(has_scan=True, clusters=rows[:limit])
 
 
 # --- Apply / dry-run -------------------------------------------------------------------------

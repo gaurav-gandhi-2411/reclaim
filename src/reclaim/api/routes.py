@@ -10,6 +10,7 @@ from reclaim.api.schemas import (
     ApplyRequest,
     ApplyResponse,
     CandidatesResponse,
+    DuplicateClusterReviewResponse,
     QuarantineListResponse,
     RestoreResponse,
     ScanRequest,
@@ -89,6 +90,13 @@ def candidates(
             status_code=400, detail=f"tier must be one of A, B, both (got {tier!r})"
         )
     return service.list_candidates(get_state(request), tier=tier, category_group=category)
+
+
+@router.get("/duplicate-clusters/review", response_model=DuplicateClusterReviewResponse)
+def duplicate_cluster_review(request: Request, limit: int = 15) -> DuplicateClusterReviewResponse:
+    if limit < 1:
+        raise HTTPException(status_code=400, detail=f"limit must be >= 1 (got {limit!r})")
+    return service.list_duplicate_cluster_review(get_state(request), limit=limit)
 
 
 @router.post("/apply", response_model=ApplyResponse)

@@ -81,6 +81,13 @@
         </div>
       </div>
 
+      <section class="rc-duplicate-review" aria-labelledby="duplicate-review-heading">
+        <h2 id="duplicate-review-heading">Largest duplicate clusters — keep vs. delete</h2>
+        <p>Top clusters by hardlink-aware reclaimable bytes, independent of the tier/category filters below. Eyeball the survivor before applying — nothing here has been touched.</p>
+        <div id="duplicate-review-state"></div>
+        <div id="duplicate-review-content" hidden></div>
+      </section>
+
       <div class="rc-toolbar">
         <div class="rc-field">
           <label for="review-tier-filter">Tier</label>

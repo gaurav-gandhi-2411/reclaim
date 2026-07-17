@@ -167,6 +167,23 @@ class CandidateOut(BaseModel):
     duplicate_cluster: DuplicateClusterOut | None = None
 
 
+class DuplicateClusterReviewOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cluster: DuplicateClusterOut
+    reclaimable_bytes: int
+    reclaimable_bytes_human: str
+    needs_review: bool
+    rationale: str
+
+
+class DuplicateClusterReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    has_scan: bool
+    clusters: list[DuplicateClusterReviewOut]
+
+
 class CandidatesResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

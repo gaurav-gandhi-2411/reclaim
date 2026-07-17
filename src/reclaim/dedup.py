@@ -72,6 +72,60 @@ def _is_downloads_or_temp(path: Path) -> bool:
     return any(part.lower() in _KEEP_HEURISTIC_LOCATION_SEGMENTS for part in path.parts)
 
 
+def _location_rank(record: FileRecord) -> int:
+    """ADR-0007: lower ranks first (preferred as keep). `0`: inside a git repository / active
+    project — the strongest "this is the real, working copy" signal available. `1`: neither in
+    a git repo nor in Downloads/Temp — a generic, undetermined location. `2`: inside
+    Downloads/Temp — exactly the places an incidental/junk copy lives.
+
+    A plain "not Downloads/Temp" boolean (this project's original rule 1) doesn't distinguish a
+    genuine project copy from an arbitrary non-Downloads/Temp location — a copy sitting in, say,
+    a random `Documents/backup` folder would tie with a git-repo copy on that check alone and
+    fall through to the ctime/depth tiebreaks, which could pick the non-project copy as keep and
+    propose the git-repo copy for deletion. This three-way rank makes git-repo membership a
+    POSITIVE, first-class preference instead of just the absence of a Downloads/Temp penalty —
+    a git-repo member is never outranked by a non-git, non-Downloads/Temp member.
+    """
+    if record.git_repo_root is not None:
+        return 0
+    if _is_downloads_or_temp(record.path):
+        return 2
+    return 1
+
+
+def _is_risky_sole_survivor_location(record: FileRecord) -> bool:
+    """ADR-0007: true if `record` sits in Downloads/Temp or is a cloud-sync placeholder (not
+    fully synced locally) — the two location classes unsuitable to be the SOLE surviving copy
+    of a duplicate cluster once every other member is deleted. Distinct from `_location_rank`'s
+    keep-heuristic ranking: this asks "is the location we ended up keeping actually durable,"
+    not "which candidate should we prefer."""
+    return _is_downloads_or_temp(record.path) or record.is_cloud_placeholder
+
+
+def cluster_needs_manual_review(cluster: DuplicateCluster) -> bool:
+    """ADR-0007: true if the kept copy would be the cluster's sole survivor in a risky location
+    (Downloads/Temp/cloud-placeholder) while at least one about-to-be-deleted member sits
+    somewhere more durable. Auto-applying a cluster like this would strand the only surviving
+    copy somewhere less durable than what's being thrown away — flagged for manual review
+    (forced Tier B) instead of auto-picked, regardless of `config.categories.duplicates.enabled`.
+
+    Honest reachability note: given `select_keep`'s location-rank ordering (`_location_rank` —
+    Downloads/Temp always ranks worst), a Downloads/Temp copy can only win as keep if every
+    OTHER cluster member is ALSO Downloads/Temp, in which case there is no more-durable member
+    being thrown away and this function correctly returns `False` regardless. Given
+    `ScanIndex.duplicate_size_candidates`'s pre-existing `is_cloud_placeholder = 0` filter, a
+    cloud-placeholder file never becomes a cluster member (keep or duplicate) through the real
+    pipeline at all. So this function's `True` branch is not reachable via
+    `generate_duplicate_candidates` as the codebase stands today — it exists as defense-in-depth
+    should either of those two upstream guarantees ever change, and is verified directly at the
+    unit level (see `test_cluster_needs_manual_review_when_keep_is_risky_and_a_deleted_copy_is_
+    stable`) rather than an end-to-end scenario that can't currently be constructed.
+    """
+    if not _is_risky_sole_survivor_location(cluster.keep):
+        return False
+    return any(not _is_risky_sole_survivor_location(d) for d in cluster.duplicates)
+
+
 def _compute_partial_hash(path: Path, size_bytes: int) -> str:
     hasher = blake3.blake3()
     with path.open("rb") as fh:
@@ -118,17 +172,25 @@ def _hash_with_guard(
 
 
 def select_keep(members: Sequence[FileRecord]) -> FileRecord:
-    """Picks the one cluster member to keep. Ranking, in order: (1) prefer a path not under a
-    Downloads/Temp directory, (2) oldest `ctime` — Windows creation time, the "which copy
-    existed first" signal, not POSIX change time — (3) shortest path depth (fewest path
-    segments from the drive root), (4) lexicographic path sort as a final, deterministic
-    tiebreak so output is reproducible run-to-run."""
+    """Picks the one cluster member to keep. Ranking, in order (ADR-0007): (1) location rank —
+    prefer a copy inside a git repository/active project, then a copy in neither a git repo nor
+    Downloads/Temp, then last a copy under Downloads/Temp (see `_location_rank`); (2) shortest
+    path depth (fewest path segments from the drive root); (3) oldest `ctime` — Windows creation
+    time, the "which copy existed first" signal, not POSIX change time; (4) lexicographic path
+    sort as a final, deterministic tiebreak so output is reproducible run-to-run.
+
+    Content survival was never the risk here — every cluster member is byte-identical by
+    construction. Keeping the WRONG copy is: this ordering guarantees a git-repo/project member
+    is never the one proposed for deletion as long as at least one exists in the cluster, even
+    if a Downloads/Temp copy happens to have an older creation time or shallower path (the
+    failure mode rank (1) alone, without git-repo awareness, could otherwise produce).
+    """
     return min(
         members,
         key=lambda record: (
-            _is_downloads_or_temp(record.path),
-            record.ctime,
+            _location_rank(record),
             len(record.path.parts),
+            record.ctime,
             record.path.as_posix(),
         ),
     )
@@ -346,18 +408,19 @@ def _keep_rationale(cluster: DuplicateCluster) -> str:
     """Concrete, honest rationale naming the kept path and the factual heuristic-relevant
     properties that led to it being kept — never a fabricated claim about which single rule
     was decisive, since that depends on the other members it was compared against."""
-    location = (
-        "outside Downloads/Temp"
-        if not _is_downloads_or_temp(cluster.keep.path)
-        else ("under a Downloads/Temp directory (shared by every member of this cluster)")
-    )
+    if cluster.keep.git_repo_root is not None:
+        location = f"inside git repository '{cluster.keep.git_repo_root}'"
+    elif _is_downloads_or_temp(cluster.keep.path):
+        location = "under a Downloads/Temp directory (shared by every member of this cluster)"
+    else:
+        location = "outside Downloads/Temp (not in a git repository)"
     created = datetime.fromtimestamp(cluster.keep.ctime, tz=UTC).isoformat()
     return (
         f"Exact duplicate of '{cluster.keep.path}' (byte-identical, BLAKE3 full-hash match); "
         f"kept copy is {location}, created {created}, path depth "
-        f"{len(cluster.keep.path.parts)} — selected by the keep-heuristic (prefer outside "
-        "Downloads/Temp, then oldest creation time, then shallowest path, then lexicographic "
-        "order)."
+        f"{len(cluster.keep.path.parts)} — selected by the keep-heuristic (ADR-0007: prefer "
+        "git-repo/project membership, then shallowest path, then oldest creation time, then "
+        "lexicographic order)."
     )
 
 
@@ -370,9 +433,9 @@ def generate_duplicate_candidates(
 ) -> list[Candidate]:
     """Mirrors `detectors.py::generate_candidates()`'s contract/shape: runs every non-keep
     cluster member through `SafetyValidator.evaluate()` before it is ever tagged a tier.
-    `BLOCKED` -> excluded entirely; `REVIEW_ONLY` -> forced Tier B; `ELIGIBLE` -> Tier A only if
-    `config.categories.duplicates` is enabled, else Tier B. The kept member of a cluster is
-    never evaluated and never appears in the output — it isn't being proposed for any action.
+    `REVIEW_ONLY` -> forced Tier B; `ELIGIBLE` -> Tier A only if `config.categories.duplicates`
+    is enabled, else Tier B. The kept member of a cluster is never evaluated for a tier and
+    never appears in the output — it isn't being proposed for any action.
 
     `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
     `min_reclaim_bytes` comes from `config.categories.duplicates.min_reclaim_bytes` — the
@@ -385,19 +448,52 @@ def generate_duplicate_candidates(
     content — this category's entire selection criterion — is exactly what a hardlink produces,
     so this is not a rare edge case here. Exposed as `Candidate.reclaimable_bytes`, distinct
     from `size_bytes`'s logical size and never silently substituted for it.
+
+    ADR-0007, two safety checks beyond the per-member evaluation:
+    1. If ANY non-kept member is `BLOCKED` (a protected root, git-repo membership, a protected
+       extension, ...), the WHOLE cluster is excluded — not just that one member, silently
+       proposing the rest as if nothing were unusual about this byte-identical group. A cluster
+       with a protected member deserves a human looking at the whole group, not a partial
+       candidate list with no visibility into what got left out.
+    2. If the kept copy would be the cluster's sole surviving location and that location is
+       risky (Downloads/Temp/a cloud-sync placeholder) while a more durable copy is being
+       deleted, every surviving candidate in the cluster is forced to Tier B (review), regardless
+       of `config.categories.duplicates.enabled` — see `cluster_needs_manual_review`.
     """
     candidates: list[Candidate] = []
     min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
     for cluster in find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips):
+        member_results = {
+            duplicate.path: safety.evaluate(duplicate) for duplicate in cluster.duplicates
+        }
+        if any(result.verdict == Verdict.BLOCKED for result in member_results.values()):
+            blocked_paths = [
+                str(path)
+                for path, result in member_results.items()
+                if result.verdict == Verdict.BLOCKED
+            ]
+            logger.info(
+                "dedup.cluster_excluded_protected_member",
+                keep=str(cluster.keep.path),
+                blocked_paths=blocked_paths,
+            )
+            continue
+
         rationale = _keep_rationale(cluster)
+        needs_review = cluster_needs_manual_review(cluster)
+        if needs_review:
+            rationale = (
+                f"{rationale} FLAGGED FOR REVIEW: the kept copy sits in a Downloads/Temp/"
+                "cloud-placeholder location while at least one deleted copy sat somewhere more "
+                "durable — auto-applying this cluster would strand the sole survivor somewhere "
+                "less durable than what was thrown away."
+            )
         reclaim_estimates = estimate_reclaimable_bytes(
             [(duplicate.path, duplicate.size_bytes) for duplicate in cluster.duplicates]
         )
         for duplicate in cluster.duplicates:
-            result = safety.evaluate(duplicate)
-            if result.verdict == Verdict.BLOCKED:
-                continue
-            if result.verdict == Verdict.REVIEW_ONLY:
+            result = member_results[duplicate.path]
+            if result.verdict == Verdict.REVIEW_ONLY or needs_review:
                 tier = Tier.B
             else:
                 tier = Tier.A if config.categories.duplicates.enabled else Tier.B
@@ -405,9 +501,10 @@ def generate_duplicate_candidates(
             member_rationale = rationale
             if estimate.resolved and estimate.reclaimable_bytes == 0:
                 member_rationale = (
-                    f"{rationale} Already deduplicated at the filesystem level (this path is a "
-                    "hardlink sharing the same on-disk blocks as another surviving copy) — 0 "
-                    "bytes reclaimable if deleted, excluded from the reclaimable total."
+                    f"{member_rationale} Already deduplicated at the filesystem level (this "
+                    "path is a hardlink sharing the same on-disk blocks as another surviving "
+                    "copy) — 0 bytes reclaimable if deleted, excluded from the reclaimable "
+                    "total."
                 )
             candidates.append(
                 Candidate(
