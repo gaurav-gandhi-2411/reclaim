@@ -5,6 +5,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
+
 # ADR-0006: the uv/cache purge measured logical size (14.3GB) against real disk-free delta
 # (5.21GB) and found a large gap — uv hardlinks cache blobs into live venvs, so deleting the
 # cache's own name for a blob drops its link count without freeing the shared blocks as long as
@@ -21,11 +23,23 @@ class LinkIdentity:
     gotcha this project's scanner already discovered once; see `PLAN.md`'s "Gotchas
     discovered"). `nlink` is the TOTAL number of names pointing to this inode across the whole
     filesystem, not just however many happen to be in any particular candidate set.
+
+    ADR-0008: `is_reparse_point` is a separate, independent signal from `nlink` — a real
+    Windows hardlink is NOT a reparse point (multiple directory entries pointing at the same MFT
+    record, no reparse tag involved), but some OTHER storage-sharing mechanisms (Windows Server
+    Data Deduplication's chunk store, `IO_REPARSE_TAG_DEDUP`; possibly others in the future) DO
+    use a reparse point and would still report `st_nlink == 1` since they aren't hardlinks —
+    `st_nlink` alone can't see that kind of sharing. Investigated against this project's real,
+    reported HF-hub blob/snapshot pairs: confirmed via direct `os.stat()` that those specific
+    pairs are genuinely separate inodes with `nlink == 1` and NOT reparse points (a symlink-
+    privilege fallback produced full copies, not a link) — this field does not change that
+    finding, it's an independent defensive check for a different, adjacent risk class.
     """
 
     dev: int
     ino: int
     nlink: int
+    is_reparse_point: bool
 
 
 def read_link_identity(path: Path) -> LinkIdentity | None:
@@ -36,7 +50,12 @@ def read_link_identity(path: Path) -> LinkIdentity | None:
         st = path.stat()
     except OSError:
         return None
-    return LinkIdentity(dev=st.st_dev, ino=st.st_ino, nlink=st.st_nlink)
+    return LinkIdentity(
+        dev=st.st_dev,
+        ino=st.st_ino,
+        nlink=st.st_nlink,
+        is_reparse_point=bool(st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +98,14 @@ def estimate_reclaimable_bytes(
     whole group's `reclaimable_bytes` is `0` — deleting every member of this candidate set alone
     would not free those blocks (the classic "duplicate is actually a hardlink to the kept
     copy" case: the kept file's own name is exactly that "other name outside this set").
+
+    ADR-0008: a path that looks like a standalone file by `st_nlink` (`nlink == 1`) but IS a
+    reparse point is treated the same as an unresolvable path — `resolved=False`,
+    `reclaimable_bytes=0` — rather than confidently claiming its full logical size. A real
+    hardlink is never a reparse point, so this never fires for the case this module was built
+    for; it exists for storage-sharing mechanisms `st_nlink` cannot see at all (e.g. Windows
+    Data Deduplication's chunk store), where claiming the full size is reclaimable could
+    overclaim in a way this module's whole purpose is to avoid.
     """
     results: dict[Path, ReclaimEstimate] = {}
     groups: dict[tuple[int, int], list[tuple[Path, int]]] = defaultdict(list)
@@ -90,9 +117,14 @@ def estimate_reclaimable_bytes(
             results[path] = ReclaimEstimate(logical_bytes=size, reclaimable_bytes=0, resolved=False)
             continue
         if identity.nlink <= 1:
-            results[path] = ReclaimEstimate(
-                logical_bytes=size, reclaimable_bytes=size, resolved=True
-            )
+            if identity.is_reparse_point:
+                results[path] = ReclaimEstimate(
+                    logical_bytes=size, reclaimable_bytes=0, resolved=False
+                )
+            else:
+                results[path] = ReclaimEstimate(
+                    logical_bytes=size, reclaimable_bytes=size, resolved=True
+                )
             continue
         key = (identity.dev, identity.ino)
         groups[key].append((path, size))

@@ -93,6 +93,34 @@ def test_unresolvable_path_is_conservatively_zero_reclaimable(tmp_path: Path) ->
     assert estimates[missing].resolved is False
 
 
+def test_reparse_point_reporting_nlink_one_is_conservatively_zero_reclaimable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0008: a reparse point that looks standalone by `st_nlink` (`nlink == 1`) must never
+    be confidently reported as fully reclaimable — `st_nlink` alone cannot see storage-sharing
+    mechanisms some reparse points implement (e.g. Windows Data Deduplication's chunk store),
+    unlike a real hardlink group, which `st_nlink` reports correctly. Exercised via monkeypatch
+    rather than a real reparse point: creating one needs elevated privilege or Developer Mode,
+    which this project's own real-disk investigation (ADR-0008) found unavailable on the dev
+    machine — the same constraint would make a real-reparse-point version of this test
+    unreliable wherever it runs."""
+    target = tmp_path / "reparse_like.bin"
+    target.write_bytes(b"r" * 80)
+
+    from reclaim import linkinfo
+
+    real_identity = linkinfo.read_link_identity(target)
+    assert real_identity is not None
+    reparse_identity = linkinfo.LinkIdentity(
+        dev=real_identity.dev, ino=real_identity.ino, nlink=1, is_reparse_point=True
+    )
+    monkeypatch.setattr(linkinfo, "read_link_identity", lambda path: reparse_identity)
+
+    estimates = estimate_reclaimable_bytes([(target, 80)])
+    assert estimates[target].reclaimable_bytes == 0
+    assert estimates[target].resolved is False
+
+
 def test_mixed_standalone_and_hardlinked_candidates(tmp_path: Path) -> None:
     """A realistic candidate set: one ordinary standalone file plus a fully-covered hardlink
     pair, in the same `estimate_reclaimable_bytes` call — each group resolved independently."""

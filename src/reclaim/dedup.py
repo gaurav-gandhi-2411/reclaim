@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -124,6 +125,97 @@ def cluster_needs_manual_review(cluster: DuplicateCluster) -> bool:
     if not _is_risky_sole_survivor_location(cluster.keep):
         return False
     return any(not _is_risky_sole_survivor_location(d) for d in cluster.duplicates)
+
+
+# ADR-0008: HF Hub's on-disk cache layout stores one logical model/dataset "object" as a
+# content-addressed blob under `<repo-dir>/blobs/<sha>` plus a human-readable revision tree under
+# `<repo-dir>/snapshots/<rev>/...` (normally a symlink back to the blob; without symlink-creation
+# privilege, huggingface_hub falls back to a real, separate copy instead — confirmed on this
+# project's real disk via direct `os.stat()`: distinct inodes, `nlink == 1` each, no
+# `FILE_ATTRIBUTE_REPARSE_POINT`). Blob and snapshot are the SAME HF-managed object by design
+# regardless of which storage mechanism produced them — treating them as independent duplicates
+# and proposing one side for deletion can break model loading (application code reads the
+# snapshot path, not the blob path directly) or leave a stray, unreferenced blob behind.
+_HF_CACHE_REPO_PREFIXES = ("models--", "datasets--", "spaces--")
+_HF_CACHE_OBJECT_SUBDIRS = frozenset({"blobs", "snapshots", "refs"})
+
+
+def _hf_cache_object_root(path: Path) -> Path | None:
+    """Returns the shared HF-repo cache directory (e.g. `.../hub/models--org--name`) if `path`
+    sits under its `blobs/`, `snapshots/`, or `refs/` subtree — recognized structurally by the
+    HF cache's own naming convention, independent of where that cache physically lives (not
+    limited to `config.categories.model_caches.paths`'s configured default location)."""
+    parts = path.parts
+    for i, part in enumerate(parts[:-1]):
+        if part.lower().startswith(_HF_CACHE_REPO_PREFIXES) and parts[i + 1].lower() in (
+            _HF_CACHE_OBJECT_SUBDIRS
+        ):
+            return Path(*parts[: i + 1])
+    return None
+
+
+def _is_under_any(path: Path, roots: Sequence[Path]) -> bool:
+    path_posix = path.as_posix().lower()
+    for root in roots:
+        root_posix = root.as_posix().lower()
+        if path_posix == root_posix or path_posix.startswith(f"{root_posix}/"):
+            return True
+    return False
+
+
+def _is_model_cache_path(path: Path, model_cache_roots: Sequence[Path]) -> bool:
+    """ADR-0008: true if `path` sits under a configured model-cache root
+    (`config.categories.model_caches.paths` — HF hub, torch hub, Ollama) OR matches the HF
+    blob/snapshot cache structure directly, regardless of location. `exact_duplicate` must never
+    propose a path like this for deletion — model-weight caches are reviewed as one unit under
+    `model_caches` (ADR-0003's cost-aware retention), never piecemeal from the duplicate-
+    detection side."""
+    return _is_under_any(path, model_cache_roots) or _hf_cache_object_root(path) is not None
+
+
+# ADR-0008: conda/venv environments intentionally duplicate their own copy of shared dependency
+# binaries (e.g. CUDA DLLs) for isolation between environments — deleting one environment's own
+# copy because ANOTHER environment happens to carry a byte-identical copy can break that
+# environment's DLL resolution, even though the bytes really are identical right now.
+def _environment_root(path: Path) -> Path | None:
+    """The root directory of the Python environment `path` lives inside (a conda base install,
+    a named conda `envs/<name>`, or a `venv`/`.venv`), if any — identified by the
+    `Lib/site-packages` layout Windows conda and venv environments both use. Conda's own `pkgs/`
+    extraction cache is deliberately EXCLUDED even though it has the same internal layout: it's
+    a package-manager cache (analogous to pip/uv's own caches), not a live environment, and
+    reclaiming a duplicate out of it is exactly as safe as any other package-cache reclaim
+    already handled by `package_caches` — protecting it here would be over-broad.
+    """
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if i > 0 and part.lower() == "site-packages" and parts[i - 1].lower() == "lib":
+            root_parts = parts[: i - 1]
+            if any(p.lower() == "pkgs" for p in root_parts):
+                return None
+            return Path(*root_parts)
+    return None
+
+
+def _is_cross_environment_duplicate(duplicate: FileRecord, keep: FileRecord) -> bool:
+    """ADR-0008: true if `duplicate` and `keep` are each inside a DIFFERENT live Python
+    environment (conda base vs. a named env, two named envs, or two separate venvs)."""
+    duplicate_root = _environment_root(duplicate.path)
+    keep_root = _environment_root(keep.path)
+    return duplicate_root is not None and keep_root is not None and duplicate_root != keep_root
+
+
+def _dedup_ineligibility_reason(
+    duplicate: FileRecord, keep: FileRecord, model_cache_roots: Sequence[Path]
+) -> str | None:
+    """ADR-0008: why `duplicate` can never be an `exact_duplicate` deletion candidate,
+    regardless of `SafetyValidator`'s verdict — `None` if there's no such reason. Checked before
+    a duplicate ever reaches safety evaluation/tiering, so an excluded path never even shows up
+    as a `BLOCKED`/`ELIGIBLE` candidate — it simply isn't one."""
+    if _is_model_cache_path(duplicate.path, model_cache_roots):
+        return "model_cache_managed"
+    if _is_cross_environment_duplicate(duplicate, keep):
+        return "cross_environment"
+    return None
 
 
 def _compute_partial_hash(path: Path, size_bytes: int) -> str:
@@ -467,6 +559,14 @@ def generate_duplicate_candidates(
        risky (Downloads/Temp/a cloud-sync placeholder) while a more durable copy is being
        deleted, every surviving candidate in the cluster is forced to Tier B (review), regardless
        of `config.categories.duplicates.enabled` — see `cluster_needs_manual_review`.
+
+    ADR-0008, one more filter BEFORE the above two, on a per-member basis (not whole-cluster):
+    a path under a model-cache root, matching the HF blob/snapshot cache structure, or that
+    would be deleted from one live conda/venv environment to keep another's byte-identical copy
+    is dropped from `cluster.duplicates` entirely — it never reaches safety evaluation or
+    tiering, because it was never a legitimate `exact_duplicate` candidate in the first place
+    (see `_dedup_ineligibility_reason`). A cluster left with zero remaining duplicates after this
+    filter contributes no candidates at all.
     """
     candidates: list[Candidate] = []
     min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
@@ -475,7 +575,24 @@ def generate_duplicate_candidates(
         if clusters is not None
         else find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips)
     )
+    model_cache_roots = [Path(p) for p in config.categories.model_caches.paths]
     for cluster in resolved_clusters:
+        eligible_duplicates: list[FileRecord] = []
+        for duplicate in cluster.duplicates:
+            reason = _dedup_ineligibility_reason(duplicate, cluster.keep, model_cache_roots)
+            if reason is not None:
+                logger.info(
+                    "dedup.member_excluded",
+                    path=str(duplicate.path),
+                    keep=str(cluster.keep.path),
+                    reason=reason,
+                )
+                continue
+            eligible_duplicates.append(duplicate)
+        if not eligible_duplicates:
+            continue
+        cluster = _dataclass_replace(cluster, duplicates=tuple(eligible_duplicates))
+
         member_results = {
             duplicate.path: safety.evaluate(duplicate) for duplicate in cluster.duplicates
         }

@@ -8,16 +8,27 @@ from pathlib import Path
 import pytest
 
 import reclaim.dedup as dedup_module
-from reclaim.config import CategoriesConfig, Config, DuplicatesConfig, SafetyConfig
+from reclaim.config import (
+    CategoriesConfig,
+    Config,
+    DuplicatesConfig,
+    ModelCachesConfig,
+    SafetyConfig,
+)
 from reclaim.dedup import (
     _HEARTBEAT_INTERVAL_SECONDS,
     _PARTIAL_HASH_CHUNK_BYTES,
     _PARTIAL_HASH_WHOLE_FILE_THRESHOLD,
     _compute_full_hash,
     _compute_partial_hash,
+    _dedup_ineligibility_reason,
     _due,
+    _environment_root,
     _hash_with_guard,
+    _hf_cache_object_root,
+    _is_cross_environment_duplicate,
     _is_downloads_or_temp,
+    _is_model_cache_path,
     _is_risky_sole_survivor_location,
     _location_rank,
     cluster_needs_manual_review,
@@ -663,3 +674,200 @@ def test_generate_duplicate_candidates_excludes_whole_cluster_when_non_kept_memb
         candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
 
     assert candidates == []  # whole cluster excluded, not just the protected member
+
+
+# --- ADR-0008: HF blob/snapshot + conda/venv environment exclusion from exact_duplicate --------
+
+
+def test_hf_cache_object_root_matches_blobs_and_snapshots_under_same_repo() -> None:
+    hub = Path("C:/Users/dev/.cache/huggingface/hub")
+    blob = hub / "models--stabilityai--sdxl-turbo" / "blobs" / "48fa4616"
+    snapshot = (
+        hub
+        / "models--stabilityai--sdxl-turbo"
+        / "snapshots"
+        / "7115331"
+        / "unet"
+        / "diffusion_pytorch_model.fp16.safetensors"
+    )
+    assert _hf_cache_object_root(blob) == hub / "models--stabilityai--sdxl-turbo"
+    assert _hf_cache_object_root(snapshot) == hub / "models--stabilityai--sdxl-turbo"
+
+
+def test_hf_cache_object_root_none_for_unrelated_path() -> None:
+    assert (
+        _hf_cache_object_root(Path("C:/Users/dev/ml-projects/OtherProject/models/file.bin")) is None
+    )
+
+
+def test_is_model_cache_path_matches_configured_root_or_hf_structure() -> None:
+    configured_root = Path("C:/Users/dev/.cache/torch/hub")
+    under_configured_root = configured_root / "checkpoints" / "model.pth"
+    assert _is_model_cache_path(under_configured_root, [configured_root]) is True
+
+    # HF structure recognized even with an EMPTY configured-roots list (independent detection).
+    hf_path = Path("C:/some/other/hub/models--org--name/blobs/abc123")
+    assert _is_model_cache_path(hf_path, []) is True
+
+    assert (
+        _is_model_cache_path(Path("C:/Users/dev/Documents/file.bin"), [configured_root]) is False
+    )
+
+
+def test_environment_root_identifies_conda_base_named_env_and_excludes_pkgs_cache() -> None:
+    anaconda = Path("C:/Users/dev/anaconda3")
+    base_file = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "cudnn_adv64_9.dll"
+    named_env_file = (
+        anaconda / "envs" / "aetherart" / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
+    )
+    pkgs_cache_file = (
+        anaconda
+        / "pkgs"
+        / "pytorch-2.5.1-py3.10_cuda12.1_cudnn9_0"
+        / "Lib"
+        / "site-packages"
+        / "torch"
+        / "lib"
+        / "x.dll"
+    )
+
+    assert _environment_root(base_file) == anaconda
+    assert _environment_root(named_env_file) == anaconda / "envs" / "aetherart"
+    assert _environment_root(pkgs_cache_file) is None  # package cache, not a live environment
+    assert _environment_root(Path("C:/Users/dev/Documents/file.bin")) is None
+
+
+def test_is_cross_environment_duplicate_true_for_different_envs_false_for_same_or_cache() -> None:
+    anaconda = Path("C:/Users/dev/anaconda3")
+    base = _record(str(anaconda / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"))
+    named_env = _record(
+        str(anaconda / "envs" / "aetherart" / "Lib" / "site-packages" / "torch" / "lib" / "x.dll")
+    )
+    pkgs_cache = _record(
+        str(
+            anaconda
+            / "pkgs"
+            / "pytorch-2.5.1"
+            / "Lib"
+            / "site-packages"
+            / "torch"
+            / "lib"
+            / "x.dll"
+        )
+    )
+
+    assert _is_cross_environment_duplicate(named_env, base) is True
+    assert _is_cross_environment_duplicate(base, base) is False
+    assert _is_cross_environment_duplicate(pkgs_cache, base) is False  # cache, not an env
+
+
+def test_dedup_ineligibility_reason_reports_model_cache_then_cross_environment_then_none() -> None:
+    keep = _record("C:/Users/dev/anaconda3/Lib/site-packages/torch/lib/x.dll")
+    hf_duplicate = _record(
+        "C:/Users/dev/.cache/huggingface/hub/models--org--name/snapshots/rev/model.bin"
+    )
+    cross_env_duplicate = _record(
+        "C:/Users/dev/anaconda3/envs/aetherart/Lib/site-packages/torch/lib/x.dll"
+    )
+    ordinary_duplicate = _record("C:/Users/dev/Documents/x.dll")
+
+    assert _dedup_ineligibility_reason(hf_duplicate, keep, []) == "model_cache_managed"
+    assert _dedup_ineligibility_reason(cross_env_duplicate, keep, []) == "cross_environment"
+    assert _dedup_ineligibility_reason(ordinary_duplicate, keep, []) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_hf_blob_snapshot_pair_entirely(
+    tmp_path: Path,
+) -> None:
+    """The exact real-disk scenario that triggered the halt: an HF blob and its snapshot are
+    the SAME HF-managed object (confirmed on real disk to be separate, non-hardlinked copies —
+    ADR-0008), byte-identical only because that's how the cache represents one object twice.
+    exact_duplicate must never propose either side, regardless of which one the keep-heuristic
+    would otherwise have picked."""
+    hub_root = tmp_path / ".cache" / "huggingface" / "hub"
+    repo_dir = hub_root / "models--stabilityai--sdxl-turbo"
+    blob_path = repo_dir / "blobs" / "48fa4616"
+    blob_path.parent.mkdir(parents=True)
+    blob_path.write_bytes(b"model-weights-" * 10_000)
+    snapshot_path = repo_dir / "snapshots" / "7115331" / "unet" / "diffusion_pytorch_model.bin"
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_bytes(blob_path.read_bytes())
+    size = blob_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(blob_path), size_bytes=size, ctime=100.0),
+                _index_record(str(snapshot_path), size_bytes=size, ctime=100.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(
+                duplicates=DuplicatesConfig(min_reclaim_bytes=0),
+                model_caches=ModelCachesConfig(paths=[hub_root.as_posix()]),
+            ),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert candidates == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_cross_environment_but_keeps_pkgs_cache_duplicate(
+    tmp_path: Path,
+) -> None:
+    """The exact real-disk scenario for clusters 5/11: a conda base-env copy is kept; a `pkgs/`
+    package-cache copy of the SAME file is still a legitimate, safely-reclaimable duplicate (no
+    different from any other package cache); a copy inside a DIFFERENT live environment
+    (`envs/aetherart`) must never be proposed, since that environment intentionally carries its
+    own copy for isolation."""
+    anaconda = tmp_path / "anaconda3"
+    base_path = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "cudnn_adv64_9.dll"
+    base_path.parent.mkdir(parents=True)
+    base_path.write_bytes(b"cuda-binary-" * 10_000)
+    pkgs_path = (
+        anaconda
+        / "pkgs"
+        / "pytorch-2.5.1"
+        / "Lib"
+        / "site-packages"
+        / "torch"
+        / "lib"
+        / "cudnn_adv64_9.dll"
+    )
+    pkgs_path.parent.mkdir(parents=True)
+    pkgs_path.write_bytes(base_path.read_bytes())
+    env_path = (
+        anaconda
+        / "envs"
+        / "aetherart"
+        / "Lib"
+        / "site-packages"
+        / "torch"
+        / "lib"
+        / "cudnn_adv64_9.dll"
+    )
+    env_path.parent.mkdir(parents=True)
+    env_path.write_bytes(base_path.read_bytes())
+    size = base_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(base_path), size_bytes=size, ctime=100.0),  # kept (oldest)
+                _index_record(str(pkgs_path), size_bytes=size, ctime=200.0),
+                _index_record(str(env_path), size_bytes=size, ctime=200.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert len(candidates) == 1
+    assert candidates[0].path == pkgs_path
