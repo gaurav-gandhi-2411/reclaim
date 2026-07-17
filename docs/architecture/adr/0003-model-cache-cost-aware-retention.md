@@ -102,3 +102,45 @@ decided by path type (is this under a known cache directory?), not by actual reb
    already produces exactly this outcome for free once `suggested_tier=Tier.B` is set at the
    detector — a separate enforcement mechanism would be redundant complexity solving an already-
    solved problem.
+
+## Addendum (2026-07-17): package-cache exemption from the size guard
+
+The first scoped real-disk apply (see ADR-0004) measured the size guard's actual cost: it
+vaulted 33.3GB of `package_cache` candidates (a 14.3GB `uv` cache, an 11.8GB `pip` cache, a
+7.2GB `.gradle` cache) instead of direct-deleting them, purely because each individually cleared
+the 1GB threshold — turning what should have been immediate, real disk-free gain into
+vault-pending-purge with no immediate benefit.
+
+This is a real cost/benefit mismatch, not a bug in the guard's original logic. The guard exists
+to protect *expensive-to-recover* items (Decision 2's own framing: "an unboundedly expensive-to-
+redo item"). A pip/uv/npm/gradle/yarn cache is not that — regenerating it costs exactly the same
+thing regardless of its current size on disk: re-fetching public package artifacts on the next
+`pip install`/`uv sync`/`npm install`/`gradle build`, deterministically and automatically, the
+same guarantee `PackageCachesConfig.retention_days=None`'s docstring already relies on. Gating
+that category's permanence on size was applying a size-based heuristic to a category the size
+axis never actually applied to.
+
+**Decision:** `PackageCachesConfig` gains `size_guard_exempt: bool = True`. `Candidate` gains a
+matching `size_guard_exempt: bool = False` field, resolved in `generate_candidates` the same way
+`retention_days`/`recovery_cost_note` already are — a new
+`_CATEGORY_GROUP_SIZE_GUARD_EXEMPT_GETTERS` dict-of-lambdas mirroring the existing
+`_CATEGORY_GROUP_RETENTION_GETTERS`/`_CATEGORY_GROUP_ENABLED_GETTERS` shape, hardcoded `False`
+for every other category group (model caches, duplicates, and everything else default to
+`retention_days` values that either never reach the guard at all, or genuinely should stay
+size-gated). `_effective_method_and_retention_days` (executor.py) skips the guard entirely when
+`candidate.size_guard_exempt` is `True`, regardless of `size_bytes`. Also added the default
+Yarn cache path (`%LOCALAPPDATA%\Yarn\Cache`) to `_default_package_cache_paths` — named
+explicitly in the exemption's scope but not previously covered by any default path.
+
+**Consequences:** a package cache of any size now always direct-deletes (assuming it's Tier A
+and under the size where `retention_days=None` even applies) — the next apply's ~33.3GB of
+package caches becomes immediate, measured disk-free gain instead of vault-pending-purge.
+`model_caches` is unaffected (`size_guard_exempt` defaults `False` there, and model caches
+default to vaulted `retention_days=30` anyway, so they never reach the guard in the first
+place) — a 5GB `.safetensors` candidate still vaults exactly as before.
+
+**Alternative considered:** exempt by raw file extension (e.g. `.whl`, `.tar.gz` wheel/package
+artifacts) instead of by category. Rejected: the category axis already correctly identifies
+"this came from a package manager cache directory," which is the actual property that matters
+(a `.whl` file sitting in a user's own project directory, unrelated to any package cache, has no
+special recovery guarantee and shouldn't be exempted just because of its extension).

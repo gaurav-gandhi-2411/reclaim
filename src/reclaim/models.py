@@ -172,3 +172,11 @@ class Candidate:
     retention_days: int | None
     # ADR-0003: see `RawCandidate.recovery_cost_note`.
     recovery_cost_note: str | None = None
+    # ADR-0003 addendum: resolved from `config.categories.<group>.size_guard_exempt` (where that
+    # config field exists — most category groups don't have one and are never exempt) at the
+    # same point `retention_days` is resolved. `True` means the executor's cost-aware size guard
+    # (`direct_delete_size_guard_bytes`) never downgrades this candidate to vault regardless of
+    # size — reserved for categories whose rebuild cost is genuinely negligible even at large
+    # sizes (package manager caches: re-fetching public artifacts on the next build), never for
+    # categories where size correlates with real recovery risk (model caches, duplicates).
+    size_guard_exempt: bool = False

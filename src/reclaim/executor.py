@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import time
 import uuid
@@ -69,6 +70,16 @@ class DirectDeleteRestoreImpossibleError(RuntimeError):
     by hand via Windows Explorer, and merely unsupported *by this tool*. A `direct_delete`
     entry has no surviving bytes anywhere — restoring it isn't unsupported, it's impossible by
     construction, and the message says so plainly rather than reusing the Recycle-Bin wording.
+    """
+
+
+class VaultIntegrityError(RuntimeError):
+    """Raised by `_atomic_move` when a copy-based vault/restore move's destination doesn't
+    verify byte/file-count parity with its source (ADR-0004).
+
+    Caught by the same broad per-item `except Exception` in `apply_batch`/`restore_batch` as any
+    other filesystem error — one item's integrity failure is recorded as a failed item, it never
+    aborts the rest of the batch.
     """
 
 
@@ -223,6 +234,143 @@ def _measure_disk_free(anchor: Path | None) -> int | None:
         return None
 
 
+# --- ADR-0004: long-path-safe, atomic-or-nothing vault/restore moves -------------------------
+#
+# A real-disk run vaulted a deeply-nested directory (a chat-session scratch tree, thousands of
+# short UUID-named subdirectories) and hit Windows' legacy 260-character MAX_PATH limit partway
+# through the move: `shutil.move` fell back to `copytree`+`rmtree` (its behavior whenever a
+# same-volume `os.rename` isn't usable), `copytree` failed on one over-length nested path, and
+# the failure left an orphaned PARTIAL copy sitting in the vault with the original untouched —
+# no data was lost, but the vault directory silently held incomplete, unreferenced bytes with no
+# manifest entry pointing at them, and the size guard that routes the largest/deepest items to
+# `vault` (ADR-0003) systematically makes this MORE likely to recur, not less: the vault
+# destination path (`<vault_dir>/<batch_id>/<uuid32>_<name>/...`) is always longer than the
+# source, so exactly the highest-value guard-routed targets are the ones most likely to already
+# be close to the limit. Empirically confirmed on this system (see PLAN.md's 2026-07-17
+# checkpoint): a >260-char path fails even a bare `os.makedirs`/`open()` without the `\\?\`
+# extended-length prefix, and succeeds with it — this system has no `LongPathsEnabled` opt-in.
+_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def _long_path(path: Path) -> str:
+    r"""Returns an absolute, `\\?\`-prefixed path string so the Win32 APIs behind `os`/`shutil`
+    bypass the legacy 260-character MAX_PATH limit (this tool targets Windows/NTFS exclusively —
+    see `pytestmark` in the test suite).
+
+    `\\?\` disables the normal path parser's `.`/`..` and forward-slash handling entirely, so the
+    string must already be a fully-normalized, all-backslash absolute path before the prefix is
+    added — `str(Path(...))` (not raw string concatenation) guarantees that on Windows. Idempotent:
+    a path already carrying the prefix is returned unchanged. UNC paths get the `\\?\UNC\` form;
+    drive-letter paths get a plain `\\?\` prefix.
+    """
+    raw = str(Path(path).absolute())
+    if raw.startswith(_LONG_PATH_PREFIX):
+        return raw
+    if raw.startswith("\\\\"):  # UNC: \\server\share\... -> \\?\UNC\server\share\...
+        return _LONG_PATH_PREFIX + "UNC\\" + raw[2:]
+    return _LONG_PATH_PREFIX + raw
+
+
+def _tree_stats(long_path_root: str) -> tuple[int, int]:
+    r"""(file_count, total_bytes) for a directory tree, walked via a `\\?\`-prefixed root so it
+    works past MAX_PATH. Used by `_atomic_move` to verify a copied vault/restore destination is
+    byte-for-byte complete before the source is ever removed.
+
+    Deliberately `os.*`/string paths throughout this function and `_atomic_move` below, never
+    `pathlib.Path` — `Path` doesn't reliably round-trip a `\\?\`-prefixed string (it tries to
+    parse it as a UNC-style root and mishandles the literal `?` segment), so every PTH-rule
+    finding in this section is an intentional, necessary exception, not an oversight.
+    """
+    count = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(long_path_root):
+        for name in filenames:
+            total += os.path.getsize(os.path.join(dirpath, name))  # noqa: PTH202, PTH118
+            count += 1
+    return count, total
+
+
+def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+    r"""Moves `src` to `dst` with an "either fully succeeds, or `src` is left completely
+    untouched with zero orphaned debris at `dst`" guarantee — never a partial state, and never
+    even an empty leftover directory shell (ADR-0004).
+
+    Tries an atomic `os.rename` first: a single filesystem metadata operation that either fully
+    succeeds or raises with nothing changed, and — now that both paths are always `\\?\`-prefixed
+    — succeeds for same-volume moves regardless of path depth, which is the common case here and
+    means the risky fallback below is rarely even reached anymore.
+
+    Only falls back to a manual copy-verify-delete sequence if rename raises `OSError` (e.g. a
+    cross-volume `vault_dir`). Even then, `src` is removed ONLY after `dst` is verified to have
+    the same file count and total bytes as `src` — an interrupted or partially-failed copy never
+    loses data, and a copy that fails partway (the exact failure this ADR responds to) has its
+    partial `dst` cleaned up immediately rather than left as orphaned vault debris.
+
+    Owns creating `dst`'s parent directory (rather than requiring the caller to `mkdir` it
+    first): if this call is the one that speculatively created that parent and the move then
+    fails, the empty parent is removed too — a batch subdirectory made just for one item
+    shouldn't outlive that item's failure as debris, but a parent shared with other already-
+    vaulted siblings in the same batch is left alone (only removed if it's actually empty).
+    """
+    long_src = _long_path(src)
+    long_dst = _long_path(dst)
+    dst_parent = os.path.dirname(long_dst)  # noqa: PTH120 -- str, not Path; see module note above
+    parent_already_existed = os.path.isdir(dst_parent)  # noqa: PTH112
+    os.makedirs(dst_parent, exist_ok=True)  # noqa: PTH103
+
+    def _cleanup_dst_and_empty_parent() -> None:
+        if os.path.exists(long_dst):  # noqa: PTH110
+            if os.path.isdir(long_dst):  # noqa: PTH112
+                shutil.rmtree(long_dst, ignore_errors=True)
+            else:
+                os.unlink(long_dst)  # noqa: PTH108
+        if (
+            not parent_already_existed
+            and os.path.isdir(dst_parent)  # noqa: PTH112
+            and not os.listdir(dst_parent)  # noqa: PTH208
+        ):
+            os.rmdir(dst_parent)  # noqa: PTH106
+
+    try:
+        os.rename(long_src, long_dst)  # noqa: PTH104
+    except OSError:
+        pass
+    else:
+        return
+
+    if is_dir:
+        pre_stats = _tree_stats(long_src)
+        try:
+            shutil.copytree(long_src, long_dst)
+        except Exception:
+            _cleanup_dst_and_empty_parent()
+            raise
+        post_stats = _tree_stats(long_dst)
+        if post_stats != pre_stats:
+            _cleanup_dst_and_empty_parent()
+            raise VaultIntegrityError(
+                f"copy parity mismatch moving {src} -> {dst}: source had "
+                f"{pre_stats[0]} files/{pre_stats[1]} bytes, destination has "
+                f"{post_stats[0]} files/{post_stats[1]} bytes"
+            )
+        shutil.rmtree(long_src)
+    else:
+        pre_size = os.path.getsize(long_src)  # noqa: PTH202
+        try:
+            shutil.copy2(long_src, long_dst)
+        except Exception:
+            _cleanup_dst_and_empty_parent()
+            raise
+        post_size = os.path.getsize(long_dst)  # noqa: PTH202
+        if post_size != pre_size:
+            _cleanup_dst_and_empty_parent()
+            raise VaultIntegrityError(
+                f"copy size mismatch moving {src} -> {dst}: source {pre_size} bytes, "
+                f"destination {post_size} bytes"
+            )
+        os.unlink(long_src)  # noqa: PTH108
+
+
 def _category_breakdown(items: Sequence[ItemApplyResult]) -> dict[str, CategoryBreakdown]:
     breakdown: dict[str, CategoryBreakdown] = {}
     for item in items:
@@ -301,9 +449,16 @@ def _effective_method_and_retention_days(
     to model caches, which already default to vaulted retention and so rarely reach this
     branch) protecting against any category whose direct-delete default turns out, on a given
     disk, to hit an unboundedly expensive-to-redo item.
+
+    ADR-0003 addendum: `candidate.size_guard_exempt` (resolved from
+    `config.categories.<group>.size_guard_exempt` where that field exists — package caches only,
+    today) skips this guard entirely regardless of size. The guard protects *expensive-to-
+    recover* items; a large pip/uv/npm/gradle/yarn cache is exactly as cheap to rebuild at 20GB
+    as it is at 20MB (re-fetch public artifacts on the next build), so gating its permanence on
+    size alone was penalizing the wrong axis.
     """
     if candidate.retention_days is None:
-        if candidate.size_bytes >= size_guard_bytes:
+        if candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt:
             logger.info(
                 "executor.retention_size_guard_downgrade",
                 path=str(candidate.path),
@@ -479,16 +634,15 @@ def apply_batch(
         try:
             if item_method == "vault":
                 vault_path = _compute_vault_path(resolved_vault_dir, batch_id, candidate.path)
-                vault_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(candidate.path), str(vault_path))
+                _atomic_move(candidate.path, vault_path, is_dir=candidate.is_dir)
             elif item_method == "recycle_bin":
                 send2trash.send2trash(str(candidate.path))
                 vault_path = None
             else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
                 if candidate.is_dir:
-                    shutil.rmtree(candidate.path)
+                    shutil.rmtree(_long_path(candidate.path))
                 else:
-                    candidate.path.unlink()
+                    os.unlink(_long_path(candidate.path))  # noqa: PTH108 -- \\?\ str, not Path
                 vault_path = None
         except Exception as exc:  # broad on purpose: isolates one item's failure from the batch
             logger.warning(
@@ -655,7 +809,7 @@ def restore_batch(
             )
             continue
 
-        if entry.original_path.exists():
+        if os.path.exists(_long_path(entry.original_path)):  # noqa: PTH110 -- \\?\ str, not Path
             items.append(
                 RestoreItemResult(
                     original_path=entry.original_path,
@@ -670,9 +824,8 @@ def restore_batch(
             continue
 
         try:
-            entry.original_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(entry.vault_path), str(entry.original_path))
-        except OSError as exc:
+            _atomic_move(entry.vault_path, entry.original_path, is_dir=entry.is_dir)
+        except (OSError, VaultIntegrityError) as exc:
             logger.warning(
                 "executor.restore_item_failed",
                 path=str(entry.original_path),

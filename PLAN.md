@@ -673,6 +673,103 @@ retention + restore, now with an explicit `purge` command for expired entries.
   this chain now (whole-table materialization, whole-candidate-set materialization before
   hashing, an O(n) materiality-blind hash pass, ESCAPE-defeated indexes, and this O(n²) nested-
   candidate pass) — each only became visible at real-disk scale, never at fixture scale.
+- Sixth (successful) real-disk dry run: scan 3,117,471 entries in 239.84s; dedup 137,492
+  candidates -> 27,486 clusters, 97,724 immaterial buckets excluded (materiality gate working),
+  563 hash-unreadable skips (all benign permission-denied on locked system files); apply
+  [DRY-RUN] processed=57,373 succeeded=57,373 failed=0, bytes_freed≈212.4GiB. First-ever clean,
+  complete real-disk report — closes the original stall-diagnosis ask from earlier in this
+  session.
+
+### 2026-07-17 — ADR-0003: model-cache category + cost-aware size guard
+- Real-disk report showed `.cache/huggingface/hub` (124.9GB) classified `package_cache` ->
+  `retention=none` -> permanent delete — wrong: re-acquiring 100+GB is not the same recovery
+  cost as `npm ci`, and gated/private/fine-tuned/manually-pushed models may be unrecoverable.
+- New `model_caches` category (HuggingFace hub, torch hub, Ollama models, plus
+  `*.safetensors`/`*.ckpt`/`*.bin` scoped to those roots): defaults to vaulted 30-day retention
+  (never direct-delete) and hardcoded `Tier.B` (falls out of the existing tier formula for free
+  once `suggested_tier=Tier.B` is set at the detector — never auto-quarantine-eligible
+  regardless of `enabled`).
+- General cost-aware guard in `apply_batch`: any `retention_days=None` candidate at/above
+  `config.safety.direct_delete_size_guard_bytes` (default 1GB) downgrades to vault with its own
+  retention window, regardless of category — protects every direct-delete category, not just
+  model caches.
+- `Candidate`/`RawCandidate` gain `recovery_cost_note`, surfaced in the CLI report and dashboard
+  alongside `rebuild_instruction`. Verifier signed off (adversarial-tested the 1GB boundary,
+  confirmed guard-vaulted items restore correctly since `restore_batch` keys off `entry.method`
+  not `retention_days`); 222 tests + evals pass, ruff/mypy clean. Committed `b286509`.
+- New `--include-categories` CLI flag on `reclaim apply`: fine-grained category filter narrowing
+  an already tier/root-filtered selection — needed because group-level `enabled` flags (e.g.
+  `dev_artifacts`) can't isolate one category (pycache) from its siblings (node_modules,
+  dist_output) within the same apply run. Verifier signed off; committed `ae550ff`.
+
+### 2026-07-17 — First real-disk scoped apply: 6 categories, 10.8GB freed, 2 bugs found
+- Scoped apply (`windows_temp`, `package_cache`, `crash_dump_file`, `crash_dump_wer_report`,
+  `browser_cache`, `dev_artifact_pycache`; explicitly excluding `exact_duplicate`/`model_caches`/
+  `dev_artifact_node_modules`/`dist_output`/`archive_pairs` for later reviewed applies), after
+  user confirmation given the size guard would vault ~40.5GB of the ~53.5GB total rather than
+  direct-delete it.
+- Result: 23,815 processed, 23,572 succeeded, 243 failed. Real measured disk-free delta ~10.8GB
+  (manifest: 23,565 direct_delete entries / 9.79GiB + 7 vault entries / 36.07GiB). Restore
+  mechanism pre-validated via 3 throwaway files (byte-identical) — did NOT restore-test a real
+  vaulted item since `restore_batch` operates at whole-batch granularity (would have undone all
+  7 real vault gains just to prove what the throwaway test already proved).
+- Two bugs discovered from real production data, both root-caused and fixed same day — see the
+  ADR-0004 entry below and the size-guard-exemption entry after it.
+
+### 2026-07-17 — ADR-0004: long-path-safe, atomic-or-nothing vault/restore moves
+- Bug 1: one guard-vaulted directory (`Temp\claude`, 5,064 dirs/27,403 files) failed with
+  `WinError 3` mid-move. Root cause: the vault destination path is always longer than the
+  source (adds a batch dir + UUID prefix), pushing already-near-260-char nested paths over
+  Windows' legacy MAX_PATH; `shutil.move` fell back to `copytree`+`rmtree`, `copytree` failed
+  partway, and — since `rmtree(src)` only runs after `copytree` succeeds — the source stayed
+  fully intact (verified: all 5,064/27,403 present) but left an ORPHANED PARTIAL copy (1,705/
+  3,838) in the vault with no manifest entry, silently wasting ~673MB. Manually cleaned up;
+  no data was lost, but the mechanism needed hardening before the much-larger duplicates/
+  model-cache apply (124.9GB HF hub, same failure mode at bigger scale).
+- Empirically confirmed on this machine (no `LongPathsEnabled`): a bare `os.makedirs`/`open()`
+  fails past 260 chars unprefixed, succeeds with a `\\?\` extended-length prefix.
+- Fix: `_long_path()` helper (`\\?\`-prefixed absolute string; `pathlib.Path` doesn't reliably
+  round-trip that prefix, so this section deliberately uses `os.*`/string paths throughout, not
+  `Path` methods — every PTH-rule noqa here is intentional). New `_atomic_move(src, dst,
+  is_dir)` replaces raw `shutil.move` in both `apply_batch`'s vault branch and `restore_batch`'s
+  move-back: tries atomic `os.rename` first (now almost always usable since both paths are
+  long-path-safe), falls back to copy-verify-delete only if rename raises, verifies file-count/
+  total-bytes parity before ever removing the source, and owns creating/cleaning-up `dst`'s
+  parent directory (an empty batch-dir shell made just for one failed item is removed too,
+  never left as debris — a shared parent with successful siblings is left alone).
+  `VaultIntegrityError` (new) is caught by the same per-item handler as any other filesystem
+  error. Tests: a >260-char deep-tree fixture proving vault→restore round-trips byte-identical
+  (the old throwaway-file test only proved short paths); two injected-failure tests (copytree
+  raises partway; copytree returns normally but silently incomplete) both proving source stays
+  untouched, vault gets zero orphaned bytes/dirs, and the item lands in the failed list.
+- Bug 2 (same real apply, unrelated mechanism): `detect_crash_dumps` proposes a `.dmp` file
+  both by extension (anywhere) and as a CrashDumps/WER root's direct child — two
+  `RawCandidate`s for the same path, two different categories. No data loss (the file gets
+  deleted either way) but whichever candidate applies second finds it already gone and is
+  recorded as a spurious failure — explains all 10 of the real apply's `crash_dump_wer_report`
+  "failures" (the same 10 files as 10 of the 12 `crash_dump_file` successes). Fix: new
+  `_dedupe_by_path` (first-seen wins) runs in `generate_candidates` right after combining all
+  detectors' output — general/detector-agnostic, not a `detect_crash_dumps`-specific patch.
+- 235 tests pass (12 new), ruff/mypy clean.
+
+### 2026-07-17 — ADR-0003 addendum: package caches exempt from the size guard
+- The scoped apply's real numbers showed the cost of the ADR-0003 size guard concretely: 33.3GB
+  of `package_cache` (uv 14.3GB, pip 11.8GB, gradle 7.2GB) vaulted instead of direct-deleting,
+  purely because each cleared 1GB — but a package-manager cache is exactly as cheap to rebuild
+  at 20GB as at 20MB (deterministic re-fetch of public artifacts), so gating its permanence on
+  size was the wrong axis for this specific category.
+- `PackageCachesConfig.size_guard_exempt: bool = True` (new); `Candidate.size_guard_exempt:
+  bool = False` (new), resolved in `generate_candidates` via a new
+  `_CATEGORY_GROUP_SIZE_GUARD_EXEMPT_GETTERS` dict mirroring the existing retention/enabled
+  getter dicts — hardcoded `False` for every other group. `_effective_method_and_retention_days`
+  skips the guard entirely when exempt, regardless of size. Also added the default Yarn cache
+  path (previously not covered by any default) since it was named explicitly in scope.
+- Tests: a 20GB `uv`-cache-style fixture direct-deletes; a 5GB `model_cache`-style fixture still
+  vaults (exemption is category-scoped, not a blanket bypass). Full suite green, ruff/mypy clean.
+- Next: dispatch verifier for ADR-0004 + the size-guard exemption together, then commit both.
+  After that, the deferred categories (`exact_duplicate`, `model_caches`, `dev_artifact_
+  node_modules`, `dist_output`, `archive_pairs`) get their own reviewed, scoped apply — now with
+  the vault-move robustness fix in place before the 124.9GB HuggingFace hub tree goes through it.
 
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub

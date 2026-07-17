@@ -9,13 +9,17 @@ from reclaim.config import (
     ArchivePairsConfig,
     CategoriesConfig,
     Config,
+    CrashDumpsConfig,
     DevArtifactsConfig,
     ModelCachesConfig,
+    PackageCachesConfig,
     SafetyConfig,
 )
 from reclaim.detectors import (
     _category_enabled,
     _category_retention_days,
+    _category_size_guard_exempt,
+    _dedupe_by_path,
     _drop_nested_candidates,
     detect_archive_pairs,
     detect_crash_dumps,
@@ -412,15 +416,59 @@ def test_log_like_name_without_log_extension_still_matches(index: ScanIndex) -> 
 # --- Nested-candidate suppression -------------------------------------------------------------
 
 
-def _raw(path: str, *, is_dir: bool) -> RawCandidate:
+def _raw(path: str, *, is_dir: bool, category: str = "test_category") -> RawCandidate:
     return RawCandidate(
         path=Path(path),
         is_dir=is_dir,
-        category="test_category",
+        category=category,
         category_group="dev_artifacts",
         suggested_tier=Tier.A,
         rationale="test",
     )
+
+
+# --- Same-path duplicate suppression (ADR-0004) -------------------------------------------
+
+
+def test_dedupe_by_path_keeps_first_occurrence() -> None:
+    raw = [
+        _raw("C:/Dumps/dump.dmp", is_dir=False, category="crash_dump_file"),
+        _raw("C:/Dumps/dump.dmp", is_dir=False, category="crash_dump_wer_report"),
+        _raw("C:/Dumps/other.dmp", is_dir=False, category="crash_dump_file"),
+    ]
+    deduped = _dedupe_by_path(raw)
+    assert len(deduped) == 2
+    assert {c.path for c in deduped} == {Path("C:/Dumps/dump.dmp"), Path("C:/Dumps/other.dmp")}
+    kept = next(c for c in deduped if c.path == Path("C:/Dumps/dump.dmp"))
+    assert kept.category == "crash_dump_file"  # first-seen wins
+
+
+def test_dedupe_by_path_is_a_no_op_when_every_path_is_unique() -> None:
+    raw = [_raw("C:/a", is_dir=False), _raw("C:/b", is_dir=False)]
+    assert _dedupe_by_path(raw) == raw
+
+
+def test_crash_dump_file_directly_under_root_is_never_proposed_twice(index: ScanIndex) -> None:
+    """End-to-end regression for the real-disk finding: a `.dmp` file that is BOTH matched by
+    extension AND sits directly under a configured CrashDumps root must survive
+    `generate_candidates` exactly once, not as two separate crash_dump_file/
+    crash_dump_wer_report candidates for the same path."""
+    root = "C:/Users/gg/AppData/Local/CrashDumps"
+    dump_path = f"{root}/app.exe.1234.dmp"
+    _seed(index, _record(root, is_dir=True), _record(dump_path, size_bytes=4096))
+
+    result = detect_crash_dumps(index, [root])
+    matching = [c for c in result if c.path == Path(dump_path)]
+    assert len(matching) == 2  # detect_crash_dumps itself still proposes both raw candidates...
+
+    config = Config(
+        safety=SafetyConfig(protected_roots=[]),
+        categories=CategoriesConfig(crash_dumps=CrashDumpsConfig(enabled=True, paths=[root])),
+    )
+    candidates = generate_candidates(index, config, SafetyValidator(config), now=_NOW)
+    surviving = [c for c in candidates if c.path == Path(dump_path)]
+    assert len(surviving) == 1  # ...but exactly one survives generate_candidates's central dedup
+    assert surviving[0].category == "crash_dump_file"
 
 
 def test_drop_nested_candidates_removes_descendants_of_kept_directory() -> None:
@@ -492,3 +540,54 @@ def test_category_retention_days_rejects_unknown_group() -> None:
     `ValueError` on an unknown group."""
     with pytest.raises(ValueError, match="unknown candidate category_group"):
         _category_retention_days("not_a_real_category", Config())
+
+
+# --- Category-group -> config size_guard_exempt mapping (ADR-0003 addendum) --------------------
+
+
+def test_category_size_guard_exempt_only_true_for_package_caches() -> None:
+    """package_caches is the one category exempt from the executor's cost-aware size guard by
+    default — every other category must resolve `False`."""
+    config = Config()
+    assert _category_size_guard_exempt("package_caches", config) is True
+    for group in (
+        "dev_artifacts",
+        "model_caches",
+        "temp_and_browser_caches",
+        "crash_dumps",
+        "old_installers",
+        "archive_pairs",
+        "large_logs",
+    ):
+        assert _category_size_guard_exempt(group, config) is False
+
+
+def test_category_size_guard_exempt_reflects_explicit_override() -> None:
+    config = Config(
+        categories=CategoriesConfig(
+            package_caches=PackageCachesConfig(size_guard_exempt=False),
+        )
+    )
+    assert _category_size_guard_exempt("package_caches", config) is False
+
+
+def test_category_size_guard_exempt_rejects_unknown_group() -> None:
+    with pytest.raises(ValueError, match="unknown candidate category_group"):
+        _category_size_guard_exempt("not_a_real_category", Config())
+
+
+def test_generate_candidates_resolves_size_guard_exempt_for_package_cache(
+    tmp_path: Path, index: ScanIndex
+) -> None:
+    cache_dir = tmp_path / "pip_cache"
+    _seed(index, _record(cache_dir.as_posix(), is_dir=True, size_bytes=20 * 1024 * 1024 * 1024))
+    config = Config(
+        safety=SafetyConfig(protected_roots=[]),
+        categories=CategoriesConfig(
+            package_caches=PackageCachesConfig(enabled=True, paths=[cache_dir.as_posix()])
+        ),
+    )
+    candidates = generate_candidates(index, config, SafetyValidator(config), now=_NOW)
+    package_candidates = [c for c in candidates if c.category_group == "package_caches"]
+    assert len(package_candidates) == 1
+    assert package_candidates[0].size_guard_exempt is True

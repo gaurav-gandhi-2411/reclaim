@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from reclaim.executor import (
     RecycleBinRestoreUnsupportedError,
     SafetyInvariantError,
     _latest_entries_for_batch,
+    _long_path,
     apply_batch,
     restore_batch,
 )
@@ -20,6 +22,26 @@ from reclaim.models import Candidate, Tier, Verdict
 from reclaim.safety import SafetyValidator
 
 _NOW = 1_700_000_000.0
+
+
+def _make_deep_tree(root: Path, *, depth: int = 15, segment_len: int = 20) -> Path:
+    r"""Builds a directory tree whose full path comfortably exceeds Windows' 260-char MAX_PATH,
+    to exercise `\\?\`-prefixed long-path handling (ADR-0004). Uses `os.makedirs` on a raw
+    `\\?\`-prefixed string rather than `Path.mkdir` — `pathlib.Path` doesn't reliably round-trip
+    that prefix, same reasoning as `reclaim.executor`'s own long-path helpers."""
+    current = root
+    for i in range(depth):
+        current = current / (f"seg_{i:03d}_" + "x" * segment_len)
+        os.makedirs(_long_path(current), exist_ok=True)  # noqa: PTH103
+    assert len(str(current)) > 260, f"fixture path too short: {len(str(current))} chars"
+    return current
+
+
+def _long_read_bytes(path: Path) -> bytes:
+    r"""Reads a file via its `\\?\`-prefixed path — the test's own read must be long-path-safe
+    too, independent of whether the production code under test got it right."""
+    with open(_long_path(path), "rb") as fh:  # noqa: PTH123
+        return fh.read()
 
 
 def _safety() -> SafetyValidator:
@@ -40,6 +62,7 @@ def _candidate(
     tier: Tier = Tier.A,
     safety_verdict: Verdict = Verdict.ELIGIBLE,
     retention_days: int | None = 30,
+    size_guard_exempt: bool = False,
 ) -> Candidate:
     return Candidate(
         path=path,
@@ -53,6 +76,7 @@ def _candidate(
         safety_verdict=safety_verdict,
         safety_reason_code="TEST_REASON",
         retention_days=retention_days,
+        size_guard_exempt=size_guard_exempt,
     )
 
 
@@ -213,6 +237,150 @@ def test_vault_restore_refuses_to_overwrite_existing_destination(tmp_path: Path)
     assert restore_report.items[0].error is not None
     assert "already exists" in restore_report.items[0].error
     assert target.read_bytes() == b"unrelated-new-content"  # never clobbered
+
+
+# --- ADR-0004: long-path-safe, atomic-or-nothing vault/restore moves ---------------------------
+
+
+def test_vault_move_and_restore_survive_path_past_max_path(tmp_path: Path) -> None:
+    """The real-disk regression this ADR responds to: a directory tree deep enough that its
+    full path exceeds Windows' 260-char MAX_PATH must vault-move AND restore successfully, with
+    the payload byte-identical on both ends of the round trip — not just short paths, which the
+    pre-ADR-0004 throwaway-file test only ever proved."""
+    top = tmp_path / "deep_root"
+    top.mkdir()
+    leaf = _make_deep_tree(top)
+    content = b"deep-path-payload-content-" * 200
+    payload_rel = Path("payload.bin")
+    with open(_long_path(leaf / payload_rel), "wb") as fh:  # noqa: PTH123 -- \\?\ str, not Path
+        fh.write(content)
+
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    apply_report = apply_batch(
+        [_candidate(top, is_dir=True, size_bytes=len(content), retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert apply_report.files_succeeded == 1, apply_report.items
+    # The per-line ignores below are all `\?\`-str paths, not Path -- see module docstring above.
+    assert not os.path.exists(_long_path(top))  # noqa: PTH110 -- source fully gone
+
+    entries = _latest_entries_for_batch(manifest_path, apply_report.batch_id)
+    vault_path = entries[0].vault_path
+    assert vault_path is not None
+    rel_from_top = leaf.relative_to(top) / payload_rel
+    vaulted_payload = vault_path / rel_from_top
+    assert _long_read_bytes(vaulted_payload) == content
+
+    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+    assert restore_report.files_succeeded == 1, restore_report.items
+    assert os.path.exists(_long_path(top))  # noqa: PTH110
+    restored_payload = top / rel_from_top
+    assert _long_read_bytes(restored_payload) == content
+    assert not os.path.exists(_long_path(vault_path))  # noqa: PTH110 -- moved out, not copied
+
+
+def test_vault_move_cleans_up_partial_copy_on_injected_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the exact real-disk failure mode: `os.rename` can't be used (forced here to
+    exercise the fallback deterministically, rather than depending on a real cross-volume setup)
+    and the subsequent `shutil.copytree` fails partway through. Proves the atomic-or-nothing
+    guarantee: the source is left completely untouched, the vault gets zero orphaned bytes for
+    this item, and the item is recorded as failed rather than silently losing data or leaving
+    debris behind for a human to find and clean up by hand."""
+    src = tmp_path / "source_dir"
+    src.mkdir()
+    (src / "file_a.bin").write_bytes(b"a" * 100)
+    (src / "file_b.bin").write_bytes(b"b" * 100)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copytree fallback path")
+
+    def _fake_copytree(_src_path: str, dst_path: str, **_kwargs: object) -> str:
+        Path(dst_path).mkdir(parents=True, exist_ok=True)
+        (Path(dst_path) / "file_a.bin").write_bytes(b"a" * 100)
+        raise OSError("simulated: copytree fails partway through, file_b never copied")
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.shutil, "copytree", _fake_copytree)
+
+    report = apply_batch(
+        [_candidate(src, is_dir=True, size_bytes=200, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 0
+    assert report.files_failed == 1
+    assert src.exists()  # source completely untouched
+    assert (src / "file_a.bin").read_bytes() == b"a" * 100
+    assert (src / "file_b.bin").read_bytes() == b"b" * 100
+    leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
+    assert leftover == [], f"orphaned vault debris: {leftover}"
+    assert _latest_entries_for_batch(manifest_path, report.batch_id) == []  # never claimed done
+
+
+def test_vault_move_detects_and_cleans_up_incomplete_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copytree that raises no exception but silently produces an incomplete copy (e.g. an
+    interrupted process that leaves no error, just missing bytes) must still be caught by the
+    file-count/total-bytes parity check, not accepted as a successful vault entry."""
+    src = tmp_path / "source_dir"
+    src.mkdir()
+    (src / "file_a.bin").write_bytes(b"a" * 100)
+    (src / "file_b.bin").write_bytes(b"b" * 100)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copytree fallback path")
+
+    def _fake_copytree(_src_path: str, dst_path: str, **_kwargs: object) -> str:
+        Path(dst_path).mkdir(parents=True, exist_ok=True)
+        (Path(dst_path) / "file_a.bin").write_bytes(b"a" * 100)
+        return dst_path  # returns normally — file_b silently missing, no exception raised
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.shutil, "copytree", _fake_copytree)
+
+    report = apply_batch(
+        [_candidate(src, is_dir=True, size_bytes=200, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 0
+    assert report.files_failed == 1
+    assert "parity mismatch" in (report.items[0].error or "")
+    assert src.exists()
+    assert (src / "file_a.bin").read_bytes() == b"a" * 100
+    assert (src / "file_b.bin").read_bytes() == b"b" * 100
+    leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
+    assert leftover == [], f"orphaned vault debris: {leftover}"
+    assert _latest_entries_for_batch(manifest_path, report.batch_id) == []
 
 
 # --- Recycle-bin method: send2trash called, restore refused ------------------------------------
@@ -567,6 +735,71 @@ def test_direct_delete_size_guard_does_not_trigger_below_threshold(tmp_path: Pat
     )
 
     assert report.items[0].method == "direct_delete"
+    assert not target.exists()
+
+
+def test_size_guard_exempt_candidate_direct_deletes_regardless_of_size(tmp_path: Path) -> None:
+    """ADR-0003 addendum: a package-cache-style candidate (`size_guard_exempt=True`) direct-
+    deletes even at 20GB — the guard exists to protect expensive-to-recover items, and a package
+    manager cache is exactly as cheap to rebuild at 20GB as at 20MB."""
+    target = tmp_path / "uv_cache"
+    target.mkdir()
+    (target / "wheel.whl").write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [
+            _candidate(
+                target,
+                is_dir=True,
+                size_bytes=20 * 1024 * 1024 * 1024,
+                category="package_cache",
+                retention_days=None,
+                size_guard_exempt=True,
+            )
+        ],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.items[0].method == "direct_delete"
+    assert not target.exists()
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].method == "direct_delete"
+    assert entries[0].retention_days is None
+
+
+def test_non_exempt_oversized_candidate_still_vaults_despite_similar_size(tmp_path: Path) -> None:
+    """A non-package-cache candidate (`size_guard_exempt=False`, the default) at a comparable
+    size to the exempt case above must still hit the guard and vault — the exemption is
+    category-scoped, not a blanket size-guard bypass."""
+    target = tmp_path / "huge_model.safetensors"
+    target.write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [
+            _candidate(
+                target,
+                size_bytes=5 * 1024 * 1024 * 1024,
+                category="model_cache",
+                retention_days=None,
+                size_guard_exempt=False,
+            )
+        ],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.items[0].method == "vault"
+    assert report.items[0].vault_path is not None
+    assert report.items[0].vault_path.exists()
     assert not target.exists()
 
 

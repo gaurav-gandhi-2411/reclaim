@@ -86,6 +86,7 @@ def _default_package_cache_paths() -> list[str]:
         f"{local_appdata}/pip/Cache",
         f"{appdata}/npm-cache",
         f"{local_appdata}/uv/cache",
+        f"{local_appdata}/Yarn/Cache",
         # Judgment call: only the user-profile conda pkgs cache is covered by default (the
         # alternative "<conda-install>/pkgs" location can't be derived without querying a
         # running conda installation) — a user can add it via [categories.package_caches.paths]
@@ -172,6 +173,13 @@ class PackageCachesConfig(BaseModel):
     # Package caches redownload deterministically at negligible cost, so they default to `None`.
     # Model-weight caches are NOT covered here — see `ModelCachesConfig` / ADR-0003.
     retention_days: int | None = None
+    # ADR-0003 addendum: package-manager caches (pip/npm/uv/yarn/conda/.m2/.gradle) are exempt
+    # from `safety.direct_delete_size_guard_bytes` regardless of size — the guard exists to
+    # protect expensive-to-recover items, and re-fetching public package artifacts on the next
+    # build/install is the cheapest possible recovery, not an expensive one. Without this
+    # exemption a large pip/uv/gradle cache gets vaulted (no immediate disk-free gain) purely
+    # because of its size, even though its actual recovery cost never justified that caution.
+    size_guard_exempt: bool = True
 
 
 class ModelCachesConfig(BaseModel):

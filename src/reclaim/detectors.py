@@ -572,6 +572,39 @@ def detect_large_logs(
     return candidates
 
 
+# --- Same-path duplicate suppression (ADR-0004) -------------------------------------------
+
+
+def _dedupe_by_path(raw: Sequence[RawCandidate]) -> list[RawCandidate]:
+    """Keeps only the first-seen `RawCandidate` for any path proposed more than once.
+
+    `detect_crash_dumps` proposes a `.dmp` file both by extension (anywhere in the inventory)
+    and, when it happens to sit directly under a configured CrashDumps/WER root, again as that
+    root's direct child — two independent `RawCandidate`s for the exact same real file, under
+    two different `category` labels. `_drop_nested_candidates` doesn't catch this: same-path
+    isn't ancestor-nesting (`Path.parents` never includes the path itself). Left undeduped, a
+    real apply processes both: whichever runs second finds the file already gone (deleted by
+    its twin) and is recorded as a spurious failure — no data loss, but false "failed" noise
+    and a manifest/report that double-counts the candidate. This is a general, detector-agnostic
+    guard (not a `detect_crash_dumps`-specific patch) so any other detector introducing the same
+    kind of overlap in the future is covered automatically.
+
+    "First seen" is deterministic given `_run_all_detectors`'s fixed call order and each
+    detector's own internal iteration order — for `detect_crash_dumps` specifically, its
+    extension-based loop runs before its root-children loop, so `crash_dump_file` wins over
+    `crash_dump_wer_report` for a shared path, matching which of the two already succeeds first
+    in practice.
+    """
+    seen: set[Path] = set()
+    deduped: list[RawCandidate] = []
+    for candidate in raw:
+        if candidate.path in seen:
+            continue
+        seen.add(candidate.path)
+        deduped.append(candidate)
+    return deduped
+
+
 # --- Nested-candidate suppression --------------------------------------------------------
 
 
@@ -654,6 +687,31 @@ def _category_retention_days(category_group: str, config: Config) -> int | None:
     return getter(config)
 
 
+# ADR-0003 addendum: same dict-of-lambdas shape as the two getters above, resolving
+# `config.categories.<group>.size_guard_exempt` where that field exists. Most category groups
+# have no such field and are hardcoded `False` — never exempt — since the size guard's whole
+# point (recovery cost, not category, gates permanence) only has an exception for categories
+# whose rebuild cost is genuinely negligible even at large sizes (package manager caches).
+_CATEGORY_GROUP_SIZE_GUARD_EXEMPT_GETTERS: dict[str, Callable[[Config], bool]] = {
+    _GROUP_DEV_ARTIFACTS: lambda c: False,
+    _GROUP_PACKAGE_CACHES: lambda c: c.categories.package_caches.size_guard_exempt,
+    _GROUP_MODEL_CACHES: lambda c: False,
+    _GROUP_TEMP_AND_BROWSER_CACHES: lambda c: False,
+    _GROUP_CRASH_DUMPS: lambda c: False,
+    _GROUP_OLD_INSTALLERS: lambda c: False,
+    _GROUP_ARCHIVE_PAIRS: lambda c: False,
+    _GROUP_LARGE_LOGS: lambda c: False,
+}
+
+
+def _category_size_guard_exempt(category_group: str, config: Config) -> bool:
+    try:
+        getter = _CATEGORY_GROUP_SIZE_GUARD_EXEMPT_GETTERS[category_group]
+    except KeyError as exc:
+        raise ValueError(f"unknown candidate category_group: {category_group!r}") from exc
+    return getter(config)
+
+
 def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[RawCandidate]:
     categories = config.categories
     raw: list[RawCandidate] = []
@@ -707,6 +765,7 @@ def generate_candidates(
     """
     now_ts = now if now is not None else time.time()
     raw = _run_all_detectors(index, config, now_ts)
+    raw = _dedupe_by_path(raw)
     raw = _drop_nested_candidates(raw)
 
     candidates: list[Candidate] = []
@@ -742,6 +801,7 @@ def generate_candidates(
                 safety_reason_code=result.reason_code,
                 retention_days=_category_retention_days(rc.category_group, config),
                 recovery_cost_note=rc.recovery_cost_note,
+                size_guard_exempt=_category_size_guard_exempt(rc.category_group, config),
             )
         )
     return candidates
