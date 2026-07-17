@@ -276,6 +276,50 @@ def test_duplicate_cluster_review_shows_keep_vs_delete_side_by_side(tmp_path: Pa
     assert keep_members[0]["path"] == paths["dup_original"].as_posix()
 
 
+def test_duplicate_cluster_review_never_displays_an_adr_0008_excluded_member(
+    tmp_path: Path,
+) -> None:
+    """ADR-0008 excludes a duplicate from `generate_duplicate_candidates` per-member (not
+    whole-cluster) when it sits in an HF-style cache layout. The review endpoint's member LIST
+    must reflect that exclusion too -- showing an excluded path as if it were still proposed for
+    deletion would mislead the exact "eyeball the survivor" review this endpoint exists for."""
+    root = tmp_path / "tree"
+    content = b"same-bytes-" * 10_000
+
+    keep_path = root / "Archive" / "report.bin"
+    keep_path.parent.mkdir(parents=True)
+    keep_path.write_bytes(content)
+
+    eligible_duplicate = root / "Downloads" / "report_copy.bin"
+    eligible_duplicate.parent.mkdir(parents=True)
+    eligible_duplicate.write_bytes(content)
+
+    hf_duplicate = (
+        root
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / "models--org--name"
+        / "snapshots"
+        / "rev"
+        / "report.bin"
+    )
+    hf_duplicate.parent.mkdir(parents=True)
+    hf_duplicate.write_bytes(content)
+
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.get("/api/duplicate-clusters/review")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["clusters"]) == 1
+
+    member_paths = {m["path"] for m in body["clusters"][0]["cluster"]["members"]}
+    assert member_paths == {keep_path.as_posix(), eligible_duplicate.as_posix()}
+    assert hf_duplicate.as_posix() not in member_paths
+
+
 def test_duplicate_cluster_review_empty_before_any_scan(tmp_path: Path) -> None:
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
     response = client.get("/api/duplicate-clusters/review")

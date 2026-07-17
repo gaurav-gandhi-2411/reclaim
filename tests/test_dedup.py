@@ -714,62 +714,104 @@ def test_is_model_cache_path_matches_configured_root_or_hf_structure() -> None:
     )
 
 
-def test_environment_root_identifies_conda_base_named_env_and_excludes_pkgs_cache() -> None:
-    anaconda = Path("C:/Users/dev/anaconda3")
-    base_file = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "cudnn_adv64_9.dll"
-    named_env_file = (
-        anaconda / "envs" / "aetherart" / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
-    )
+def _make_conda_env(root: Path) -> Path:
+    """A real `conda-meta/` marker directory — the canonical signal conda itself uses to
+    recognize a directory as an environment root (base install or named env alike)."""
+    (root / "conda-meta").mkdir(parents=True)
+    return root
+
+
+def _make_venv(root: Path) -> Path:
+    """A real `pyvenv.cfg` marker file — the canonical signal Python's own `venv` module uses."""
+    root.mkdir(parents=True)
+    (root / "pyvenv.cfg").write_text("home = C:/Python312\n")
+    return root
+
+
+def test_environment_root_identifies_conda_base_named_env_and_excludes_pkgs_cache(
+    tmp_path: Path,
+) -> None:
+    anaconda = _make_conda_env(tmp_path / "anaconda3")
+    # Real-disk finding (ADR-0008): the risk isn't limited to Lib/site-packages -- DLLs/data
+    # under DLLs/ and Library/lib/ carry the exact same cross-env risk, so both are exercised.
+    base_site_packages_file = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
+    base_site_packages_file.parent.mkdir(parents=True)
+    base_dlls_file = anaconda / "DLLs" / "_uuid.pyd"
+    base_dlls_file.parent.mkdir(parents=True)
+
+    named_env = _make_conda_env(anaconda / "envs" / "aetherart")
+    named_env_file = named_env / "Library" / "lib" / "tdbc1.1.5" / "tdbc115t.dll"
+    named_env_file.parent.mkdir(parents=True)
+
     pkgs_cache_file = (
         anaconda
         / "pkgs"
         / "pytorch-2.5.1-py3.10_cuda12.1_cudnn9_0"
         / "Lib"
         / "site-packages"
-        / "torch"
-        / "lib"
         / "x.dll"
     )
+    pkgs_cache_file.parent.mkdir(parents=True)
 
-    assert _environment_root(base_file) == anaconda
-    assert _environment_root(named_env_file) == anaconda / "envs" / "aetherart"
+    assert _environment_root(base_site_packages_file) == anaconda
+    assert _environment_root(base_dlls_file) == anaconda
+    assert _environment_root(named_env_file) == named_env
     assert _environment_root(pkgs_cache_file) is None  # package cache, not a live environment
-    assert _environment_root(Path("C:/Users/dev/Documents/file.bin")) is None
+    assert _environment_root(tmp_path / "Documents" / "file.bin") is None
 
 
-def test_is_cross_environment_duplicate_true_for_different_envs_false_for_same_or_cache() -> None:
-    anaconda = Path("C:/Users/dev/anaconda3")
-    base = _record(str(anaconda / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"))
-    named_env = _record(
-        str(anaconda / "envs" / "aetherart" / "Lib" / "site-packages" / "torch" / "lib" / "x.dll")
-    )
-    pkgs_cache = _record(
-        str(
-            anaconda
-            / "pkgs"
-            / "pytorch-2.5.1"
-            / "Lib"
-            / "site-packages"
-            / "torch"
-            / "lib"
-            / "x.dll"
-        )
-    )
+def test_environment_root_identifies_bare_venv_via_pyvenv_cfg(tmp_path: Path) -> None:
+    venv = _make_venv(tmp_path / "project" / ".venv")
+    venv_file = venv / "Lib" / "site-packages" / "requests" / "__init__.py"
+    venv_file.parent.mkdir(parents=True)
+    assert _environment_root(venv_file) == venv
 
-    assert _is_cross_environment_duplicate(named_env, base) is True
+
+def test_is_cross_environment_duplicate_true_for_different_envs_false_for_same_or_cache(
+    tmp_path: Path,
+) -> None:
+    anaconda = _make_conda_env(tmp_path / "anaconda3")
+    base_path = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
+    base_path.parent.mkdir(parents=True)
+    base = _record(str(base_path))
+
+    named_env = _make_conda_env(anaconda / "envs" / "aetherart")
+    named_env_path = named_env / "Library" / "lib" / "x.dll"
+    named_env_path.parent.mkdir(parents=True)
+    named_env_record = _record(str(named_env_path))
+
+    pkgs_path = anaconda / "pkgs" / "pytorch-2.5.1" / "Lib" / "site-packages" / "x.dll"
+    pkgs_path.parent.mkdir(parents=True)
+    pkgs_cache = _record(str(pkgs_path))
+
+    assert _is_cross_environment_duplicate(named_env_record, base) is True
     assert _is_cross_environment_duplicate(base, base) is False
     assert _is_cross_environment_duplicate(pkgs_cache, base) is False  # cache, not an env
+    # The asymmetric real-disk case: the KEEP is a pkgs/-cache copy (env_root=None), and the
+    # duplicate lives inside a real environment. Still cross-environment/unsafe -- an
+    # environment's own copy must never be deleted just because the survivor is a cache entry
+    # that package_caches may independently delete at any time.
+    assert _is_cross_environment_duplicate(named_env_record, pkgs_cache) is True
 
 
-def test_dedup_ineligibility_reason_reports_model_cache_then_cross_environment_then_none() -> None:
-    keep = _record("C:/Users/dev/anaconda3/Lib/site-packages/torch/lib/x.dll")
+def test_dedup_ineligibility_reason_reports_model_cache_then_cross_environment_then_none(
+    tmp_path: Path,
+) -> None:
+    anaconda = _make_conda_env(tmp_path / "anaconda3")
+    keep_path = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
+    keep_path.parent.mkdir(parents=True)
+    keep = _record(str(keep_path))
+
     hf_duplicate = _record(
-        "C:/Users/dev/.cache/huggingface/hub/models--org--name/snapshots/rev/model.bin"
+        str(tmp_path / ".cache/huggingface/hub/models--org--name/snapshots/rev/model.bin")
     )
-    cross_env_duplicate = _record(
-        "C:/Users/dev/anaconda3/envs/aetherart/Lib/site-packages/torch/lib/x.dll"
-    )
-    ordinary_duplicate = _record("C:/Users/dev/Documents/x.dll")
+
+    named_env = _make_conda_env(anaconda / "envs" / "aetherart")
+    cross_env_path = named_env / "Lib" / "site-packages" / "torch" / "lib" / "x.dll"
+    cross_env_path.parent.mkdir(parents=True)
+    cross_env_duplicate = _record(str(cross_env_path))
+
+    ordinary_duplicate = _record(str(tmp_path / "Documents" / "x.dll"))
 
     assert _dedup_ineligibility_reason(hf_duplicate, keep, []) == "model_cache_managed"
     assert _dedup_ineligibility_reason(cross_env_duplicate, keep, []) == "cross_environment"
@@ -824,7 +866,7 @@ def test_generate_duplicate_candidates_excludes_cross_environment_but_keeps_pkgs
     different from any other package cache); a copy inside a DIFFERENT live environment
     (`envs/aetherart`) must never be proposed, since that environment intentionally carries its
     own copy for isolation."""
-    anaconda = tmp_path / "anaconda3"
+    anaconda = _make_conda_env(tmp_path / "anaconda3")
     base_path = anaconda / "Lib" / "site-packages" / "torch" / "lib" / "cudnn_adv64_9.dll"
     base_path.parent.mkdir(parents=True)
     base_path.write_bytes(b"cuda-binary-" * 10_000)
@@ -840,16 +882,8 @@ def test_generate_duplicate_candidates_excludes_cross_environment_but_keeps_pkgs
     )
     pkgs_path.parent.mkdir(parents=True)
     pkgs_path.write_bytes(base_path.read_bytes())
-    env_path = (
-        anaconda
-        / "envs"
-        / "aetherart"
-        / "Lib"
-        / "site-packages"
-        / "torch"
-        / "lib"
-        / "cudnn_adv64_9.dll"
-    )
+    named_env = _make_conda_env(anaconda / "envs" / "aetherart")
+    env_path = named_env / "Lib" / "site-packages" / "torch" / "lib" / "cudnn_adv64_9.dll"
     env_path.parent.mkdir(parents=True)
     env_path.write_bytes(base_path.read_bytes())
     size = base_path.stat().st_size
@@ -871,3 +905,86 @@ def test_generate_duplicate_candidates_excludes_cross_environment_but_keeps_pkgs
 
     assert len(candidates) == 1
     assert candidates[0].path == pkgs_path
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_cross_environment_outside_site_packages(
+    tmp_path: Path,
+) -> None:
+    """Real-disk finding (ADR-0008): the cross-environment risk is NOT limited to
+    `Lib/site-packages` -- a `DLLs/` file duplicated across two named conda envs (`shelfsense`
+    vs `tes-verify-090` on the real disk, `.pyd` files under each env's own `DLLs/` folder) is
+    just as unsafe to cross-delete. A `Lib/site-packages`-only check would miss this entirely."""
+    anaconda = tmp_path / "anaconda3"
+    env_a = _make_conda_env(anaconda / "envs" / "shelfsense")
+    path_a = env_a / "DLLs" / "_uuid.pyd"
+    path_a.parent.mkdir(parents=True)
+    path_a.write_bytes(b"native-extension-" * 10_000)
+    env_b = _make_conda_env(anaconda / "envs" / "tes-verify-090")
+    path_b = env_b / "DLLs" / "_uuid.pyd"
+    path_b.parent.mkdir(parents=True)
+    path_b.write_bytes(path_a.read_bytes())
+    size = path_a.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(path_a), size_bytes=size, ctime=100.0),
+                _index_record(str(path_b), size_bytes=size, ctime=200.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert candidates == []  # cross-environment, outside Lib/site-packages -- still excluded
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_env_copies_when_keep_is_pkgs_cache(
+    tmp_path: Path,
+) -> None:
+    """The exact real-disk scenario found while re-estimating post-fix: a Python stdlib file
+    (`Tools/scripts/find-uname.py`) is byte-identical across conda's OWN `pkgs/` package-cache
+    copy and four separate named environments. The keep-heuristic picked the `pkgs/` copy as
+    keep (oldest ctime, shallower/unrelated to the environment ranking) -- `_environment_root`
+    correctly returns `None` for it. A naive "both must be non-None and different" cross-
+    environment check would never fire here (keep's root is None, not merely different), letting
+    every environment's own copy through for deletion with the sole survivor sitting in a cache
+    entry `package_caches` may independently delete at any time. All four environment copies
+    must be excluded."""
+    anaconda = tmp_path / "anaconda3"
+    pkgs_path = anaconda / "pkgs" / "python-3.10.18-h981015d_0" / "Tools" / "scripts" / "x.py"
+    pkgs_path.parent.mkdir(parents=True)
+    pkgs_path.write_bytes(b"stdlib-script-" * 1_000)
+
+    env_paths = []
+    for env_name in ("tracegauge", "shelfsense", "aetherart-torch28", "aetherart"):
+        env_root = _make_conda_env(anaconda / "envs" / env_name)
+        env_path = env_root / "Tools" / "scripts" / "x.py"
+        env_path.parent.mkdir(parents=True)
+        env_path.write_bytes(pkgs_path.read_bytes())
+        env_paths.append(env_path)
+    size = pkgs_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(pkgs_path), size_bytes=size, ctime=100.0),  # oldest -> kept
+                *(
+                    _index_record(str(p), size_bytes=size, ctime=200.0 + i)
+                    for i, p in enumerate(env_paths)
+                ),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert candidates == []  # every environment's own copy excluded, not just some of them

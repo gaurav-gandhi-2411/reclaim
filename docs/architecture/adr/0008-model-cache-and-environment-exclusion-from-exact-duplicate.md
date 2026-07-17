@@ -68,22 +68,56 @@ paths as independent, arbitrary duplicates at all, regardless of whether they sh
    the structure is excluded on its own, which is a strict superset of "exclude the pair" and
    simpler to reason about and verify.
 3. **Conda/venv cross-environment exclusion.** `_environment_root(path)` identifies the Python
-   environment a path lives inside (conda base, a named `envs/<name>`, or a `venv`/`.venv`) via
-   the `Lib/site-packages` layout both conda and Windows venvs use. A duplicate is excluded if
-   its environment root differs from the cluster's kept member's environment root — i.e. never
-   propose deleting one environment's own copy to keep a different environment's copy. Conda's
-   own `pkgs/` extraction cache is deliberately **not** treated as a live environment (despite
-   having the same internal `Lib/site-packages` layout) — it's a package-manager cache, exactly
-   as safe to reclaim as any other package cache (`package_caches`), and protecting it here would
-   be over-broad. This exclusion is per-member relative to the kept copy, not whole-cluster: a
-   `pkgs/`-cache duplicate in the same cluster as an excluded cross-environment duplicate is
-   still proposed normally.
+   environment a path lives inside (conda base, a named `envs/<name>`, or a `venv`/`.venv`) by
+   walking UP from `path` to the nearest ancestor carrying the canonical marker each tool uses to
+   recognize its own environment roots: a `conda-meta/` directory (conda base or named env) or a
+   `pyvenv.cfg` file (venv). **First implementation attempt used a `Lib/site-packages`-only path
+   heuristic instead and was corrected before shipping**: re-running the estimate with that
+   version still proposed 1,456 DLL/`.exe`/`.pyd`/`.lib` candidates under various `envs/<name>/`
+   trees — every one of them living outside `Lib/site-packages` (`envs/<name>/DLLs/`,
+   `envs/<name>/Library/lib/`, and similar), which the site-packages-only check never saw at all.
+   The marker-based walk-up protects an environment's ENTIRE directory tree uniformly, not just
+   its site-packages subtree. A duplicate is excluded if it lives inside a recognized environment
+   and `keep` does NOT live inside that SAME environment — i.e. never propose deleting one
+   environment's own copy to keep a survivor that isn't that exact same environment's own copy.
+
+   **Second correction, found in the same real-disk validation pass:** the first version of this
+   check required BOTH `duplicate` and `keep` to resolve to a non-`None`, unequal environment
+   root before flagging cross-environment — but a real cluster (a stdlib file,
+   `Tools/scripts/find-uname.py`) had its KEEP picked as conda's own `pkgs/`-cache copy
+   (`_environment_root` correctly returns `None` for `pkgs/`), with duplicates spread across four
+   different named environments. `None` is not "equal to" any environment root, so the
+   both-non-`None` check never fired, and all four environments' own copies passed through
+   uncaught — silently stranding every one of those environments' files behind a cache entry
+   that `package_caches` may independently and legitimately delete at any time. The check is now
+   asymmetric: it fires whenever the DUPLICATE resolves to a live environment, regardless of
+   whether `keep` resolves to none at all, not only when both resolve to two different ones.
+
+   Conda's own `pkgs/` extraction cache is deliberately **not** treated as a live environment
+   itself (despite having the same internal `Lib/site-packages` layout) — it's a package-manager
+   cache, exactly as safe to reclaim as any other package cache (`package_caches`), and protecting
+   it here would be over-broad — but (per the correction above) it is NOT treated as durable
+   enough to be the sole survivor for something that WAS a live environment's own file. This
+   exclusion is per-member relative to the kept copy, not whole-cluster: a `pkgs/`-cache
+   duplicate in the same cluster as an excluded cross-environment duplicate is still proposed
+   normally.
 4. **Both exclusions are applied per-member, before safety evaluation or tiering**
    (`_dedup_ineligibility_reason`, in `generate_duplicate_candidates`) — an excluded path is
    filtered out of `cluster.duplicates` entirely and never reaches `SafetyValidator.evaluate()`
    or gets a tier; it simply isn't an `exact_duplicate` candidate. A cluster left with zero
    remaining duplicates after filtering contributes nothing. Each exclusion is logged
    (`dedup.member_excluded`, with a `reason` field) for observability.
+4a. **Fourth correction, also found in this same validation pass: the dashboard review endpoint
+   (ADR-0007's `list_duplicate_cluster_review`) was still DISPLAYING excluded members.** It
+   reused the raw, pre-filter `DuplicateCluster` (every original member) for its side-by-side
+   view while correctly using the post-filter candidate list for the reclaimable-bytes total —
+   so an ADR-0008-excluded path (an `envs/aetherart` copy, say) still showed up in the member
+   table as "proposed for deletion" even though `generate_duplicate_candidates` would never
+   actually touch it. Fixed by building the displayed cluster from ONLY the kept member plus
+   whichever duplicates survived filtering (`dataclasses.replace(cluster, duplicates=...)`,
+   mirroring the same pattern `generate_duplicate_candidates` already uses internally); the
+   `needs_review` check was updated to use that same filtered view for the same reason — a
+   member that was excluded is neither being deleted nor available to strand a review flag on.
 5. **`linkinfo.py` defensive addition (not the fix for this specific bug, but a related gap
    worth closing while here).** `LinkIdentity` gains `is_reparse_point`, read from the same
    `os.stat()` call already made (`st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`, no
@@ -106,10 +140,12 @@ paths as independent, arbitrary duplicates at all, regardless of whether they sh
   `pkgs/` cache paths remain fully reclaimable through their own categories with their own
   review/retention policies; nothing is silently lost from consideration, only redirected to the
   category actually responsible for it.
-- **Scope boundary, stated honestly:** `_environment_root`'s `Lib/site-packages` detection
-  targets the Windows conda/venv layout this real disk exhibits; a fundamentally different
-  environment layout (e.g. a non-Windows-style venv) would not be recognized and would fall
-  through to ordinary duplicate handling. This is a known, documented boundary, not a silent gap.
+- **Scope boundary, stated honestly:** `_environment_root`'s marker-based walk-up recognizes any
+  directory carrying `conda-meta/` or `pyvenv.cfg` — the canonical markers conda and `venv`
+  create themselves — so it is not tied to a specific internal subdirectory layout. A Python
+  environment created by a tool that uses neither marker (uncommon on Windows) would not be
+  recognized and would fall through to ordinary duplicate handling; this is a known, documented
+  boundary, not a silent gap.
 - **The reparse-point addition to `linkinfo.py` is confirmed NOT the fix for the reported bug**
   (see the investigation table above) — it's shipped anyway as cheap, harmless defense-in-depth
   for a distinct risk class, and is explicitly not conflated with the real root cause in the
@@ -135,18 +171,38 @@ paths as independent, arbitrary duplicates at all, regardless of whether they sh
    a real (if currently inactive on this machine) Windows storage-sharing mechanism `st_nlink`
    genuinely cannot see — cheap enough to ship as belt-and-suspenders while documenting plainly
    that it didn't explain the reported symptom.
+4. **Keep the `Lib/site-packages`-only heuristic for `_environment_root` rather than switching
+   to marker-file detection.** Rejected after measuring its actual coverage against the real
+   disk: it missed 1,456 real DLL/`.exe`/`.pyd`/`.lib` candidates living outside
+   `Lib/site-packages` inside named conda envs (`DLLs/`, `Library/lib/`, ...) — the exact same
+   risk class the fix exists for, just in a different subdirectory. `conda-meta/`/`pyvenv.cfg`
+   marker detection costs a few bounded `is_dir`/`is_file` stat calls per candidate (never a
+   whole-disk walk) and protects the entire environment tree correctly.
+5. **Keep the symmetric "both non-`None` and unequal" cross-environment check.** Rejected after
+   the real-disk `find-uname.py` cluster showed it silently passes every environment's own copy
+   through whenever the keep-heuristic happens to pick a non-environment location (a `pkgs/`
+   cache entry, or any ordinary file) as keep — `None` never equals a real environment root, so
+   the symmetric check simply never fires in that case. The asymmetric version (fires whenever
+   the DUPLICATE resolves to an environment, regardless of what `keep` resolves to) closes this
+   without changing any of the already-correct same-environment/`pkgs`-duplicate behavior.
 
 ## Test coverage
 
 - Unit: `_hf_cache_object_root` matches blob and snapshot paths under the same repo dir to the
   same root, returns `None` for unrelated paths; `_is_model_cache_path` matches a configured
   root OR the HF structure independent of configured roots; `_environment_root` identifies conda
-  base, a named env, and excludes `pkgs/`; `_is_cross_environment_duplicate` is true only across
-  different live environments, false for same-environment or `pkgs/`-cache pairs;
+  base and a named env via real `conda-meta/` fixtures (both inside AND outside
+  `Lib/site-packages`), identifies a bare venv via a real `pyvenv.cfg` fixture, and excludes
+  `pkgs/`; `_is_cross_environment_duplicate` is true for different live environments, true when
+  the KEEP is a `pkgs/`-cache copy (env_root `None`) and the duplicate is a live environment's
+  own copy (the asymmetric case), false for same-environment or `pkgs/`-as-duplicate pairs;
   `_dedup_ineligibility_reason` returns the right reason (or `None`) in priority order.
 - Full pipeline: an HF blob/snapshot pair produces zero candidates regardless of the
   keep-heuristic's pick; a base-env/pkgs-cache/named-env trio produces exactly one candidate
-  (the `pkgs/` copy) — the named-env copy is excluded, the `pkgs/` copy is not.
+  (the `pkgs/` copy) — the named-env copy is excluded, the `pkgs/` copy is not; a cross-
+  environment duplicate living OUTSIDE `Lib/site-packages` (two named envs' own `DLLs/` copies
+  of the same file) is still excluded; a cluster whose KEEP is a `pkgs/`-cache copy with FOUR
+  different named environments' own copies as duplicates excludes all four, not just some.
 - `linkinfo.py`: a path reporting `nlink == 1` and `is_reparse_point == True` (via monkeypatch —
   creating a real reparse point needs privilege this dev machine's own investigation found
   unavailable) is reported `resolved=False`, `reclaimable_bytes=0`, never a confident full-size

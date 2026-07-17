@@ -174,34 +174,70 @@ def _is_model_cache_path(path: Path, model_cache_roots: Sequence[Path]) -> bool:
 
 
 # ADR-0008: conda/venv environments intentionally duplicate their own copy of shared dependency
-# binaries (e.g. CUDA DLLs) for isolation between environments — deleting one environment's own
-# copy because ANOTHER environment happens to carry a byte-identical copy can break that
-# environment's DLL resolution, even though the bytes really are identical right now.
+# binaries and data (CUDA DLLs, vendored tzdata, Tcl/Tk libraries, ...) for isolation between
+# environments — deleting one environment's own copy because ANOTHER environment happens to
+# carry a byte-identical copy can break that environment, even though the bytes really are
+# identical right now. Real-disk validation (ADR-0008) found this isn't limited to
+# `Lib/site-packages`: `envs/<name>/DLLs/`, `envs/<name>/Library/lib/`, and similar
+# non-site-packages subtrees carry the exact same risk and are just as populated with
+# byte-identical cross-env "duplicates" (1,456 DLL/exe/pyd/lib candidates alone, across many
+# distinct conda envs, on the machine this ADR was written against) — a `Lib/site-packages`-only
+# check would have left nearly all of them unprotected.
+_CONDA_MARKER_DIRNAME = "conda-meta"
+_VENV_MARKER_FILENAME = "pyvenv.cfg"
+
+
 def _environment_root(path: Path) -> Path | None:
-    """The root directory of the Python environment `path` lives inside (a conda base install,
-    a named conda `envs/<name>`, or a `venv`/`.venv`), if any — identified by the
-    `Lib/site-packages` layout Windows conda and venv environments both use. Conda's own `pkgs/`
-    extraction cache is deliberately EXCLUDED even though it has the same internal layout: it's
-    a package-manager cache (analogous to pip/uv's own caches), not a live environment, and
-    reclaiming a duplicate out of it is exactly as safe as any other package-cache reclaim
-    already handled by `package_caches` — protecting it here would be over-broad.
+    """The root directory of the Python environment `path` lives inside (a conda base install, a
+    named conda `envs/<name>`, or a `venv`/`.venv`), if any. Walks UP from `path` looking for the
+    nearest ancestor that IS an environment root, identified by the same canonical marker each
+    tool uses to recognize its own environments: a `conda-meta/` subdirectory (conda base or
+    named env) or a `pyvenv.cfg` file (venv) — robust regardless of which subdirectory inside the
+    environment `path` happens to live in, unlike a `Lib/site-packages`-only name check. Bounded
+    to the ancestors of one file already in a small candidate cluster — never a directory walk
+    over the whole disk.
+
+    Conda's own `pkgs/` extraction cache is deliberately excluded up front (short-circuited
+    before the walk, via the well-known `pkgs` path segment): it's a package-manager cache
+    (analogous to pip/uv's own caches), not a live environment, and reclaiming a duplicate out of
+    it is exactly as safe as any other package-cache reclaim already handled by `package_caches`.
+    Without this, a `pkgs/<extracted-package>/...` path would otherwise walk up into the conda
+    installation's own `conda-meta/` and be misidentified as belonging to the BASE environment.
     """
-    parts = path.parts
-    for i, part in enumerate(parts):
-        if i > 0 and part.lower() == "site-packages" and parts[i - 1].lower() == "lib":
-            root_parts = parts[: i - 1]
-            if any(p.lower() == "pkgs" for p in root_parts):
-                return None
-            return Path(*root_parts)
+    if any(part.lower() == "pkgs" for part in path.parts):
+        return None
+    for ancestor in path.parents:
+        try:
+            if (ancestor / _CONDA_MARKER_DIRNAME).is_dir() or (
+                ancestor / _VENV_MARKER_FILENAME
+            ).is_file():
+                return ancestor
+        except OSError:
+            continue
     return None
 
 
 def _is_cross_environment_duplicate(duplicate: FileRecord, keep: FileRecord) -> bool:
-    """ADR-0008: true if `duplicate` and `keep` are each inside a DIFFERENT live Python
-    environment (conda base vs. a named env, two named envs, or two separate venvs)."""
+    """ADR-0008: true if `duplicate` lives inside a recognized live Python environment (conda
+    base, a named `envs/<name>`, or a venv) and `keep` does NOT live inside that SAME
+    environment — whether `keep` is in a different environment, or not in any recognized
+    environment at all.
+
+    The second half matters as much as the first: real-disk validation found clusters where the
+    keep-heuristic picked a conda `pkgs/`-cache copy as keep (`_environment_root` correctly
+    returns `None` for `pkgs/`) while EVERY OTHER member was a different named environment's own
+    copy of the same file. A naive "both must be in DIFFERENT environments" check would have
+    let every one of those environment copies through, because comparing "environment A" against
+    "not an environment" never satisfied a not-equal-and-both-non-None test — silently stranding
+    every one of those environments' own copies behind a `pkgs/` cache entry that
+    `package_caches` may independently and legitimately delete at any time. An environment must
+    keep its OWN copy of its own files; an identical copy existing somewhere else (another
+    environment, or a cache) does not make deleting the environment's own copy safe, regardless
+    of what's kept."""
     duplicate_root = _environment_root(duplicate.path)
-    keep_root = _environment_root(keep.path)
-    return duplicate_root is not None and keep_root is not None and duplicate_root != keep_root
+    if duplicate_root is None:
+        return False
+    return _environment_root(keep.path) != duplicate_root
 
 
 def _dedup_ineligibility_reason(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -351,9 +352,12 @@ def list_duplicate_cluster_review(
     """ADR-0007: the `limit` largest exact-duplicate clusters by hardlink-aware reclaimable
     bytes, keep-vs-delete paths shown side by side — so a human eyeballs the survivor before any
     apply, not just the biggest logical-size candidates. Reuses `generate_duplicate_candidates`'s
-    own safety filtering (whole-cluster exclusion on a BLOCKED non-kept member) rather than
-    recomputing it, so this view can never show a cluster the apply pipeline itself would refuse
-    to touch."""
+    own safety filtering (whole-cluster exclusion on a BLOCKED non-kept member; ADR-0008's
+    per-member model-cache/cross-environment exclusion) rather than recomputing it, so this view
+    can never show a cluster the apply pipeline itself would refuse to touch — and the member
+    list actually DISPLAYED is restricted to the kept copy plus only the members that survived
+    that filtering, never a member ADR-0008 excluded (a raw, unfiltered `cluster` would otherwise
+    show an excluded path as if it were still proposed for deletion, which it isn't)."""
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return DuplicateClusterReviewResponse(has_scan=False, clusters=[])
@@ -371,24 +375,25 @@ def list_duplicate_cluster_review(
 
     rows: list[DuplicateClusterReviewOut] = []
     for cluster in clusters:
-        member_candidates = [
-            candidate_by_path[d.path] for d in cluster.duplicates if d.path in candidate_by_path
-        ]
-        if not member_candidates:
+        surviving_duplicates = tuple(d for d in cluster.duplicates if d.path in candidate_by_path)
+        if not surviving_duplicates:
             # Every non-kept member is missing from the candidate list — either the whole
-            # cluster was excluded (a member is SafetyValidator-BLOCKED) or it fell below the
+            # cluster was excluded (a member is SafetyValidator-BLOCKED), every member was
+            # excluded per-path (ADR-0008: model-cache/cross-environment), or it fell below the
             # materiality floor. Either way there's nothing here to review.
             continue
+        member_candidates = [candidate_by_path[d.path] for d in surviving_duplicates]
+        display_cluster = _dataclass_replace(cluster, duplicates=surviving_duplicates)
         reclaimable_total = sum(
             c.reclaimable_bytes if c.reclaimable_bytes is not None else c.size_bytes
             for c in member_candidates
         )
         rows.append(
             DuplicateClusterReviewOut(
-                cluster=_duplicate_cluster_out(cluster),
+                cluster=_duplicate_cluster_out(display_cluster),
                 reclaimable_bytes=reclaimable_total,
                 reclaimable_bytes_human=format_bytes(reclaimable_total),
-                needs_review=cluster_needs_manual_review(cluster),
+                needs_review=cluster_needs_manual_review(display_cluster),
                 rationale=member_candidates[0].rationale,
             )
         )
