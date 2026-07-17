@@ -464,6 +464,13 @@ function renderCandidateCard(candidate) {
     card.appendChild(rebuild);
   }
 
+  if (candidate.recovery_cost_note) {
+    const cost = document.createElement("p");
+    cost.className = "rc-candidate-rationale rc-candidate-recovery-cost";
+    cost.textContent = `Recovery cost: ${candidate.recovery_cost_note}`;
+    card.appendChild(cost);
+  }
+
   if (candidate.duplicate_cluster) {
     card.appendChild(renderClusterTable(candidate.duplicate_cluster));
   }

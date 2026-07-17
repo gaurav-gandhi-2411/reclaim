@@ -21,6 +21,7 @@ _SECONDS_PER_DAY = 86400.0
 # must be one of, matched against `_CATEGORY_GROUP_ENABLED_GETTERS` in `_category_enabled`.
 _GROUP_DEV_ARTIFACTS = "dev_artifacts"
 _GROUP_PACKAGE_CACHES = "package_caches"
+_GROUP_MODEL_CACHES = "model_caches"
 _GROUP_TEMP_AND_BROWSER_CACHES = "temp_and_browser_caches"
 _GROUP_CRASH_DUMPS = "crash_dumps"
 _GROUP_OLD_INSTALLERS = "old_installers"
@@ -192,10 +193,14 @@ def detect_dev_artifacts(index: ScanIndex) -> list[RawCandidate]:
 
 
 def detect_package_caches(index: ScanIndex, cache_paths: Sequence[str]) -> list[RawCandidate]:
-    """Global package/model download caches (pip, npm, uv, HuggingFace hub, torch hub, conda
-    pkgs, .m2/.gradle) — no manifest-adjacency check, matched purely by configured path
-    patterns (`config.categories.package_caches.paths`, defaulting to the real Windows
-    locations).
+    """Global package download caches (pip, npm, uv, conda pkgs, .m2/.gradle) — no manifest-
+    adjacency check, matched purely by configured path patterns
+    (`config.categories.package_caches.paths`, defaulting to the real Windows locations).
+
+    Model-weight caches (HuggingFace hub, torch hub, Ollama) are NOT detected here — see
+    `detect_model_caches` / ADR-0003: their recovery cost (bandwidth, time, and sometimes
+    unrecoverable gated/private/fine-tuned models) is not the same as a package manager's
+    re-download, so they get their own category, tier ceiling, and retention default.
 
     SQL-pushdown: each configured pattern is one `files_matching_path_pattern` query against
     the indexed `path_lower` column, not a Python-side `fnmatch` over every row.
@@ -215,15 +220,91 @@ def detect_package_caches(index: ScanIndex, cache_paths: Sequence[str]) -> list[
                     category_group=_GROUP_PACKAGE_CACHES,
                     suggested_tier=Tier.A,
                     rationale=(
-                        "Package/model download cache — the owning tool re-downloads "
-                        "artifacts into this directory automatically on next use."
+                        "Package download cache — the owning tool re-downloads packages into "
+                        "this directory automatically on next use."
                     ),
                     rebuild_instruction=(
-                        "Re-run the package manager or model download; the cache repopulates "
-                        "automatically."
+                        "Re-run the package manager; the cache repopulates automatically."
                     ),
                 )
             )
+    return candidates
+
+
+# --- Model-weight caches (ADR-0003) ----------------------------------------------------------
+
+_MODEL_CACHE_RATIONALE = (
+    "Model-weight cache — large ML checkpoints that redownload deterministically for public "
+    "models, but at real cost: bandwidth, time, and — for gated, private, fine-tuned, or "
+    "manually-pushed models — authentication that may no longer be available."
+)
+_MODEL_CACHE_REBUILD_INSTRUCTION = (
+    "Re-run the model download (huggingface-cli / torch.hub / ollama pull); the cache "
+    "repopulates automatically for public models only."
+)
+_MODEL_CACHE_RECOVERY_COST_NOTE = (
+    "Recovery cost scales with model size (commonly several GB, sometimes 100+ GB) and requires "
+    "network access; gated, private, fine-tuned, or manually-pushed models may be permanently "
+    "unrecoverable if the original access or credentials are gone."
+)
+
+
+def detect_model_caches(
+    index: ScanIndex, cache_paths: Sequence[str], model_extensions: Sequence[str]
+) -> list[RawCandidate]:
+    """Model-weight caches (HuggingFace hub, torch hub, Ollama models, ...) — split out from
+    `package_caches` (ADR-0003): "rebuildable" was being decided by path type, not real rebuild
+    cost, and a 100+GB HuggingFace hub redownload (or an unrecoverable gated/fine-tuned/
+    manually-pushed model) is not the same risk as `npm ci` repopulating a cache.
+
+    Always proposed at `suggested_tier=Tier.B` (review-queue) — model caches are never
+    Tier-A/auto-quarantine-eligible, regardless of `config.categories.model_caches.enabled`; a
+    human reviews every one before it's ever quarantined.
+
+    Two independent detection surfaces, both scoped to `cache_paths` roots only (never a
+    disk-wide sweep): whole matching cache-root directories (same pattern as
+    `detect_package_caches`), and individual model-weight files by extension — defense in depth
+    for a cache layout the directory-level match alone might not fully cover.
+    """
+    candidates: list[RawCandidate] = []
+    seen: set[Path] = set()
+
+    for pattern in cache_paths:
+        for record in index.files_matching_path_pattern(pattern, is_dir=True):
+            if record.path in seen:
+                continue
+            seen.add(record.path)
+            candidates.append(
+                RawCandidate(
+                    path=record.path,
+                    is_dir=True,
+                    category="model_cache",
+                    category_group=_GROUP_MODEL_CACHES,
+                    suggested_tier=Tier.B,
+                    rationale=_MODEL_CACHE_RATIONALE,
+                    rebuild_instruction=_MODEL_CACHE_REBUILD_INSTRUCTION,
+                    recovery_cost_note=_MODEL_CACHE_RECOVERY_COST_NOTE,
+                )
+            )
+
+    for root in cache_paths:
+        for ext in model_extensions:
+            for record in index.files_matching_path_pattern(f"{root}/*{ext}", is_dir=False):
+                if record.path in seen:
+                    continue
+                seen.add(record.path)
+                candidates.append(
+                    RawCandidate(
+                        path=record.path,
+                        is_dir=False,
+                        category="model_cache",
+                        category_group=_GROUP_MODEL_CACHES,
+                        suggested_tier=Tier.B,
+                        rationale=_MODEL_CACHE_RATIONALE,
+                        rebuild_instruction=_MODEL_CACHE_REBUILD_INSTRUCTION,
+                        recovery_cost_note=_MODEL_CACHE_RECOVERY_COST_NOTE,
+                    )
+                )
     return candidates
 
 
@@ -532,6 +613,7 @@ def _drop_nested_candidates(raw: Sequence[RawCandidate]) -> list[RawCandidate]:
 _CATEGORY_GROUP_ENABLED_GETTERS: dict[str, Callable[[Config], bool]] = {
     _GROUP_DEV_ARTIFACTS: lambda c: c.categories.dev_artifacts.enabled,
     _GROUP_PACKAGE_CACHES: lambda c: c.categories.package_caches.enabled,
+    _GROUP_MODEL_CACHES: lambda c: c.categories.model_caches.enabled,
     _GROUP_TEMP_AND_BROWSER_CACHES: lambda c: c.categories.temp_and_browser_caches.enabled,
     _GROUP_CRASH_DUMPS: lambda c: c.categories.crash_dumps.enabled,
     _GROUP_OLD_INSTALLERS: lambda c: c.categories.old_installers.enabled,
@@ -555,6 +637,7 @@ def _category_enabled(category_group: str, config: Config) -> bool:
 _CATEGORY_GROUP_RETENTION_GETTERS: dict[str, Callable[[Config], int | None]] = {
     _GROUP_DEV_ARTIFACTS: lambda c: c.categories.dev_artifacts.retention_days,
     _GROUP_PACKAGE_CACHES: lambda c: c.categories.package_caches.retention_days,
+    _GROUP_MODEL_CACHES: lambda c: c.categories.model_caches.retention_days,
     _GROUP_TEMP_AND_BROWSER_CACHES: lambda c: c.categories.temp_and_browser_caches.retention_days,
     _GROUP_CRASH_DUMPS: lambda c: c.categories.crash_dumps.retention_days,
     _GROUP_OLD_INSTALLERS: lambda c: c.categories.old_installers.retention_days,
@@ -576,6 +659,11 @@ def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[Raw
     raw: list[RawCandidate] = []
     raw.extend(detect_dev_artifacts(index))
     raw.extend(detect_package_caches(index, categories.package_caches.paths))
+    raw.extend(
+        detect_model_caches(
+            index, categories.model_caches.paths, categories.model_caches.model_extensions
+        )
+    )
     raw.extend(
         detect_temp_and_browser_caches(
             index,
@@ -653,6 +741,7 @@ def generate_candidates(
                 safety_verdict=result.verdict,
                 safety_reason_code=result.reason_code,
                 retention_days=_category_retention_days(rc.category_group, config),
+                recovery_cost_note=rc.recovery_cost_note,
             )
         )
     return candidates

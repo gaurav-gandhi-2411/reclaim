@@ -70,8 +70,15 @@ def _win_path(env_var: str, fallback: str) -> str:
 
 
 def _default_package_cache_paths() -> list[str]:
-    """Real default Windows locations for package/model download caches. Global caches, so —
-    unlike dev-artifact directories — these need no project-manifest-adjacency check."""
+    """Real default Windows locations for package download caches. Global caches, so —
+    unlike dev-artifact directories — these need no project-manifest-adjacency check.
+
+    Model-weight caches (HuggingFace hub, torch hub, Ollama) are deliberately NOT here — see
+    `_default_model_cache_paths` / ADR-0003. Re-acquiring a package cache costs a `pip install`;
+    re-acquiring a 100+GB model checkpoint, or one that's gated/private/fine-tuned and may not
+    be re-downloadable at all, is a different order of recovery cost and gets its own category
+    with vaulted (never direct-delete) retention.
+    """
     local_appdata = _win_path("LOCALAPPDATA", "C:/Users/Default/AppData/Local")
     appdata = _win_path("APPDATA", "C:/Users/Default/AppData/Roaming")
     userprofile = _win_path("USERPROFILE", "C:/Users/Default")
@@ -79,8 +86,6 @@ def _default_package_cache_paths() -> list[str]:
         f"{local_appdata}/pip/Cache",
         f"{appdata}/npm-cache",
         f"{local_appdata}/uv/cache",
-        f"{userprofile}/.cache/huggingface/hub",
-        f"{userprofile}/.cache/torch/hub",
         # Judgment call: only the user-profile conda pkgs cache is covered by default (the
         # alternative "<conda-install>/pkgs" location can't be derived without querying a
         # running conda installation) — a user can add it via [categories.package_caches.paths]
@@ -90,6 +95,19 @@ def _default_package_cache_paths() -> list[str]:
         # `.gradle`/`.m2` in the spec for why these two live here, not in dev-artifact detection).
         f"{userprofile}/.m2/repository",
         f"{userprofile}/.gradle/caches",
+    ]
+
+
+def _default_model_cache_paths() -> list[str]:
+    """Real default Windows locations for ML model-weight caches (ADR-0003). Split out from
+    `_default_package_cache_paths` because these hold the multi-GB-to-100+GB artifacts whose
+    recovery cost (bandwidth, time, and sometimes gated/private auth that may no longer be
+    available) is nothing like a package manager's re-download."""
+    userprofile = _win_path("USERPROFILE", "C:/Users/Default")
+    return [
+        f"{userprofile}/.cache/huggingface/hub",
+        f"{userprofile}/.cache/torch/hub",
+        f"{userprofile}/.ollama/models",
     ]
 
 
@@ -131,6 +149,17 @@ class SafetyConfig(BaseModel):
     )
     vm_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_VM_EXTENSIONS))
     finance_tokens: list[str] = Field(default_factory=lambda: list(DEFAULT_FINANCE_TOKENS))
+    # ADR-0003: recovery cost, not category, is what should gate permanent deletion. Any single
+    # candidate at or above this size is forced from `retention_days=None` (direct-delete) to
+    # vaulted, regardless of which category it belongs to — protects against a future
+    # direct-delete category (or a misconfigured one) reaching an unboundedly expensive-to-
+    # redo item. 1GB default: generous enough to leave small, genuinely-cheap-to-rebuild cache
+    # files on the fast direct-delete path, strict enough to catch the model/large-archive case
+    # that motivated this guard.
+    direct_delete_size_guard_bytes: int = 1024 * 1024 * 1024
+    # Retention window applied only when the guard above fires — independent of the category's
+    # own `retention_days` (which is `None` by construction whenever this guard is reachable).
+    direct_delete_size_guard_retention_days: int = 30
 
 
 class PackageCachesConfig(BaseModel):
@@ -140,8 +169,26 @@ class PackageCachesConfig(BaseModel):
     paths: list[str] = Field(default_factory=_default_package_cache_paths)
     # ADR-0001: `None` -> direct permanent delete on apply (no vault, no send2trash); an int ->
     # vault + manifest + restore, with `purge` eligible once that many days have passed.
-    # Package/model caches redownload deterministically, so they default to `None`.
+    # Package caches redownload deterministically at negligible cost, so they default to `None`.
+    # Model-weight caches are NOT covered here — see `ModelCachesConfig` / ADR-0003.
     retention_days: int | None = None
+
+
+class ModelCachesConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="forbid")
+
+    enabled: bool = False
+    paths: list[str] = Field(default_factory=_default_model_cache_paths)
+    # ADR-0003: individual model-weight files by extension, matched under the SAME `paths` roots
+    # only (never a disk-wide sweep) — defense in depth for a cache layout the whole-directory
+    # match above doesn't fully cover (e.g. a user-added custom root, or a hub layout variant).
+    model_extensions: list[str] = Field(default_factory=lambda: [".safetensors", ".ckpt", ".bin"])
+    # ADR-0003: unlike every other package/dev-artifact cache, model weights default to VAULTED
+    # (30-day) retention, never `None`. Re-acquiring a model checkpoint can cost hours of
+    # bandwidth for a multi-GB-to-100+GB file, and a gated/private/fine-tuned/manually-pushed
+    # model may not be re-downloadable at all if the original access has lapsed — "rebuildable"
+    # was being decided by path type, not real rebuild cost, and this corrects that.
+    retention_days: int | None = 30
 
 
 class TempAndBrowserCachesConfig(BaseModel):
@@ -237,6 +284,7 @@ class CategoriesConfig(BaseModel):
 
     dev_artifacts: DevArtifactsConfig = Field(default_factory=DevArtifactsConfig)
     package_caches: PackageCachesConfig = Field(default_factory=PackageCachesConfig)
+    model_caches: ModelCachesConfig = Field(default_factory=ModelCachesConfig)
     temp_and_browser_caches: TempAndBrowserCachesConfig = Field(
         default_factory=TempAndBrowserCachesConfig
     )

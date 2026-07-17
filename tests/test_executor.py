@@ -473,6 +473,103 @@ def test_apply_batch_rejects_explicit_direct_delete_method(tmp_path: Path) -> No
         )
 
 
+# --- ADR-0003: cost-aware size guard downgrades oversized direct-delete candidates ------------
+
+
+def test_oversized_direct_delete_candidate_downgrades_to_vault(tmp_path: Path) -> None:
+    """Core ADR-0003 invariant: a `retention_days=None` candidate at/above the size guard is
+    forced to `vault`, never `direct_delete`, regardless of its category — recovery cost, not
+    category, decides permanence."""
+    target = tmp_path / "cache" / "huge_model.safetensors"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"stand-in content")  # actual bytes on disk are irrelevant to the guard
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=2 * 1024 * 1024 * 1024, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert report.items[0].method == "vault"
+    assert report.items[0].vault_path is not None
+    assert report.items[0].vault_path.exists()
+    assert not target.exists()  # moved into the vault, not left in place
+
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].method == "vault"
+    assert entries[0].retention_days == 30  # default direct_delete_size_guard_retention_days
+    assert entries[0].retention_until is not None
+
+
+def test_oversized_direct_delete_candidate_stays_restorable(tmp_path: Path) -> None:
+    """The guard-downgraded item is a normal vaulted entry as far as `restore_batch` is
+    concerned — restorability is decided by `entry.method`, not `entry.retention_days`."""
+    target = tmp_path / "huge_model.safetensors"
+    target.write_bytes(b"content")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=2 * 1024 * 1024 * 1024, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    restore_report = restore_batch(report.batch_id, manifest_path=manifest_path)
+    assert restore_report.files_succeeded == 1
+    assert target.exists()
+
+
+def test_direct_delete_size_guard_respects_configured_threshold(tmp_path: Path) -> None:
+    """A custom, smaller guard threshold triggers on a candidate well below the 1GB default —
+    proves the threshold is actually threaded through, not hardcoded."""
+    target = tmp_path / "medium.bin"
+    target.write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=500, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+        direct_delete_size_guard_bytes=100,
+        direct_delete_size_guard_retention_days=7,
+    )
+
+    assert report.items[0].method == "vault"
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].retention_days == 7
+
+
+def test_direct_delete_size_guard_does_not_trigger_below_threshold(tmp_path: Path) -> None:
+    target = tmp_path / "small.bin"
+    target.write_bytes(b"x")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=50, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+        direct_delete_size_guard_bytes=100,
+    )
+
+    assert report.items[0].method == "direct_delete"
+    assert not target.exists()
+
+
 def test_mixed_batch_vault_and_direct_delete_processes_both(tmp_path: Path) -> None:
     vaulted = tmp_path / "vaulted.bin"
     vaulted.write_bytes(b"vault-me")

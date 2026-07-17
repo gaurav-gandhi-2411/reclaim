@@ -95,6 +95,11 @@ class RawCandidate:
     suggested_tier: Tier
     rationale: str
     rebuild_instruction: str | None = None
+    # ADR-0003: a per-candidate recovery-cost caveat shown alongside `rebuild_instruction` —
+    # "rebuildable" alone doesn't say whether that rebuild is a free `npm ci` or a multi-hour,
+    # possibly-unrecoverable model redownload. `None` for categories whose rebuild is already
+    # cheap enough that no extra caveat is warranted.
+    recovery_cost_note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,3 +170,5 @@ class Candidate:
     # deletes this item on apply (no vault); an int -> vault + manifest + restore as before,
     # `purge`-eligible once that many days have passed.
     retention_days: int | None
+    # ADR-0003: see `RawCandidate.recovery_cost_note`.
+    recovery_cost_note: str | None = None

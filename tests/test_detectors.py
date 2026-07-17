@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from reclaim.config import ArchivePairsConfig, CategoriesConfig, Config, DevArtifactsConfig
+from reclaim.config import (
+    ArchivePairsConfig,
+    CategoriesConfig,
+    Config,
+    DevArtifactsConfig,
+    ModelCachesConfig,
+    SafetyConfig,
+)
 from reclaim.detectors import (
     _category_enabled,
     _category_retention_days,
@@ -14,12 +21,15 @@ from reclaim.detectors import (
     detect_crash_dumps,
     detect_dev_artifacts,
     detect_large_logs,
+    detect_model_caches,
     detect_old_installers,
     detect_package_caches,
     detect_temp_and_browser_caches,
+    generate_candidates,
 )
 from reclaim.index import ScanIndex
-from reclaim.models import FileRecord, RawCandidate, Tier
+from reclaim.models import Candidate, FileRecord, RawCandidate, Tier
+from reclaim.safety import SafetyValidator
 
 _NOW = 1_700_000_000.0
 _DAY = 86400.0
@@ -149,6 +159,83 @@ def test_package_cache_does_not_match_unrelated_dir(index: ScanIndex) -> None:
     _seed(index, _record("C:/Users/gg/Documents/notes", is_dir=True))
     result = detect_package_caches(index, ["C:/Users/gg/AppData/Local/pip/Cache"])
     assert result == []
+
+
+# --- Model-weight caches (ADR-0003) ----------------------------------------------------------
+
+
+def test_model_cache_matches_configured_hub_directory(index: ScanIndex) -> None:
+    _seed(index, _record("C:/Users/gg/.cache/huggingface/hub", is_dir=True))
+    result = detect_model_caches(
+        index, ["C:/Users/gg/.cache/huggingface/hub"], [".safetensors", ".ckpt", ".bin"]
+    )
+    assert Path("C:/Users/gg/.cache/huggingface/hub") in _paths(result)
+    candidate = next(c for c in result if c.path == Path("C:/Users/gg/.cache/huggingface/hub"))
+    assert candidate.category == "model_cache"
+    assert candidate.category_group == "model_caches"
+    assert candidate.suggested_tier == Tier.B
+    assert candidate.recovery_cost_note is not None
+
+
+def test_model_cache_matches_safetensors_file_under_configured_root(index: ScanIndex) -> None:
+    """A model-weight file sitting directly under a configured root (not itself matched by the
+    whole-directory sweep, e.g. a hub layout the directory pattern doesn't cover) must still be
+    caught by the extension-based surface — scoped to the same configured root, never a
+    disk-wide sweep."""
+    _seed(
+        index,
+        _record(
+            "C:/Users/gg/.cache/huggingface/hub/model.safetensors",
+            size_bytes=5_000_000_000,
+        ),
+    )
+    result = detect_model_caches(
+        index, ["C:/Users/gg/.cache/huggingface/hub"], [".safetensors", ".ckpt", ".bin"]
+    )
+    assert Path("C:/Users/gg/.cache/huggingface/hub/model.safetensors") in _paths(result)
+    candidate = result[0]
+    assert candidate.category == "model_cache"
+    assert candidate.category_group == "model_caches"
+    assert candidate.suggested_tier == Tier.B
+
+
+def test_model_cache_does_not_match_files_outside_configured_roots(index: ScanIndex) -> None:
+    _seed(index, _record("C:/Users/gg/Documents/my_project/weights.safetensors"))
+    result = detect_model_caches(
+        index, ["C:/Users/gg/.cache/huggingface/hub"], [".safetensors", ".ckpt", ".bin"]
+    )
+    assert result == []
+
+
+def test_model_cache_never_reaches_tier_a_even_when_category_enabled(
+    tmp_path: Path, index: ScanIndex
+) -> None:
+    """The core ADR-0003 invariant: a model-cache candidate is Tier B (review-queue) no matter
+    what `config.categories.model_caches.enabled` says — unlike every other category, there is
+    no config knob that promotes it to Tier A/auto-quarantine-eligible."""
+    hub = tmp_path / "hub"
+    _seed(index, _record(hub.as_posix(), is_dir=True, size_bytes=125_000_000_000))
+
+    for enabled in (False, True):
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(
+                model_caches=ModelCachesConfig(enabled=enabled, paths=[hub.as_posix()])
+            ),
+        )
+        candidates: list[Candidate] = generate_candidates(
+            index, config, SafetyValidator(config), now=_NOW
+        )
+        model_candidates = [c for c in candidates if c.category_group == "model_caches"]
+        assert len(model_candidates) == 1
+        assert model_candidates[0].tier == Tier.B
+        assert model_candidates[0].retention_days == 30
+
+
+def test_model_cache_default_retention_is_vaulted_not_none() -> None:
+    """Unlike every other `retention_days=None`-by-default cache category, model caches default
+    to vaulted (30-day) retention — the whole point of ADR-0003."""
+    assert _category_retention_days("model_caches", Config()) == 30
 
 
 def test_temp_root_children_proposed_but_never_the_root_itself(index: ScanIndex) -> None:
@@ -376,10 +463,12 @@ def test_category_retention_days_reflects_config_defaults() -> None:
     """Mirrors ADR-0001's default table: direct-delete (`None`) for dev_artifacts,
     package_caches, temp_and_browser_caches, crash_dumps; 30-day vaulted retention for
     old_installers, archive_pairs, large_logs (duplicates' default lives in dedup.py, not
-    detectors.py's getter table)."""
+    detectors.py's getter table). ADR-0003 adds model_caches at 30-day vaulted retention too —
+    the one cache category that does NOT default to direct-delete, unlike its siblings."""
     config = Config()
     assert _category_retention_days("dev_artifacts", config) is None
     assert _category_retention_days("package_caches", config) is None
+    assert _category_retention_days("model_caches", config) == 30
     assert _category_retention_days("temp_and_browser_caches", config) is None
     assert _category_retention_days("crash_dumps", config) is None
     assert _category_retention_days("old_installers", config) == 30

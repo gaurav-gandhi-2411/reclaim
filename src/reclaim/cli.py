@@ -260,6 +260,10 @@ def _print_top_n_largest(selected: Sequence[Candidate]) -> None:
     print(f"  top {len(largest)} largest candidates:")  # noqa: T201
     for candidate in largest:
         print(f"    {candidate.size_bytes:>14,} bytes  {candidate.path}")  # noqa: T201
+        if candidate.rebuild_instruction is not None:
+            print(f"      recovery: {candidate.rebuild_instruction}")  # noqa: T201
+        if candidate.recovery_cost_note is not None:
+            print(f"      cost: {candidate.recovery_cost_note}")  # noqa: T201
 
 
 def _print_hash_skips(skips: Sequence[HashSkip]) -> None:
@@ -325,6 +329,10 @@ def _run_apply(args: argparse.Namespace) -> int:
             method=method,
             vault_dir=args.vault_dir,
             manifest_path=args.manifest,
+            direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
+            direct_delete_size_guard_retention_days=(
+                config.safety.direct_delete_size_guard_retention_days
+            ),
         )
     except SafetyInvariantError as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201

@@ -499,6 +499,10 @@ button {
   margin: var(--rc-space-2) 0 0;
 }
 
+.rc-candidate-recovery-cost {
+  color: var(--rc-warning);
+}
+
 .rc-cluster-table {
   width: 100%;
   border-collapse: collapse;

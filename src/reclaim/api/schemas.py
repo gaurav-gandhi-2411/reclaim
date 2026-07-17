@@ -27,7 +27,8 @@ def format_bytes(size_bytes: int) -> str:
 
 _CATEGORY_LABELS: dict[str, str] = {
     "dev_artifacts": "Dev Artifacts",
-    "package_caches": "Package/Model Caches",
+    "package_caches": "Package Caches",
+    "model_caches": "Model Weight Caches",
     "temp_and_browser_caches": "Browser & Temp Caches",
     "crash_dumps": "Crash Dumps & WER Reports",
     "old_installers": "Old Installers (Downloads)",
@@ -157,6 +158,7 @@ class CandidateOut(BaseModel):
     tier: Tier
     rationale: str
     rebuild_instruction: str | None
+    recovery_cost_note: str | None = None
     safety_verdict: Verdict
     safety_reason_code: str
     duplicate_cluster: DuplicateClusterOut | None = None

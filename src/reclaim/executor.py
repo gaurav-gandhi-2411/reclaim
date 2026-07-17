@@ -282,12 +282,38 @@ def _latest_entries_for_batch(manifest_path: Path, batch_id: str) -> list[Quaran
     ]
 
 
-def _effective_method(candidate: Candidate, method: QuarantineMethod) -> QuarantineMethod:
+def _effective_method_and_retention_days(
+    candidate: Candidate,
+    method: QuarantineMethod,
+    *,
+    size_guard_bytes: int,
+    size_guard_retention_days: int,
+) -> tuple[QuarantineMethod, int | None]:
     """A batch's `method` parameter only governs candidates whose category has a real
     retention window; permanent deletion is a property of the *category* (ADR-0001), not a
-    per-run choice, so a `retention_days is None` candidate always direct-deletes regardless of
-    what the caller requested for the rest of the batch."""
-    return "direct_delete" if candidate.retention_days is None else method
+    per-run choice, so a `retention_days is None` candidate normally always direct-deletes
+    regardless of what the caller requested for the rest of the batch.
+
+    ADR-0003: recovery cost, not category, is what should gate permanent deletion. A
+    `retention_days is None` candidate at or above `size_guard_bytes` is forced to `vault`
+    instead, with its own `size_guard_retention_days` window — independent of the category's
+    own (`None`) setting, and regardless of `method`. This is a general safety net (not specific
+    to model caches, which already default to vaulted retention and so rarely reach this
+    branch) protecting against any category whose direct-delete default turns out, on a given
+    disk, to hit an unboundedly expensive-to-redo item.
+    """
+    if candidate.retention_days is None:
+        if candidate.size_bytes >= size_guard_bytes:
+            logger.info(
+                "executor.retention_size_guard_downgrade",
+                path=str(candidate.path),
+                size_bytes=candidate.size_bytes,
+                category=candidate.category,
+                size_guard_bytes=size_guard_bytes,
+            )
+            return "vault", size_guard_retention_days
+        return "direct_delete", None
+    return method, candidate.retention_days
 
 
 def _reverify_direct_delete_candidates(
@@ -333,6 +359,10 @@ def _reverify_direct_delete_candidates(
         )
 
 
+_DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES = 1024 * 1024 * 1024
+_DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS = 30
+
+
 def apply_batch(
     candidates: list[Candidate],
     *,
@@ -342,6 +372,8 @@ def apply_batch(
     vault_dir: Path | None = None,
     manifest_path: Path | None = None,
     now: float | None = None,
+    direct_delete_size_guard_bytes: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES,
+    direct_delete_size_guard_retention_days: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS,
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
@@ -359,9 +391,14 @@ def apply_batch(
 
     `method` (`"vault"`/`"recycle_bin"`) only governs candidates whose category has a real
     retention window; a candidate with `retention_days is None` always direct-deletes
-    regardless of `method` (ADR-0001) — see `_effective_method`. A single batch may therefore
-    mix direct-delete and vaulted/recycle-binned items; `item.method` on each `ItemApplyResult`
-    records which one actually applied to that item, not just the batch-level `method` param.
+    regardless of `method` (ADR-0001) — see `_effective_method_and_retention_days`. A single
+    batch may therefore mix direct-delete and vaulted/recycle-binned items; `item.method` on
+    each `ItemApplyResult` records which one actually applied to that item, not just the
+    batch-level `method` param.
+
+    ADR-0003: a `retention_days is None` candidate at or above `direct_delete_size_guard_bytes`
+    is forced to `vault` instead of `direct_delete`, with `direct_delete_size_guard_retention_days`
+    as its retention window — recovery cost, not category, gates permanent deletion.
 
     Defense in depth, in two layers:
     1. Raises `SafetyInvariantError` and refuses the *entire* batch if any candidate's
@@ -406,10 +443,15 @@ def apply_batch(
     items: list[ItemApplyResult] = []
     manifest_entries: list[QuarantineManifestEntry] = []
     for candidate in candidates:
-        item_method = _effective_method(candidate, method)
+        item_method, item_retention_days = _effective_method_and_retention_days(
+            candidate,
+            method,
+            size_guard_bytes=direct_delete_size_guard_bytes,
+            size_guard_retention_days=direct_delete_size_guard_retention_days,
+        )
         item_retention_until = (
-            now_ts + candidate.retention_days * _SECONDS_PER_DAY
-            if candidate.retention_days is not None
+            now_ts + item_retention_days * _SECONDS_PER_DAY
+            if item_retention_days is not None
             else None
         )
 
@@ -496,7 +538,7 @@ def apply_batch(
                 tier=candidate.tier,
                 method=item_method,
                 vault_path=vault_path,
-                retention_days=candidate.retention_days,
+                retention_days=item_retention_days,
                 quarantined_at=now_ts,
                 retention_until=item_retention_until,
             )

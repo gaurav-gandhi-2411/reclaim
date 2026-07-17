@@ -285,6 +285,7 @@ def _candidate_out(candidate: Candidate, cluster: DuplicateCluster | None) -> Ca
         tier=candidate.tier,
         rationale=candidate.rationale,
         rebuild_instruction=candidate.rebuild_instruction,
+        recovery_cost_note=candidate.recovery_cost_note,
         safety_verdict=candidate.safety_verdict,
         safety_reason_code=candidate.safety_reason_code,
         duplicate_cluster=_duplicate_cluster_out(cluster) if cluster is not None else None,
@@ -401,6 +402,10 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
         method=request.method,
         vault_dir=state.vault_dir,
         manifest_path=state.manifest_path,
+        direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+        direct_delete_size_guard_retention_days=(
+            state.config.safety.direct_delete_size_guard_retention_days
+        ),
     )
     return _apply_response(report)
 
