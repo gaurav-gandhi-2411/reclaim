@@ -430,6 +430,7 @@ def generate_duplicate_candidates(
     safety: SafetyValidator,
     *,
     skips: list[HashSkip] | None = None,
+    clusters: Sequence[DuplicateCluster] | None = None,
 ) -> list[Candidate]:
     """Mirrors `detectors.py::generate_candidates()`'s contract/shape: runs every non-keep
     cluster member through `SafetyValidator.evaluate()` before it is ever tagged a tier.
@@ -440,6 +441,13 @@ def generate_duplicate_candidates(
     `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
     `min_reclaim_bytes` comes from `config.categories.duplicates.min_reclaim_bytes` — the
     materiality gate is config-driven, not hardcoded, same as every other category threshold.
+
+    `clusters`: pass an already-computed cluster list (e.g. from a caller that also needs the
+    keep/delete shape directly, like the dashboard's cluster-review endpoint) to skip a second
+    full `find_duplicate_clusters` pass — hashing every candidate file twice on a multi-million-
+    file real disk index is expensive, and a stale-quarantine-path `hash_unreadable` warning gets
+    logged once per pass, so calling this twice back-to-back doubles both the runtime and the
+    log noise for no benefit. Defaults to `None`, computing clusters here exactly as before.
 
     ADR-0006: each cluster's non-keep members also go through `linkinfo.
     estimate_reclaimable_bytes` (one direct `os.stat()` per member, bounded by cluster size —
@@ -462,7 +470,12 @@ def generate_duplicate_candidates(
     """
     candidates: list[Candidate] = []
     min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
-    for cluster in find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips):
+    resolved_clusters = (
+        clusters
+        if clusters is not None
+        else find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips)
+    )
+    for cluster in resolved_clusters:
         member_results = {
             duplicate.path: safety.evaluate(duplicate) for duplicate in cluster.duplicates
         }

@@ -358,11 +358,16 @@ def list_duplicate_cluster_review(
         if not index.has_any_records():
             return DuplicateClusterReviewResponse(has_scan=False, clusters=[])
 
-        duplicate_candidates = generate_duplicate_candidates(index, state.config, state.safety)
-        candidate_by_path = {c.path: c for c in duplicate_candidates}
+        # Computed once and threaded through to `generate_duplicate_candidates` below — that
+        # function would otherwise recompute clusters itself, hashing every candidate file a
+        # second time (see `generate_duplicate_candidates`'s `clusters` param docstring).
         clusters = find_duplicate_clusters(
             index, min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes
         )
+        duplicate_candidates = generate_duplicate_candidates(
+            index, state.config, state.safety, clusters=clusters
+        )
+        candidate_by_path = {c.path: c for c in duplicate_candidates}
 
     rows: list[DuplicateClusterReviewOut] = []
     for cluster in clusters:
