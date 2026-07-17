@@ -94,6 +94,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "be restored by this tool.",
     )
     apply_parser.add_argument(
+        "--include-categories",
+        type=str,
+        default=None,
+        help="Comma-separated fine-grained candidate categories (e.g. "
+        "'windows_temp,package_cache') to restrict this apply to. A category's group must "
+        "still be enabled in config.toml and its tier still match --tier for it to be "
+        "generated at all — this flag narrows an already-generated, already-tier-filtered "
+        "selection further, for staged/scoped rollouts (apply a reviewed subset now, defer "
+        "the rest to a later run). Default: no restriction.",
+    )
+    apply_parser.add_argument(
         "--db",
         type=Path,
         default=_DEFAULT_DB_PATH,
@@ -319,6 +330,16 @@ def _run_apply(args: argparse.Namespace) -> int:
 
     tiers = _TIER_SELECTIONS[args.tier]
     selected = [c for c in candidates if c.tier in tiers and _under_root(c.path, root)]
+
+    if args.include_categories is not None:
+        wanted_categories = {c.strip() for c in args.include_categories.split(",") if c.strip()}
+        before_count = len(selected)
+        selected = [c for c in selected if c.category in wanted_categories]
+        print(  # noqa: T201
+            f"reclaim apply: --include-categories restricted selection to "
+            f"{sorted(wanted_categories)} — {len(selected)}/{before_count} "
+            "tier/root-eligible candidate(s) kept, the rest deferred to a later run."
+        )
 
     method: QuarantineMethod = args.method
     try:

@@ -105,3 +105,45 @@ def test_apply_report_shows_materiality_exclusion_alongside_real_duplicate(
     assert "exact_duplicate" in out  # the real 2MB pair still surfaces
     assert "1 size bucket(s) excluded as immaterial" in out
     assert "theoretical best-case size 100 bytes" in out
+
+
+def test_apply_include_categories_restricts_to_named_categories(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--include-categories` narrows an already tier/root-filtered selection to just the named
+    fine-grained categories — the staged-rollout mechanism for applying a reviewed subset of one
+    enabled group (here: dev_artifacts) while deferring the rest of that same group to a later
+    run. `dev_artifacts.enabled=True` makes BOTH node_modules and pycache Tier A candidates;
+    `--include-categories dev_artifact_pycache` must apply only the pycache one."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "package.json").write_bytes(b"{}")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "pkg.js").write_bytes(b"x" * 100)
+    (root / "__pycache__").mkdir()
+    (root / "__pycache__" / "mod.pyc").write_bytes(b"y" * 100)
+    db = tmp_path / "index.sqlite3"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[categories.dev_artifacts]\nenabled = true\n", encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "apply",
+            str(root),
+            "--db",
+            str(db),
+            "--config",
+            str(config_path),
+            "--include-categories",
+            "dev_artifact_pycache",
+        ]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "restricted selection to ['dev_artifact_pycache']" in out
+    assert "1/2 tier/root-eligible candidate(s) kept" in out
+    assert "dev_artifact_pycache: count=1" in out
+    assert "dev_artifact_node_modules" not in out
