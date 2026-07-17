@@ -14,6 +14,7 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import HashCacheEntry, ScanIndex, cached_full_hash, cached_partial_hash
+from reclaim.linkinfo import estimate_reclaimable_bytes
 from reclaim.models import (
     Candidate,
     DuplicateCluster,
@@ -376,11 +377,22 @@ def generate_duplicate_candidates(
     `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
     `min_reclaim_bytes` comes from `config.categories.duplicates.min_reclaim_bytes` — the
     materiality gate is config-driven, not hardcoded, same as every other category threshold.
+
+    ADR-0006: each cluster's non-keep members also go through `linkinfo.
+    estimate_reclaimable_bytes` (one direct `os.stat()` per member, bounded by cluster size —
+    never the whole inventory). A "duplicate" that's actually a hardlink to the kept copy
+    already shares the same on-disk blocks and reclaims 0 bytes if deleted; byte-identical
+    content — this category's entire selection criterion — is exactly what a hardlink produces,
+    so this is not a rare edge case here. Exposed as `Candidate.reclaimable_bytes`, distinct
+    from `size_bytes`'s logical size and never silently substituted for it.
     """
     candidates: list[Candidate] = []
     min_reclaim_bytes = config.categories.duplicates.min_reclaim_bytes
     for cluster in find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips):
         rationale = _keep_rationale(cluster)
+        reclaim_estimates = estimate_reclaimable_bytes(
+            [(duplicate.path, duplicate.size_bytes) for duplicate in cluster.duplicates]
+        )
         for duplicate in cluster.duplicates:
             result = safety.evaluate(duplicate)
             if result.verdict == Verdict.BLOCKED:
@@ -389,6 +401,14 @@ def generate_duplicate_candidates(
                 tier = Tier.B
             else:
                 tier = Tier.A if config.categories.duplicates.enabled else Tier.B
+            estimate = reclaim_estimates[duplicate.path]
+            member_rationale = rationale
+            if estimate.resolved and estimate.reclaimable_bytes == 0:
+                member_rationale = (
+                    f"{rationale} Already deduplicated at the filesystem level (this path is a "
+                    "hardlink sharing the same on-disk blocks as another surviving copy) — 0 "
+                    "bytes reclaimable if deleted, excluded from the reclaimable total."
+                )
             candidates.append(
                 Candidate(
                     path=duplicate.path,
@@ -397,11 +417,12 @@ def generate_duplicate_candidates(
                     category_group=_CATEGORY_GROUP,
                     size_bytes=duplicate.size_bytes,
                     tier=tier,
-                    rationale=rationale,
+                    rationale=member_rationale,
                     rebuild_instruction=None,
                     safety_verdict=result.verdict,
                     safety_reason_code=result.reason_code,
                     retention_days=config.categories.duplicates.retention_days,
+                    reclaimable_bytes=estimate.reclaimable_bytes,
                 )
             )
     return candidates

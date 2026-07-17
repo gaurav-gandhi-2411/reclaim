@@ -159,6 +159,9 @@ class CandidateOut(BaseModel):
     rationale: str
     rebuild_instruction: str | None
     recovery_cost_note: str | None = None
+    # ADR-0006: hardlink-aware estimate, distinct from size_bytes's logical size. `None` means
+    # "not computed for this category" — the dashboard must never treat that as a claim of zero.
+    reclaimable_bytes: int | None = None
     safety_verdict: Verdict
     safety_reason_code: str
     duplicate_cluster: DuplicateClusterOut | None = None

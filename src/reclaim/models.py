@@ -202,3 +202,12 @@ class Candidate:
     # guard's normal default — regret is impossible for a category whose only recovery path was
     # already "rebuild it," so there is no reason to hold the vault copy hostage for 30 days.
     rebuildable: bool = False
+    # ADR-0006: hardlink-aware estimate of real reclaimable bytes (`linkinfo.
+    # estimate_reclaimable_bytes`), distinct from `size_bytes`'s logical size. `None` means "not
+    # computed for this category" (most categories today) — a caller should treat that as
+    # "assume equal to size_bytes," not as a claim of zero. Populated today only for
+    # `duplicates` (`dedup.generate_duplicate_candidates`): a "duplicate" that's actually a
+    # hardlink to the kept copy shares the same blocks already and reclaims 0 bytes if deleted,
+    # and byte-identical content — the cluster's whole selection criterion — is exactly what a
+    # hardlink produces, so this isn't a rare edge case for this category specifically.
+    reclaimable_bytes: int | None = None

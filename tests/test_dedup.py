@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import reclaim.dedup as dedup_module
-from reclaim.config import DuplicatesConfig
+from reclaim.config import CategoriesConfig, Config, DuplicatesConfig, SafetyConfig
 from reclaim.dedup import (
     _HEARTBEAT_INTERVAL_SECONDS,
     _PARTIAL_HASH_CHUNK_BYTES,
@@ -18,11 +19,13 @@ from reclaim.dedup import (
     _hash_with_guard,
     _is_downloads_or_temp,
     find_duplicate_clusters,
+    generate_duplicate_candidates,
     materiality_exclusion_stats,
     select_keep,
 )
 from reclaim.index import ScanIndex
 from reclaim.models import FileRecord, HashSkip
+from reclaim.safety import SafetyValidator
 
 _NOW = 1_700_000_000.0
 
@@ -375,3 +378,71 @@ def test_materiality_exclusion_stats_default_matches_config_default() -> None:
     caller invoking either without a config (evals, direct API service calls) gets the same
     real-world-tuned floor, not a silent "hash everything" fallback."""
     assert DuplicatesConfig().min_reclaim_bytes == dedup_module._DEFAULT_MIN_RECLAIM_BYTES
+
+
+# --- ADR-0006: hardlink-aware reclaimable-bytes estimation for exact_duplicate -----------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_flags_hardlinked_duplicate_as_zero_reclaimable(
+    tmp_path: Path,
+) -> None:
+    """The exact required scenario: a same-inode 'duplicate' pair must report 0 reclaimable
+    bytes, not its full logical size — byte-identical content, the cluster's whole selection
+    criterion, is exactly what a hardlink produces, so this is not a rare edge case here."""
+    kept_path = tmp_path / "kept.bin"
+    kept_path.write_bytes(b"identical-content-" * 10_000)  # clears the default materiality gate
+    linked_path = tmp_path / "hardlinked_duplicate.bin"
+    os.link(kept_path, linked_path)
+    size = kept_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(kept_path), size_bytes=size, ctime=100.0),
+                _index_record(str(linked_path), size_bytes=size, ctime=200.0),  # newer -> not kept
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert len(candidates) == 1
+    assert candidates[0].path == linked_path
+    assert candidates[0].size_bytes == size  # logical size still reported in full
+    assert candidates[0].reclaimable_bytes == 0
+    assert "hardlink" in candidates[0].rationale.lower()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_reports_full_reclaimable_for_genuine_copies(
+    tmp_path: Path,
+) -> None:
+    """Contrast case: two genuinely separate files with identical content (not hardlinked) must
+    still report the full logical size as reclaimable — the hardlink check must never
+    under-credit an ordinary duplicate pair that really is two independent copies on disk."""
+    kept_path = tmp_path / "kept.bin"
+    kept_path.write_bytes(b"identical-content-" * 10_000)
+    other_path = tmp_path / "genuine_copy.bin"
+    other_path.write_bytes(kept_path.read_bytes())  # same content, separate inode
+    size = kept_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(kept_path), size_bytes=size, ctime=100.0),
+                _index_record(str(other_path), size_bytes=size, ctime=200.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert len(candidates) == 1
+    assert candidates[0].reclaimable_bytes == size

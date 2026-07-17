@@ -278,10 +278,48 @@ def _print_top_n_largest(selected: Sequence[Candidate]) -> None:
     print(f"  top {len(largest)} largest candidates:")  # noqa: T201
     for candidate in largest:
         print(f"    {candidate.size_bytes:>14,} bytes  {candidate.path}")  # noqa: T201
+        # ADR-0006: only printed when this category has actually computed a hardlink-aware
+        # estimate (reclaimable_bytes is None for every category that hasn't) — logical size
+        # above is always real; this line is never silently substituted for it.
+        if (
+            candidate.reclaimable_bytes is not None
+            and candidate.reclaimable_bytes != candidate.size_bytes
+        ):
+            print(  # noqa: T201
+                f"      estimated reclaimable: {candidate.reclaimable_bytes:,} bytes "
+                f"(logical size above may be shared with a surviving hardlink)"
+            )
         if candidate.rebuild_instruction is not None:
             print(f"      recovery: {candidate.rebuild_instruction}")  # noqa: T201
         if candidate.recovery_cost_note is not None:
             print(f"      cost: {candidate.recovery_cost_note}")  # noqa: T201
+
+
+def _print_duplicate_reclaim_estimate(selected: Sequence[Candidate]) -> None:
+    """ADR-0006: the uv/cache purge measured logical size (14.3GB) against real disk-free delta
+    (5.21GB) and found a large gap from Windows hardlinks sharing blocks across names. Exact
+    duplicates are the same shape in reverse — a "duplicate" that's actually a hardlink to the
+    kept copy reclaims 0 bytes if deleted — so the logical `size_bytes` total this category
+    reports is never trustable on its own; this prints the hardlink-aware estimate alongside it,
+    clearly separated, never blended into one number."""
+    duplicates = [c for c in selected if c.category_group == "duplicates"]
+    if not duplicates:
+        return
+    logical_total = sum(c.size_bytes for c in duplicates)
+    reclaimable_total = sum(
+        c.reclaimable_bytes if c.reclaimable_bytes is not None else c.size_bytes for c in duplicates
+    )
+    already_deduplicated = [c for c in duplicates if c.reclaimable_bytes == 0]
+    print(  # noqa: T201
+        f"  exact_duplicate reclaim estimate: logical={logical_total:,} bytes, "
+        f"hardlink-aware estimated reclaimable={reclaimable_total:,} bytes"
+    )
+    if already_deduplicated:
+        print(  # noqa: T201
+            f"    {len(already_deduplicated)} candidate(s) already deduplicated via an existing "
+            "hardlink to the surviving copy — 0 bytes reclaimable each, excluded from the "
+            "estimated-reclaimable total above"
+        )
 
 
 def _print_hash_skips(skips: Sequence[HashSkip]) -> None:
@@ -381,6 +419,7 @@ def _run_apply(args: argparse.Namespace) -> int:
         print(  # noqa: T201
             f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}"
         )
+    _print_duplicate_reclaim_estimate(selected)
     _print_top_n_largest(selected)
     _print_hash_skips(hash_skips)
     if materiality is not None:

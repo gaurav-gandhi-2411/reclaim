@@ -286,6 +286,7 @@ def _candidate_out(candidate: Candidate, cluster: DuplicateCluster | None) -> Ca
         rationale=candidate.rationale,
         rebuild_instruction=candidate.rebuild_instruction,
         recovery_cost_note=candidate.recovery_cost_note,
+        reclaimable_bytes=candidate.reclaimable_bytes,
         safety_verdict=candidate.safety_verdict,
         safety_reason_code=candidate.safety_reason_code,
         duplicate_cluster=_duplicate_cluster_out(cluster) if cluster is not None else None,
