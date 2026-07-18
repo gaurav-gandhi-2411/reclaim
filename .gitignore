@@ -30,6 +30,9 @@ data/_test_scratch/
 # User's real config (may contain personal deny/allow paths) — config.example.toml is committed
 config.toml
 
+# Node (tests/frontend — jsdom regression harness only, no app build)
+node_modules/
+
 # IDE / OS
 .vscode/
 .idea/

@@ -543,6 +543,11 @@ function renderCandidateCard(candidate) {
   return card;
 }
 
+// `cluster.full_hash` is a BLAKE3 hex digest and every other field on this path is a
+// server-formatted number/enum — safe to template into innerHTML. `member.path` is a raw
+// filesystem path (attacker-controllable: this tool's whole job is walking a real disk, so a
+// file/directory literally named e.g. `<img src=x onerror=...>` is real, reachable input) and
+// MUST NEVER be interpolated into innerHTML — it goes through `textContent` only, below.
 function renderClusterTable(cluster) {
   const table = document.createElement("table");
   table.className = "rc-cluster-table";
@@ -556,17 +561,39 @@ function renderClusterTable(cluster) {
   for (const member of cluster.members) {
     const row = document.createElement("tr");
     row.dataset.keep = String(member.is_keep);
-    row.innerHTML = `
-      <td class="rc-candidate-path">${member.path}</td>
-      <td>${member.size_human}</td>
-      <td>${new Date(member.ctime * 1000).toLocaleString()}</td>
-      <td>${member.is_keep ? '<span class="rc-badge" data-kind="heuristic">Kept — heuristic pick</span>' : "Proposed for removal"}</td>
-    `;
+
+    const pathCell = document.createElement("td");
+    pathCell.className = "rc-candidate-path";
+    pathCell.textContent = member.path;
+    row.appendChild(pathCell);
+
+    const sizeCell = document.createElement("td");
+    sizeCell.textContent = member.size_human;
+    row.appendChild(sizeCell);
+
+    const createdCell = document.createElement("td");
+    createdCell.textContent = new Date(member.ctime * 1000).toLocaleString();
+    row.appendChild(createdCell);
+
+    const statusCell = document.createElement("td");
+    if (member.is_keep) {
+      const badge = document.createElement("span");
+      badge.className = "rc-badge";
+      badge.dataset.kind = "heuristic";
+      badge.textContent = "Kept — heuristic pick";
+      statusCell.appendChild(badge);
+    } else {
+      statusCell.textContent = "Proposed for removal";
+    }
+    row.appendChild(statusCell);
+
     tbody.appendChild(row);
   }
   table.appendChild(tbody);
   return table;
 }
+
+export { renderClusterTable };
 
 function updateApplyBar() {
   const countEl = document.getElementById("apply-selected-count");

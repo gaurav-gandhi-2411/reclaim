@@ -1,0 +1,12 @@
+{
+  "name": "reclaim-frontend-tests",
+  "private": true,
+  "type": "module",
+  "description": "DOM-level regression tests for src/reclaim/api/static/*.js — not a build, just a jsdom harness for node:test. Kept separate from the Python package (no npm dependency for the app itself, which ships zero JS build step by design).",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^29.0.0"
+  }
+}
