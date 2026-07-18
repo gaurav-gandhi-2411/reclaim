@@ -861,6 +861,62 @@ retention + restore, now with an explicit `purge` command for expired entries.
   link to its blob). Not started — model_cache stays review-only, never applied, until this
   lands.
 
+### 2026-07-18 — Security audit + single-user/technical-reviewer packaging pass
+- Scope explicitly narrowed by GG mid-session to Stage 1 only: security-harden + installable for
+  self/technical reviewers. Safe-mode-by-default and a signed public installer are Stage 2,
+  pending a separate go-public decision — not attempted this pass.
+- Item 0 (ML/AI positioning check): grep-confirmed zero code references anywhere in `src/reclaim`
+  to any Phase-2 similarity component named in `reclaim-spec.md` (pHash/dHash, CLIP embeddings,
+  MinHash/SimHash) — the running app is 100% rules-first, exact BLAKE3 hash dedup only. Worth
+  restating for anyone reading the spec cold: Phase 2's ML section describes a future stage, not
+  current behavior.
+- **Top finding — filename-driven XSS in the Review Queue's duplicate-cluster table**
+  (`renderClusterTable`, `app.js`): built each row via `row.innerHTML` with an unescaped
+  `member.path`. Since the dashboard now carries its own CSRF token in the page (this same
+  pass), a script executing via this XSS could have read that token and called
+  `/api/apply`/`/api/restore` directly — a display bug that was one step from a delete primitive.
+  Fixed to build every cell via `textContent`/DOM APIs; `tests/frontend/xss.test.mjs` (jsdom,
+  `node --test`, new CI job) feeds the real render function `<img onerror>`/`<script>` payloads
+  and asserts zero markup elements survive. Full detail and the "why this is worse than the
+  eleven engine bugs" argument: `docs/CASE_STUDY.md`'s new Security audit section.
+- Four more findings, each fixed and tested, not just documented: hard loopback-only `--host`
+  gate (argparse-level, `127.0.0.1`/`::1` only — `localhost` deliberately excluded too, since
+  it's a DNS/hosts-file lookup); per-process CSRF token + Host/Origin DNS-rebinding guard on
+  every mutating `/api/*` call (`reclaim.api.security`); a manifest-integrity/zip-slip-equivalent
+  guard on `restore_batch` (refuses the whole restore if a vault entry's `vault_path` escapes the
+  configured vault dir or `original_path` matches a protected root — new `RestoreIntegrityError`);
+  a no-elevation guard (`reclaim.elevation`) refusing every mutating command if the process holds
+  an elevated Windows token. `pip-audit` added to CI (zero vulnerabilities found in current
+  locked deps).
+- Packaging: `pyproject.toml`'s existing `reclaim = "reclaim.cli:main"` entry point was already
+  `uv tool install`-ready — verified end to end (`uv tool install .` → real `reclaim` executable
+  on PATH → `reclaim scan` against a real directory). Added `reclaim dashboard` (serve + auto-open
+  browser) as the one-command launch path. README rewritten for the install target (uv
+  tool/pipx install, first-run, restore, security posture, explicit distribution-status
+  boundaries).
+- Nuitka one-folder standalone build: attempted and verified, not just documented. `--standalone`
+  (not `--onefile`, per the "one-folder" ask) against this project's own dev venv (which pulls in
+  the full `--all-groups` closure, not just runtime deps — `dist/cli.dist/` came to 121MB,
+  ~858 C files compiled via an auto-downloaded MinGW64 since no MSVC was present) produced a
+  working `reclaim.exe`: `--help` and a real `scan` against a scratch directory both verified.
+  Unsigned — AV/SmartScreen false-positive is expected and documented, not chased. `dist/` added
+  to `.gitignore`.
+- 6 atomic commits (`e3dbe34`..`431deac`): XSS fix, CSRF/Origin guard, restore-integrity guard,
+  CLI hardening (bind/elevation/dashboard, bundled — cli.py accumulated all three and splitting
+  further via manual hunk surgery wasn't worth the risk), CI jobs, docs. Independent Haiku
+  verifier re-ran the full suite + spot-checked every fix against the source (not just the diff)
+  before commit: 14/14 checks passed. Final state: 327 tests pass (2 skipped, both pre-existing
+  non-Windows skips), 95% coverage, ruff/mypy clean, eval suite (including the Stage 1 safety hard
+  gate) green.
+- **Correction, mid-session**: accidentally ran the CI workflow's `git config --global user.email/
+  user.name` step (fixture identity, meant for an ephemeral CI runner) directly against GG's real
+  global git config. Caught within the same turn before any commit was made under the wrong
+  identity; restored to `gaurav.gandhi2411@gmail.com`/`Gaurav Gandhi` immediately. No commits,
+  pushes, or repo state were affected — logged here per house rule 53 (honest about failures).
+- Next: the deferred `model_cache` apply (link-structure hold from the 2026-07-17 checkpoint)
+  and Stage 2 (safe-mode default, first-run disclaimer, signed public installer) both remain
+  open, pending GG's go-public call on the latter.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
