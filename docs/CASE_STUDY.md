@@ -9,6 +9,12 @@ exists because a wrong number is embarrassing and a wrong delete is unrecoverabl
 record of what it actually took to earn that guarantee against a real, 3.1-million-file disk in
 active daily use, not a fixture tree.
 
+The honest version of this thesis is not "the safety system worked." It's narrower and less
+comfortable than that: every individual safety mechanism in this codebase was defeated at least
+once, by a real filesystem shape none of its tests modeled — and the project is still standing
+only because the one operation that actually ran destructive was chosen to be reversible before
+anyone knew it would need to be. That is not a triumphant ending. It's the accurate one.
+
 ## Architecture
 
 - **Rules-first.** No ML in the deletion path. Every candidate comes from a deterministic
@@ -46,9 +52,10 @@ did a correctness fix increase the estimate.
 | ADR-0008 | 4.26GB | model-cache and conda/venv-environment exclusion — byte-identical stdlib/model files inside a structurally-managed cache or a live environment are never safe to treat as arbitrary duplicates, regardless of what they share on disk |
 | real apply (same day, natural disk drift) | 4.24GB selected | not a correction — the live disk had changed slightly between estimate and apply time |
 | ADR-0009, after the real apply | 3.92GB, net of 186 restored files | a live incident found the ADR-0008 exclusion didn't cover *standalone* Python installations (no `conda-meta/`, no `pyvenv.cfg`) — closed, verified against the entire applied batch |
+| ADR-0010, follow-up | unchanged number, tightened guarantee | root-caused *why* marker-only detection missed all three incident installs (none is conda or venv) and replaced it with structural detection by default — re-verified against the same 10,134-file batch: still exactly 186 violations, confirming ADR-0009's recovery was already complete, not that a fourth incident was hiding |
 
 Each drop is a correctness fix, not a change of heart about what counts as "reclaimable." The
-last one happened *after* the apply had already run for real — see below.
+last two happened *after* the apply had already run for real — see below.
 
 ## The 11-bug trail
 
@@ -116,38 +123,50 @@ delete."**
     byte-identical for structural reasons that have nothing to do with waste. Fixed with a
     location-ranked keep-heuristic, whole-cluster exclusion on a protected member, and
     model-cache/cross-environment exclusion, dropping the estimate from 23.09GB to 4.26GB.
-11. **The exact_duplicate apply ran for real — and broke this project's own development
-    environment within minutes.** `socket.py` and 185 other files were recycle-binned from three
-    shared Python interpreter installations (a uv-managed build, `gcloud`'s bundled Python, the
-    Android NDK's toolchain Python) because none of them are a conda environment or a venv — no
-    `conda-meta/`, no `pyvenv.cfg` — so the ADR-0008 protection never recognized them as
-    environments at all. A first, keyword-driven recovery pass found and restored 71 files and
-    looked complete; it wasn't. A systematic re-audit — re-running the fixed detector against
-    every one of the 10,134 applied files — found 186 true violations, not 71. All 186 were
-    recovered from the Windows Recycle Bin by parsing its `$I`/`$R` index format directly (the
-    project's own restore command doesn't support Recycle Bin batches). Fixed by adding a
-    third, tool-agnostic marker to the environment detector: `python.exe` + a sibling `Lib/`
-    directory, the structural signature of *any* complete Python installation, independent of
-    which tool produced it (ADR-0009).
+11. **Capstone — the tool broke its own runtime, live, and recovered only because the delete
+    was reversible.** The exact_duplicate apply ran for real, and within minutes this project's
+    own `.venv` stopped working: `import socket` failed. `socket.py` and 185 other files had
+    been recycle-binned from three shared Python interpreter installations (a uv-managed build,
+    `gcloud`'s bundled Python, the Android NDK's toolchain Python) because none of them are a
+    conda environment or a venv — no `conda-meta/`, no `pyvenv.cfg` — so the ADR-0008 protection
+    never recognized them as environments at all. A first, keyword-driven recovery pass found
+    and restored 71 files and looked complete; it wasn't. A systematic re-audit — re-running the
+    fixed detector against every one of the 10,134 applied files, not just the paths a keyword
+    scan thought to check — found 186 true violations, not 71. All 186 were recovered from the
+    Windows Recycle Bin by parsing its `$I`/`$R` index format directly (the project's own
+    restore command doesn't support Recycle Bin batches). Fixed twice, not once: first by adding
+    a marker to the environment detector (`python.exe` + a sibling `Lib/` directory — ADR-0009),
+    then by root-causing *why* marker-based detection was always going to be incomplete and
+    replacing it with structural detection by default (ADR-0010) — checking this project's OWN
+    `.venv` directly found that Windows venvs put their interpreter in `Scripts/`, not the venv
+    root, meaning even ADR-0009's fix would have missed a venv whose `pyvenv.cfg` ever went
+    missing. Nothing here proves the class of risk is closed; ADR-0010 says so explicitly.
 
-Bug 11 is the whole thesis in one incident: the estimate had already been corrected twice
-(bugs 9 and 10) by the time this ran, the pre-apply review had explicitly checked for exactly
-this class of risk and found zero violations, and it still happened — because the check that
-existed was precise about the environments it knew to look for, and this was one it didn't.
-Recycle Bin, chosen specifically for its recoverability and not because anything was expected to
-go wrong, is why the incident is a paragraph in a case study instead of a rebuilt machine.
+Bug 11 is the whole thesis in one incident, not a coda after it. The estimate had already been
+corrected twice (bugs 9 and 10) by the time this ran; the pre-apply review had explicitly
+checked for exactly this class of risk and found zero violations; and it still happened —
+because the check that existed was precise about the environments it knew to look for, and this
+was one it didn't. Every one of the ten bugs before it was caught by a human or a script
+watching a real run; this one was caught by the tool breaking something the person running it
+depended on. Recycle Bin, chosen specifically for its recoverability and not because anything
+was expected to go wrong, is the only reason this is a paragraph in a case study instead of a
+rebuilt development machine.
 
 ## Honest metrics
 
 | metric | value | source |
 |---|---|---|
-| Real disk-free reclaimed (measured, before/after `shutil.disk_usage`) | **36,216,430,592 bytes — 33.73GB** | sum of three real applies' own before/after deltas: `data/real-disk-run/real_apply_report.txt` (10,270,556,160), `redo_real_apply.txt` (20,349,280,256), `purge_real_apply.txt` (5,596,594,176) |
-| exact_duplicate, pending (Recycle Bin, not yet real free space) | 4,205,571,147 bytes — 3.92GB | `data/real-disk-run/final_reconciliation.txt` — net of 186 files restored per ADR-0009; real only once the Recycle Bin is emptied, disclosed separately, never summed into the figure above |
+| Real disk-free reclaimed (measured, before/after `shutil.disk_usage`) | **36,216,430,592 bytes — 33.73GB** | sum of three real applies' own before/after deltas: `data/real-disk-run/real_apply_report.txt` (10,270,556,160), `redo_real_apply.txt` (20,349,280,256), `purge_real_apply.txt` (5,596,594,176) — independently cross-checked byte-for-byte against the actual filesystem in `data/real-disk-run/headline_33_73GB_verification.txt`, not just the reports' own claims |
+| exact_duplicate, pending (Recycle Bin, not yet real free space) | 4,205,571,147 bytes — 3.92GB | `data/real-disk-run/final_reconciliation.txt` — net of 186 files restored per ADR-0009; real only once the Recycle Bin is emptied, disclosed separately, never summed into the headline above |
+| Unrelated vault content, also still pending (found while verifying the headline, not part of this apply) | 5,425,947,894 bytes — 5.05GB | `data/real-disk-run/quarantine/batch_1784296779_d5389247/` — 4 size-guard-downgraded `windows_temp` directories from an earlier apply, mid-30-day retention (expires 2026-08-16); confirmed on disk, confirmed excluded from the headline above, disclosed for completeness |
 | exact_duplicate candidates applied | 10,134 succeeded / 10,247 selected / 113 failed (all explained: access-denied, file-in-use, long-path, vanished-in-race) | `data/real-disk-run/exact_duplicate_real_apply.txt` |
 | Estimate corrections, same category | 48GB → 23.09GB → 4.26GB → 3.92GB | ADR-0006, ADR-0008, ADR-0009 |
 
 Every number above traces to a specific file in `data/real-disk-run/` produced by the actual
-run it describes — none of them is a recomputation or a rounded restatement. Nothing here is a
-final total: `model_caches` and several other reviewed categories remain unapplied by design,
-and the 3.92GB sitting in the Recycle Bin stays a pending number, not a freed one, until someone
-empties it.
+run it describes — none of them is a recomputation or a rounded restatement. The 33.73GB
+headline was independently re-derived from the raw before/after numbers, not copy-pasted from
+an earlier claim, specifically to check it wasn't quietly counting bytes that had only moved
+(vault or Recycle Bin) rather than been freed — it wasn't; both pending pools above are real,
+separate, and neither one is hiding inside it. Nothing here is a final total: `model_caches` and
+several other reviewed categories remain unapplied by design, and both pending figures above
+stay pending numbers, not freed ones, until someone empties them.
