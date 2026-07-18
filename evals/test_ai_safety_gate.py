@@ -196,6 +196,46 @@ def test_near_identical_track_without_a_keeper_is_browse_only_not_a_suggestion()
     assert cluster.suggests_deletion is False
 
 
+def test_near_dup_document_track_with_a_keeper_does_suggest_deletion() -> None:
+    """Feature 1b: NEAR_DUP_DOCUMENT joined the deletion-eligible set (spec §2: "deletion
+    suggestions only for high-similarity near-dups") — same mechanism as near-identical
+    images, proven the same way."""
+    keep = AIClusterMember(path=Path("report_v2.docx"), size_bytes=100, is_recommended_keep=True)
+    drop = AIClusterMember(path=Path("report_v2_copy.docx"), size_bytes=100)
+    cluster = AICluster(
+        cluster_id="doc-1",
+        track=AITrack.NEAR_DUP_DOCUMENT,
+        members=(keep, drop),
+        raw_score=0.05,
+        score_kind="minhash_jaccard_distance",
+        rationale="test",
+    )
+    assert cluster.suggests_deletion is True
+
+
+def test_version_chain_track_with_a_keeper_does_suggest_deletion() -> None:
+    """Feature 1b: VERSION_CHAIN joined the deletion-eligible set (spec §2: "recommend keeping
+    the latest, surface the older ones for review") — the latest version is the
+    `is_recommended_keep` member, older versions carry a `position` but no keep flag."""
+    v1 = AIClusterMember(path=Path("draft_v1.docx"), size_bytes=90, position=0)
+    v2 = AIClusterMember(path=Path("draft_v2.docx"), size_bytes=95, position=1)
+    final = AIClusterMember(
+        path=Path("draft_final.docx"),
+        size_bytes=100,
+        is_recommended_keep=True,
+        position=2,
+    )
+    chain = AICluster(
+        cluster_id="chain-1",
+        track=AITrack.VERSION_CHAIN,
+        members=(v1, v2, final),
+        raw_score=0.88,
+        score_kind="content_similarity",
+        rationale="test",
+    )
+    assert chain.suggests_deletion is True
+
+
 def test_review_queue_partitions_deletion_suggestions_from_browse_only() -> None:
     keep = AIClusterMember(path=Path("a.jpg"), size_bytes=100, is_recommended_keep=True)
     drop = AIClusterMember(path=Path("b.jpg"), size_bytes=100)

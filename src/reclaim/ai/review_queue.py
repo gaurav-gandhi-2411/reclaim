@@ -13,10 +13,11 @@ from reclaim.ai.models import AICluster
 @dataclass(slots=True)
 class AIReviewQueue:
     """In-memory holding area for AI-produced clusters, split into the two spec-mandated
-    views: deletion suggestions (near-identical track only) and everything else
-    (browse/ranking-only). No method here writes to disk, calls `apply_batch`, or otherwise
-    touches the deterministic engine — this class only accumulates and partitions data the
-    caller already computed.
+    views: deletion suggestions (tracks in `models._DELETION_SUGGESTION_ELIGIBLE_TRACKS` —
+    near-identical images, high-similarity document near-dups, version chains) and everything
+    else (browse/ranking-only). No method here writes to disk, calls `apply_batch`, or
+    otherwise touches the deterministic engine — this class only accumulates and partitions
+    data the caller already computed.
     """
 
     clusters: list[AICluster] = field(default_factory=list)
@@ -25,9 +26,9 @@ class AIReviewQueue:
         self.clusters.append(cluster)
 
     def deletion_suggestions(self) -> list[AICluster]:
-        """Near-identical clusters with an identified keep-best member — the only AI output
-        ever framed as a deletion suggestion, and even then, recommend-only: nothing in this
-        class (or anywhere in `reclaim.ai`) can act on it."""
+        """Clusters with an identified keep-best/keep-latest member on a deletion-eligible
+        track — the only AI output ever framed as a deletion suggestion, and even then,
+        recommend-only: nothing in this class (or anywhere in `reclaim.ai`) can act on it."""
         return [cluster for cluster in self.clusters if cluster.suggests_deletion]
 
     def browse_only(self) -> list[AICluster]:

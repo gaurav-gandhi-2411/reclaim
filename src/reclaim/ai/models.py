@@ -15,22 +15,25 @@ AI_CATEGORY_GROUP_PREFIX = "ai_"
 class AITrack(StrEnum):
     """Which AI pipeline produced a review-queue entry.
 
-    Only `NEAR_IDENTICAL_IMAGE` may ever carry a deletion suggestion (spec §0.7: "near-
-    identical ... may produce a deletion suggestion; semantic similarity is browse-grouping
-    only") — see `_DELETION_SUGGESTION_ELIGIBLE_TRACKS` and `AICluster.suggests_deletion`.
-    Every value here other than near-identical image dedup is a placeholder for a future
-    feature (1b/1a-Track-B/2/3); nothing produces them yet.
+    Only tracks in `_DELETION_SUGGESTION_ELIGIBLE_TRACKS` may ever carry a deletion
+    suggestion (spec §0.7/§2: "near-identical ... may produce a deletion suggestion; semantic
+    similarity is browse-grouping only" for images, and "deletion suggestions only for
+    high-similarity near-dups; version-chains are ordered recommendations" for documents) —
+    see `AICluster.suggests_deletion`. `SEMANTIC_IMAGE`/`SCREENSHOT_BURST`/`RANKED_CLUTTER`
+    remain browse/ranking-only placeholders for future features (1a-Track-B/2/3).
     """
 
     NEAR_IDENTICAL_IMAGE = "near_identical_image"  # Feature 1a Track A — deletion-eligible
     SEMANTIC_IMAGE = "semantic_image"  # Feature 1a Track B — browse-only, future
-    NEAR_DUP_DOCUMENT = "near_dup_document"  # Feature 1b — browse-only until re-scoped, future
-    VERSION_CHAIN = "version_chain"  # Feature 1b — ordered recommendation, future
+    NEAR_DUP_DOCUMENT = "near_dup_document"  # Feature 1b — deletion-eligible (high-similarity)
+    VERSION_CHAIN = "version_chain"  # Feature 1b — deletion-eligible (keep-latest recommendation)
     SCREENSHOT_BURST = "screenshot_burst"  # Feature 2 — browse-only, future
     RANKED_CLUTTER = "ranked_clutter"  # Feature 3 — ranking-only, future
 
 
-_DELETION_SUGGESTION_ELIGIBLE_TRACKS = frozenset({AITrack.NEAR_IDENTICAL_IMAGE})
+_DELETION_SUGGESTION_ELIGIBLE_TRACKS = frozenset(
+    {AITrack.NEAR_IDENTICAL_IMAGE, AITrack.NEAR_DUP_DOCUMENT, AITrack.VERSION_CHAIN}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,7 @@ class AIClusterMember:
     size_bytes: int
     quality_score: float | None = None  # keep-best scorer output, if computed for this member
     is_recommended_keep: bool = False
+    position: int | None = None  # VERSION_CHAIN only: 0-indexed chain order, oldest first
 
 
 @dataclass(frozen=True, slots=True)

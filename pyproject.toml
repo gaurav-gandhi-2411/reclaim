@@ -21,15 +21,19 @@ dependencies = [
 # Applied-AI layer (reclaim-ai-features-spec.md). The core deterministic tool installs and
 # runs without ANY of these — every import is lazy/guarded (reclaim.ai._optional.require),
 # so `pip install reclaim` alone never pulls these in. `pip install reclaim[ai]` /
-# `uv sync --extra ai` adds them. Grows incrementally as each spec feature lands — today only
-# Feature 1a Track A (pHash/dHash near-identical clustering + classical keep-best scorer)
-# needs anything; later features add their own deps here (datasketch for 1b, open-clip-torch
-# + hnswlib for 1a Track B, rapidocr/pytesseract for Feature 2, lightgbm for Feature 3),
-# each recorded with its license in the ADR that lands it (ADR-0011 covers the deps below).
+# `uv sync --extra ai` adds them. Grows incrementally as each spec feature lands — Feature 1a
+# Track A (pHash/dHash + classical keep-best) needs the first three; Feature 1b (MinHash/LSH
+# document near-dup + sentence-embedding residual + version-chain) adds the rest (ADR-0017
+# covers licenses). Still to come: open-clip-torch + hnswlib for 1a Track B, rapidocr/
+# pytesseract for Feature 2, lightgbm for Feature 3.
 ai = [
     "imagehash>=4.3",             # BSD-2-Clause — pHash/dHash perceptual hashing
     "opencv-python-headless>=4.9", # Apache-2.0 — Laplacian-variance sharpness scoring
     "pillow>=10.0",                # HPND (permissive) — image I/O, resolution/exposure checks
+    "datasketch>=1.6",             # MIT — MinHash/LSH near-dup prefilter (Feature 1b Stage 1)
+    "sentence-transformers>=3.0",  # Apache-2.0 — all-MiniLM-L6-v2 (Feature 1b Stage 2, residual only)
+    "python-docx>=1.1",            # MIT — local .docx text extraction, never logged
+    "pypdf>=5.0",                  # BSD-3-Clause — local .pdf text extraction, never logged
 ]
 
 [project.scripts]
