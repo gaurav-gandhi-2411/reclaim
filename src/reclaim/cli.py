@@ -8,11 +8,13 @@ from pathlib import Path
 from reclaim.config import load_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
+from reclaim.elevation import ElevatedProcessError, assert_not_elevated
 from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
     QuarantineMethod,
     RecycleBinRestoreUnsupportedError,
+    RestoreIntegrityError,
     SafetyInvariantError,
     apply_batch,
     restore_batch,
@@ -27,6 +29,26 @@ _DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
 _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
+
+# Literal loopback IPs only — deliberately excludes the hostname "localhost", since that's a
+# DNS/hosts-file lookup (uvicorn/the socket layer resolves it, not this code) and a tampered
+# hosts file could in principle point it somewhere non-loopback. This tool moves and deletes
+# files on command from whatever hits its API, so the bind address is a hard security boundary,
+# not a convenience default — see SECURITY_HOST_VALIDATION_ONLY_LITERAL_LOOPBACK_IPS.
+_ALLOWED_BIND_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+
+def _loopback_host(value: str) -> str:
+    """argparse `type=` for `--host`: fails fast at parse time, not deep inside `_run_serve`,
+    and can't be bypassed by any caller that goes through the CLI (including a future
+    `reclaim dashboard` subcommand reusing this same parser machinery)."""
+    if value not in _ALLOWED_BIND_HOSTS:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not an allowed bind address — reclaim serve must never be reachable "
+            "from the network (this tool moves and permanently deletes files on command from "
+            f"whatever hits its API). Allowed: {', '.join(sorted(_ALLOWED_BIND_HOSTS))}."
+        )
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -191,46 +213,79 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
     )
+    undo_parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine) — must match the "
+        "directory 'reclaim apply' actually vaulted into, since restore_batch validates every "
+        "manifest entry's vault_path resolves inside it before moving anything.",
+    )
+    undo_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing) — used to build the live SafetyValidator the pre-restore integrity check "
+        "runs against.",
+    )
 
     serve_parser = subparsers.add_parser(
         "serve",
-        help="Run the localhost-only FastAPI dashboard (scan/review/apply/undo in a browser).",
+        help="Run the localhost-only FastAPI dashboard (scan/review/apply/undo in a browser). "
+        "Does not open a browser tab for you — see 'dashboard' for that.",
     )
-    serve_parser.add_argument(
+    _add_serve_like_arguments(serve_parser)
+
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Same as 'serve', but also opens your default browser to the dashboard once the "
+        "server is up — the one-command way to launch Reclaim as an installed tool.",
+    )
+    _add_serve_like_arguments(dashboard_parser)
+
+    return parser
+
+
+def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
+    """Shared by `serve` and `dashboard` — identical bind/storage arguments, since `dashboard`
+    is `serve` plus an auto-opened browser tab (see `_run_dashboard`), not a different server."""
+    parser.add_argument(
         "--host",
+        type=_loopback_host,
         default=_DEFAULT_HOST,
-        help=f"Bind host (default: {_DEFAULT_HOST}). This tool moves/deletes files — never bind "
-        "0.0.0.0 or a non-loopback address unless you understand that risk.",
+        help=f"Bind host (default: {_DEFAULT_HOST}). Hard-enforced loopback-only — "
+        f"{', '.join(sorted(_ALLOWED_BIND_HOSTS))} are the only accepted values; this tool "
+        "moves and permanently deletes files and must never be reachable from the network.",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--port", type=int, default=_DEFAULT_PORT, help=f"Bind port (default: {_DEFAULT_PORT})."
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--db",
         type=Path,
         default=_DEFAULT_DB_PATH,
         help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--config",
         type=Path,
         default=_DEFAULT_CONFIG_PATH,
         help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
         "missing).",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--vault-dir",
         type=Path,
         default=None,
         help="Override the vault directory (default: data/quarantine).",
     )
-    serve_parser.add_argument(
+    parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
     )
-    return parser
 
 
 def _run_scan(args: argparse.Namespace) -> int:
@@ -347,6 +402,12 @@ def _print_materiality_exclusion(
 
 
 def _run_apply(args: argparse.Namespace) -> int:
+    try:
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
     root: Path = args.path
     if not root.is_dir():
         print(f"reclaim: apply path does not exist or is not a directory: {root}", file=sys.stderr)  # noqa: T201
@@ -430,31 +491,79 @@ def _run_apply(args: argparse.Namespace) -> int:
     return 0 if report.files_failed == 0 else 1
 
 
-def _run_serve(args: argparse.Namespace) -> int:
+def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
+    try:
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim serve: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
     # Imports deferred to inside the function: uvicorn/the FastAPI app are only needed for
-    # `reclaim serve`, so `scan`/`apply`/`undo` (and every existing test importing this module)
-    # never pay the FastAPI/uvicorn import cost.
+    # `reclaim serve`/`dashboard`, so `scan`/`apply`/`undo` (and every existing test importing
+    # this module) never pay the FastAPI/uvicorn import cost.
+    import threading
+    import webbrowser
+
     import uvicorn
 
     from reclaim.api.app import create_app
 
+    # Defense in depth: `_loopback_host` already gates this at argparse parse time for every
+    # real CLI invocation, but this function is also callable directly (tests, a future
+    # in-process caller) bypassing argparse entirely — re-validate here so there is no path to
+    # `uvicorn.run` with a non-loopback host regardless of caller.
+    _loopback_host(args.host)
+
     config_path: Path = args.config
     config = load_config(config_path if config_path.exists() else None)
     app = create_app(
-        db_path=args.db, config=config, vault_dir=args.vault_dir, manifest_path=args.manifest
+        db_path=args.db,
+        config=config,
+        vault_dir=args.vault_dir,
+        manifest_path=args.manifest,
+        host=args.host,
+        port=args.port,
     )
-    print(f"reclaim serve: http://{args.host}:{args.port} (Ctrl+C to stop)")  # noqa: T201
+    url = f"http://{args.host}:{args.port}"
+    print(f"reclaim serve: {url} (Ctrl+C to stop)")  # noqa: T201
+    if open_browser:
+        # uvicorn.run() blocks for the life of the server, so the browser is opened from a
+        # short-delayed background timer rather than after the call — by the time the delay
+        # elapses the server is up in the near-totality of real runs (startup is sub-second);
+        # if it isn't, the browser's own connection retry/error page covers the gap, same as
+        # opening a bookmark half a second before your server finishes starting normally would.
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
 
+def _run_dashboard(args: argparse.Namespace) -> int:
+    return _run_serve(args, open_browser=True)
+
+
 def _run_undo(args: argparse.Namespace) -> int:
     try:
-        report = restore_batch(args.batch_id, manifest_path=args.manifest)
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim undo: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    config_path: Path = args.config
+    config = load_config(config_path if config_path.exists() else None)
+    safety = SafetyValidator(config)
+
+    try:
+        report = restore_batch(
+            args.batch_id,
+            manifest_path=args.manifest,
+            vault_dir=args.vault_dir,
+            safety=safety,
+        )
     except (
         BatchNotFoundError,
         RecycleBinRestoreUnsupportedError,
         DirectDeleteRestoreImpossibleError,
+        RestoreIntegrityError,
     ) as exc:
         print(f"reclaim undo: {exc}", file=sys.stderr)  # noqa: T201
         return 1
@@ -473,6 +582,12 @@ def _run_undo(args: argparse.Namespace) -> int:
 
 
 def _run_purge(args: argparse.Namespace) -> int:
+    try:
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim purge: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
     config_path: Path = args.config
     config = load_config(config_path if config_path.exists() else None)
     safety = SafetyValidator(config)
@@ -528,6 +643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_purge(args)
     if args.command == "serve":
         return _run_serve(args)
+    if args.command == "dashboard":
+        return _run_dashboard(args)
     parser.error(f"unknown command: {args.command}")
     return 1
 

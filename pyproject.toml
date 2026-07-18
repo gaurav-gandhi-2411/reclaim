@@ -46,7 +46,10 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S108"]           # assert allowed in tests; predictable temp paths in fixtures
+"tests/**" = ["S101", "S108", "S104"]   # assert/temp paths in fixtures; S104 fires on the
+                                         # literal "0.0.0.0" strings these tests assert get
+                                         # REJECTED, not bound to (see test_cli.py's bind-gate
+                                         # tests) — the rule can't distinguish the two contexts.
 "evals/**" = ["S101", "S108"]
 "scripts/**" = ["T201"]                 # print() is fine in operational scripts
 

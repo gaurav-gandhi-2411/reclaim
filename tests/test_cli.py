@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
-from reclaim.cli import main
+from reclaim.cli import _build_parser, _run_serve, main
 
 
 def test_apply_dry_run_skips_duplicates_by_default(
@@ -147,3 +148,204 @@ def test_apply_include_categories_restricts_to_named_categories(
     assert "1/2 tier/root-eligible candidate(s) kept" in out
     assert "dev_artifact_pycache: count=1" in out
     assert "dev_artifact_node_modules" not in out
+
+
+# --- serve: hard loopback-only bind gate ------------------------------------------------------
+
+
+def test_serve_default_host_is_loopback() -> None:
+    """The default `--host` (no flag passed at all) must be a real loopback IP — this tool
+    moves and permanently deletes files on command from whatever hits its API."""
+    args = _build_parser().parse_args(["serve"])
+    assert args.host == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "::", "192.168.1.5", "10.0.0.1", "localhost", "example.com", "0000:0000::1"],
+)
+def test_serve_rejects_non_loopback_host_at_parse_time(host: str) -> None:
+    """`--host` is hard-gated at argparse parse time, before any server code ever runs — a
+    typo'd or malicious `0.0.0.0`/LAN address must never reach `uvicorn.run`. `localhost` is
+    deliberately rejected too (not just 0.0.0.0): it's a DNS/hosts-file lookup, not a literal
+    loopback IP, and a tampered hosts file could point it elsewhere."""
+    with pytest.raises(SystemExit) as exc_info:
+        _build_parser().parse_args(["serve", "--host", host])
+    assert exc_info.value.code == 2
+
+
+def test_serve_accepts_ipv6_loopback() -> None:
+    args = _build_parser().parse_args(["serve", "--host", "::1"])
+    assert args.host == "::1"
+
+
+def test_run_serve_revalidates_host_even_when_argparse_is_bypassed() -> None:
+    """Defense in depth: `_run_serve` re-checks its `args.host` itself, so a caller that builds
+    an `argparse.Namespace` directly (bypassing the CLI's own `type=` gate entirely) still can't
+    reach `uvicorn.run` with a non-loopback host."""
+    args = argparse.Namespace(
+        host="0.0.0.0",
+        port=8420,
+        db=Path("unused.sqlite3"),
+        config=Path("unused-config.toml"),
+        vault_dir=None,
+        manifest_path=None,
+    )
+    with pytest.raises(argparse.ArgumentTypeError):
+        _run_serve(args)
+
+
+# --- No-elevation guard: every mutating command refuses to run elevated ------------------------
+
+
+def test_apply_refuses_to_run_elevated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--apply"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
+    assert (root / "a.bin").exists()  # refused before touching anything
+
+
+def test_undo_refuses_to_run_elevated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["undo", "some-batch-id"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
+
+
+def test_purge_refuses_to_run_elevated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["purge"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
+
+
+def test_serve_refuses_to_run_elevated(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["serve"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
+
+
+def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read-only `scan` touches nothing and must never be blocked by the elevation guard —
+    only the mutating commands (apply/undo/purge/serve) check it."""
+
+    def _boom() -> None:
+        raise AssertionError("scan must never call assert_not_elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+
+
+# --- dashboard: serve + auto-open browser -------------------------------------------------------
+
+
+def test_dashboard_parses_with_the_same_defaults_as_serve() -> None:
+    serve_args = _build_parser().parse_args(["serve"])
+    dashboard_args = _build_parser().parse_args(["dashboard"])
+    for attr in ("host", "port", "db", "config", "vault_dir", "manifest"):
+        assert getattr(serve_args, attr) == getattr(dashboard_args, attr)
+
+
+def test_dashboard_rejects_non_loopback_host_same_as_serve() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        _build_parser().parse_args(["dashboard", "--host", "0.0.0.0"])
+    assert exc_info.value.code == 2
+
+
+def test_dashboard_opens_browser_and_delegates_to_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reclaim dashboard` must do exactly what `reclaim serve` does (same app, same bind
+    guard) plus open the dashboard URL in the default browser — proven here by mocking
+    `uvicorn.run` (never actually starts a server / blocks) and `webbrowser.open` (never
+    actually launches a browser) and asserting both were called with the right arguments."""
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    run_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: run_calls.append(kw))
+
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+
+    class _ImmediateTimer:
+        def __init__(
+            self, interval: float, function: object, args: tuple[object, ...] = ()
+        ) -> None:
+            self._function = function
+            self._args = args
+
+        def start(self) -> None:
+            self._function(*self._args)  # type: ignore[operator]
+
+    monkeypatch.setattr(threading, "Timer", _ImmediateTimer)
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["dashboard", "--db", str(db)])
+
+    assert exit_code == 0
+    assert opened == ["http://127.0.0.1:8420"]
+    assert run_calls == [{"host": "127.0.0.1", "port": 8420}]
+
+
+def test_dashboard_refuses_to_run_elevated(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["dashboard"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
