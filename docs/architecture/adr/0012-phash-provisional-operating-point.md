@@ -1,16 +1,25 @@
 # 0012. Feature 1a Track A: pHash operating point (MEASURED) + classical keep-best weights
 
-## Status update (see ADR-0015)
+## Status update (see ADR-0015, then the realistic-distribution follow-up below)
 
 **The `max_hamming_distance` operating point is promoted from PROVISIONAL to MEASURED as of
 ADR-0015.** It is now derived from a real PR curve over the public INRIA Copydays dataset (real,
 human-construction-verified ground truth — not synthetic, not LLM-labeled), not from the
 synthetic CI fixtures. The synthetic-fixture measurement below is kept in this ADR for history
 and because it still backs the fast, deterministic CI regression test — but it is no longer the
-basis for the shipped/production value. **Measured value: `max_hamming_distance = 14`,
-precision = 0.96, recall = 0.0764**, against 74,305 real pairs (314 positive) from Copydays'
-`original` + `strong` splits — see "Measured operating point (real, ADR-0015)" below for the
-full curve and the honest caveat about what that recall number does and doesn't represent.
+basis for the shipped/production value.
+
+**Second status update — the recall number above was measured on the WRONG distribution, and
+GG caught it.** ADR-0015's only reachable real data was Copydays' `strong` split — its single
+hardest, deliberately adversarial attack tier (print-and-scan/blur/paint), not representative
+of Feature 1a's actual target (ordinary consumer duplicate accumulation: re-saves, resizes,
+format conversions, messaging-app re-compression). Measuring recall against that tier alone and
+treating it as "the" operating distribution was flagged as not shippable. A follow-up
+measurement against a programmatically-generated REALISTIC distribution (see "Realistic-
+distribution measurement" below) found **precision = 0.9987, recall = 1.0000** at the same
+`max_hamming_distance = 14` — the earlier 0.0764 recall figure was real but was measuring the
+wrong thing, not revealing an actual pHash limitation. `max_hamming_distance = 14` is
+**reaffirmed**, now for the correct reason.
 
 ## Context
 
@@ -102,6 +111,121 @@ a direct, reliable measurement of false-positive risk on real data, which is the
 protects users from bad delete-suggestions and matters most for the "never delete on an AI
 hunch" hard gate.
 
+## Realistic-distribution measurement (follow-up — this is what actually governs the operating point)
+
+**Why this exists.** GG's read of the 0.0764 recall figure above was correct to distrust: a
+recall number is only meaningful relative to the distribution it was measured against, and
+`strong` is Copydays' single most adversarial tier by design — nobody's consumer photo library
+accumulates duplicates via deliberate print-and-scan or paint-filter attacks. The instruction
+was explicit: either recover Copydays' milder graduated splits, or generate the realistic
+transformations programmatically from clean real images with known ground truth — and re-measure
+recall per tier, not as one blended adversarial-only number.
+
+**A second search for the milder splits found nothing new.** Before generating anything,
+`copydays_jpeg`/`copydays_crop` were searched for again across Kaggle, Zenodo, Academic
+Torrents, the Wayback Machine (specifically for those two files, not just the tarball already
+tried in ADR-0015), and two more third-party dataset-hosting platforms (Graviti, TIB's LDM
+service) — none had them reachable. This confirms ADR-0015's original finding rather than
+reopening it; the programmatic-generation path is the one actually taken.
+
+**Generated a realistic distribution from Copydays' own 157 real originals.**
+`evals/ai_fixtures/build_realistic_recompression_tiers.py` applies five deterministic,
+named transform profiles to every real original photo — no synthetic drawn shapes, real
+photographic content throughout:
+
+| tier | profile | what it simulates |
+|---|---|---|
+| mild | `mild_recompress_q92` | re-export at the same size, high JPEG quality |
+| mild | `mild_resize_97_q90` | barely-perceptible downscale + high quality |
+| moderate | `moderate_resize_80_q70` | "resize to share" copy, moderate quality |
+| moderate | `moderate_roundtrip_png_q65` | two compression generations (edit-then-re-export) |
+| messaging_app | `messaging_app_resave` | WhatsApp/Instagram-style downscale to ≤1600px long edge, quality 75, metadata stripped |
+
+157 originals × 5 profiles = 785 real-content-derived positive pairs (each original vs. its own
+variant), with the existing `hard` tier (229 real Copydays `strong`-attack pairs) kept and
+reported alongside for honest comparison — never discarded, never blended into the distribution
+used to select the operating point. Negatives are the 12,246 real original-vs-original
+cross-block pairs (deliberately excluding any `strong`-tainted image from the negative pool —
+a heavily blurred/painted image could show an artificially large Hamming distance for reasons
+unrelated to genuine dissimilarity, which would inflate the realistic-distribution precision
+estimate if it leaked into "negative" pairs).
+
+Reproduce:
+```
+uv run pytest evals/test_ai_copydays_realistic_distribution.py -v -s
+```
+
+**Per-tier recall at the currently-locked threshold (`max_hamming_distance = 14`):**
+
+| tier | recall | pairs caught |
+|---|---:|---:|
+| mild | **1.0000** | 314/314 |
+| moderate | **1.0000** | 314/314 |
+| messaging_app | **1.0000** | 157/157 |
+| hard (Copydays `strong`, for comparison only) | 0.0961 | 22/229 |
+
+pHash catches **every single** mild/moderate/messaging-app-resave duplicate at the current
+threshold. The `hard` tier's 9.6% recall is real, honestly reported, and **irrelevant to Feature
+1a's actual target failure mode** — pHash was never expected to survive a deliberate anti-
+forensic attack, and Reclaim's target user doesn't produce print-and-scanned copies of their own
+phone photos by accident. Confirming `mild` recall exceeds `hard` recall is asserted as a
+regression-catching sanity check in the eval itself (an inversion would mean the hash pipeline
+is broken, not just that recall happens to be low).
+
+**Full precision-recall tradeoff on the realistic distribution** (mild+moderate+messaging_app
+positives, clean original-vs-original negatives; cumulative "every pair with distance ≤ X"):
+
+| max_hamming_distance | precision | recall |
+|---:|---:|---:|
+| 0 | 1.0000 | 0.9248 |
+| **2** | **1.0000** | **1.0000** |
+| 12 | 0.9987 | 1.0000 |
+| **14 (locked)** | **0.9987** | **1.0000** |
+| 16 | 0.9975 | 1.0000 |
+| 18 | 0.9849 | 1.0000 |
+| 20 | 0.9268 | 1.0000 |
+
+**Recall at precision ≥0.95 / ≥0.90 / ≥0.85 — all three collapse to the same point:**
+`max_hamming_distance = 2`, precision = 1.0000, recall = 1.0000. This isn't a copy-paste
+artifact: recall saturates at 1.0000 by distance 2 and precision stays at 1.0000 all the way to
+distance 10, so the highest-recall point clearing *any* of the three targets is the same point —
+there is no precision/recall tradeoff to make in this range at all, because recall has nothing
+left to gain.
+
+**Operating-point decision: KEEP `max_hamming_distance = 14`, and do NOT loosen toward a 0.90
+precision target.** GG's instruction asked to re-evaluate whether 0.90 precision might be a
+better operating point than 0.96, given the recommend-only human-confirmed review-queue design
+(a lower-precision, higher-recall point can be worth it when a human always double-checks
+before deletion). The realistic-distribution measurement answers this directly: **there is no
+recall to buy by loosening past distance 2.** Every point from distance 2 through at least
+distance 20 shows recall = 1.0000 on this measured set; loosening the threshold only trades away
+precision (1.0000 → 0.9268 by distance 20) for zero additional recall, which would only add more
+false positives to the human reviewer's queue for no offsetting benefit. The "0.90 precision
+buys meaningfully more recall" premise, which was reasonable to raise given the ADR-0015-only
+data, does not hold once the realistic distribution is the one being measured.
+
+Given that, why keep 14 instead of tightening to 2 (which shows the same perfect 1.0000/1.0000
+on this exact measured set)? **Deliberate margin beyond the 5 tested transform profiles.** These
+5 profiles don't exhaust real-world duplicate variation — a slightly more aggressive resave, a
+minor color/contrast edit, a different resize algorithm, a watermark, could plausibly push a
+real duplicate a few Hamming bits further than anything tested here. `max_hamming_distance = 14`
+retains the same measured precision (0.9987 — a difference of one single false positive across
+12,246 real negative pairs) while giving real headroom for duplicate variation this specific
+measurement didn't cover, consistent with the original margin reasoning from the synthetic-
+fixture era, now grounded in a real quantified cost (0.13 percentage points of precision) rather
+than an arbitrary guess.
+
+**Track B (CLIP embeddings) trigger: NOT triggered by this data.** The build brief asked this
+measurement to double as the "do embeddings earn their compute" decision input for Track A
+specifically. It does not: pHash already achieves near-perfect precision and perfect recall on
+the realistic near-identical/copy-detection distribution. There is no Track-A recall gap for
+embeddings to close. Track B's own motivation — semantic/viewpoint grouping (near-identical
+bursts, different photos of the same subject/scene) — is a genuinely different problem from
+copy/near-duplicate detection and remains independently justified on its own terms, not as a
+Track A recall rescue. If a real Track-A recall gap ever does appear (e.g. from GG's own
+gold-set labels showing a case these 5 synthetic profiles didn't cover), that would be the
+actual trigger — this measurement is not it.
+
 **Keep-best, measured on the same real dataset.** `evals/test_ai_copydays_gold.py::
 test_keep_best_against_copydays_original_vs_attacked` uses Copydays' 157 original-vs-attacked
 blocks as real (non-fabricated, non-LLM) keep-best ground truth — the unmodified original is
@@ -138,26 +262,37 @@ evidence the weights were never the problem, the fixture's realism was.
 
 ## Consequences
 
-- **`max_hamming_distance = 14` may now be cited as Reclaim's MEASURED near-identical
-  operating point**, sourced from a real, human-construction-verified public dataset
-  (ADR-0015) — with the recall caveat above stated alongside it every time, since precision and
-  recall tell honestly different stories on this particular real measurement. The old
-  "provisional, synthetic-fixture-derived" qualifier no longer applies to this number.
+- **`max_hamming_distance = 14` is Reclaim's MEASURED near-identical operating point**, and —
+  as of the realistic-distribution follow-up — may be cited with confidence on the distribution
+  that actually matters: precision 0.9987, recall 1.0000 on mild/moderate/messaging-app-style
+  consumer duplicates. The `hard`-tier-only figures (precision 0.9600, recall 0.0764) remain in
+  this ADR for the record and must always carry the "Copydays' adversarial `strong` tier only,
+  not the operating distribution" qualifier if cited at all — user-facing copy should cite the
+  realistic-distribution numbers, not the hard-tier ones.
 - Whether `max_hamming_distance` generalizes as a single global constant vs. needing
   per-content-type tuning remains open. GG's own gold-set labeling (ADR-0014's tool, still
-  unrun as of this ADR) would add a second, independent, consumer-realistic real-data point —
-  if it disagrees materially with this measurement, that disagreement is itself the signal to
+  unrun as of this ADR) would add a third, independent, real-photo-library data point — if it
+  disagrees materially with either measurement here, that disagreement is itself the signal to
   investigate, not a reason to prefer one source over the other by default.
+- The realistic-distribution measurement is itself bounded by the 5 transform profiles tested
+  (see `build_realistic_recompression_tiers.py`) — real duplicate variation could exceed what
+  those 5 profiles cover. `max_hamming_distance = 14`'s margin above the bare-minimum-2 needed
+  for these specific profiles is the disclosed mitigation, not a claim that 5 profiles are
+  exhaustive. GG's own gold-set labels remain the strongest available check on this.
 - Re-acquiring Copydays' `jpeg`/`crop` splits (or an equivalent milder, graduated-severity
-  public source) from a different mirror is an explicit, disclosed follow-up that would let this
-  measurement's recall number be re-derived on a distribution closer to Feature 1a's actual
-  target use case.
+  public source) remains a nice-to-have, not a blocker — the programmatically-generated
+  realistic distribution already answers the question those splits would have answered, and a
+  second search pass for them (ADR-0012's realistic-distribution follow-up) confirmed they're
+  still not reachable on any checked mirror.
 - The classical scorer's weights remain a documented, inspectable formula, never presented as
   a calibrated confidence score (spec §0.6) — `combined` is explicitly labeled as a ranking
   signal, not a probability, everywhere it's used. They are now real-data-checked (0.8726 top-1
   agreement, 1.0 safety rate on Copydays) in addition to directionally-correct-by-construction
   on synthetic fixtures — still not re-fit to either, per the "directional, not fit" reasoning
   above, which continues to hold.
+- Track B (CLIP embeddings) is NOT triggered by Track A's measured performance — see the
+  realistic-distribution section above. It remains a separately-justified, on-hold build-order
+  item for its own semantic-grouping mission, not a recall rescue for Track A.
 
 ## Alternatives considered
 
@@ -178,7 +313,11 @@ metric, keep-best top-1 agreement, end-to-end orchestration with a safety-filter
 `tests/test_ai_phash.py` (7 cases), `tests/test_ai_keep_best.py` (6 cases).
 
 **Real (local, on-demand, not in CI — see ADR-0015):** `evals/test_ai_copydays_gold.py` (2
-cases: the real PR curve + operating-point selection, and keep-best top-1/safety/disagreement
-reporting), against the actual downloaded INRIA Copydays dataset. This is the source of every
-MEASURED number in this ADR; the synthetic suite continues to serve as the fast CI regression
-gate at the value this real suite established.
+cases: the real PR curve + operating-point selection against Copydays' `hard` tier, and
+keep-best top-1/safety/disagreement reporting), against the actual downloaded INRIA Copydays
+dataset. `evals/test_ai_copydays_realistic_distribution.py` (1 case: per-tier recall at the
+locked threshold + the realistic-distribution PR tradeoff), against Copydays' 157 real originals
+plus 785 programmatically-generated realistic variants
+(`evals/ai_fixtures/build_realistic_recompression_tiers.py`). Together these are the source of
+every MEASURED number in this ADR; the synthetic suite continues to serve as the fast CI
+regression gate at the value this real suite established.

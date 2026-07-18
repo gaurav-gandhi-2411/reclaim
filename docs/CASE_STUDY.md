@@ -324,6 +324,47 @@ grant does for Copydays. Skipped, with the reasoning recorded in ADR-0015 rather
 dropped — the more operationally important half of the instruction (real preference ground
 truth, disagreements surfaced not fabricated) was still fully delivered.
 
+## A measured number can still be measuring the wrong thing
+
+The Copydays measurement above shipped a real number — 0.0764 recall — and it was genuinely
+measured, not fabricated. It was also, on its own, misleading, and catching that is its own
+small case study in why "we ran a real eval" isn't the same claim as "we ran the right eval."
+
+**The catch.** The only real gold data reachable turned out to be Copydays' `strong` split —
+the dataset's single hardest, deliberately adversarial attack tier (print-and-scan, blur,
+paint: built to test whether an algorithm survives someone actively *trying* to defeat copy
+detection). Feature 1a's actual job is nothing like that — it's catching a photo library's
+ordinary duplicate accumulation: a re-save, a resize, a messaging-app re-compression. The
+0.0764 recall figure was real, reproducible, and completely uninformative about the thing
+Feature 1a actually needs to do well at. Trusting it as-is would have meant either shipping a
+feature that looks worse than it is, or — worse — tuning the threshold to chase recall on a
+distribution nobody will ever actually hit.
+
+**The fix wasn't to re-tune the threshold — it was to fix what was being measured.** Copydays'
+own milder splits (graduated JPEG-quality and crop ladders, which would have been the right
+comparison) turned out to be unreachable on every mirror tried, including a second search pass
+specifically for those two files. So the realistic distribution was built directly: five named,
+deterministic transforms — light re-save, moderate resize+recompress, a PNG round-trip
+simulating a re-edit, and a WhatsApp/Instagram-style resave (downscale to a max long edge,
+moderate quality, metadata stripped) — applied to Copydays' own 157 real photos, not synthetic
+drawn shapes. Real photographic content, programmatically and deterministically attacked in
+ways that actually resemble what a phone's camera roll accumulates.
+
+**The result flipped the entire read of the feature.** At the exact same locked threshold,
+recall on the realistic distribution was 1.0000 — not a typo, every one of 785 mild/moderate/
+messaging-app duplicate pairs caught, at precision 0.9987. The `hard`-tier number wasn't wrong;
+it was answering a question nobody needed answered. This also settled a second, harder
+question cleanly: whether to loosen the threshold toward 90% precision for more recall, since
+every AI suggestion is human-confirmed before deletion anyway. The realistic curve showed there
+was no recall left to buy past a very tight threshold — precision stayed at 1.0000 all the way
+out past where recall had already saturated. Loosening further would only have added false
+positives to the review queue for zero benefit. And it answered a third question that wasn't
+even being asked yet: whether pHash's limitations were the empirical trigger to justify CLIP
+embeddings (Track B). They weren't — pHash's ceiling on the distribution that matters is
+already close to perfect, so embeddings would be solving a problem Track A doesn't have.
+Track B remains justified on its own separate merits (semantic grouping is a different problem
+than copy detection), not as a rescue for a gap that this measurement shows doesn't exist.
+
 ## Honest metrics
 
 | metric | value | source |

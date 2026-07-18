@@ -1088,6 +1088,43 @@ retention + restore, now with an explicit `purge` command for expired entries.
   closes on the public dataset" — 1a's operating point is now closed on the public dataset.
   Next build-order item unblocked but not started this session.
 
+### 2026-07-19 — Recall 0.0764 was a dataset artifact, not a pHash limitation; resolved
+- GG caught a real problem in the measurement above before trusting it: 0.0764 recall was
+  measured ONLY against Copydays' `strong` split — its single hardest, deliberately adversarial
+  attack tier (print-and-scan/blur/paint), not Feature 1a's actual target (ordinary consumer
+  duplicate accumulation). Flagged as not shippable until resolved: recover the milder
+  graduated splits, or generate the realistic transformations programmatically with known
+  ground truth, and report recall per tier plus the full precision/recall tradeoff, not just
+  the single ≥0.95 point.
+- Second search for Copydays' `jpeg`/`crop` splits (Kaggle, Zenodo, Academic Torrents, Wayback
+  Machine for those two specific files, two more mirror platforms) confirmed ADR-0015's
+  original finding — still unreachable. Went with programmatic generation instead, applied to
+  Copydays' own 157 REAL original photos (not synthetic drawn shapes):
+  `evals/ai_fixtures/build_realistic_recompression_tiers.py` — 5 deterministic, named profiles
+  (mild recompress, mild resize, moderate resize+recompress, moderate PNG round-trip,
+  messaging-app-style resave: downscale to ≤1600px, quality 75, metadata stripped) = 785
+  realistic positive pairs from real photographic content.
+- **Result: at the same locked threshold (14), recall on mild/moderate/messaging_app is
+  1.0000/1.0000/1.0000 (was 0.0764 measuring the wrong distribution) with precision 0.9987.**
+  The `hard` (Copydays `strong`) tier's 9.6% recall is real, kept, reported separately — and
+  confirmed irrelevant to Feature 1a's actual target failure mode, not a feature gap.
+- Full realistic-distribution PR tradeoff computed at precision ≥0.95/0.90/0.85 — all three
+  collapse to the same point (distance 2, precision 1.0, recall 1.0), since recall saturates at
+  1.0 well before precision would need to drop that far. Conclusion: no case for loosening
+  toward 0.90 precision — there's no recall left to buy, only false positives to add.
+  `max_hamming_distance = 14` reaffirmed, now justified as deliberate margin (0.13 points of
+  precision) beyond the bare-minimum-2 needed for the 5 tested profiles, not as a
+  precision/recall compromise.
+- Track B (CLIP) trigger assessed and NOT triggered: pHash already achieves near-perfect
+  precision+recall on the realistic distribution, so there's no Track-A recall gap for
+  embeddings to close. Track B remains independently justified by its own semantic-grouping
+  mission, not by a rescue need that doesn't exist. Recorded as the actual answer to the "do
+  embeddings earn their compute" question for Track A specifically.
+- ADR-0012 rewritten with the realistic-distribution section, per-tier table, full tradeoff,
+  and the operating-point rationale tied to the recommend-only review-queue design. New files:
+  `evals/ai_fixtures/build_realistic_recompression_tiers.py`,
+  `evals/test_ai_copydays_realistic_distribution.py`.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
