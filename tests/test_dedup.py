@@ -24,6 +24,9 @@ from reclaim.dedup import (
     _dedup_ineligibility_reason,
     _due,
     _environment_root,
+    _has_interpreter_bin_dir,
+    _has_python_executable,
+    _has_site_packages,
     _hash_with_guard,
     _hf_cache_object_root,
     _is_cross_environment_duplicate,
@@ -797,6 +800,97 @@ def test_environment_root_identifies_standalone_python_install_via_exe_and_lib(
     lonely_lib = tmp_path / "SomeProject" / "Lib" / "file.py"
     lonely_lib.parent.mkdir(parents=True)
     assert _environment_root(lonely_lib) is None
+
+
+# --- ADR-0010: structural detection (the 3 environments ADR-0009's marker-only fix still missed)
+
+
+def test_has_python_executable_true_only_with_a_real_sibling_exe(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "python.exe").write_bytes(b"x")
+    assert _has_python_executable(real) is True
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _has_python_executable(empty) is False
+
+
+def test_has_interpreter_bin_dir_finds_windows_scripts_and_posix_bin(tmp_path: Path) -> None:
+    windows_style = tmp_path / "windows_venv"
+    (windows_style / "Scripts").mkdir(parents=True)
+    (windows_style / "Scripts" / "python.exe").write_bytes(b"x")
+    assert _has_interpreter_bin_dir(windows_style) is True
+
+    posix_style = tmp_path / "posix_style"
+    (posix_style / "bin").mkdir(parents=True)
+    (posix_style / "bin" / "python3").write_bytes(b"x")
+    assert _has_interpreter_bin_dir(posix_style) is True
+
+    empty_scripts = tmp_path / "empty_scripts"
+    (empty_scripts / "Scripts").mkdir(parents=True)
+    assert _has_interpreter_bin_dir(empty_scripts) is False  # dir exists but no interpreter in it
+
+
+def test_has_site_packages_finds_windows_and_posix_layout(tmp_path: Path) -> None:
+    windows_style = tmp_path / "windows_env"
+    (windows_style / "Lib" / "site-packages").mkdir(parents=True)
+    assert _has_site_packages(windows_style) is True
+
+    posix_style = tmp_path / "posix_env"
+    (posix_style / "lib" / "site-packages").mkdir(parents=True)
+    assert _has_site_packages(posix_style) is True
+
+    no_site_packages = tmp_path / "no_site_packages"
+    (no_site_packages / "Lib").mkdir(parents=True)
+    assert _has_site_packages(no_site_packages) is False
+
+
+def test_environment_root_protects_venv_via_scripts_dir_even_without_pyvenv_cfg(
+    tmp_path: Path,
+) -> None:
+    """ADR-0010: the residual risk ADR-0009 left open, closed. A real Windows `venv` puts its
+    interpreter in `Scripts/`, not the environment root (confirmed against this project's OWN
+    `.venv`: no `python.exe` at its root, only `Scripts/python.exe` + `pyvenv.cfg`). If
+    `pyvenv.cfg` is ever missing, stripped, or unwritten by a nonstandard tool, ADR-0009's
+    python.exe-at-root-only check would have missed it entirely -- this fixture has NO
+    `pyvenv.cfg` and NO `conda-meta/`, relying solely on the new `Scripts/` structural signal."""
+    venv_like = tmp_path / "project" / ".venv_no_marker"
+    (venv_like / "Scripts").mkdir(parents=True)
+    (venv_like / "Scripts" / "python.exe").write_bytes(b"x")
+    site_packages_file = venv_like / "Lib" / "site-packages" / "requests" / "__init__.py"
+    site_packages_file.parent.mkdir(parents=True)
+    site_packages_file.write_text("# requests")
+
+    assert _environment_root(site_packages_file) == venv_like
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "relative_stdlib_path"),
+    [
+        # Real shape #1: this project's real incident (uv-managed Python build under
+        # ~/AppData/Roaming/uv/python/<build>/ -- no conda-meta/, no pyvenv.cfg).
+        ("uv_managed_build", "Lib/socket.py"),
+        # Real shape #2: gcloud's bundled Python (~/AppData/Local/Google/Cloud SDK/
+        # google-cloud-sdk/platform/bundledpython/ -- no conda-meta/, no pyvenv.cfg).
+        ("gcloud_bundled_python", "Lib/site-packages/pip/_vendor/rich/align.py"),
+        # Real shape #3: Android NDK's toolchain Python (~/sdks/android-sdk/ndk/<ver>/
+        # toolchains/llvm/prebuilt/windows-x86_64/python3/ -- no conda-meta/, no pyvenv.cfg).
+        ("ndk_toolchain_python3", "Lib/lib2to3/fixes/fix_execfile.py"),
+    ],
+)
+def test_environment_root_catches_all_three_real_environments_adr_0009_missed(
+    tmp_path: Path, fixture_name: str, relative_stdlib_path: str
+) -> None:
+    """ADR-0010 regression fixtures for the exact 3 shared installations the real ADR-0009
+    incident lost files from. Each is a real standalone CPython distribution with `python.exe`
+    directly at its root and neither `conda-meta/` nor `pyvenv.cfg` -- confirmed against the
+    real directory listings on the machine the incident happened on, not assumed."""
+    install_root = _make_standalone_python_install(tmp_path / fixture_name)
+    stdlib_file = install_root / Path(relative_stdlib_path)
+    stdlib_file.parent.mkdir(parents=True, exist_ok=True)
+    stdlib_file.write_text("# stdlib or vendored file")
+    assert _environment_root(stdlib_file) == install_root
 
 
 def test_is_cross_environment_duplicate_true_for_different_envs_false_for_same_or_cache(

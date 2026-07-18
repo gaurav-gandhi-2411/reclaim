@@ -110,6 +110,22 @@ per candidate, never a whole-disk walk).
   that could exist on some other machine, or on this one in a category `exact_duplicate` hasn't
   touched yet — the keyword scan in this ADR's Context section already proved that kind of
   enumeration is exactly the failure mode this fix replaces with a structural test.
+- **Residual risk, found on later review and closed by ADR-0010 — stated plainly, not
+  glossed over.** This ADR's own fix (`python.exe`/`pythonw.exe` directly in the root, alongside
+  `Lib/`) is itself still marker-dependent in one sense: it assumes the interpreter binary sits
+  at the environment's own root. That assumption holds for every install this incident actually
+  touched (conda base/env, the uv-managed build, `gcloud`'s bundled Python, the Android NDK's
+  toolchain Python — confirmed against each one's real directory listing), but it does NOT hold
+  for the standard Windows `venv` layout, which puts the interpreter in `Scripts/`, not the venv
+  root — confirmed against this very project's own `.venv`, which has no `python.exe` at its
+  root at all. This project's `.venv` was never actually at risk (its real `pyvenv.cfg` already
+  protected it, both before and after this ADR), but the finding stands on its own: **marker-file
+  detection is not, and was never claimed to be, a complete defense** — `exact_duplicate` cannot
+  be proven safe against an arbitrary embedded Python or runtime environment whose marker file is
+  missing, corrupted, or simply never written by a tool this codebase knows to check for. ADR-0010
+  replaces marker-only detection with structure-first detection (interpreter binary, `Scripts/`/
+  `bin/` directory, or `site-packages` — any one sufficient) as the new default, specifically to
+  stop depending on tools remembering to leave a marker behind at all.
 
 ## Alternatives considered
 

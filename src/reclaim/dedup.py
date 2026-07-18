@@ -185,35 +185,86 @@ def _is_model_cache_path(path: Path, model_cache_roots: Sequence[Path]) -> bool:
 # check would have left nearly all of them unprotected.
 _CONDA_MARKER_DIRNAME = "conda-meta"
 _VENV_MARKER_FILENAME = "pyvenv.cfg"
-# ADR-0009: a standalone Python interpreter *installation* (not itself a conda env or a venv —
-# e.g. a uv-managed Python build under `~/AppData/Roaming/uv/python/<build>/`, or any other
-# system/user-level Python install) has neither `conda-meta/` nor `pyvenv.cfg`, but is structured
-# identically to one at the filesystem level: `python.exe`/`pythonw.exe` directly in the root,
-# alongside a `Lib/` directory. This is the general, tool-agnostic signature of "a complete
-# CPython installation lives here" — catches uv's managed builds (which the two markers above
-# miss entirely) without being specific to uv.
 _PYTHON_EXECUTABLE_NAMES = ("python.exe", "pythonw.exe")
+# ADR-0010: `bin/Scripts`-style layouts put the interpreter in a subdirectory, not the
+# environment root itself (the real, Windows-standard `venv` layout: `<venv>/Scripts/python.exe`,
+# not `<venv>/python.exe` — confirmed against this project's OWN `.venv`, which has no
+# interpreter binary at its root at all, only `Scripts/` and `pyvenv.cfg`). `bin/` is the POSIX
+# name for the same concept, checked too since some cross-platform/embedded distributions use it
+# even under Windows.
+_INTERPRETER_BIN_DIRNAMES = ("Scripts", "bin")
+_POSIX_PYTHON_EXECUTABLE_NAMES = ("python", "python3")
 _PYTHON_STDLIB_DIRNAME = "Lib"
+_SITE_PACKAGES_DIRNAME = "site-packages"
+
+
+def _has_python_executable(directory: Path) -> bool:
+    """ADR-0009/0010: `python.exe`/`pythonw.exe` directly in `directory` — the layout every
+    standalone CPython installation this project has found on real disk uses (conda base/env,
+    a uv-managed build, `gcloud`'s bundled Python, the Android NDK's toolchain Python, and a
+    plain `python.org` installer all put the interpreter directly at their own root)."""
+    try:
+        return any((directory / name).is_file() for name in _PYTHON_EXECUTABLE_NAMES)
+    except OSError:
+        return False
+
+
+def _has_interpreter_bin_dir(directory: Path) -> bool:
+    """ADR-0010: a `Scripts/`or `bin/` child directory that itself holds an interpreter binary —
+    the layout `venv`-created environments use on Windows (`Scripts/`) and POSIX (`bin/`).
+    Catches an environment whose `pyvenv.cfg` is missing, corrupted, or was never written by a
+    tool this function already recognizes by marker file — structural detection as the fallback,
+    not the norm."""
+    for bin_dirname in _INTERPRETER_BIN_DIRNAMES:
+        bin_dir = directory / bin_dirname
+        try:
+            if not bin_dir.is_dir():
+                continue
+            if any((bin_dir / name).is_file() for name in _PYTHON_EXECUTABLE_NAMES):
+                return True
+            if any((bin_dir / name).is_file() for name in _POSIX_PYTHON_EXECUTABLE_NAMES):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _has_site_packages(directory: Path) -> bool:
+    """ADR-0010: a `site-packages/` directory at its canonical nested location —
+    `Lib/site-packages` (Windows) or `lib/site-packages` (POSIX-style embedded layouts) —
+    directly under `directory`. `site-packages` existing at all is itself proof `directory` is
+    (or was built as) a Python environment root, independent of whether its interpreter binary
+    is still present, findable, or in a location this function otherwise recognizes."""
+    for lib_dirname in (_PYTHON_STDLIB_DIRNAME, _PYTHON_STDLIB_DIRNAME.lower()):
+        try:
+            if (directory / lib_dirname / _SITE_PACKAGES_DIRNAME).is_dir():
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _environment_root(path: Path) -> Path | None:
     """The root directory of the Python environment `path` lives inside (a conda base install, a
     named conda `envs/<name>`, a `venv`/`.venv`, or a standalone Python installation), if any.
     Walks UP from `path` looking for the nearest ancestor that IS an environment/installation
-    root, identified by the same canonical marker each tool uses to recognize its own
-    environments: a `conda-meta/` subdirectory (conda base or named env), a `pyvenv.cfg` file
-    (venv), or a `python.exe`/`pythonw.exe` + `Lib/` pair (any standalone CPython installation,
-    including ones neither conda nor venv manages — ADR-0009) — robust regardless of which
-    subdirectory inside the environment `path` happens to live in, unlike a `Lib/site-packages`-
-    only name check. Bounded to the ancestors of one file already in a small candidate cluster —
-    never a directory walk over the whole disk.
+    root, identified by any ONE of several signals, in priority order: a `conda-meta/`
+    subdirectory (conda base or named env), a `pyvenv.cfg` file (venv) — both canonical marker
+    files each tool writes for itself — or, ADR-0010, one of three STRUCTURAL signals that don't
+    depend on any tool having written a marker at all: a Python executable directly in the
+    directory, a `Scripts/`/`bin/` subdirectory holding one, or a `Lib/site-packages` (or
+    `lib/site-packages`) subdirectory. Marker-file detection alone is NOT a complete defense —
+    see ADR-0009's own incident and ADR-0010's honest accounting of it — so structural detection
+    is the default here, not an opt-in fallback. Bounded to the ancestors of one file already in
+    a small candidate cluster — never a directory walk over the whole disk.
 
     Conda's own `pkgs/` extraction cache is deliberately excluded up front (short-circuited
     before the walk, via the well-known `pkgs` path segment): it's a package-manager cache
     (analogous to pip/uv's own caches), not a live environment, and reclaiming a duplicate out of
     it is exactly as safe as any other package-cache reclaim already handled by `package_caches`.
     Without this, a `pkgs/<extracted-package>/...` path would otherwise walk up into the conda
-    installation's own `conda-meta/` and be misidentified as belonging to the BASE environment.
+    installation's own `conda-meta/` (or match its own bundled `Lib/site-packages`/interpreter
+    layout) and be misidentified as a live environment rather than a cache entry.
     """
     if any(part.lower() == "pkgs" for part in path.parts):
         return None
@@ -223,8 +274,10 @@ def _environment_root(path: Path) -> Path | None:
                 ancestor / _VENV_MARKER_FILENAME
             ).is_file():
                 return ancestor
-            if (ancestor / _PYTHON_STDLIB_DIRNAME).is_dir() and any(
-                (ancestor / exe_name).is_file() for exe_name in _PYTHON_EXECUTABLE_NAMES
+            if (
+                _has_python_executable(ancestor)
+                or _has_interpreter_bin_dir(ancestor)
+                or _has_site_packages(ancestor)
             ):
                 return ancestor
         except OSError:
