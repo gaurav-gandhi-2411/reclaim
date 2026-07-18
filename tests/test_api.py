@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from reclaim.api import security
 from reclaim.api.app import create_app
 from reclaim.config import (
     CategoriesConfig,
@@ -54,14 +55,33 @@ def _write(path: Path, content: bytes, *, mtime: float = _NOW) -> None:
     os.utime(path, (mtime, mtime))
 
 
+_TEST_HOST = "127.0.0.1"
+_TEST_PORT = 8420
+
+
 def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
+    """Every test in this file exercises the real `local_origin_violation` guard (rule: local-
+    API hardening), not a bypassed one — `base_url` makes httpx send a `Host` header matching
+    what `create_app` was told it's bound to, and the default `headers=` carries the real
+    per-process CSRF token, so every `client.get`/`client.post` call site below needs no
+    changes at all. Tests that want to exercise a *rejected* request build their own client
+    (or override a header) explicitly — see the `local_origin_violation`-specific tests at the
+    end of this file.
+    """
     app = create_app(
         db_path=tmp_path / "index.sqlite3",
         config=config,
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
     )
-    return TestClient(app)
+    csrf_token: str = app.state.reclaim.csrf_token
+    return TestClient(
+        app,
+        base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
+        headers={security.CSRF_HEADER_NAME: csrf_token},
+    )
 
 
 # --- Empty state (no scan yet) ---------------------------------------------------------------
@@ -452,3 +472,109 @@ def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
     # separately-worded UI string — identical wording to what the listing endpoint already
     # showed (same recycle_bin entry count feeds both).
     assert restore_response.json()["detail"] == batch["restore_blocked_reason"]
+
+
+# --- Local-origin guard: CSRF token + Host/Origin (DNS-rebinding) hardening -------------------
+
+
+def test_mutating_request_without_csrf_token_is_rejected(tmp_path: Path) -> None:
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    # No default headers at all — simulates any request that never read the dashboard's own
+    # <meta> tag (a cross-origin page has no way to read it; this is the exact case CSRF
+    # protection exists for).
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.post("/api/scan", json={"path": str(tmp_path)})
+    assert response.status_code == 403
+    assert "CSRF" in response.json()["detail"]
+
+
+def test_mutating_request_with_wrong_csrf_token_is_rejected(tmp_path: Path) -> None:
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    client = TestClient(
+        app,
+        base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
+        headers={security.CSRF_HEADER_NAME: "not-the-real-token"},
+    )
+
+    response = client.post("/api/scan", json={"path": str(tmp_path)})
+    assert response.status_code == 403
+    assert "CSRF" in response.json()["detail"]
+
+
+def test_read_only_request_needs_no_csrf_token(tmp_path: Path) -> None:
+    """GET is never mutating — a bare client (no CSRF header at all) must still be able to read,
+    as long as its Host header matches (see the DNS-rebinding tests below for what does gate
+    reads)."""
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.get("/api/summary")
+    assert response.status_code == 200
+
+
+def test_request_with_mismatched_host_header_is_rejected(tmp_path: Path) -> None:
+    """DNS-rebinding defense: a request whose `Host` header doesn't name the exact loopback
+    authority this process is bound to is refused outright, even for a read-only GET — this is
+    exactly the shape of a successful DNS-rebinding attack (the browser's `fetch` genuinely
+    connects to 127.0.0.1, but the `Host` header it sends still carries the attacker's original
+    hostname)."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/summary", headers={"host": "evil.example.com"})
+    assert response.status_code == 403
+    assert "Host header" in response.json()["detail"]
+
+
+def test_request_with_mismatched_origin_header_is_rejected(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/summary", headers={"origin": "http://evil.example.com"})
+    assert response.status_code == 403
+    assert "Origin header" in response.json()["detail"]
+
+
+def test_request_with_matching_origin_header_is_accepted(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/summary", headers={"origin": f"http://{_TEST_HOST}:{_TEST_PORT}"})
+    assert response.status_code == 200
+
+
+def test_non_api_paths_are_not_guarded(tmp_path: Path) -> None:
+    """The static dashboard shell (`/`, `/static/*`) carries no per-user data — the guard is
+    deliberately scoped to `/api` only, so a mismatched Host there is not itself a 403 (the
+    browser still can't do anything useful with it without a valid CSRF token on the API)."""
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.get("/", headers={"host": "evil.example.com"})
+    assert response.status_code == 200

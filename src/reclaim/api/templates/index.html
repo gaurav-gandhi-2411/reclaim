@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Per-process CSRF token (reclaim.api.security) — app.js reads this and sends it back as
+       the X-Reclaim-CSRF-Token header on every mutating /api request. A cross-origin page has
+       no way to read this tag (same-origin policy), so it can't forge the header either. -->
+  <meta name="reclaim-csrf-token" content="{{ csrf_token }}" />
   <title>Reclaim — Disk Cleanup</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
   <link rel="stylesheet" href="/static/tokens.css" />

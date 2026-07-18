@@ -34,6 +34,12 @@ function updateThemeButtonLabel() {
 
 // --- Fetch helper -------------------------------------------------------------------------------
 
+// Read once at module load from the <meta> tag reclaim.api.app's index() route renders — a
+// cross-origin page can't read this tag (same-origin policy), so it can't forge the header
+// reclaim.api.security requires on every mutating request either. See CSRF_HEADER_NAME there.
+const CSRF_HEADER_NAME = "X-Reclaim-CSRF-Token";
+const CSRF_TOKEN = document.querySelector('meta[name="reclaim-csrf-token"]')?.content ?? "";
+
 class ApiError extends Error {
   constructor(message, status) {
     super(message);
@@ -43,7 +49,11 @@ class ApiError extends Error {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      [CSRF_HEADER_NAME]: CSRF_TOKEN,
+      ...(options.headers ?? {}),
+    },
     ...options,
   });
   const isJson = response.headers.get("content-type")?.includes("application/json");

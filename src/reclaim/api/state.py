@@ -48,5 +48,12 @@ class AppState:
     vault_dir: Path
     manifest_path: Path
     safety: SafetyValidator
+    # Per-process CSRF token (rule: local-API hardening) and the loopback host:port this
+    # process is actually bound to, used by the Origin/Host DNS-rebinding guard — see
+    # `reclaim.api.security`. Both required (no default) so a caller can never accidentally
+    # construct an `AppState` without them and silently disable the guard.
+    csrf_token: str
+    host: str
+    port: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     scan_status: ScanStatus = field(default_factory=ScanStatus)
