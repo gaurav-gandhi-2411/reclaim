@@ -12,6 +12,7 @@ from ai_fixtures.copydays_loader import (
 )
 
 from reclaim.ai.eval_harness import (
+    DistributionDeclaration,
     EvalReport,
     current_commit_sha,
     precision_recall_curve,
@@ -37,9 +38,22 @@ from reclaim.ai.phash import compute_image_hashes, hamming_distance
 
 _COPYDAYS_ROOT = Path("data/ai_datasets/copydays/extracted")
 _TARGET_PRECISION = 0.95  # spec §7.3: near-identical/deletion-suggestion tracks >= 0.95
+_MIN_RECALL_FLOOR = 0.5  # ADR-0016 policy default for this track: catch at least half of
+# realistic duplicates, or the feature isn't worth shipping even at perfect precision.
 _COMMAND = "uv run pytest evals/test_ai_copydays_gold.py -v -s"
 _FIXTURE = "data/ai_datasets/copydays (INRIA Copydays, ADR-0015)"
 _DISAGREEMENTS_REPORT = Path("reports/ai/copydays_keep_best_disagreements.json")
+_HARD_TIER_DISTRIBUTION = DistributionDeclaration(
+    description="Copydays `strong` split — print-and-scan/blur/paint, deliberately adversarial",
+    is_realistic=False,
+    is_adversarial_tail_only=True,
+    is_synthetic_only=False,
+    untested_variation_note=(
+        "covers only the hardest Copydays attack tier; says nothing about ordinary "
+        "resize/recompress/re-export duplicates — see "
+        "evals/test_ai_copydays_realistic_distribution.py for that measurement"
+    ),
+)
 
 pytestmark = pytest.mark.skipif(
     not _COPYDAYS_ROOT.exists() or not any(_COPYDAYS_ROOT.glob("*.jpg")),
@@ -61,10 +75,16 @@ def _hash_all(images: list[CopydaysImage]) -> dict[Path, tuple[str, str]]:
 
 
 def test_real_pr_curve_and_operating_point_on_copydays() -> None:
-    """The measurement ADR-0012 graduates from provisional to MEASURED on — the actual PR
-    curve, computed from real Hamming distances over every one of Copydays' ~74k image pairs,
-    labeled by the dataset's own construction (same block = same source photo, however
-    attacked; different block = unrelated). No synthetic data, no LLM labels."""
+    """Copydays' `strong`-tier PR curve — computed from real Hamming distances over every one
+    of Copydays' ~74k image pairs, labeled by the dataset's own construction (same block = same
+    source photo, however attacked; different block = unrelated). No synthetic data, no LLM
+    labels. This is ADR-0012's ORIGINAL measurement, kept as a permanent regression test for
+    ADR-0016's gate-hardening: `select_operating_point`'s recall floor must REJECT this
+    distribution (it clears the 0.95 precision target but not the recall/usefulness floor,
+    since it's adversarial-tail-only) — the exact class of mistake that let this measurement
+    alone justify MEASURED status the first time. See
+    evals/test_ai_copydays_realistic_distribution.py for the measurement that actually governs
+    Feature 1a's shipped operating point."""
     images = discover_copydays_images(_COPYDAYS_ROOT)
     assert len(images) == 386, (
         f"expected the known Copydays original+strong count, got {len(images)}"
@@ -85,13 +105,35 @@ def test_real_pr_curve_and_operating_point_on_copydays() -> None:
         scored.append((float(-distance), pair.is_same_photo))  # negate: higher = more similar
 
     curve = precision_recall_curve(scored, higher_score_is_more_similar=True)
+
+    # What the OLD precision-only gate would have found — kept explicit so the regression this
+    # test guards against is visible in the test itself, not just asserted away.
+    precision_only_eligible = [p for p in curve if p.precision >= _TARGET_PRECISION]
+    assert precision_only_eligible, "sanity: the hard tier must still clear the precision floor"
+    precision_only_best = max(precision_only_eligible, key=lambda p: p.recall)
+    assert precision_only_best.precision >= _TARGET_PRECISION
+    assert precision_only_best.recall < _MIN_RECALL_FLOOR, (
+        "sanity: this test's whole point is that the hard tier's best precision-qualifying "
+        "point has USELESSLY LOW recall — if this ever fails, Copydays' strong-tier recall "
+        "improved enough that the regression scenario no longer applies here"
+    )
+
     operating_point = select_operating_point(
         curve,
         target_precision=_TARGET_PRECISION,
+        min_recall=_MIN_RECALL_FLOOR,
+        distribution=_HARD_TIER_DISTRIBUTION,
         source_description=(
-            f"INRIA Copydays (ADR-0015), commit {current_commit_sha()} — REAL gold set, "
-            "not synthetic"
+            f"INRIA Copydays `strong` tier (ADR-0015), commit {current_commit_sha()} — REAL "
+            "gold set, not synthetic, but ADVERSARIAL-TAIL-ONLY (see ADR-0016)"
         ),
+    )
+    # THE regression assertion: the gate must reject this distribution outright, even though
+    # it clears the precision target — ADR-0012's original mistake was accepting it anyway.
+    assert operating_point is None, (
+        "the hardened gate should REJECT Copydays' strong-tier-only measurement on recall "
+        "grounds — if this now returns a real operating point, either the recall floor logic "
+        "regressed or the hard tier's actual recall unexpectedly improved past the floor"
     )
 
     # Report the full curve shape (a handful of representative points, not all ~74k) so the
@@ -114,40 +156,24 @@ def test_real_pr_curve_and_operating_point_on_copydays() -> None:
             f"precision={point.precision:.4f}  recall={point.recall:.4f}"
         )
 
-    if operating_point is None:
-        report = EvalReport(
-            metric_name="copydays_operating_point_max_hamming_distance",
-            value=float("nan"),
-            commit_sha=current_commit_sha(),
-            command=_COMMAND,
-            fixture_path=_FIXTURE,
-        )
-        print(  # noqa: T201
-            f"\nNO threshold on the real Copydays PR curve reaches target precision "
-            f"{_TARGET_PRECISION} — this is a real, reportable finding, not a bug to paper "
-            f"over. {report}"
-        )
-        best_precision = max((p.precision for p in curve), default=0.0)
-        print(f"Best achievable precision on this curve: {best_precision:.4f}")  # noqa: T201
-        pytest.skip(
-            f"No operating point clears target precision {_TARGET_PRECISION} on the real "
-            "Copydays curve — see printed curve above; reported to GG rather than silently "
-            "lowering the target or picking an unqualified point."
-        )
-    else:
-        max_distance = int(-operating_point.threshold)
-        report = EvalReport(
-            metric_name="copydays_operating_point_max_hamming_distance",
-            value=float(max_distance),
-            commit_sha=current_commit_sha(),
-            command=_COMMAND,
-            fixture_path=_FIXTURE,
-        )
-        print(f"\nMEASURED operating point: {report}")  # noqa: T201
-        print(  # noqa: T201
-            f"  precision={operating_point.precision:.4f}  recall={operating_point.recall:.4f}  "
-            f"is_provisional={operating_point.is_provisional}"
-        )
+    report = EvalReport(
+        metric_name="copydays_hard_tier_best_precision_qualifying_recall",
+        value=precision_only_best.recall,
+        commit_sha=current_commit_sha(),
+        command=_COMMAND,
+        fixture_path=_FIXTURE,
+    )
+    print(  # noqa: T201
+        f"\nHard tier clears precision {_TARGET_PRECISION} at max_hamming_distance="
+        f"{int(-precision_only_best.threshold)} (precision={precision_only_best.precision:.4f}) "
+        f"but recall={precision_only_best.recall:.4f} is below the {_MIN_RECALL_FLOOR} "
+        f"usefulness floor — gate correctly REJECTS this as an operating point. {report}"
+    )
+    print(  # noqa: T201
+        "This tier is reported for honest comparison only — see "
+        "evals/test_ai_copydays_realistic_distribution.py for Feature 1a's actual, "
+        "gate-passing operating point."
+    )
 
 
 def test_keep_best_against_copydays_original_vs_attacked() -> None:

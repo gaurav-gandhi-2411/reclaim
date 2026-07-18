@@ -21,6 +21,30 @@ distribution measurement" below) found **precision = 0.9987, recall = 1.0000** a
 wrong thing, not revealing an actual pHash limitation. `max_hamming_distance = 14` is
 **reaffirmed**, now for the correct reason.
 
+**Third status update — required gate-hardening disclosure (ADR-0016), applied retroactively
+here.** ADR-0016 requires every operating point to carry an explicit `DistributionDeclaration`
+stating what was and wasn't measured, precisely because the incident above showed a real
+measurement can still be silently non-representative. Applying that requirement to THIS ADR's
+own MEASURED claim, stated plainly:
+
+> **5 transforms measured; uncommon transforms unmeasured.** `max_hamming_distance = 14`'s
+> MEASURED status rests on 5 deterministic transform profiles (mild recompress, mild resize,
+> moderate resize+recompress, moderate PNG round-trip, messaging-app-style resave — see
+> `build_realistic_recompression_tiers.py`) applied to 157 real photos. It has NOT been measured
+> against: rotation, cropping, aspect-ratio changes, watermarks/text overlays, color/contrast/
+> filter edits, heavier JPEG recompression than quality 65, multi-generation chains beyond two
+> re-saves, or any combination of the above. These are all plausible real-world sources of
+> consumer photo duplicates that this measurement is silent on. `max_hamming_distance = 14`'s
+> margin above the bare-minimum-2 needed for the 5 tested profiles (see "Operating-point
+> decision" below) is the disclosed mitigation for this gap — not a claim the gap doesn't exist.
+
+This is the same content the "Realistic-distribution measurement" section below states in
+narrative form (`untested_variation_note` on `_REALISTIC_DISTRIBUTION` in
+`evals/test_ai_copydays_realistic_distribution.py` carries it as machine-checked data, not just
+prose) — repeated here explicitly, at the top of the ADR, per ADR-0016's requirement that this
+disclosure be visible wherever MEASURED is claimed, not buried in a later section a reader might
+skip.
+
 ## Context
 
 `reclaim-ai-features-spec.md` §7.3 requires every threshold to be "chosen from the PR curve
@@ -262,6 +286,12 @@ evidence the weights were never the problem, the fixture's realism was.
 
 ## Consequences
 
+- **This ADR's own operating-point selection now runs through ADR-0016's hardened gate**:
+  `evals/test_ai_copydays_gold.py`'s hard-tier curve is asserted to be REJECTED by
+  `select_operating_point`'s recall floor (proving the original mistake can't recur silently),
+  and `evals/test_ai_copydays_realistic_distribution.py` calls
+  `assert_safe_to_promote_to_measured` on the distribution this ADR actually cites, proving that
+  citation is structurally safe, not just asserted to be in prose.
 - **`max_hamming_distance = 14` is Reclaim's MEASURED near-identical operating point**, and —
   as of the realistic-distribution follow-up — may be cited with confidence on the distribution
   that actually matters: precision 0.9987, recall 1.0000 on mild/moderate/messaging-app-style

@@ -5,6 +5,7 @@ from pathlib import Path
 from ai_fixtures.build_image_similarity_fixtures import build_image_similarity_fixtures
 
 from reclaim.ai.eval_harness import (
+    DistributionDeclaration,
     EvalReport,
     bcubed_precision_recall,
     current_commit_sha,
@@ -63,6 +64,19 @@ def test_phash_operating_point_meets_target_precision_on_synthetic_fixtures(
     operating_point = select_operating_point(
         curve,
         target_precision=_TARGET_PRECISION,
+        min_recall=0.0,  # this test proves the selection MACHINERY works, not a shipped gate
+        distribution=DistributionDeclaration(
+            description=(
+                "synthetic CI fixtures (evals/ai_fixtures/build_image_similarity_fixtures.py)"
+            ),
+            is_realistic=False,
+            is_adversarial_tail_only=False,
+            is_synthetic_only=True,
+            untested_variation_note=(
+                "entirely synthetic — no real-world variation covered at all; see "
+                "evals/test_ai_copydays_realistic_distribution.py for the real measurement"
+            ),
+        ),
         source_description=(
             "synthetic CI fixtures (evals/ai_fixtures/build_image_similarity_fixtures.py) — "
             "PROVISIONAL, not GG's gold set"

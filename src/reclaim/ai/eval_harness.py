@@ -99,21 +99,101 @@ def precision_recall_curve(
 
 
 @dataclass(frozen=True, slots=True)
+class DistributionDeclaration:
+    """What distribution a PR curve / operating-point selection was actually computed
+    against — REQUIRED alongside every `select_operating_point` call (ADR-0016's eval-gate
+    hardening, prompted directly by ADR-0012's recall-artifact incident: a precision-only gate
+    let Feature 1a's operating point pass CI while catching under 8% of real duplicates,
+    because the only real data reachable was Copydays' single adversarial attack tier and
+    nothing forced that fact to be stated anywhere machine-checkable). Every field must be set
+    truthfully by the caller — there is no default that lets the honest answer go unstated.
+    """
+
+    description: str  # e.g. "5 realistic transform profiles on real Copydays originals"
+    is_realistic: bool  # does this represent the feature's actual target use case?
+    is_adversarial_tail_only: bool  # worst-case/attack-only data, not typical real usage
+    is_synthetic_only: bool  # no real-world data involved at all
+    untested_variation_note: str  # what real-world variation this measurement does NOT cover
+
+    def __post_init__(self) -> None:
+        if not self.description.strip():
+            raise ValueError(
+                "DistributionDeclaration.description must not be empty — every "
+                "operating-point selection must state what it was measured against"
+            )
+        if not self.untested_variation_note.strip():
+            raise ValueError(
+                "DistributionDeclaration.untested_variation_note must not be empty — even a "
+                "realistic measurement has a boundary; state it explicitly rather than "
+                "implying the measurement is exhaustive"
+            )
+        if self.is_realistic and (self.is_adversarial_tail_only or self.is_synthetic_only):
+            raise ValueError(
+                "a distribution cannot be both 'realistic' and "
+                "'adversarial-tail-only'/'synthetic-only' — pick the honest one"
+            )
+
+
+class UnsafeMeasuredPromotionError(Exception):
+    """Raised by `assert_safe_to_promote_to_measured` — see that function's docstring."""
+
+
+def assert_safe_to_promote_to_measured(distribution: DistributionDeclaration) -> None:
+    """Call this before an ADR claims an operating point is MEASURED (a real, production-
+    basis number) rather than PROVISIONAL. Raises `UnsafeMeasuredPromotionError` if the
+    distribution backing that claim is adversarial-tail-only or synthetic-only — both are
+    legitimate, honestly-reportable measurements, but ADR-0012's incident proved neither may
+    ALONE justify a "this is our real-world number" claim. A test asserting this function does
+    NOT raise for a feature's chosen operating point is the structural proof (not just ADR
+    prose) that the gate-hardening policy (ADR-0016) was actually followed.
+    """
+    if distribution.is_adversarial_tail_only:
+        raise UnsafeMeasuredPromotionError(
+            f"cannot promote to MEASURED from an adversarial-tail-only distribution "
+            f"({distribution.description!r}) — this is exactly the mistake ADR-0012 made with "
+            f"Copydays' `strong` split alone; report it as a disclosed tier, not the basis for "
+            f"the operating point"
+        )
+    if distribution.is_synthetic_only:
+        raise UnsafeMeasuredPromotionError(
+            f"cannot promote to MEASURED from a synthetic-only distribution "
+            f"({distribution.description!r}) — synthetic fixtures remain PROVISIONAL by "
+            f"definition"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OperatingPoint:
     threshold: float
     precision: float
     recall: float
     is_provisional: bool
     source_description: str
+    distribution: DistributionDeclaration
 
 
 def select_operating_point(
-    curve: Sequence[PRPoint], *, target_precision: float, source_description: str
+    curve: Sequence[PRPoint],
+    *,
+    target_precision: float,
+    min_recall: float,
+    distribution: DistributionDeclaration,
+    source_description: str,
 ) -> OperatingPoint | None:
-    """Picks the highest-recall point on `curve` whose precision >= `target_precision`, or
-    `None` if no point clears the target (callers MUST handle `None` explicitly — never fall
-    back to a lower-precision point silently, per spec §7.3's "chosen from the PR curve at a
-    target precision — NOT hand-set").
+    """Picks the highest-recall point on `curve` whose precision >= `target_precision`, THEN
+    requires that point's recall to also clear `min_recall` — a precision-only gate is exactly
+    what let Feature 1a's first operating point pass CI while catching under 8% of real
+    duplicates (ADR-0012's incident, ADR-0016's fix). Returns `None` if no point clears the
+    precision target, OR if the best precision-qualifying point still fails the recall/
+    usefulness floor: callers MUST handle `None` explicitly in both cases — never fall back to
+    a lower-precision point, and never ship a precise-but-useless operating point, per spec
+    §7.3 and ADR-0016.
+
+    `distribution` is a required `DistributionDeclaration`, not optional — see that class's
+    docstring. This function does not itself enforce `assert_safe_to_promote_to_measured`
+    (a curve MAY legitimately be computed against an adversarial-tail-only distribution, e.g.
+    to honestly report that tier's own numbers) — that check happens at the point an ADR
+    claims MEASURED, not at every curve computation.
 
     `is_provisional` is always `True` from this function alone — a caller selecting on
     synthetic CI fixtures (the only data available before GG's gold-set labeling) must
@@ -126,12 +206,15 @@ def select_operating_point(
     if not eligible:
         return None
     best = max(eligible, key=lambda point: point.recall)
+    if best.recall < min_recall:
+        return None
     return OperatingPoint(
         threshold=best.threshold,
         precision=best.precision,
         recall=best.recall,
         is_provisional=True,
         source_description=source_description,
+        distribution=distribution,
     )
 
 
