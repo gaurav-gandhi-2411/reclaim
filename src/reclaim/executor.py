@@ -84,6 +84,24 @@ class VaultIntegrityError(RuntimeError):
     """
 
 
+class RestoreIntegrityError(RuntimeError):
+    """Raised by `restore_batch` before it moves anything, if any vault entry's manifest data
+    fails a structural integrity check: its recorded `vault_path` doesn't resolve inside the
+    configured vault directory, or its `original_path` matches a protected system root.
+
+    Neither of these should ever happen from this tool's own normal operation — `apply_batch`
+    always computes `vault_path` under `vault_dir` (see `_compute_vault_path`) and never vaults
+    a `SafetyValidator`-BLOCKED candidate in the first place. Either condition strongly suggests
+    a corrupted or hand-edited `manifest.jsonl`, so this is the restore-side equivalent of a
+    zip-slip guard: `manifest.jsonl` is this tool's own append-only "archive," `vault_path` is
+    the analog of a zip member's path, and `original_path` is the analog of the extraction
+    target — the same "never trust the archive's own member paths, always re-verify against the
+    intended root" principle applies here. Refuses the ENTIRE restore call rather than skipping
+    just the offending entry, mirroring `SafetyInvariantError`'s "something is fundamentally
+    wrong, do nothing" philosophy.
+    """
+
+
 class QuarantineManifestEntry(BaseModel):
     """One line in the append-only `data/quarantine/manifest.jsonl` log.
 
@@ -795,13 +813,57 @@ def apply_batch(
     )
 
 
+def _is_contained(path: Path, container: Path) -> bool:
+    """True if `path` resolves to `container` itself or a descendant of it.
+
+    `Path.resolve()` normalizes `..`/`.` segments and makes the path absolute without requiring
+    it to exist (`strict=False`, the default) — so this catches a manifest `vault_path` that
+    escapes the configured vault directory via traversal segments or an outright unrelated
+    absolute path, without needing the vault entry to still be on disk. Windows path comparison
+    via `Path.__eq__`/`.parents` is already case-insensitive (`os.path.normcase`), matching every
+    other path-identity check in this module.
+    """
+    resolved_path = path.resolve()
+    resolved_container = container.resolve()
+    return resolved_path == resolved_container or resolved_container in resolved_path.parents
+
+
+def _restore_integrity_violations(
+    vault_entries: Sequence[QuarantineManifestEntry], vault_dir: Path, safety: SafetyValidator
+) -> list[str]:
+    """Pre-move structural check over every vault entry in the batch — see
+    `RestoreIntegrityError` for why this exists and why a violation aborts the whole call rather
+    than just the offending item."""
+    violations: list[str] = []
+    for entry in vault_entries:
+        if entry.vault_path is not None and not _is_contained(entry.vault_path, vault_dir):
+            violations.append(
+                f"{entry.original_path}: recorded vault_path {entry.vault_path} does not "
+                f"resolve inside the configured vault directory {vault_dir}"
+            )
+        if safety.path_is_protected_root(entry.original_path):
+            violations.append(
+                f"{entry.original_path}: original_path matches a protected system root — "
+                "refusing to restore into it"
+            )
+    return violations
+
+
 def restore_batch(
     batch_id: str,
     *,
     manifest_path: Path | None = None,
+    vault_dir: Path | None = None,
+    safety: SafetyValidator,
     now: float | None = None,
 ) -> RestoreReport:
     """Restores every *restorable* item in `batch_id` back to its exact original path.
+
+    `vault_dir`/`safety` are required so every restore runs the `RestoreIntegrityError`
+    pre-check below (a manifest-integrity/zip-slip-equivalent guard) before touching anything —
+    there is no code path that restores without it. `vault_dir` must be the same directory
+    `apply_batch` was configured with (the caller's responsibility, same as `manifest_path`);
+    a mismatch here would make the containment check meaningless, not merely lenient.
 
     Reads current state from the manifest (see `_latest_entries_for_batch`). A single
     `apply_batch` call always shares one requested `method` param, but ADR-0001's per-candidate
@@ -825,6 +887,7 @@ def restore_batch(
     `already_restored` and left untouched, so restoring the same batch twice is safe.
     """
     resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
+    resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
     now_ts = now if now is not None else time.time()
 
     entries = _latest_entries_for_batch(resolved_manifest_path, batch_id)
@@ -834,6 +897,15 @@ def restore_batch(
     vault_entries = [entry for entry in entries if entry.method == "vault"]
     direct_delete_entries = [entry for entry in entries if entry.method == "direct_delete"]
     recycle_bin_entries = [entry for entry in entries if entry.method == "recycle_bin"]
+
+    integrity_violations = _restore_integrity_violations(vault_entries, resolved_vault_dir, safety)
+    if integrity_violations:
+        raise RestoreIntegrityError(
+            f"restore_batch's manifest-integrity pre-check found {len(integrity_violations)} "
+            "violation(s) in batch_id="
+            f"{batch_id!r} — refusing the entire restore, moving nothing: "
+            f"{integrity_violations[:5]}"
+        )
 
     if not vault_entries:
         # Nothing restorable at all in this batch — preserve the loud, whole-call refusal

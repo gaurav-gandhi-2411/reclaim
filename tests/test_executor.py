@@ -13,6 +13,7 @@ from reclaim.executor import (
     DirectDeleteRestoreImpossibleError,
     QuarantineManifestEntry,
     RecycleBinRestoreUnsupportedError,
+    RestoreIntegrityError,
     SafetyInvariantError,
     _latest_entries_for_batch,
     apply_batch,
@@ -182,7 +183,11 @@ def test_vault_apply_moves_file_and_restore_round_trips_byte_identical(tmp_path:
     assert vault_item.vault_path.read_bytes() == original_content
 
     restore_report = restore_batch(
-        apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 10
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 10,
     )
     assert restore_report.files_succeeded == 1
     assert restore_report.files_failed == 0
@@ -196,19 +201,32 @@ def test_vault_restore_is_idempotent_on_second_call(tmp_path: Path) -> None:
     target = tmp_path / "file.bin"
     target.write_bytes(b"content")
     manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
 
     apply_report = apply_batch(
         [_candidate(target)],
         safety=_safety(),
         apply=True,
         method="vault",
-        vault_dir=tmp_path / "vault",
+        vault_dir=vault_dir,
         manifest_path=manifest_path,
         now=_NOW,
     )
-    restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+    restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
 
-    second = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 2)
+    second = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 2,
+    )
     assert second.files_succeeded == 1
     assert second.files_failed == 0
     assert second.items[0].already_restored is True
@@ -221,20 +239,27 @@ def test_vault_restore_refuses_to_overwrite_existing_destination(tmp_path: Path)
     target = tmp_path / "file.bin"
     target.write_bytes(b"original")
     manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
 
     apply_report = apply_batch(
         [_candidate(target)],
         safety=_safety(),
         apply=True,
         method="vault",
-        vault_dir=tmp_path / "vault",
+        vault_dir=vault_dir,
         manifest_path=manifest_path,
         now=_NOW,
     )
     # Something else now occupies the original path.
     target.write_bytes(b"unrelated-new-content")
 
-    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW)
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW,
+    )
     assert restore_report.files_failed == 1
     assert restore_report.files_succeeded == 0
     assert restore_report.items[0].error is not None
@@ -282,7 +307,13 @@ def test_vault_move_and_restore_survive_path_past_max_path(tmp_path: Path) -> No
     vaulted_payload = vault_path / rel_from_top
     assert _long_read_bytes(vaulted_payload) == content
 
-    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
     assert restore_report.files_succeeded == 1, restore_report.items
     assert os.path.exists(long_path(top))  # noqa: PTH110
     restored_payload = top / rel_from_top
@@ -536,12 +567,16 @@ def test_restore_refuses_recycle_bin_batch_with_documented_error(
     )
 
     with pytest.raises(RecycleBinRestoreUnsupportedError, match="Recycle Bin"):
-        restore_batch(report.batch_id, manifest_path=manifest_path)
+        restore_batch(report.batch_id, manifest_path=manifest_path, safety=_safety())
 
 
 def test_restore_batch_not_found_raises() -> None:
     with pytest.raises(BatchNotFoundError):
-        restore_batch("nonexistent-batch-id", manifest_path=Path("does_not_exist.jsonl"))
+        restore_batch(
+            "nonexistent-batch-id",
+            manifest_path=Path("does_not_exist.jsonl"),
+            safety=_safety(),
+        )
 
 
 # --- Defense in depth: BLOCKED candidate ------------------------------------------------------
@@ -798,17 +833,20 @@ def test_oversized_direct_delete_candidate_stays_restorable(tmp_path: Path) -> N
     target = tmp_path / "huge_model.safetensors"
     target.write_bytes(b"content")
     manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
 
     report = apply_batch(
         [_candidate(target, size_bytes=2 * 1024 * 1024 * 1024, retention_days=None)],
         safety=_safety(),
         apply=True,
-        vault_dir=tmp_path / "vault",
+        vault_dir=vault_dir,
         manifest_path=manifest_path,
         now=_NOW,
     )
 
-    restore_report = restore_batch(report.batch_id, manifest_path=manifest_path)
+    restore_report = restore_batch(
+        report.batch_id, manifest_path=manifest_path, vault_dir=vault_dir, safety=_safety()
+    )
     assert restore_report.files_succeeded == 1
     assert target.exists()
 
@@ -1031,7 +1069,7 @@ def test_restore_refuses_direct_delete_batch_with_distinct_message(tmp_path: Pat
     )
 
     with pytest.raises(DirectDeleteRestoreImpossibleError, match="permanently-deleted"):
-        restore_batch(report.batch_id, manifest_path=manifest_path)
+        restore_batch(report.batch_id, manifest_path=manifest_path, safety=_safety())
 
 
 def test_restore_mixed_batch_restores_vault_entry_and_skips_direct_delete_entry(
@@ -1048,18 +1086,25 @@ def test_restore_mixed_batch_restores_vault_entry_and_skips_direct_delete_entry(
     deleted.parent.mkdir(parents=True)
     deleted.write_bytes(b"delete-me-forever")
     manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
 
     report = apply_batch(
         [_candidate(vaulted, retention_days=30), _candidate(deleted, retention_days=None)],
         safety=_safety(),
         apply=True,
         method="vault",
-        vault_dir=tmp_path / "vault",
+        vault_dir=vault_dir,
         manifest_path=manifest_path,
         now=_NOW,
     )
 
-    restore_report = restore_batch(report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+    restore_report = restore_batch(
+        report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
 
     assert restore_report.files_processed == 2
     assert restore_report.files_succeeded == 1
@@ -1090,13 +1135,14 @@ def test_restore_mixed_batch_with_recycle_bin_entry_also_partially_restores(
     trashed = tmp_path / "trashed.bin"
     trashed.write_bytes(b"trash-me")
     manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
 
     apply_report = apply_batch(
         [_candidate(vaulted, retention_days=30, category_group="a")],
         safety=_safety(),
         apply=True,
         method="vault",
-        vault_dir=tmp_path / "vault",
+        vault_dir=vault_dir,
         manifest_path=manifest_path,
         now=_NOW,
     )
@@ -1127,7 +1173,13 @@ def test_restore_mixed_batch_with_recycle_bin_entry_also_partially_restores(
         ],
     )
 
-    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=_NOW + 1)
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
 
     assert restore_report.files_succeeded == 1
     assert restore_report.files_unsupported == 1
@@ -1280,3 +1332,151 @@ def test_manifest_purged_fields_round_trip_through_json() -> None:
     )
     round_tripped = QuarantineManifestEntry.model_validate_json(entry.model_dump_json())
     assert round_tripped == entry
+
+
+# --- Restore manifest-integrity guard (zip-slip equivalent) ------------------------------------
+
+
+def test_restore_refuses_whole_batch_when_a_vault_path_escapes_the_vault_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault entry whose recorded vault_path doesn't resolve inside the configured vault
+    directory must abort the ENTIRE restore, not just be skipped — this is the shape a
+    corrupted/hand-edited manifest.jsonl would take, and trusting it would let restore_batch
+    move an arbitrary file from outside the vault to wherever original_path says."""
+    from reclaim.executor import append_manifest_entries
+
+    vault_dir = tmp_path / "vault"
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    legit_target = tmp_path / "legit.bin"
+    legit_target.write_bytes(b"legit-content")
+    apply_report = apply_batch(
+        [_candidate(legit_target, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+    legit_vault_path = apply_report.items[0].vault_path
+    assert legit_vault_path is not None
+
+    # A second, "tampered" entry sharing the same batch_id whose vault_path escapes vault_dir
+    # entirely — simulates a corrupted/hand-edited manifest.jsonl, not anything this tool's own
+    # apply_batch would ever produce.
+    escaping_source = tmp_path / "outside_vault" / "not_actually_vaulted.bin"
+    escaping_source.parent.mkdir(parents=True)
+    escaping_source.write_bytes(b"should-never-move")
+    tampered_original = tmp_path / "restored_elsewhere.bin"
+
+    append_manifest_entries(
+        manifest_path,
+        [
+            QuarantineManifestEntry(
+                batch_id=apply_report.batch_id,
+                original_path=tampered_original,
+                size_bytes=18,
+                is_dir=False,
+                category="test_category",
+                category_group="test_group",
+                rationale="test",
+                rebuild_instruction=None,
+                tier=Tier.A,
+                method="vault",
+                vault_path=escaping_source,
+                retention_days=30,
+                quarantined_at=_NOW,
+                retention_until=_NOW + 30 * 86400.0,
+            )
+        ],
+    )
+
+    with pytest.raises(RestoreIntegrityError, match="vault_path"):
+        restore_batch(
+            apply_report.batch_id,
+            manifest_path=manifest_path,
+            vault_dir=vault_dir,
+            safety=_safety(),
+            now=_NOW + 1,
+        )
+
+    # Refused the WHOLE call — the legit vault entry sharing this batch_id was never moved back
+    # either, even though nothing was wrong with it specifically.
+    assert legit_vault_path.exists()
+    assert not legit_target.exists()
+    assert escaping_source.exists()
+    assert escaping_source.read_bytes() == b"should-never-move"
+    assert not tampered_original.exists()
+
+
+def test_restore_refuses_whole_batch_when_original_path_is_a_protected_root(
+    tmp_path: Path,
+) -> None:
+    """A vault entry whose original_path matches a protected system root must also abort the
+    entire restore — the "never write here, no matter what the manifest says" backstop,
+    independent of the vault_path containment check above."""
+    from reclaim.executor import append_manifest_entries
+
+    protected_dir = tmp_path / "Windows"
+    protected_dir.mkdir()
+    vault_dir = tmp_path / "vault"
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    legit_target = tmp_path / "legit.bin"
+    legit_target.write_bytes(b"legit-content")
+    safety = SafetyValidator(
+        Config(safety=SafetyConfig(protected_roots=[f"{protected_dir.as_posix()}/*"]))
+    )
+    apply_report = apply_batch(
+        [_candidate(legit_target, retention_days=30)],
+        safety=safety,
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+    legit_vault_path = apply_report.items[0].vault_path
+    assert legit_vault_path is not None
+
+    tampered_vault_source = vault_dir / apply_report.batch_id / "tampered_secret.bin"
+    tampered_vault_source.parent.mkdir(parents=True, exist_ok=True)
+    tampered_vault_source.write_bytes(b"should-never-land-in-windows")
+    tampered_original = protected_dir / "secret.bin"
+
+    append_manifest_entries(
+        manifest_path,
+        [
+            QuarantineManifestEntry(
+                batch_id=apply_report.batch_id,
+                original_path=tampered_original,
+                size_bytes=28,
+                is_dir=False,
+                category="test_category",
+                category_group="test_group",
+                rationale="test",
+                rebuild_instruction=None,
+                tier=Tier.A,
+                method="vault",
+                vault_path=tampered_vault_source,
+                retention_days=30,
+                quarantined_at=_NOW,
+                retention_until=_NOW + 30 * 86400.0,
+            )
+        ],
+    )
+
+    with pytest.raises(RestoreIntegrityError, match="protected system root"):
+        restore_batch(
+            apply_report.batch_id,
+            manifest_path=manifest_path,
+            vault_dir=vault_dir,
+            safety=safety,
+            now=_NOW + 1,
+        )
+
+    assert legit_vault_path.exists()
+    assert not legit_target.exists()
+    assert not tampered_original.exists()

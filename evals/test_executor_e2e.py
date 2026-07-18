@@ -115,7 +115,13 @@ def test_executor_end_to_end_real_scan_apply_restore(tmp_path: Path) -> None:
     # recomputed from the ground-truth content captured before anything moved.
     assert apply_report.bytes_freed == expected_node_modules_bytes + expected_old_log_bytes
 
-    restore_report = restore_batch(apply_report.batch_id, manifest_path=manifest_path, now=now)
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=safety,
+        now=now,
+    )
     assert restore_report.files_failed == 0
     assert restore_report.files_succeeded == len(tier_a_candidates)
     assert restore_report.bytes_restored == apply_report.bytes_freed

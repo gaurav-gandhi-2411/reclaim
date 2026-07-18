@@ -23,6 +23,7 @@ from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
     RecycleBinRestoreUnsupportedError,
+    RestoreIntegrityError,
     SafetyInvariantError,
     restore_batch,
 )
@@ -123,9 +124,20 @@ def quarantine(request: Request) -> QuarantineListResponse:
 def restore(batch_id: str, request: Request) -> RestoreResponse:
     state = get_state(request)
     try:
-        report = restore_batch(batch_id, manifest_path=state.manifest_path)
+        report = restore_batch(
+            batch_id,
+            manifest_path=state.manifest_path,
+            vault_dir=state.vault_dir,
+            safety=state.safety,
+        )
     except BatchNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (RecycleBinRestoreUnsupportedError, DirectDeleteRestoreImpossibleError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RestoreIntegrityError as exc:
+        # Same "should never trigger" honesty as apply's SafetyInvariantError -> 500 below:
+        # every vault entry restore_batch reads back should already be well-formed, so hitting
+        # this means an invariant broke (a corrupted/tampered manifest), not that the caller
+        # supplied bad input.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return service.restore_response(report)

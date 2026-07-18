@@ -170,3 +170,40 @@ def test_filter_candidates_preserves_order(validator: SafetyValidator) -> None:
     records = [_record("C:/Data/notes.txt"), _record("C:/Windows/system.dll")]
     results = validator.filter_candidates(records)
     assert [r.verdict for r in results] == [Verdict.ELIGIBLE, Verdict.BLOCKED]
+
+
+def test_protected_root_denial_is_unaffected_by_process_elevation_state(
+    validator: SafetyValidator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`SafetyValidator` is a pure pattern match with no OS-permission or elevation-state
+    dependency anywhere in it — confirms that holds even if the process happened to be
+    elevated (`reclaim.elevation.is_elevated()` mocked True here), which is the scenario the
+    no-elevation CLI guard (`assert_not_elevated`, wired into every mutating command) exists to
+    make unreachable in the first place. Same verdict, same reason code, regardless."""
+    from reclaim import elevation
+
+    record = _record("C:/Windows/allow-me/system.dll")
+
+    monkeypatch.setattr(elevation, "is_elevated", lambda: False)
+    not_elevated_result = validator.evaluate(record)
+
+    monkeypatch.setattr(elevation, "is_elevated", lambda: True)
+    elevated_result = validator.evaluate(record)
+
+    assert not_elevated_result.verdict == Verdict.BLOCKED
+    assert elevated_result.verdict == Verdict.BLOCKED
+    assert elevated_result.reason_code == not_elevated_result.reason_code == "PROTECTED_SYSTEM_ROOT"
+
+
+def test_path_is_protected_root_matches_protected_roots_pattern(
+    validator: SafetyValidator,
+) -> None:
+    """Used by `executor.restore_batch`'s manifest-integrity guard, which validates a restore
+    *destination* that doesn't exist yet — so unlike `evaluate()`, this needs no `FileRecord`/
+    stat at all, just the path string."""
+    assert validator.path_is_protected_root(Path("C:/Windows/system.dll")) is True
+    assert validator.path_is_protected_root(Path("C:/Data/notes.txt")) is False
+
+
+def test_path_is_protected_root_matches_docker_wsl_roots(validator: SafetyValidator) -> None:
+    assert validator.path_is_protected_root(Path("C:/Users/gg/AppData/Local/Docker/data")) is True

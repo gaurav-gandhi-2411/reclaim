@@ -141,6 +141,23 @@ class SafetyValidator:
     def filter_candidates(self, records: Iterable[FileRecord]) -> list[SafetyResult]:
         return [self.evaluate(record) for record in records]
 
+    def path_is_protected_root(self, path: Path) -> bool:
+        """Pattern-only check usable when no `FileRecord`/stat is available — e.g.
+        `executor.restore_batch` validating a restore *destination* that doesn't exist yet (the
+        file is about to be recreated there, so there's nothing to stat).
+
+        Checks only the two `_builtin_deny` sub-checks that need no live stat or git-repo state
+        (`protected_roots`, `docker_wsl_roots`) — not the full `evaluate()` precedence chain
+        (extensions, cloud-placeholder, finance tokens, user allow/deny lists all either need a
+        stat or accept an ambiguity that's fine for a proactive scan decision but not for a
+        last-resort "never write here" restore guard, where a false negative is the only
+        acceptable failure mode and a false positive just means one restore item is refused).
+        """
+        cfg = self._safety
+        return _any_pattern_matches(path, cfg.protected_roots) or _any_pattern_matches(
+            path, cfg.docker_wsl_roots
+        )
+
     def _builtin_deny(self, record: FileRecord) -> tuple[SafetyResult | None, _Exemption | None]:
         cfg = self._safety
 
