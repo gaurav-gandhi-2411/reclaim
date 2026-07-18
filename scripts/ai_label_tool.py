@@ -48,6 +48,28 @@ def main(argv: list[str] | None = None) -> int:
         help="Looser than ADR-0012's CI gate (10) on purpose — shows borderline candidates "
         "for you to reject, not just the ones the current threshold already accepts (default: 15).",
     )
+    parser.add_argument(
+        "--per-stratum",
+        type=int,
+        default=60,
+        help="Max boundary and negative-control pairs to sample each (default: 60) — see "
+        "ADR-0014 for why both strata are sampled independently of the near-duplicate pool.",
+    )
+    parser.add_argument(
+        "--max-images-for-boundary-sampling",
+        type=int,
+        default=800,
+        help="Caps the image count used for O(n^2) boundary/negative-control pairwise "
+        "sampling (default: 800) — deterministically subsampled if the scanned directory has "
+        "more; near-duplicate cluster discovery still runs against the full set regardless.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic candidate sampling (default: 42) — the same directory "
+        "and flags always propose the same candidates.",
+    )
     parser.add_argument("--host", type=_loopback_host, default=_DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=_DEFAULT_PORT)
     parser.add_argument(
@@ -81,7 +103,13 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
-    from reclaim.ai.labeling import discover_label_candidates
+    from reclaim.ai.labeling import (
+        DEFAULT_TARGET_PER_STRATUM_MINIMUM,
+        DEFAULT_TARGET_TOTAL,
+        LabelStore,
+        compute_progress,
+        discover_label_candidates,
+    )
     from reclaim.ai.labeling_app import create_labeling_app
     from reclaim.config import load_config
     from reclaim.safety import SafetyValidator
@@ -92,15 +120,33 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"ai_label_tool: scanning {args.path} for candidate clusters...")
     candidates = discover_label_candidates(
-        args.path, safety=safety, max_hamming_distance=args.max_hamming_distance
+        args.path,
+        safety=safety,
+        max_hamming_distance=args.max_hamming_distance,
+        per_stratum=args.per_stratum,
+        max_images_for_boundary_sampling=args.max_images_for_boundary_sampling,
+        seed=args.seed,
     )
+    strata_counts: dict[str, int] = {}
+    for candidate in candidates:
+        strata_counts[candidate.stratum] = strata_counts.get(candidate.stratum, 0) + 1
     print(
-        f"ai_label_tool: {len(candidates)} candidate cluster(s) found "
-        f"({sum(len(c.members) for c in candidates)} images total)"
+        f"ai_label_tool: {len(candidates)} candidate(s) found — "
+        + ", ".join(f"{stratum}: {count}" for stratum, count in sorted(strata_counts.items()))
     )
     if not candidates:
-        print("ai_label_tool: nothing to label — no candidate clusters found.")
+        print("ai_label_tool: nothing to label — no candidates found.")
         return 0
+
+    progress = compute_progress(
+        LabelStore(args.labels_out),
+        target_total=DEFAULT_TARGET_TOTAL,
+        target_per_stratum_minimum=DEFAULT_TARGET_PER_STRATUM_MINIMUM,
+    )
+    print(
+        f"ai_label_tool: {progress.total_labeled}/{progress.target_total} already labeled in "
+        f"{args.labels_out} — targets met: {progress.meets_targets}"
+    )
 
     app = create_labeling_app(
         candidates, label_store_path=args.labels_out, host=args.host, port=args.port

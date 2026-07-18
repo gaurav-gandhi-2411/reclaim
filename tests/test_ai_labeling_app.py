@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from reclaim.ai.labeling import LabelStore
+from reclaim.ai.labeling import LabelCandidate, LabelStore
 from reclaim.ai.labeling_app import create_labeling_app
 from reclaim.ai.models import AICluster, AIClusterMember, AITrack
 
@@ -18,7 +18,7 @@ def _make_image(path: Path) -> None:
     Image.new("RGB", (32, 32), color=(120, 60, 200)).save(path, format="PNG")
 
 
-def _make_client(tmp_path: Path) -> tuple[TestClient, list[AICluster], Path]:
+def _make_client(tmp_path: Path) -> tuple[TestClient, list[LabelCandidate], Path]:
     img_a = tmp_path / "a.png"
     img_b = tmp_path / "b.png"
     _make_image(img_a)
@@ -34,10 +34,11 @@ def _make_client(tmp_path: Path) -> tuple[TestClient, list[AICluster], Path]:
         score_kind="hamming_distance",
         rationale="test cluster",
     )
+    candidate = LabelCandidate(cluster=cluster, stratum="near_duplicate")
     label_path = tmp_path / "labels.jsonl"
-    app = create_labeling_app([cluster], label_store_path=label_path, host=_HOST, port=_PORT)
+    app = create_labeling_app([candidate], label_store_path=label_path, host=_HOST, port=_PORT)
     client = TestClient(app, base_url=f"http://{_HOST}:{_PORT}")
-    return client, [cluster], label_path
+    return client, [candidate], label_path
 
 
 def _csrf_token(client: TestClient) -> str:
@@ -46,15 +47,25 @@ def _csrf_token(client: TestClient) -> str:
 
 
 def test_index_page_lists_the_pending_cluster(tmp_path: Path) -> None:
-    client, _clusters, _ = _make_client(tmp_path)
+    client, _candidates, _ = _make_client(tmp_path)
     response = client.get("/")
     assert response.status_code == 200
     assert "cluster-0" in response.text
     assert "1 pending" in response.text
+    assert "[near_duplicate]" in response.text
+
+
+def test_index_page_shows_progress_summary(tmp_path: Path) -> None:
+    client, _candidates, _ = _make_client(tmp_path)
+    response = client.get("/")
+    assert "Progress" in response.text
+    assert "near_duplicate" in response.text
+    assert "boundary" in response.text
+    assert "negative_control" in response.text
 
 
 def test_image_route_serves_a_known_member(tmp_path: Path) -> None:
-    client, _clusters, _ = _make_client(tmp_path)
+    client, _candidates, _ = _make_client(tmp_path)
     response = client.get("/image/cluster-0/0")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("image/")
@@ -81,15 +92,16 @@ def test_image_route_cannot_be_used_as_a_generic_path_traversal(tmp_path: Path) 
     assert response.status_code in (404, 422)
 
 
-def test_label_route_records_a_confirmed_decision(tmp_path: Path) -> None:
-    client, clusters, label_path = _make_client(tmp_path)
+def test_label_route_records_a_confirmed_decision_with_reasons(tmp_path: Path) -> None:
+    client, candidates, label_path = _make_client(tmp_path)
     csrf_token = _csrf_token(client)
     response = client.post(
         "/api/label",
         json={
             "cluster_id": "cluster-0",
             "decision": "confirmed_near_duplicates",
-            "keep_path": clusters[0].members[0].path.as_posix(),
+            "keep_path": candidates[0].cluster.members[0].path.as_posix(),
+            "keep_reasons": ["sharper", "higher_resolution"],
         },
         headers={"X-Reclaim-CSRF-Token": csrf_token},
     )
@@ -99,6 +111,25 @@ def test_label_route_records_a_confirmed_decision(tmp_path: Path) -> None:
     decisions = store.read_all()
     assert len(decisions) == 1
     assert decisions[0].decision == "confirmed_near_duplicates"
+    assert decisions[0].keep_reasons == ("sharper", "higher_resolution")
+    assert decisions[0].stratum == "near_duplicate"
+    assert decisions[0].commit_sha != "unknown"
+
+
+def test_label_route_rejects_an_invalid_keep_reason(tmp_path: Path) -> None:
+    client, candidates, _ = _make_client(tmp_path)
+    csrf_token = _csrf_token(client)
+    response = client.post(
+        "/api/label",
+        json={
+            "cluster_id": "cluster-0",
+            "decision": "confirmed_near_duplicates",
+            "keep_path": candidates[0].cluster.members[0].path.as_posix(),
+            "keep_reasons": ["because I said so"],
+        },
+        headers={"X-Reclaim-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 400
 
 
 def test_label_route_rejects_a_keep_path_not_in_the_cluster(tmp_path: Path) -> None:
