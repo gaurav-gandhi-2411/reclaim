@@ -196,6 +196,73 @@ possible future rendering path is safe by construction.
 | Nothing stopped Reclaim from running elevated, silently discarding the OS's own permission backstop | every mutating command (`apply`/`undo`/`purge`/`serve`/`dashboard`) refuses to start if the process holds an elevated token | `tests/test_elevation.py` + `tests/test_cli.py` — mocked-elevated runs refused before touching disk; `tests/test_safety.py` separately confirms `SafetyValidator`'s protected-root verdict is identical regardless of elevation state (it was always a pure pattern match, never OS-permission-dependent — the guard closes the *other* backstop, not this one) |
 | No dependency vulnerability scanning | `pip-audit` added to CI, failing the build on any known vulnerability in a locked dependency (zero found as of this pass) | `.github/workflows/ci.yml` `pip-audit` job |
 
+## The applied-AI layer — safety-eval-first, and provisional means provisional
+
+Everything above is the deterministic engine: hashes and path rules, no models. A separate
+build added an applied-AI layer beside it — near-identical image clustering and a classical
+keep-best scorer — and the build order itself is the interesting engineering decision: the
+safety eval had to pass, independently verified, *before a single model existed*. Not "we'll
+add a safety test eventually." The harness and the recommend-only guarantee came first,
+against scaffolding and fabricated data, precisely so no feature could ever be built on top of
+an unproven boundary.
+
+**The boundary is structural, not conventional.** `AICluster`/`AIClusterMember`
+(`src/reclaim/ai/models.py`) deliberately share zero field names with the deterministic
+engine's `Candidate` — `reclaim.executor.apply_batch` accesses `candidate.safety_verdict`
+unconditionally on every item it's handed, so passing it an AI-produced object raises
+`AttributeError` before any filesystem call, not because a convention was followed but because
+the object literally doesn't have the field. A static AST scan re-checks every file under
+`src/reclaim/ai/` on every CI run for an import of `reclaim.executor` or `send2trash`; an
+independent verifier pass tried to find a gap in that scan and found one for real (`from
+reclaim import executor` — a form the scan's first version missed by reading only
+`ImportFrom.module`, not the imported names) — closed with a regression test before the gate
+was allowed to pass. The adversarial case named explicitly in the build brief — a
+`config.toml` that tries to inject an AI-named category into the auto-quarantine path — is
+rejected by `pydantic`'s `extra="forbid"` on every config model; there is no field for it to
+land in.
+
+**The XSS lesson from the security audit recurred immediately, in new code, and was caught the
+same way.** Building the gold-set labeling tool's review UI, the first draft used
+`onclick="selectKeep('...', i, '...')"` with `html.escape()`-wrapped filenames interpolated
+into the JS string literal — the exact double-context injection class already fixed once this
+session in the main dashboard, just in a different component. HTML-escaping a quote character
+does not protect a JS string literal inside an inline event-handler attribute: the browser
+HTML-decodes the attribute value *before* parsing it as JavaScript, so the escaped quote
+reappears as a literal one and breaks out of the string. Caught and rewritten — every
+filename/path now travels exclusively through `data-*` attributes read via `.dataset`, never
+re-interpreted as code — before any test was written against the vulnerable version, and an
+independent verifier separately constructed its own adversarial filenames
+(`');alert(1);//`-style paths, backticks, mixed quotes) against the fixed version to confirm
+the fix actually holds, not just that the diff looks right.
+
+**Every operating point is labeled provisional, everywhere, on purpose.** The measured
+Hamming-distance threshold (2, at precision 1.0) comes from a real PR-curve derivation — the
+actual selection method the spec requires — run against synthetic, seeded (42) fixtures, not
+real photos. `select_operating_point()` hardcodes `is_provisional=True`; there is no code path
+that returns a non-provisional result. The CI regression gate deliberately uses a looser,
+margined threshold (10) rather than the measured 2, because clean synthetic transforms
+(resize, recompress, mild brightness shift) are an easier case than real near-duplicate
+photos, and the gate's job is catching regressions, not asserting a production value. None of
+this may be cited as "Reclaim's near-dup threshold is X" in any user-facing copy — that
+requires the gold-set labeling tool this same build delivered (a loopback-only FastAPI review
+UI reusing the dashboard's own audited Host/Origin/CSRF guard, verified end-to-end in a real
+browser session: select a keeper, confirm, reload, confirm persistence, then a live `curl`
+proof that a spoofed Host header and a missing CSRF token are both actually rejected by the
+running server) to actually be run against real data — a deliberate, disclosed stop, not an
+oversight.
+
+**The fixture itself needed a real bug fix to give honest ground truth.** An early version of
+the synthetic image fixtures resized every quality variant back to identical final pixel
+dimensions before measuring quality — which silently zeroed out the keep-best scorer's
+resolution signal and produced an arbitrary 0.667 top-1 agreement between two members that
+were, by every signal the scorer actually measures, genuinely tied. The fix wasn't to tune the
+scorer's weights until the number looked better; it was to make the fixture preserve real
+resolution differences between variants (also the more realistic shape — an actual resized
+copy usually does carry fewer pixels), which resolved agreement to 1.0 without touching the
+scorer at all. The eval was catching real ambiguity in the test data, not a code defect — worth
+noting because the instinct to "fix" a failing eval by adjusting the thing being measured is
+exactly backwards, and this is a small, concrete example of resisting it.
+
 ## Honest metrics
 
 | metric | value | source |

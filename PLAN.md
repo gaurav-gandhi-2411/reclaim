@@ -969,6 +969,55 @@ retention + restore, now with an explicit `purge` command for expired entries.
 - Next: Feature 1a Track A (pHash/dHash near-identical clustering + classical keep-best
   scorer) — the first real feature, per build order.
 
+### 2026-07-18 — Feature 1a Track A + gold-set labeling tool
+- Feature 1a Track A shipped: `src/reclaim/ai/{phash,keep_best,image_similarity}.py` (pHash/
+  dHash prefilter + Hamming union-find clustering + classical sharpness/resolution/exposure
+  keep-best scorer, no NIMA — spec says add only if measured to beat classical, nothing did
+  that measurement). `evals/ai_fixtures/build_image_similarity_fixtures.py` (deterministic,
+  seed=42, no binary images committed) + `evals/test_ai_image_similarity.py` (PR-curve
+  operating-point derivation at target precision >=0.95, BCubed clustering floor, keep-best
+  safety metric + top-1 agreement, end-to-end safety-filtered proof). An early fixture
+  revision zeroed out the resolution signal by resizing every variant back to identical
+  dimensions (produced an arbitrary 0.667 top-1 agreement); fixed the fixture, not the
+  scorer's weights — see CASE_STUDY's new AI-layer section for why that distinction mattered.
+  ADR-0012 records the measured-but-provisional threshold (Hamming distance 2, precision 1.0
+  on synthetic fixtures) and the CI gate's deliberately looser, margined value (10).
+  Independent verifier constructed adversarial cases outside the test suite (1x1 pixel
+  images, all-black/all-white, corrupted files, threshold-boundary sweeps) — all handled
+  sanely. Committed `ae57723`.
+- Gold-set labeling tool shipped (delivered per the autonomy boundary, NOT run against real
+  photos): `src/reclaim/ai/labeling.py` (LabelStore, append-only JSONL; `discover_label_
+  candidates` reuses the real Track A pipeline, not a separate implementation, at a looser
+  default threshold so borderline cases get reviewed) + `src/reclaim/ai/labeling_app.py`
+  (loopback-only FastAPI review UI reusing `reclaim.api.security` wholesale — same Host/
+  Origin/CSRF guard as the main dashboard, not a lesser bar for "just a dev tool") +
+  `scripts/ai_label_tool.py` (CLI launcher). ADR-0013.
+  **Caught a real vulnerability in this feature's own first draft**, same class as the
+  dashboard XSS fixed earlier this session: an inline `onclick="selectKeep('...', i, '...')"`
+  handler with `html.escape()`-wrapped filenames interpolated into the JS string literal —
+  HTML-escaping a quote doesn't protect a JS string literal in an inline event-handler
+  attribute (the browser HTML-decodes the attribute before parsing it as JS). Fixed to
+  data-*-attributes-plus-delegated-listener before any test was written against the
+  vulnerable version.
+  **Verified live, not just unit-tested**: launched the tool against a synthetic photo
+  directory, drove it through chrome-devtools in a real browser end to end (select keeper,
+  confirm, reload, confirm persistence and updated counts, reject a different cluster,
+  confirm empty state), then confirmed via `curl` that the running server actually rejects a
+  spoofed Host header and a missing CSRF token. Independent verifier separately constructed
+  its own adversarial filenames and image-route inputs (path traversal, negative/non-numeric
+  indices) against the fixed version. Committed `9656760`.
+- 402 tests green (was 327 before this session's AI-layer work started), all 4 AI ADRs
+  (0011-0013 plus the earlier architecture one) verified independently before landing. Full
+  eval suite (deterministic safety hard gate + all AI evals) reconfirmed green as a final
+  checkpoint. CASE_STUDY gained an AI-layer section.
+- Remaining build order (not attempted this session, per "one feature at a time, report
+  before next"): Feature 1b (MinHash doc near-dup + version-chain), Feature 1a Track B (CLIP
+  semantic grouping, only after Track A's pipeline is proven — it is), Feature 2 (screenshot
+  burst + OCR, privacy-locked), Feature 3 (feedback logging + LambdaMART ranker, label-gated).
+  Real gold-set labeling (running `scripts/ai_label_tool.py` against GG's actual photos) is
+  an explicit follow-up requiring GG's own time, not something this session can or should do
+  on his behalf.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
