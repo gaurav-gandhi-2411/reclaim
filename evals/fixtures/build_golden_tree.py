@@ -81,10 +81,24 @@ def _materialize(entry: dict[str, Any], root: Path) -> None:
 
 def _init_git_repo(repo_dir: Path, *, dirty: bool) -> None:
     _run_git(["init", "--quiet"], cwd=repo_dir)
-    _run_git(["config", "user.email", _GIT_USER_EMAIL], cwd=repo_dir)
-    _run_git(["config", "user.name", _GIT_USER_NAME], cwd=repo_dir)
     _run_git(["add", "-A"], cwd=repo_dir)
-    _run_git(["commit", "--quiet", "--allow-empty", "-m", "chore: fixture baseline"], cwd=repo_dir)
+    # Identity scoped via -c to this single commit invocation only — no `git config` call at
+    # all, local or global, ever writes a config file for this. See scripts/git_guard.py's
+    # docstring for why this repo prefers -c over even repo-local `git config` where possible.
+    _run_git(
+        [
+            "-c",
+            f"user.email={_GIT_USER_EMAIL}",
+            "-c",
+            f"user.name={_GIT_USER_NAME}",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "chore: fixture baseline",
+        ],
+        cwd=repo_dir,
+    )
     if dirty:
         marker = repo_dir / "_dirty_marker.txt"
         marker.write_text("uncommitted change for fixture\n", encoding="utf-8")

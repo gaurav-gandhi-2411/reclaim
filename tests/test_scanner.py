@@ -29,11 +29,24 @@ def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 def _init_repo(repo_dir: Path) -> None:
     repo_dir.mkdir(parents=True, exist_ok=True)
     _run_git(["init", "--quiet"], cwd=repo_dir)
-    _run_git(["config", "user.email", _GIT_EMAIL], cwd=repo_dir)
-    _run_git(["config", "user.name", _GIT_NAME], cwd=repo_dir)
     (repo_dir / "tracked.txt").write_text("hello\n", encoding="utf-8")
     _run_git(["add", "-A"], cwd=repo_dir)
-    _run_git(["commit", "--quiet", "-m", "chore: baseline"], cwd=repo_dir)
+    # Identity scoped via -c to this single commit invocation only — no `git config` call at
+    # all, local or global, ever writes a config file for this. See scripts/git_guard.py's
+    # docstring for why this repo prefers -c over even repo-local `git config` where possible.
+    _run_git(
+        [
+            "-c",
+            f"user.email={_GIT_EMAIL}",
+            "-c",
+            f"user.name={_GIT_NAME}",
+            "commit",
+            "--quiet",
+            "-m",
+            "chore: baseline",
+        ],
+        cwd=repo_dir,
+    )
 
 
 # --- is_cloud_sync_root heuristic -------------------------------------------------------
