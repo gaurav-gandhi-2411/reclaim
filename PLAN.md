@@ -932,6 +932,43 @@ retention + restore, now with an explicit `purge` command for expired entries.
   (not trusting the claim) and did a final real-identity integrity check before sign-off.
   Committed `0f2385e`.
 
+### 2026-07-18 — Applied-AI layer kicks off: hard gates 1-3 complete
+- New track, spec-driven by `reclaim-ai-features-spec.md` (committed as-is, `6d03cdd`). Work
+  happens on `feat/ai-layer` — branch-only per explicit instruction, never merged past branch
+  protection without GG's review. New ADR series continues at 0011 (deterministic-engine ADRs
+  0001-0010 are a separate, already-shipped track).
+- Build order requires the EvalHarness + the §7.5 adversarial safety eval to land and pass,
+  independently verified, BEFORE any model is wired in — done first, against scaffolding only
+  (no pHash/CLIP/etc. exists yet at this point). Gate 1: `src/reclaim/ai/` package
+  (`AICluster`/`AIClusterMember`/`AIReviewQueue`, deliberately field-disjoint from
+  `reclaim.models.Candidate`) + `eval_harness.py` (BCubed, PR-curve, provenance) +
+  `evals/test_ai_safety_gate.py` (13 cases: AST import-graph scan, AttributeError-before-any-
+  disk-io proof, two adversarial-config injection attempts rejected by pydantic
+  `extra="forbid"`, reserved-namespace grep, construction-time invariants). Gate 2 (structural
+  separation): same AST scan + `tests/test_ai_safety_reuse.py` proving the AI layer reuses the
+  real `SafetyValidator`, not a reimplementation, against real fixture files. Gate 3 (optional
+  extra): `pyproject.toml`'s `[project.optional-dependencies] ai`, lazy-guarded imports
+  (`reclaim.ai._optional.require`), both install profiles tested
+  (`tests/test_ai_optional_extra.py`), new CI job `ai-layer-with-extras`.
+- Independent verifier pass on Gate 1 found one real gap before sign-off: the AST import-scan
+  helper missed the `from reclaim import executor` form (only checked `ImportFrom.module`, not
+  `module.alias` combinations) — fixed immediately with a regression test
+  (`test_imported_module_names_catches_the_from_reclaim_import_executor_form`), re-verified,
+  then committed. Verifier also independently re-derived §0/§6/§7.5 from the spec itself before
+  judging the code against it, and tried its own adversarial case (an indirect re-export chain)
+  — found the AST scan is per-file, not full transitive-closure, and documented that as a known
+  limitation (mitigated by the type-level AttributeError proof, which holds regardless of how
+  a stray reference to the executor might arrive).
+- ADR-0011 records the architecture + verifies Feature 1a Track A's three new dependencies'
+  licenses via real `importlib.metadata` (not memory): imagehash BSD-2-Clause,
+  opencv-python-headless Apache-2.0, pillow MIT-CMU, all transitive deps (numpy/scipy/
+  pywavelets) also permissive. Zero model weights bundled by this feature (pHash/dHash are
+  algorithms, not learned weights), so the license table is exhaustive for it.
+- All 386 tests green (was 327 before this session started), ruff/mypy clean on both install
+  profiles. Committed `4c738e7`.
+- Next: Feature 1a Track A (pHash/dHash near-identical clustering + classical keep-best
+  scorer) — the first real feature, per build order.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
