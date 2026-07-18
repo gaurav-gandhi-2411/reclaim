@@ -185,17 +185,28 @@ def _is_model_cache_path(path: Path, model_cache_roots: Sequence[Path]) -> bool:
 # check would have left nearly all of them unprotected.
 _CONDA_MARKER_DIRNAME = "conda-meta"
 _VENV_MARKER_FILENAME = "pyvenv.cfg"
+# ADR-0009: a standalone Python interpreter *installation* (not itself a conda env or a venv —
+# e.g. a uv-managed Python build under `~/AppData/Roaming/uv/python/<build>/`, or any other
+# system/user-level Python install) has neither `conda-meta/` nor `pyvenv.cfg`, but is structured
+# identically to one at the filesystem level: `python.exe`/`pythonw.exe` directly in the root,
+# alongside a `Lib/` directory. This is the general, tool-agnostic signature of "a complete
+# CPython installation lives here" — catches uv's managed builds (which the two markers above
+# miss entirely) without being specific to uv.
+_PYTHON_EXECUTABLE_NAMES = ("python.exe", "pythonw.exe")
+_PYTHON_STDLIB_DIRNAME = "Lib"
 
 
 def _environment_root(path: Path) -> Path | None:
     """The root directory of the Python environment `path` lives inside (a conda base install, a
-    named conda `envs/<name>`, or a `venv`/`.venv`), if any. Walks UP from `path` looking for the
-    nearest ancestor that IS an environment root, identified by the same canonical marker each
-    tool uses to recognize its own environments: a `conda-meta/` subdirectory (conda base or
-    named env) or a `pyvenv.cfg` file (venv) — robust regardless of which subdirectory inside the
-    environment `path` happens to live in, unlike a `Lib/site-packages`-only name check. Bounded
-    to the ancestors of one file already in a small candidate cluster — never a directory walk
-    over the whole disk.
+    named conda `envs/<name>`, a `venv`/`.venv`, or a standalone Python installation), if any.
+    Walks UP from `path` looking for the nearest ancestor that IS an environment/installation
+    root, identified by the same canonical marker each tool uses to recognize its own
+    environments: a `conda-meta/` subdirectory (conda base or named env), a `pyvenv.cfg` file
+    (venv), or a `python.exe`/`pythonw.exe` + `Lib/` pair (any standalone CPython installation,
+    including ones neither conda nor venv manages — ADR-0009) — robust regardless of which
+    subdirectory inside the environment `path` happens to live in, unlike a `Lib/site-packages`-
+    only name check. Bounded to the ancestors of one file already in a small candidate cluster —
+    never a directory walk over the whole disk.
 
     Conda's own `pkgs/` extraction cache is deliberately excluded up front (short-circuited
     before the walk, via the well-known `pkgs` path segment): it's a package-manager cache
@@ -211,6 +222,10 @@ def _environment_root(path: Path) -> Path | None:
             if (ancestor / _CONDA_MARKER_DIRNAME).is_dir() or (
                 ancestor / _VENV_MARKER_FILENAME
             ).is_file():
+                return ancestor
+            if (ancestor / _PYTHON_STDLIB_DIRNAME).is_dir() and any(
+                (ancestor / exe_name).is_file() for exe_name in _PYTHON_EXECUTABLE_NAMES
+            ):
                 return ancestor
         except OSError:
             continue

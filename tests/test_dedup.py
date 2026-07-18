@@ -767,6 +767,38 @@ def test_environment_root_identifies_bare_venv_via_pyvenv_cfg(tmp_path: Path) ->
     assert _environment_root(venv_file) == venv
 
 
+def _make_standalone_python_install(root: Path) -> Path:
+    """A real `python.exe` + `Lib/` pair -- the canonical, tool-agnostic structural signature of
+    a complete standalone CPython installation (has neither `conda-meta/` nor `pyvenv.cfg`)."""
+    root.mkdir(parents=True)
+    (root / "python.exe").write_bytes(b"fake-exe")
+    (root / "Lib").mkdir()
+    return root
+
+
+def test_environment_root_identifies_standalone_python_install_via_exe_and_lib(
+    tmp_path: Path,
+) -> None:
+    """ADR-0009: the real-disk incident this closes -- a uv-managed Python build under
+    `~/AppData/Roaming/uv/python/<build>/` has neither `conda-meta/` nor `pyvenv.cfg`, so
+    ADR-0008's two markers alone never recognized it as an environment at all. `python.exe`
+    directly in the root alongside a `Lib/` directory is the general signature every complete
+    CPython install (conda, venv, standalone, uv-managed) shares structurally."""
+    uv_python = _make_standalone_python_install(
+        tmp_path / "uv" / "python" / "cpython-3.12.12-windows-x86_64-none"
+    )
+    stdlib_file = uv_python / "Lib" / "socket.py"
+    stdlib_file.parent.mkdir(parents=True, exist_ok=True)
+    stdlib_file.write_text("# stdlib")
+    assert _environment_root(stdlib_file) == uv_python
+
+    # A Lib/ directory with no sibling python.exe (e.g. a stray directory literally named "Lib"
+    # somewhere unrelated) must NOT be misidentified as an installation root.
+    lonely_lib = tmp_path / "SomeProject" / "Lib" / "file.py"
+    lonely_lib.parent.mkdir(parents=True)
+    assert _environment_root(lonely_lib) is None
+
+
 def test_is_cross_environment_duplicate_true_for_different_envs_false_for_same_or_cache(
     tmp_path: Path,
 ) -> None:
@@ -988,3 +1020,45 @@ def test_generate_duplicate_candidates_excludes_env_copies_when_keep_is_pkgs_cac
         candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
 
     assert candidates == []  # every environment's own copy excluded, not just some of them
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_duplicate_candidates_excludes_standalone_python_install_copy(
+    tmp_path: Path,
+) -> None:
+    """ADR-0009: the actual real-disk incident this closes. A shared, uv-managed Python
+    installation's stdlib file (`Lib/socket.py`) was byte-identical to a named conda
+    environment's own copy of the same stdlib file -- before this fix, the uv install wasn't
+    recognized as ANY kind of environment (`_environment_root` returned `None` for it, since it
+    has neither `conda-meta/` nor `pyvenv.cfg`), so it was proposed for deletion and applied for
+    real, breaking every project on the machine that referenced that shared interpreter build.
+    Recovered from the Windows Recycle Bin afterward -- this test is the regression guard so it
+    can't happen again."""
+    uv_python = _make_standalone_python_install(
+        tmp_path / "uv" / "python" / "cpython-3.12.12-windows-x86_64-none"
+    )
+    uv_socket_path = uv_python / "Lib" / "socket.py"
+    uv_socket_path.write_bytes(b"stdlib-socket-module-" * 1_000)
+
+    conda_root = tmp_path / "anaconda3"
+    named_env = _make_conda_env(conda_root / "envs" / "tes-cleanroom-080")
+    env_socket_path = named_env / "Lib" / "socket.py"
+    env_socket_path.parent.mkdir(parents=True, exist_ok=True)
+    env_socket_path.write_bytes(uv_socket_path.read_bytes())
+    size = uv_socket_path.stat().st_size
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        index.upsert_records(
+            [
+                _index_record(str(env_socket_path), size_bytes=size, ctime=100.0),  # kept
+                _index_record(str(uv_socket_path), size_bytes=size, ctime=200.0),
+            ],
+            scanned_at=1000.0,
+        )
+        config = Config(
+            safety=SafetyConfig(protected_roots=[]),
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
+        )
+        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
+
+    assert candidates == []  # the shared interpreter install's copy must never be proposed
