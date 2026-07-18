@@ -917,6 +917,21 @@ retention + restore, now with an explicit `purge` command for expired entries.
   and Stage 2 (safe-mode default, first-run disclaimer, signed public installer) both remain
   open, pending GG's go-public call on the latter.
 
+### 2026-07-18 — git_guard.py: closing the accidental --global mutation gap
+- Follow-up requested after the mid-session identity mishap above: `scripts/git_guard.py` now
+  refuses any `git config --global`/`--system` invocation routed through it unless
+  `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` is set, or `RECLAIM_GIT_SANDBOX_HOME` plus a redirected
+  `HOME`/`USERPROFILE`. `eval.yml`'s fixture-identity step now routes through it with
+  `GIT_CONFIG_GLOBAL` pointed at a runner-temp path — copying just the `run:` block to a local
+  machine (without the `env:` block) now gets refused instead of repeating the incident.
+  `evals/fixtures/build_golden_tree.py`/`tests/test_scanner.py` no longer call `git config` at
+  all, even locally — identity is `-c`-scoped to the single `commit` invocation instead.
+- 22 new tests (`tests/test_git_guard.py`), including an adversarial proof that a sandboxed
+  write lands only in the redirected file and the real global `user.email` is provably
+  unchanged before/after. Independent Haiku verifier re-ran the exact refusal scenario itself
+  (not trusting the claim) and did a final real-identity integrity check before sign-off.
+  Committed `0f2385e`.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
