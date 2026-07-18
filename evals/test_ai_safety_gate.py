@@ -264,6 +264,67 @@ def test_review_queue_partitions_deletion_suggestions_from_browse_only() -> None
     assert [c.cluster_id for c in queue.browse_only()] == ["semantic-1"]
 
 
+def test_review_queue_partitions_all_four_tracks_correctly() -> None:
+    """Feature 1b's two new deletion-eligible tracks (NEAR_DUP_DOCUMENT, VERSION_CHAIN) land
+    in the same deletion_suggestions() view as NEAR_IDENTICAL_IMAGE, and a browse-only track
+    stays out of it — proven at the AIReviewQueue level, not just AICluster.suggests_deletion
+    in isolation, since the queue's partitioning is what a future UI would actually read."""
+    image_dup = AICluster(
+        cluster_id="image-1",
+        track=AITrack.NEAR_IDENTICAL_IMAGE,
+        members=(
+            AIClusterMember(path=Path("a.jpg"), size_bytes=100, is_recommended_keep=True),
+            AIClusterMember(path=Path("b.jpg"), size_bytes=100),
+        ),
+        raw_score=1.0,
+        score_kind="hamming_distance",
+        rationale="near-identical",
+    )
+    document_dup = AICluster(
+        cluster_id="document-1",
+        track=AITrack.NEAR_DUP_DOCUMENT,
+        members=(
+            AIClusterMember(path=Path("r_v1.docx"), size_bytes=100, is_recommended_keep=True),
+            AIClusterMember(path=Path("r_v2.docx"), size_bytes=100),
+        ),
+        raw_score=0.95,
+        score_kind="min_pairwise_cosine_similarity_within_cluster",
+        rationale="near-dup document",
+    )
+    chain = AICluster(
+        cluster_id="chain-1",
+        track=AITrack.VERSION_CHAIN,
+        members=(
+            AIClusterMember(path=Path("d_v1.docx"), size_bytes=90, position=0),
+            AIClusterMember(
+                path=Path("d_final.docx"), size_bytes=100, is_recommended_keep=True, position=1
+            ),
+        ),
+        raw_score=0.9,
+        score_kind="min_pairwise_content_similarity_within_chain",
+        rationale="version chain",
+    )
+    browse = AICluster(
+        cluster_id="semantic-1",
+        track=AITrack.SEMANTIC_IMAGE,
+        members=(AIClusterMember(path=Path("c.jpg"), size_bytes=100),),
+        raw_score=0.9,
+        score_kind="cosine_similarity",
+        rationale="same scene",
+    )
+
+    queue = AIReviewQueue()
+    for cluster in (image_dup, document_dup, chain, browse):
+        queue.add(cluster)
+
+    assert {c.cluster_id for c in queue.deletion_suggestions()} == {
+        "image-1",
+        "document-1",
+        "chain-1",
+    }
+    assert [c.cluster_id for c in queue.browse_only()] == ["semantic-1"]
+
+
 # --- 6. Full pipeline sanity: apply_batch's real call sites never touch reclaim.ai -------------
 
 

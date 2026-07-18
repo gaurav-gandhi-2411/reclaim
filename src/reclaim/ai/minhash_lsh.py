@@ -105,8 +105,9 @@ def cluster_by_jaccard_similarity(
     clustering semantics as `phash.cluster_by_hamming_distance`, just similarity instead of
     distance, and a MINIMUM to clear instead of a MAXIMUM). Singleton "clusters" are dropped.
 
-    `min_similarity` is a provisional operating point until measured on a real dataset — see
-    ADR-0017. O(n^2) pairwise comparison, same scale reasoning as
+    `min_similarity` is MEASURED at 0.2 on a real, realistic public-domain document
+    distribution — see ADR-0017. Still a caller-supplied parameter, not a default hardcoded
+    here. O(n^2) pairwise comparison, same scale reasoning as
     `phash.cluster_by_hamming_distance`: this runs on the residual after exact-hash dedup.
     """
     union_find = _UnionFind(len(records))

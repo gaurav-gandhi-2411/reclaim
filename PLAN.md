@@ -1125,6 +1125,64 @@ retention + restore, now with an explicit `purge` command for expired entries.
   `evals/ai_fixtures/build_realistic_recompression_tiers.py`,
   `evals/test_ai_copydays_realistic_distribution.py`.
 
+### 2026-07-19 — Eval gate hardening (ADR-0016), then Feature 1b built with the lesson applied from the start
+- Before building 1b, GG asked for the eval GATE itself hardened with 1a's recall-artifact
+  lesson: a precision-only gate let a feature pass CI while catching <8% of dupes. Added a
+  required `min_recall` floor alongside `target_precision` to `select_operating_point`, and a
+  required `DistributionDeclaration` (validated: non-empty description, non-empty
+  untested-variation note, can't claim realistic+adversarial at once) plus
+  `assert_safe_to_promote_to_measured` — structurally forbids an adversarial-tail-only or
+  synthetic-only distribution from justifying MEASURED status. The historical mistake became a
+  permanent regression test: `evals/test_ai_copydays_gold.py`'s hard-tier curve now asserts
+  the gate REJECTS it. ADR-0016 (policy), ADR-0012 retroactively disclosed ("5 transforms
+  measured, uncommon transforms unmeasured"). Verifier signed off. 22 new eval_harness tests.
+- **Feature 1b (document near-dup + version-chain) built following 1a's pattern exactly**:
+  MinHash/LSH (`datasketch`, MIT) Stage-1 prefilter over word shingles → all-MiniLM-L6-v2
+  (`sentence-transformers`, Apache-2.0) Stage-2 confirmation on the RESIDUAL only → version-
+  chain ordering via filename-pattern heuristic (vN/final/Windows (N)/copy) + mtime fallback.
+  Local text extraction (`.txt`/`.md`/`.docx`/`.pdf`) never logs content anywhere, structurally
+  (no logging calls in `document_text.py` at all). Caught and fixed a real bug before it
+  reached the eval: `\bfinal\b` doesn't match inside "report_final" because `\w` (what `\b`
+  boundaries on) includes underscore — the spec's own example filename would have silently
+  mis-ranked.
+- `NEAR_DUP_DOCUMENT`/`VERSION_CHAIN` joined `_DELETION_SUGGESTION_ELIGIBLE_TRACKS` (spec §2).
+  Verified this doesn't weaken the safety gate (the most important test in the layer):
+  `SEMANTIC_IMAGE` stays browse-only, 3 new regression tests (2 per-track + 1 queue-level
+  4-track partition test) prove the new tracks gate on an identified keeper the same way
+  `NEAR_IDENTICAL_IMAGE` already did.
+- **Dataset assessment** (GG named PAN plagiarism, Quora Question Pairs, PAWS): QQP rejected —
+  Quora's ToS carries a non-commercial restriction, inappropriate for a project with stated
+  commercialization ambitions. PAWS is real and clean-licensed but adversarial *by
+  construction and by name* (word-scrambled/back-translated negatives) — used only as a
+  disclosed secondary boundary check, never the MEASURED basis. PAN-PC-11 (CC-BY-4.0, open,
+  strong task match) found but not used — 1.7GB across RAR archives, no extraction tooling in
+  this environment, not worth a new dependency for. **Went with the proven ADR-0012 pattern
+  instead**: 8 public-domain Gutenberg books (zero licensing risk), chunked into 120 real
+  document-length pieces, 3 deterministic realistic transform profiles (mild whitespace
+  cleanup, moderate paragraph trim+reorder, collab-tool-paste flattening) = 360 real positive
+  pairs + 7,140 clean cross-book negatives.
+- **Measured MinHash Jaccard threshold: 0.2** (bare-minimum measured was 0.1328, precision
+  1.0/recall 1.0; chosen production value adds margin — max real negative observed was only
+  0.0234, so 0.2 still has >8x headroom — costing 3 of 360 pairs of recall, 0.9917 aggregate).
+  `assert_safe_to_promote_to_measured` called and passes on this distribution.
+- **Embedding threshold: 0.6**, disclosed as NOT independently PR-curve-derived — a real,
+  honest finding: at MinHash threshold 0.2, Stage 1 alone already achieves 100% precision on
+  the measured distribution, leaving no ambiguous residual for Stage 2 to discriminate
+  against. Set as a safety margin below the lowest genuine-positive similarity observed
+  (0.6467). PAWS-Wiki's real 8,000-pair PR curve showed ≥0.90 precision is NOT achievable on
+  its adversarial construction at all — reported honestly as a boundary-tier finding, not
+  Feature 1b's real-world number.
+- **Version-chain: 1.0 exact-order accuracy, 1.0 Kendall's tau** across 8 constructed chains
+  (no public dataset fits this Reclaim-specific filename-convention problem). Disclosed gap:
+  none of the 8 chains pit filename-pattern rank against mtime in genuine conflict.
+  `eval_harness.py` gained `kendall_tau`/`exact_order_accuracy` (spec §7.2), reusable for
+  Feature 3's ranker later.
+- New deps: `datasketch` (MIT), `sentence-transformers` (Apache-2.0), `python-docx` (MIT),
+  `pypdf` (BSD-3-Clause) — all lazy-imported `ai` extras; `pyarrow` (Apache-2.0) dev-only,
+  reads PAWS parquet, never in production code paths.
+- ADR-0017 (dataset + all three operating points + license summary). 454 tests green; fast
+  synthetic CI evals (1a + 1b combined) 26/26 green.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

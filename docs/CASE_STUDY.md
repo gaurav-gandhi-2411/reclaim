@@ -365,6 +365,41 @@ already close to perfect, so embeddings would be solving a problem Track A doesn
 Track B remains justified on its own separate merits (semantic grouping is a different problem
 than copy detection), not as a rescue for a gap that this measurement shows doesn't exist.
 
+## Turning an incident into a gate, then building the next feature inside it
+
+The recall-artifact incident above didn't end with a fix. Before any more features got built,
+the eval infrastructure itself changed: `select_operating_point` now requires a recall floor
+alongside the precision floor, and a `DistributionDeclaration` that has to say, in a
+structurally validated field, whether the data behind a number is realistic, adversarial-only,
+or synthetic-only. A function called `assert_safe_to_promote_to_measured` refuses to let an
+adversarial-tail-only or synthetic-only distribution justify the word "MEASURED" — and the
+original incident became a permanent regression test: the exact Copydays curve that produced
+the misleading 0.0764 recall now has to fail the new gate, on purpose, forever, or the test
+itself fails.
+
+Then the next feature — document near-duplicate detection and version-chain ordering — got
+built inside that harder gate from the first line of code, not as an afterthought. Three real,
+license-driven decisions shaped the dataset choice: Quora Question Pairs was rejected outright
+despite being the most obviously available option, because Quora's terms of service carry a
+non-commercial restriction and this project's stated posture is to build things that could
+compete in market, not just work as a demo. PAWS — real Wikipedia sentences, cleanly licensed —
+was still disqualified from being the *primary* measurement, because it's adversarial by
+construction (its own name is "Paraphrase Adversaries from Word Scrambling"): using it alone
+would have been the exact same mistake as Copydays' `strong` split, just with a different
+flavor of hard. It stayed in as a disclosed secondary check, and what it showed was itself
+telling — embedding similarity alone couldn't clear 90% precision on PAWS at any useful recall,
+confirming it really is a hard adversarial set, not evidence that Feature 1b's actual pipeline
+is unreliable.
+
+The real measurement came from eight public-domain novels, chunked into document-length pieces
+and edited with three deterministic, disclosed transforms simulating how people actually
+accumulate duplicate documents — a light resave, a restructured revision, a copy-paste into
+another app. On that distribution, the two-stage pipeline (MinHash prefilter, then a sentence-
+embedding confirmation pass) turned up an honest, slightly humbling finding: at the threshold
+that gave clean precision, Stage 1 alone already caught everything — there was no ambiguous
+residual left for Stage 2 to resolve on this measurement. That got written down as exactly what
+it is, not smoothed into a confident-sounding number the embedding stage never actually earned.
+
 ## Honest metrics
 
 | metric | value | source |

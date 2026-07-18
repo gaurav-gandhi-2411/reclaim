@@ -1,0 +1,23 @@
+{
+  "commit_sha": "4e61b3ecb01d28bdbb59c07a3d8f00e57a02c941",
+  "command": "uv run pytest evals/test_ai_paws_embedding_gold.py -v -s",
+  "fixture_path": "data/ai_datasets/paws_wiki/test.parquet (PAWS-Wiki Labeled Final, ADR-0017)",
+  "distribution": {
+    "description": "PAWS-Wiki Labeled (Final) test split \u2014 real Wikipedia sentences, word-order-scrambled/back-translated negatives constructed to be hard",
+    "is_adversarial_tail_only": true
+  },
+  "pr_tradeoff": {
+    "0.95": {
+      "achievable": false
+    },
+    "0.9": {
+      "achievable": false
+    },
+    "0.85": {
+      "achievable": true,
+      "cosine_threshold": 1.0,
+      "recall": 0.0022624434389140274
+    }
+  },
+  "note": "Disclosed boundary-tier check only \u2014 NEVER the basis for Feature 1b's shipped embedding threshold (ADR-0016). See evals/test_ai_document_gold.py for the realistic-distribution measurement that actually governs it."
+}

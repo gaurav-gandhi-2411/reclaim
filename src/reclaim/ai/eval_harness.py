@@ -218,6 +218,52 @@ def select_operating_point(
     )
 
 
+def exact_order_accuracy(predicted_order: Sequence[str], true_order: Sequence[str]) -> float:
+    """1.0 if `predicted_order` matches `true_order` exactly (same items, same sequence),
+    else 0.0 — the strict version-chain-ordering metric (spec §7.2), complementary to
+    `kendall_tau`'s partial-credit measure."""
+    if set(predicted_order) != set(true_order):
+        raise ValueError(
+            "predicted_order and true_order must contain the same items — "
+            f"symmetric difference: {set(predicted_order) ^ set(true_order)}"
+        )
+    return 1.0 if list(predicted_order) == list(true_order) else 0.0
+
+
+def kendall_tau(predicted_order: Sequence[str], true_order: Sequence[str]) -> float:
+    """Kendall's tau-a between two total orderings of the same item set (spec §7.2's
+    version-chain ordering metric): (concordant_pairs - discordant_pairs) / total_pairs,
+    ranging -1.0 (fully reversed) to 1.0 (identical order). Ties in the compared rankings
+    can't occur here since both inputs are total orders (permutations) of the same items, so
+    tau-a (no tie correction) is the right variant, not tau-b.
+    """
+    if set(predicted_order) != set(true_order):
+        raise ValueError(
+            "predicted_order and true_order must contain the same items — "
+            f"symmetric difference: {set(predicted_order) ^ set(true_order)}"
+        )
+    items = list(true_order)
+    true_rank = {item: index for index, item in enumerate(true_order)}
+    predicted_rank = {item: index for index, item in enumerate(predicted_order)}
+
+    total_pairs = len(items) * (len(items) - 1) // 2
+    if total_pairs == 0:
+        return 1.0  # 0 or 1 items: trivially "in order"
+
+    concordant = 0
+    discordant = 0
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            true_direction = true_rank[items[i]] - true_rank[items[j]]
+            predicted_direction = predicted_rank[items[i]] - predicted_rank[items[j]]
+            agreement = true_direction * predicted_direction
+            if agreement > 0:
+                concordant += 1
+            elif agreement < 0:
+                discordant += 1
+    return (concordant - discordant) / total_pairs
+
+
 def current_commit_sha(repo_root: Path | None = None) -> str:
     """Real `git rev-parse HEAD` — never hardcoded. Returns `"unknown"` (never a fabricated
     hash) if git isn't available or this isn't a repo, so a caller can detect that and refuse

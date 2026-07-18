@@ -48,8 +48,9 @@ def build_near_dup_document_clusters(
     num_perm: int = 128,
 ) -> list[AICluster]:
     """`minhash_threshold`/`embedding_threshold` are the near-dup-document operating points —
-    PROVISIONAL until measured on a real dataset (see ADR-0017). Unreadable/unsupported files
-    are skipped, never raised for.
+    MEASURED at 0.2 / 0.6 respectively on a real, realistic public-domain document distribution
+    (see ADR-0017). Still caller-supplied parameters, not defaults hardcoded here. Unreadable/
+    unsupported files are skipped, never raised for.
     """
     eligible_paths = filter_paths_through_safety_validator(document_paths, safety)
 

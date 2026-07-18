@@ -10,6 +10,8 @@ from reclaim.ai.eval_harness import (
     assert_safe_to_promote_to_measured,
     bcubed_precision_recall,
     current_commit_sha,
+    exact_order_accuracy,
+    kendall_tau,
     precision_recall_curve,
     select_operating_point,
 )
@@ -248,3 +250,41 @@ def test_current_commit_sha_returns_a_real_hash_in_this_repo() -> None:
 def test_current_commit_sha_returns_unknown_outside_a_repo(tmp_path: Path) -> None:
     sha = current_commit_sha(repo_root=tmp_path)
     assert sha == "unknown"
+
+
+def test_exact_order_accuracy_identical_order_is_one() -> None:
+    assert exact_order_accuracy(["a", "b", "c"], ["a", "b", "c"]) == 1.0
+
+
+def test_exact_order_accuracy_any_mismatch_is_zero() -> None:
+    assert exact_order_accuracy(["a", "c", "b"], ["a", "b", "c"]) == 0.0
+    assert exact_order_accuracy(["c", "b", "a"], ["a", "b", "c"]) == 0.0
+
+
+def test_exact_order_accuracy_rejects_mismatched_item_sets() -> None:
+    with pytest.raises(ValueError, match="same items"):
+        exact_order_accuracy(["a", "b"], ["a", "c"])
+
+
+def test_kendall_tau_identical_order_is_one() -> None:
+    assert kendall_tau(["a", "b", "c", "d"], ["a", "b", "c", "d"]) == pytest.approx(1.0)
+
+
+def test_kendall_tau_fully_reversed_order_is_negative_one() -> None:
+    assert kendall_tau(["d", "c", "b", "a"], ["a", "b", "c", "d"]) == pytest.approx(-1.0)
+
+
+def test_kendall_tau_hand_computed_partial_agreement() -> None:
+    """true=[a,b,c,d]. predicted=[a,c,b,d]: pairs (a,b) (a,c) (a,d) (c,d) (b,d) concordant,
+    (b,c) discordant (true has b before c, predicted has c before b). 5 concordant, 1
+    discordant, 6 total pairs -> tau = (5-1)/6 = 0.6667."""
+    assert kendall_tau(["a", "c", "b", "d"], ["a", "b", "c", "d"]) == pytest.approx(4 / 6)
+
+
+def test_kendall_tau_rejects_mismatched_item_sets() -> None:
+    with pytest.raises(ValueError, match="same items"):
+        kendall_tau(["a", "b"], ["a", "c"])
+
+
+def test_kendall_tau_single_item_is_trivially_one() -> None:
+    assert kendall_tau(["a"], ["a"]) == 1.0
