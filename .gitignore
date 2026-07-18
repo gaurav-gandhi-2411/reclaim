@@ -33,6 +33,10 @@ config.toml
 # Node (tests/frontend — jsdom regression harness only, no app build)
 node_modules/
 
+# Nuitka standalone build output (see README's "Optional: standalone reclaim.exe" section) —
+# a local, unsigned build artifact, never committed.
+dist/
+
 # IDE / OS
 .vscode/
 .idea/

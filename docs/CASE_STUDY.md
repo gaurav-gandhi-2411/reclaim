@@ -152,6 +152,50 @@ depended on. Recycle Bin, chosen specifically for its recoverability and not bec
 was expected to go wrong, is the only reason this is a paragraph in a case study instead of a
 rebuilt development machine.
 
+## Security audit — the review UI was itself the attack surface
+
+Every mechanism above defends the deletion engine. None of it defends the screen a human is
+supposed to look at *before* trusting the engine — and that screen turned out to have the most
+dangerous bug in the project, worse in kind than any of the eleven above, because it didn't
+misjudge what to delete. It could have been made to delete on command from something that was
+never the user at all.
+
+**Finding — filename-driven XSS in the one UI whose entire job is "look before you delete."**
+`renderClusterTable` (`src/reclaim/api/static/app.js`), the duplicate-cluster table in the Review
+Queue, built its `<td>` for each cluster member by interpolating `member.path` directly into
+`.innerHTML`. Reclaim's whole purpose is walking a real, arbitrary disk — a file or directory
+literally named `<img src=x onerror="...">` is not a contrived test string, it's real, reachable
+input the scanner will happily index and the dashboard will happily render. The chain that makes
+this more than a display bug: the dashboard embeds its per-session CSRF token in the page itself
+(a `<meta>` tag, added by this same audit — see below) so that legitimate `fetch()` calls can
+carry it; a script running via this XSS executes in that exact page, with that exact token
+already sitting in the DOM next to it. A filename is not supposed to be able to call
+`POST /api/apply`. Before this fix, one could — the safety model's entire premise ("nothing is
+deleted without review") assumes the reviewer sees what's actually on disk, not markup an
+attacker chose. Fixed by rewriting the row to build every cell via `textContent`
+(`git diff`-verifiable: zero `innerHTML` assignments carry a path field anywhere in the codebase
+today). Verified two ways: a static audit of every other `innerHTML` call site in `app.js`
+confirmed none of the rest interpolate attacker-controlled data (categories, tiers, and formatted
+numbers all come from a fixed server-side lookup table, not a filename); and
+`tests/frontend/xss.test.mjs` (jsdom, `node --test`, wired into CI) feeds the exact function an
+`<img onerror>` and a `<script>` payload as a cluster member's path and asserts the resulting DOM
+contains zero `<img>`/`<script>` elements and the cell's `textContent` equals the raw payload
+verbatim — proving the payload survived as inert text, not that it was silently stripped.
+**Residual, disclosed honestly:** this is a DOM-assertion regression test against the real render
+function, not a live-browser end-to-end test (no Playwright/browser-automation dependency exists
+in this repo yet) — it proves the specific vulnerable pattern can't recur without proving every
+possible future rendering path is safe by construction.
+
+**The rest of the audit**, same pass, each fixed and tested (not just documented):
+
+| finding | fix | verification |
+|---|---|---|
+| `--host` accepted any value, including `0.0.0.0` | hard-gated at argparse parse time to `127.0.0.1`/`::1` only — not merely defaulted | `tests/test_cli.py` — 0.0.0.0/LAN/`localhost`/hostname all rejected at parse time, re-validated again inside `_run_serve` for any caller that bypasses argparse |
+| No CSRF protection; no defense against DNS rebinding (a page that resolves to 127.0.0.1 but sends a foreign `Host` header) | per-process CSRF token required on every mutating `/api/*` call; `Host`/`Origin` headers checked against the exact loopback authority the server is bound to | `tests/test_api.py` — missing/wrong token rejected (403), mismatched Host/Origin rejected (403), matching Origin and read-only GETs without a token both still work |
+| `restore_batch` trusted a manifest entry's `vault_path`/`original_path` unconditionally | refuses the entire restore if a `vault_path` doesn't resolve inside the configured vault directory, or if `original_path` matches a protected system root — the zip-slip-equivalent guard for this tool's own append-only manifest | `tests/test_executor.py` — two adversarial tests hand-construct a "tampered manifest" entry (escaping vault path; protected-root destination) and confirm the whole batch is refused, including the legitimate entries sharing it |
+| Nothing stopped Reclaim from running elevated, silently discarding the OS's own permission backstop | every mutating command (`apply`/`undo`/`purge`/`serve`/`dashboard`) refuses to start if the process holds an elevated token | `tests/test_elevation.py` + `tests/test_cli.py` — mocked-elevated runs refused before touching disk; `tests/test_safety.py` separately confirms `SafetyValidator`'s protected-root verdict is identical regardless of elevation state (it was always a pure pattern match, never OS-permission-dependent — the guard closes the *other* backstop, not this one) |
+| No dependency vulnerability scanning | `pip-audit` added to CI, failing the build on any known vulnerability in a locked dependency (zero found as of this pass) | `.github/workflows/ci.yml` `pip-audit` job |
+
 ## Honest metrics
 
 | metric | value | source |
