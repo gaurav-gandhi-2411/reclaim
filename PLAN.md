@@ -1018,6 +1018,29 @@ retention + restore, now with an explicit `purge` command for expired entries.
   an explicit follow-up requiring GG's own time, not something this session can or should do
   on his behalf.
 
+### 2026-07-19 — Labeling protocol audit, before real labeling started
+- GG asked for the protocol to be confirmed against 4 statistical-soundness requirements
+  BEFORE running it for real — sampling coverage of the full distance range (not just easy
+  positives), a diagnosable keep-best label schema (WHY, not just WHICH), a volume/balance
+  target, and commit-keyed/versioned persistence. Audited against the actual code, not memory:
+  all four were real gaps, not just documentation gaps. Fixed, verified independently, then
+  reported — per GG's explicit "don't change the tool unless a gap exists."
+- `discover_label_candidates` now samples three independent strata (`near_duplicate` —
+  unchanged existing pipeline; `boundary` — pairwise Hamming 11-25; `negative_control` —
+  pairwise >=26), `LabelDecision` gained `keep_reasons` (human-checked, never auto-derived
+  from the classical scorer), `compute_progress()` tracks total + per-stratum counts against
+  documented targets (300 total, 40 minimum per non-near_duplicate stratum), and every
+  decision is stamped with a real `commit_sha` + `schema_version`. ADR-0014.
+- Verified live a second time (chrome-devtools): a 16-image synthetic directory correctly
+  produced candidates in all three strata with real measured distances; a confirmed label with
+  two reason codes round-tripped correctly including a `commit_sha` matching real repo HEAD;
+  progress persisted correctly across a reload. Independent verifier separately re-confirmed
+  all four gaps were genuinely real (not invented busywork) and probed the two subtlest risks
+  itself (stale/memoized commit_sha; old-schema label files crashing the reader) — both clean.
+  Committed `a40ba70`.
+- Still not run against GG's real photos — that's next, on him, now that the protocol is
+  confirmed sound.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
