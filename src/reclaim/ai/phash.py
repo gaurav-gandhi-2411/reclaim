@@ -91,8 +91,9 @@ def cluster_by_hamming_distance(
     hash clustering, not a bug). Singleton "clusters" (no near-dup partner found) are dropped
     — they're not near-dup candidates at all.
 
-    `max_distance` is a provisional operating point until selected from GG's gold set on the
-    real PR curve (spec §7.3) — see ADR-0012.
+    `max_distance` is the near-identical operating point — MEASURED at 14 on the real public
+    INRIA Copydays dataset via the real PR curve (spec §7.3) — see ADR-0012/ADR-0015. Still a
+    caller-supplied parameter, not a default hardcoded here.
 
     O(n²) pairwise comparison — deliberately not optimized further yet. This module operates
     on the RESIDUAL after exact-hash dedup (typically a small fraction of a real disk's image

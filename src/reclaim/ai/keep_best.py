@@ -57,14 +57,16 @@ def score_image_quality(path: Path) -> QualityScore | None:
 
 def _combine(*, sharpness: float, resolution_pixels: int, exposure_spread: float) -> float:
     """Transparent, documented weighted combination — every term is explained, nothing is a
-    tuned black-box weight presented as measured. PROVISIONAL (see ADR-0012): these weights
-    are chosen for directional correctness (sharper and higher-resolution should score
-    higher; extreme over/under-exposure should score lower), not fit to labeled data — no
-    gold-set label exists yet to fit them against. The eval this feature ships with tests
-    top-1 keep-best agreement and the "never picks the worst-quality member" safety metric on
-    synthetic fixtures where the ground truth is unambiguous by construction (one member is
-    deliberately blurred/downscaled), which does not require precisely-tuned weights to pass
-    — only correct direction.
+    tuned black-box weight presented as measured. Directional, not fit (see ADR-0012): these
+    weights are chosen for directional correctness (sharper and higher-resolution should score
+    higher; extreme over/under-exposure should score lower) — they have never been fit or
+    refit against any labeled data, including the real Copydays measurement (0.8726 top-1
+    agreement, 1.0 never-worst-quartile safety rate — see ADR-0012) that now validates the
+    direction is correct on real data too, not just synthetic fixtures. The eval this feature
+    ships with tests top-1 keep-best agreement and the "never picks the worst-quality member"
+    safety metric on synthetic fixtures where the ground truth is unambiguous by construction
+    (one member is deliberately blurred/downscaled), which does not require precisely-tuned
+    weights to pass — only correct direction.
 
     - `log1p(sharpness)`: Laplacian variance ranges from near-zero (flat/blurred) into the
       thousands (sharp, detailed) — log-compressed so one extremely sharp outlier doesn't

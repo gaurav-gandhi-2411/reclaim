@@ -34,6 +34,11 @@ config.toml
 # never committed.
 data/ai_labels/
 
+# Public research datasets downloaded for operating-point selection (ADR-0015) — third-party
+# copyrighted images (INRIA Copydays), never committed; re-downloaded by
+# evals/ai_fixtures/fetch_copydays.py on demand.
+data/ai_datasets/
+
 # Node (tests/frontend — jsdom regression harness only, no app build)
 node_modules/
 

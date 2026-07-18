@@ -1041,6 +1041,53 @@ retention + restore, now with an explicit `purge` command for expired entries.
 - Still not run against GG's real photos — that's next, on him, now that the protocol is
   confirmed sound.
 
+### 2026-07-19 — Feature 1a operating point measured on a real public dataset (INRIA Copydays)
+- GG redirected: source ground truth from public human-labeled datasets FIRST, before GG's own
+  (still-empty) gold set, and reserve LLM-as-labeler only for features with no public dataset
+  available, always with a measured error rate — never as the source of a shipped number.
+- Evaluated 5 candidates (California-ND, UKBench, INRIA Holidays, Copydays, MIR-Flickr/NUS-WIDE
+  near-dup subsets) against license + task-match + scriptable-download criteria. California-ND
+  was the best conceptual match but disqualified on download: password-gated zip, password by
+  emailing a 2013-era author, not scriptable. **INRIA Copydays selected** — purpose-built for
+  copy detection, INRIA "as-is" research license, graduated attack severities. Original host
+  (`pascal.inrialpes.fr`) is dead (real TCP timeout); used Meta/FAIR's mirror instead
+  (`dl.fbaipublicfiles.com`) — rejected an unofficial Hugging Face mirror that shipped
+  `trust_remote_code=True` with zero actual image bytes. ADR-0015.
+- Downloaded `original` (157 photos) + `strong` (229 adversarial-attacked derivatives) — the
+  milder graduated `jpeg`/`crop` splits weren't reachable on the FAIR mirror; disclosed as a
+  real coverage gap, not smoothed over.
+- **Real PR curve, 74,305 pairwise Hamming distances (314 positive / 73,991 negative), zero
+  synthetic data, zero LLM labels: operating point = max_hamming_distance 14, precision 0.9600,
+  recall 0.0764.** ADR-0012 promoted from PROVISIONAL to MEASURED. The low recall is honestly
+  flagged as a floor measured against Copydays' single hardest attack tier (print-and-scan/
+  blur/paint), not a representative estimate of ordinary consumer-duplicate recall — precision
+  carries no such caveat. CI's fast synthetic-fixture regression gate relocked at 14 (was an
+  arbitrary-margin 10); confirmed still passes cleanly against the synthetic fixtures' clean
+  separation.
+- **Keep-best measured against the same real dataset**: each Copydays block's untouched
+  original vs. its attacked derivatives is real (non-fabricated) preference ground truth.
+  0.8726 top-1 agreement, 1.0000 never-worst-quartile safety rate across all 157 blocks. The 20
+  disagreement blocks written to `reports/ai/copydays_keep_best_disagreements.json` for GG's
+  optional one-click review — not auto-resolved.
+- AVA (general-aesthetic-correlation check) explicitly skipped and the reasoning recorded, not
+  silently dropped: 32GB torrent / 49GB HF zip of individual photographers' contest images, two
+  orders of magnitude larger than Copydays for a secondary check, licensing murkier than
+  Copydays' blanket INRIA grant. The more operationally important half of the instruction (real
+  preference ground truth, disagreements surfaced not fabricated) was fully delivered via
+  Copydays instead.
+- LLM-as-labeler fallback assessed and found unnecessary for Feature 1a: both required signals
+  (near-dup ground truth, keep-best preference ground truth) are fully covered by Copydays' own
+  construction-verified labels. Zero LLM involvement anywhere in this feature's ground truth.
+- Full suite reconfirmed green: `evals/` 33 passed (446.70s, includes the new real-dataset
+  eval), `tests/` unaffected. New files: `evals/ai_fixtures/fetch_copydays.py` (idempotent,
+  checksum-verified downloader), `evals/ai_fixtures/copydays_loader.py` (pair discovery),
+  `evals/test_ai_copydays_gold.py` (the real measurement — deliberately NOT in the default CI
+  sweep; local/on-demand only, same posture as `data/real-disk-run/`'s real-disk validation).
+  ADR-0015 (new), ADR-0012 (promoted).
+- Per GG's explicit "hold build-order 1b/Track B/Feature 2/Feature 3 until 1a's operating point
+  closes on the public dataset" — 1a's operating point is now closed on the public dataset.
+  Next build-order item unblocked but not started this session.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

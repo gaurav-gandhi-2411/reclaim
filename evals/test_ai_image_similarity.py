@@ -87,14 +87,15 @@ def test_phash_operating_point_meets_target_precision_on_synthetic_fixtures(
     print(report)  # noqa: T201 -- eval reporting output, not application logging
 
 
-def test_clustering_bcubed_precision_recall_meets_floor_at_provisional_threshold(
+def test_clustering_bcubed_precision_recall_meets_floor_at_measured_threshold(
     tmp_path: Path,
 ) -> None:
     """CI precision-floor gate (spec §7.4): asserts BCubed precision/recall at a fixed,
-    already-provisional threshold (chosen once via the PR-curve test above and hardcoded here
-    for a fast, deterministic CI gate — re-deriving the PR curve on every test run would be
-    redundant with the test above, which already proves the derivation works)."""
-    max_hamming_distance = 10  # provisional; see ADR-0012 and the PR-curve test above
+    now-MEASURED threshold (hardcoded here for a fast, deterministic CI gate against synthetic
+    fixtures — re-deriving the real PR curve on every test run isn't possible in CI anyway,
+    since it needs the real Copydays dataset; see evals/test_ai_copydays_gold.py, run
+    separately, locally, on demand)."""
+    max_hamming_distance = 14  # MEASURED on INRIA Copydays — see ADR-0012/ADR-0015
     cases = build_image_similarity_fixtures(tmp_path, n_clusters=6, n_distractors=8)
 
     true_clusters = {case.id: case.true_cluster_id for case in cases}
@@ -218,7 +219,7 @@ def test_end_to_end_build_near_identical_clusters_respects_safety_and_produces_k
         Config(safety=SafetyConfig(protected_roots=[f"{protected_dir.as_posix()}/*"]))
     )
 
-    clusters = build_near_identical_clusters(all_paths, safety=safety, max_hamming_distance=10)
+    clusters = build_near_identical_clusters(all_paths, safety=safety, max_hamming_distance=14)
 
     assert len(clusters) >= 1
     for cluster in clusters:

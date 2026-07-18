@@ -31,10 +31,11 @@ def build_near_identical_clusters(
     should already be the RESIDUAL after exact-hash/BLAKE3 dedup — spec §0.4's two-stage
     compute rule). Unreadable image files are skipped, never raised for.
 
-    `max_hamming_distance` is the near-identical operating point — PROVISIONAL until selected
-    from GG's gold set on a real PR curve (see ADR-0012); this function has no opinion on
-    whether its caller's chosen value is a final one, and neither should the caller present
-    it as one.
+    `max_hamming_distance` is the near-identical operating point — MEASURED at 14 on the real
+    public INRIA Copydays dataset (see ADR-0012/ADR-0015), though still a caller-supplied
+    parameter, not a hardcoded default here: this function has no opinion on whether its
+    caller's chosen value matches the measured one, and the caller is responsible for citing
+    the ADR if it presents a value as measured.
     """
     eligible_paths = filter_paths_through_safety_validator(image_paths, safety)
 

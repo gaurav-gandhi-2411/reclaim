@@ -69,9 +69,11 @@ DEFAULT_TARGET_PER_STRATUM_MINIMUM = 40
 
 @dataclass(frozen=True, slots=True)
 class LabelDecision:
-    """One human labeling decision for one candidate — the ground truth Feature 1a's operating
-    point will eventually be selected from (ADR-0012's PROVISIONAL threshold stops being
-    provisional once enough of these exist and a new ADR records the real PR curve).
+    """One human labeling decision for one candidate — a second, independent, consumer-realistic
+    real-data source for Feature 1a's operating point, alongside the public INRIA Copydays
+    measurement ADR-0012/ADR-0015 already recorded. If GG's own labels disagree materially with
+    the Copydays-derived value, that disagreement is the signal to investigate (see ADR-0012's
+    Consequences), not a reason to prefer one source over the other by default.
 
     `commit_sha`/`schema_version` give every decision the same metric-provenance discipline
     (house rule 65b) the rest of this project holds itself to — a gold-set file is only a

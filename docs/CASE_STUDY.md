@@ -263,6 +263,67 @@ scorer at all. The eval was catching real ambiguity in the test data, not a code
 noting because the instinct to "fix" a failing eval by adjusting the thing being measured is
 exactly backwards, and this is a small, concrete example of resisting it.
 
+## Provisional becomes measured — from a public dataset, not the nearest disk
+
+The gold-set labeling tool above was built and verified, but GG hadn't run it yet — no
+`data/ai_labels/gold_labels.jsonl` existed. Rather than wait, or select Feature 1a's operating
+point against GG's own disk first (a real risk: a threshold tuned to one person's photo library
+before any broader source was tried would ship a default that's quietly overfit to that one
+disk), the instruction was to source ground truth from a public, human-labeled dataset first,
+and to treat an LLM as a labeler only as a last resort, per feature, with its own measured error
+rate — never as the source of a shipped number.
+
+**The dataset hunt was itself an engineering decision, not a formality.** Five public
+near-duplicate datasets were evaluated against three criteria: license permitting local research
+use, task match to Reclaim's actual target (consumer photo-library duplicates, not object
+recognition or scene retrieval), and a scriptable, non-interactive download path. California-ND
+was the best conceptual match — 701 real personal photos, annotated by ten human subjects
+specifically for near-duplicate judgment — and got disqualified anyway: its archive is a
+password-protected zip whose password comes from emailing the (2013-era) author directly, which
+fails "scriptable" outright. INRIA Copydays won instead: purpose-built for copy detection with
+graduated attack severities, INRIA's own "as-is, cite it" license, and — once its original host
+(`pascal.inrialpes.fr`) turned out to be dead (a genuine TCP connect timeout, not a typo) — a
+live Meta/FAIR mirror used for their own published copy-detection research. An unofficial
+Hugging Face mirror was found and rejected on sight: it shipped zero actual image bytes and
+instead a `trust_remote_code=True` loader script from an unverified community account — a
+supply-chain risk with no upside once a direct, checksum-verified HTTPS path existed.
+
+**The real measurement told a real, two-sided story, and both sides are in the ADR.** The FAIR
+mirror only carried Copydays' `original` and `strong` splits — not the milder, graduated
+`jpeg`/`crop` ladders the original host also offers. `strong` is the dataset's single hardest
+tier: print-and-scan, blur, paint, deliberately adversarial. Run for real — 74,305 pairwise
+Hamming distances, 314 genuine positives, 73,991 genuine negatives, zero synthetic data, zero
+LLM labels — the PR curve puts the ≥0.95-precision operating point at Hamming distance 14,
+precision 0.9600, **recall 0.0764**. That recall number is real and is reported as-is, but it
+would be dishonest to let it stand alone: it's a floor measured against the hardest, most
+adversarial subset available, not an estimate of how often Reclaim will actually flag an
+ordinary resized-and-recompressed duplicate. ADR-0012 says this explicitly and forbids citing
+0.0764 as "how often Feature 1a catches real duplicates" anywhere user-facing — the precision
+number (0.96, meaning few false positives) carries no such caveat and is the one that actually
+protects users from a bad delete-suggestion.
+
+**Keep-best got a real answer to the opposite question — not "is our synthetic ground truth
+consistent," but "does the scorer agree with a real, independently-known quality ordering."**
+Every Copydays block pairs one untouched original against its print-and-scanned/blurred/painted
+derivatives — a real, non-fabricated "which copy should you keep" ground truth, since those
+attacks degrade quality by construction, not by assumption. Measured across all 157 blocks: 0.8726
+top-1 agreement, and — the metric that matters more, per the spec's own ordering — 1.0000
+never-picks-the-worst-quartile safety rate, not once in 157 blocks. The 20 blocks where the
+scorer's pick differed from the original were not silently accepted or auto-corrected: they were
+written to `reports/ai/copydays_keep_best_disagreements.json`, a small, reviewable, provenance-
+tagged file, for GG's own optional look — the instruction was explicit that no preference label
+gets fabricated, by an LLM or otherwise, to paper over a disagreement.
+
+**What got skipped, and why that's disclosed rather than silent.** GG named AVA (a public
+aesthetic-scoring dataset) as a possible check on the scorer's *general* quality signal,
+separate from the keep-best question above. AVA turned out to be a 32GB torrent / 49GB single
+Hugging Face zip of individual photographers' contest submissions — two orders of magnitude
+larger than Copydays for a secondary sanity check, and the uploader's `apache-2.0` tag on their
+own packaging doesn't resolve the underlying per-photographer copyright the way INRIA's blanket
+grant does for Copydays. Skipped, with the reasoning recorded in ADR-0015 rather than quietly
+dropped — the more operationally important half of the instruction (real preference ground
+truth, disagreements surfaced not fabricated) was still fully delivered.
+
 ## Honest metrics
 
 | metric | value | source |

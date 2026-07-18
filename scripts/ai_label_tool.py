@@ -45,8 +45,9 @@ def main(argv: list[str] | None = None) -> int:
         "--max-hamming-distance",
         type=int,
         default=15,
-        help="Looser than ADR-0012's CI gate (10) on purpose — shows borderline candidates "
-        "for you to reject, not just the ones the current threshold already accepts (default: 15).",
+        help="Looser than ADR-0012's measured CI gate (14) on purpose — shows borderline "
+        "candidates for you to reject, not just the ones the current threshold already "
+        "accepts (default: 15).",
     )
     parser.add_argument(
         "--per-stratum",
