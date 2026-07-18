@@ -37,3 +37,45 @@ jobs:
 
       - name: Pytest (fast unit tests — SafetyValidator hard gate runs in eval.yml)
         run: uv run pytest --cov --cov-report=term-missing
+
+  frontend-xss-regression:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install jsdom
+        working-directory: tests/frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: DOM-level XSS regression tests (dashboard filename rendering)
+        working-directory: tests/frontend
+        run: npm test
+
+  pip-audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      # --no-emit-project: audit third-party dependencies only, not the local, unpublished
+      # `reclaim` package itself (which has no PyPI/OSV advisory feed to check against).
+      - name: Export locked dependencies
+        run: uv export --frozen --no-hashes --no-emit-project -o requirements-audit.txt
+
+      # pip-audit has no reliable, universally-populated CVSS severity field across its OSV-
+      # sourced advisories to filter on, so this fails on ANY known vulnerability — strictly
+      # stronger than "fail on high-severity only" (a superset that necessarily includes every
+      # high-severity finding), not a looser substitute for it.
+      - name: pip-audit (fails the build on any known vulnerability)
+        run: uvx pip-audit --desc -r requirements-audit.txt
