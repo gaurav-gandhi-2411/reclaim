@@ -14,6 +14,7 @@ from reclaim.executor import (
     DEFAULT_VAULT_DIR,
     CategoryBreakdown,
     QuarantineManifestEntry,
+    SafeModeViolationError,
     SafetyInvariantError,
     append_manifest_entries,
     fold_latest_manifest_entries,
@@ -21,7 +22,7 @@ from reclaim.executor import (
     rmtree_clear_readonly,
     unlink_clear_readonly,
 )
-from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, FileRecord, Verdict
+from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, FileRecord, Mode, Verdict
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -189,12 +190,28 @@ def purge_expired(
     safety: SafetyValidator,
     now: float | None = None,
     only_rebuildable: bool = False,
+    mode: Mode = Mode.POWER,
 ) -> PurgeReport:
     """Permanently deletes vaulted items (`method="vault"` manifest entries) whose retention
     window has passed, OR whose `original_path` is now stale (ADR-0005: re-occupied by
     something else, almost always a regenerated cache — see `_is_stale_original_reoccupied`).
     Never touches anything at an entry's `original_path` itself — by the time an entry is
     purge-eligible via either path, that vaulted copy is the only thing left to purge (ADR-0001).
+
+    `mode` defaults to `Mode.POWER` (preserves every existing caller's behavior unchanged);
+    real end-user entry points must pass the live mode explicitly. Stage 2 safety boundary:
+    when `mode` is `Mode.SAFE`, this function raises `SafeModeViolationError` immediately —
+    before reading the manifest, before any eligibility scan, before any I/O — unconditionally,
+    regardless of whether the vault entries it would otherwise process came from a prior
+    power-mode session. Purge is *always* a permanent-delete operation on whatever it touches
+    (there is no "purge to Recycle Bin" — the item is already a vault copy, its only fate here
+    is gone or not-yet-eligible), so safe mode forbids it outright rather than trying to make
+    it conditionally safe. In practice this is also structurally redundant with `executor.
+    apply_batch`'s safe-mode routing (safe-mode applies only ever create `method="recycle_bin"`
+    manifest entries, never `"vault"` ones, so a safe-mode-only manifest has nothing this
+    function would ever select anyway) — this explicit refusal closes the remaining case: a
+    machine with real `vault` entries from an earlier power-mode session, later switched back
+    to safe mode.
 
     Dry-run is the default (`apply=False`): makes zero mutating filesystem calls — no
     `unlink`/`rmtree`, no manifest writes, no disk-usage measurement — and reports what would
@@ -216,6 +233,13 @@ def purge_expired(
     built from the *live* config, there is no default. Any single fresh `Verdict.BLOCKED`
     aborts the *entire* purge run, deleting nothing.
     """
+    if mode == Mode.SAFE:
+        raise SafeModeViolationError(
+            "purge_expired was called with mode=Mode.SAFE — purge is always a permanent-delete "
+            "operation and is unconditionally forbidden in safe mode, regardless of manifest "
+            "content. Refusing before reading the manifest, deleting nothing."
+        )
+
     resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
     resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
     now_ts = now if now is not None else time.time()

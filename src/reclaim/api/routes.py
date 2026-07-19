@@ -11,6 +11,9 @@ from reclaim.api.schemas import (
     ApplyResponse,
     CandidatesResponse,
     DuplicateClusterReviewResponse,
+    FirstRunStatusResponse,
+    ModeStatusResponse,
+    PowerModeRequest,
     QuarantineListResponse,
     RestoreResponse,
     ScanRequest,
@@ -24,9 +27,11 @@ from reclaim.executor import (
     DirectDeleteRestoreImpossibleError,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
+    SafeModeViolationError,
     SafetyInvariantError,
     restore_batch,
 )
+from reclaim.mode import ModeSwitchDeniedError
 
 router = APIRouter(prefix="/api")
 
@@ -113,6 +118,12 @@ def apply(payload: ApplyRequest, request: Request) -> ApplyResponse:
         # already passed SafetyValidator upstream), so a 500 is correct here — it means an
         # invariant broke, not that the caller supplied bad input.
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except SafeModeViolationError as exc:
+        # Unlike SafetyInvariantError above, this is a routine, expected outcome of the caller
+        # (the dashboard frontend, or a future different client) not respecting the safe-mode
+        # contract — e.g. requesting a blanket tier-apply with no explicit paths, or a non-
+        # recycle_bin method — a real 400, not a sign anything is broken.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/quarantine", response_model=QuarantineListResponse)
@@ -141,3 +152,34 @@ def restore(batch_id: str, request: Request) -> RestoreResponse:
         # supplied bad input.
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return service.restore_response(report)
+
+
+# --- Stage 2: mode + first-run -----------------------------------------------------------------
+
+
+@router.get("/mode", response_model=ModeStatusResponse)
+def mode_status(request: Request) -> ModeStatusResponse:
+    return service.mode_status(get_state(request))
+
+
+@router.post("/mode/power", response_model=ModeStatusResponse)
+def mode_power(payload: PowerModeRequest, request: Request) -> ModeStatusResponse:
+    try:
+        return service.switch_mode_to_power(get_state(request), payload)
+    except ModeSwitchDeniedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/mode/safe", response_model=ModeStatusResponse)
+def mode_safe(request: Request) -> ModeStatusResponse:
+    return service.switch_mode_to_safe(get_state(request))
+
+
+@router.get("/first-run", response_model=FirstRunStatusResponse)
+def first_run_status(request: Request) -> FirstRunStatusResponse:
+    return service.first_run_status(get_state(request))
+
+
+@router.post("/first-run/acknowledge", response_model=FirstRunStatusResponse)
+def first_run_acknowledge(request: Request) -> FirstRunStatusResponse:
+    return service.acknowledge_first_run_screen(get_state(request))

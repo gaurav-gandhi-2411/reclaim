@@ -17,6 +17,7 @@ from reclaim.config import (
     LargeLogsConfig,
     SafetyConfig,
 )
+from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -67,12 +68,45 @@ def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
     changes at all. Tests that want to exercise a *rejected* request build their own client
     (or override a header) explicitly — see the `local_origin_violation`-specific tests at the
     end of this file.
+
+    Isolated to a pre-seeded POWER-mode log (Stage 2): this whole file predates safe mode and
+    exercises the pre-Stage-2 "full" apply/restore/vault/direct-delete behavior deliberately —
+    every test here is really testing power-mode behavior, now made explicit rather than
+    implicit. Safe-mode's own behavior is covered by its own dedicated tests
+    (tests/test_safe_mode.py), which construct their own isolated mode log with no POWER entry
+    (or an explicit SAFE one) instead of using this helper.
     """
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
     app = create_app(
         db_path=tmp_path / "index.sqlite3",
         config=config,
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        first_run_state_path=tmp_path / "first_run_state.json",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    csrf_token: str = app.state.reclaim.csrf_token
+    return TestClient(
+        app,
+        base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
+        headers={security.CSRF_HEADER_NAME: csrf_token},
+    )
+
+
+def _make_app_safe_mode(tmp_path: Path, *, config: Config) -> TestClient:
+    """Same as `_make_app`, but leaves the mode log empty — SAFE, the honest default for an
+    install that has never switched modes — for the small number of tests that specifically
+    exercise Stage 2's safe-mode behavior at the API layer."""
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=config,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=tmp_path / "mode_log.jsonl",
+        first_run_state_path=tmp_path / "first_run_state.json",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -361,6 +395,30 @@ def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:
     assert body["files_processed"] == 1
     assert body["items"][0]["path"] == paths["old_log"].as_posix()
     assert body["items"][0]["category_group"] == "large_logs"
+
+
+def test_safe_mode_apply_requires_explicit_paths_no_blanket_tier_selection(tmp_path: Path) -> None:
+    """Stage 2: a blanket tier/category-group apply with no `paths` — exactly the one-click
+    "apply everything this tier matches" flow — is refused outright while the live mode is
+    safe (the default for this app instance: `_make_app_safe_mode` never switches to power).
+    Refused even as a dry run, since a dry-run response that implies a real apply would succeed
+    the same way would be misleading."""
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app_safe_mode(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.post("/api/apply", json={"tier": "B"})
+    assert response.status_code == 400
+    assert "explicit paths list" in response.json()["detail"]
+
+    # The same request WITH explicit paths succeeds (dry-run) — the gate is specifically about
+    # the blanket-selection shape, not a blanket "safe mode can never apply anything" refusal.
+    tier_b_paths = [c["path"] for c in client.get("/api/candidates?tier=B").json()["candidates"]]
+    assert tier_b_paths, "expected at least one Tier B candidate in this fixture"
+    scoped_response = client.post("/api/apply", json={"tier": "B", "paths": tier_b_paths})
+    assert scoped_response.status_code == 200
+    assert scoped_response.json()["method"] == "recycle_bin"
 
 
 def test_apply_defaults_to_dry_run_when_field_omitted(tmp_path: Path) -> None:

@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from reclaim.config import Config
+from reclaim.config import Config, apply_safe_mode_category_overrides
+from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
+from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
+from reclaim.models import Mode
 from reclaim.safety import SafetyValidator
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed"]
@@ -44,9 +47,17 @@ class AppState:
     """
 
     db_path: Path
+    # RAW config — exactly what `config.load_config` parsed from config.toml (or built-in
+    # defaults), with NO safe-mode category override applied. Kept raw deliberately: the live
+    # mode can change mid-session via POST /api/mode/power|safe, and there is no way to
+    # "un-override" an already-overridden category back to what config.toml actually requested
+    # — see `effective_config`, which re-derives the mode-aware view fresh on every access
+    # instead of baking a startup-time snapshot into this field.
     config: Config
     vault_dir: Path
     manifest_path: Path
+    # Depends only on `config.safety` (protected roots/extensions/etc.), which is never
+    # mode-dependent — safe to build once at startup, unlike `effective_config` below.
     safety: SafetyValidator
     # Per-process CSRF token (rule: local-API hardening) and the loopback host:port this
     # process is actually bound to, used by the Origin/Host DNS-rebinding guard — see
@@ -57,3 +68,26 @@ class AppState:
     port: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     scan_status: ScanStatus = field(default_factory=ScanStatus)
+    mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
+    first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
+
+    @property
+    def live_mode(self) -> Mode:
+        """Re-read from the mode-change log on every access, never cached — the mode can
+        change mid-session via the API, and every request must see the CURRENT mode, not a
+        snapshot from whenever this `AppState` was constructed."""
+        return current_mode(self.mode_log_path)
+
+    @property
+    def effective_config(self) -> Config:
+        """`self.config` (raw) with the live mode resolved and, when SAFE, its dangerous
+        categories forced off — computed fresh on every access (see `live_mode`) rather than
+        once at startup. Every request that generates candidates, applies, or purges must use
+        this, never `self.config` directly."""
+        live_mode = self.live_mode
+        categories = (
+            apply_safe_mode_category_overrides(self.config.categories)
+            if live_mode == Mode.SAFE
+            else self.config.categories
+        )
+        return self.config.model_copy(update={"mode": live_mode, "categories": categories})

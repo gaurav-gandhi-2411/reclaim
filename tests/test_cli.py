@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from reclaim.cli import _build_parser, _run_serve, main
+from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 
 
 def test_apply_dry_run_skips_duplicates_by_default(
@@ -126,6 +127,11 @@ def test_apply_include_categories_restricts_to_named_categories(
     db = tmp_path / "index.sqlite3"
     config_path = tmp_path / "config.toml"
     config_path.write_text("[categories.dev_artifacts]\nenabled = true\n", encoding="utf-8")
+    # This test exercises dev_artifacts (forced off, and every candidate forced to Tier B, in
+    # the Stage 2 default safe mode) -- explicit power-mode opt-in, isolated to this test's own
+    # mode log, is what makes "dev_artifacts.enabled=true actually enables it" true again.
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
 
     assert main(["scan", str(root), "--db", str(db)]) == 0
     capsys.readouterr()
@@ -140,6 +146,8 @@ def test_apply_include_categories_restricts_to_named_categories(
             str(config_path),
             "--include-categories",
             "dev_artifact_pycache",
+            "--mode-log",
+            str(mode_log),
         ]
     )
     assert exit_code == 0

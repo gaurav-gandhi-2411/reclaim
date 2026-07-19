@@ -65,6 +65,33 @@ class SafetyResult:
     rationale: str
 
 
+class Mode(StrEnum):
+    """Application-wide operating mode (Stage 2 / public release). SAFE is the default for
+    every fresh install — a safety BOUNDARY, not a preference. `config.load_config` forces
+    dangerous categories off whenever the live mode is SAFE (see
+    `SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`), `detectors.generate_candidates`/`dedup.
+    generate_duplicate_candidates` force every candidate to Tier B (never auto-quarantine) in
+    SAFE mode, and `executor.apply_batch`/`purge.purge_expired` structurally refuse to ever
+    reach a permanent-delete code path while SAFE — see their own docstrings. POWER is
+    deliberate opt-in only (`reclaim.mode.switch_to_power_mode`'s typed-confirmation gate),
+    logged, and reversible back to SAFE at any time with no gate (becoming more conservative
+    is never the dangerous direction)."""
+
+    SAFE = "safe"
+    POWER = "power"
+
+
+# Stage 2: categories forced off in SAFE mode regardless of what config.toml requests —
+# `duplicates` (exact-duplicate detection reaches into environments, the same .venv-class risk
+# ADR-0009/0010 exist to catch), `model_caches` (large, sometimes gated/unrecoverable
+# checkpoints), `dev_artifacts` (node_modules/.venv/target — runtime-adjacent by definition).
+# Every other category (package_caches, temp_and_browser_caches, crash_dumps, old_installers,
+# archive_pairs, large_logs) may still be enabled in SAFE mode — see `config.
+# apply_safe_mode_category_overrides` — but every deletion for any of them still goes through
+# SAFE mode's other two structural guarantees (recycle-bin-only, review-only) regardless.
+SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS = frozenset({"duplicates", "model_caches", "dev_artifacts"})
+
+
 class Tier(StrEnum):
     """Final disposition tier for a candidate that has passed `SafetyValidator`.
 

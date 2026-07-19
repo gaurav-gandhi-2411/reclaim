@@ -22,6 +22,7 @@
     </a>
     <span class="rc-tagline">Rules-first disk cleanup — nothing deleted without review</span>
     <div class="rc-header-spacer"></div>
+    <button id="mode-badge" type="button" class="rc-mode-badge" aria-haspopup="dialog">Loading mode…</button>
     <button id="theme-toggle" type="button" class="rc-theme-toggle">Switch to dark</button>
   </header>
 
@@ -160,6 +161,40 @@
   </main>
 
   <footer class="rc-footer">Reclaim runs entirely on 127.0.0.1 — nothing here leaves your machine.</footer>
+
+  <!-- Stage 2: shown once, before anything else is usable, until acknowledged. -->
+  <div id="first-run-overlay" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="first-run-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="first-run-title">Before you start</h2>
+      <p>Reclaim scans your files and suggests things to delete — it never deletes anything without your review.</p>
+      <ul>
+        <li><strong>Safe mode is on by default.</strong> Everything is recommend/review-only: you pick what to remove, nothing is applied automatically.</li>
+        <li><strong>Deletes go to the Recycle Bin</strong> in safe mode — never a permanent delete. Restore anything from Windows' own Recycle Bin at any time, the same as if you'd deleted it yourself.</li>
+        <li><strong>Some categories stay off by default</strong> (exact-duplicate detection, ML model caches, dev-environment folders) — they reach into places a false positive would hurt most.</li>
+        <li>Power mode unlocks the full toolset (permanent delete for rebuildable caches, auto-apply) — it's opt-in, requires typing a confirmation phrase, and you can switch back to safe mode at any time.</li>
+        <li><strong>Residual risk, stated honestly:</strong> environments and project layouts aren't universally modeled. Review what's proposed before confirming, especially anything outside the categories above.</li>
+      </ul>
+      <p><a href="/LICENSE" target="_blank" rel="noopener">License &amp; no-warranty terms</a></p>
+      <button id="first-run-acknowledge" type="button" class="rc-btn rc-btn-primary">I understand, continue</button>
+    </div>
+  </div>
+
+  <!-- Stage 2: power-mode typed confirmation. Safe -> power only, safe mode itself needs no dialog. -->
+  <div id="power-mode-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="power-mode-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="power-mode-title">Switch to power mode?</h2>
+      <p>Power mode unlocks permanent delete (for rebuildable caches), vault quarantine, and auto-apply — the full toolset. This is reversible; you can switch back to safe mode at any time with no confirmation.</p>
+      <p>Type the sentence below exactly to confirm:</p>
+      <p><code id="power-mode-phrase"></code></p>
+      <label for="power-mode-input" class="rc-visually-hidden">Type the confirmation phrase</label>
+      <input id="power-mode-input" type="text" autocomplete="off" />
+      <p id="power-mode-error" class="rc-form-error" role="alert"></p>
+      <div class="rc-dialog-actions">
+        <button id="power-mode-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="power-mode-confirm" type="button" class="rc-btn rc-btn-danger">Switch to power mode</button>
+      </div>
+    </div>
+  </div>
 
   <script type="module" src="/static/app.js"></script>
 </body>

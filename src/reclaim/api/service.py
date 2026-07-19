@@ -20,7 +20,10 @@ from reclaim.api.schemas import (
     DuplicateClusterReviewOut,
     DuplicateClusterReviewResponse,
     DuplicateMemberOut,
+    FirstRunStatusResponse,
     ItemApplyResultOut,
+    ModeStatusResponse,
+    PowerModeRequest,
     QuarantineBatchOut,
     QuarantineItemOut,
     QuarantineListResponse,
@@ -43,11 +46,20 @@ from reclaim.detectors import generate_candidates
 from reclaim.executor import (
     BatchApplyReport,
     QuarantineManifestEntry,
+    QuarantineMethod,
     RestoreReport,
+    SafeModeViolationError,
     apply_batch,
 )
+from reclaim.first_run import acknowledge as acknowledge_first_run
+from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
 from reclaim.index import ScanIndex, physical_size_bytes
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, Tier
+from reclaim.mode import (
+    REQUIRED_POWER_MODE_CONFIRMATION,
+    switch_to_power_mode,
+    switch_to_safe_mode,
+)
+from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier
 from reclaim.scanner import scan_tree
 
 logger = structlog.get_logger(__name__)
@@ -61,9 +73,13 @@ _TIER_SELECTIONS: dict[str, frozenset[Tier]] = {
 
 def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     """Combined detector + exact-duplicate candidate list — the same two-function contract
-    `cli.py::_run_apply` already uses, just orchestrated for the API layer instead."""
-    candidates = generate_candidates(index, state.config, state.safety)
-    candidates += generate_duplicate_candidates(index, state.config, state.safety)
+    `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
+
+    Uses `state.effective_config` (mode-resolved fresh on every call), never `state.config`
+    directly — see `AppState.effective_config`'s docstring."""
+    config = state.effective_config
+    candidates = generate_candidates(index, config, state.safety)
+    candidates += generate_duplicate_candidates(index, config, state.safety)
     return candidates
 
 
@@ -362,14 +378,15 @@ def list_duplicate_cluster_review(
         if not index.has_any_records():
             return DuplicateClusterReviewResponse(has_scan=False, clusters=[])
 
+        config = state.effective_config
         # Computed once and threaded through to `generate_duplicate_candidates` below — that
         # function would otherwise recompute clusters itself, hashing every candidate file a
         # second time (see `generate_duplicate_candidates`'s `clusters` param docstring).
         clusters = find_duplicate_clusters(
-            index, min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes
+            index, min_reclaim_bytes=config.categories.duplicates.min_reclaim_bytes
         )
         duplicate_candidates = generate_duplicate_candidates(
-            index, state.config, state.safety, clusters=clusters
+            index, config, state.safety, clusters=clusters
         )
         candidate_by_path = {c.path: c for c in duplicate_candidates}
 
@@ -448,6 +465,22 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
 
 
 def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
+    live_mode = state.live_mode
+
+    # Stage 2 "no batch-auto for ANY category" gate: a blanket tier/category-group selection
+    # with no explicit per-item `paths` is exactly the one-click "apply everything this tier
+    # matches" flow safe mode must never allow — every safe-mode apply must be an explicitly
+    # enumerated, human-picked list of paths. (Tier is already forced to B for every candidate
+    # in safe mode — see detectors.generate_candidates — so this is a second, independent gate,
+    # not the only thing standing between a request and a blanket apply.)
+    if live_mode == Mode.SAFE and request.paths is None:
+        raise SafeModeViolationError(
+            "safe mode requires an explicit paths list for /api/apply — a blanket tier/"
+            "category-group selection with no per-item paths is refused, even as a dry run "
+            "would be misleading about what a real apply is allowed to do. Select specific "
+            "items to apply."
+        )
+
     with ScanIndex(state.db_path) as index:
         candidates = _all_candidates(index, state)
 
@@ -459,6 +492,11 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
         wanted = {Path(p).as_posix() for p in request.paths}
         selected = [c for c in selected if c.path.as_posix() in wanted]
 
+    # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally
+    # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its
+    # own method selector disabled/hidden depending on mode to avoid a confusing 400.
+    method: QuarantineMethod = "recycle_bin" if live_mode == Mode.SAFE else request.method
+
     report = apply_batch(
         selected,
         safety=state.safety,
@@ -466,7 +504,8 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
         # own default) — the two defaults agree on "touch nothing", which is the invariant that
         # actually matters; see `ApplyRequest.dry_run`'s docstring for why this is not an
         # inversion bug.
-        method=request.method,
+        method=method,
+        mode=live_mode,
         vault_dir=state.vault_dir,
         manifest_path=state.manifest_path,
         direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
@@ -614,3 +653,39 @@ def restore_response(report: RestoreReport) -> RestoreResponse:
         bytes_restored=report.bytes_restored,
         bytes_restored_human=format_bytes(report.bytes_restored),
     )
+
+
+# --- Stage 2: mode + first-run --------------------------------------------------------------
+
+
+def mode_status(state: AppState) -> ModeStatusResponse:
+    return ModeStatusResponse(
+        mode=state.live_mode, required_power_confirmation=REQUIRED_POWER_MODE_CONFIRMATION
+    )
+
+
+def switch_mode_to_power(state: AppState, request: PowerModeRequest) -> ModeStatusResponse:
+    """Raises `ModeSwitchDeniedError` (translated to a 400 by routes.py) if
+    `request.confirmation_text` doesn't exactly match the required phrase — mode stays safe,
+    nothing is logged."""
+    switch_to_power_mode(request.confirmation_text, log_path=state.mode_log_path)
+    return ModeStatusResponse(
+        mode=state.live_mode, required_power_confirmation=REQUIRED_POWER_MODE_CONFIRMATION
+    )
+
+
+def switch_mode_to_safe(state: AppState) -> ModeStatusResponse:
+    switch_to_safe_mode(log_path=state.mode_log_path)
+    return ModeStatusResponse(
+        mode=state.live_mode, required_power_confirmation=REQUIRED_POWER_MODE_CONFIRMATION
+    )
+
+
+def first_run_status(state: AppState) -> FirstRunStatusResponse:
+    acknowledged = first_run_is_acknowledged(state.first_run_state_path)
+    return FirstRunStatusResponse(acknowledged=acknowledged)
+
+
+def acknowledge_first_run_screen(state: AppState) -> FirstRunStatusResponse:
+    acknowledge_first_run(state.first_run_state_path)
+    return FirstRunStatusResponse(acknowledged=True)

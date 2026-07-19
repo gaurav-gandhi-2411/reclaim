@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from reclaim.executor import QuarantineMethod
-from reclaim.models import Tier, Verdict
+from reclaim.models import Mode, Tier, Verdict
 
 # --- Shared formatting -----------------------------------------------------------------------
 
@@ -313,3 +313,32 @@ class RestoreResponse(BaseModel):
     files_unsupported: int
     bytes_restored: int
     bytes_restored_human: str
+
+
+# --- Stage 2: mode + first-run ----------------------------------------------------------------
+
+
+class ModeStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Mode
+    # Not a secret — the phrase is meant to be displayed and typed by the user. Included here
+    # (rather than only checked server-side) so the dashboard renders the single source of
+    # truth (reclaim.mode.REQUIRED_POWER_MODE_CONFIRMATION) instead of a second, hardcoded
+    # copy in app.js that could drift from what the server actually requires.
+    required_power_confirmation: str
+
+
+class PowerModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Must exactly equal reclaim.mode.REQUIRED_POWER_MODE_CONFIRMATION — validated in
+    # reclaim.mode.switch_to_power_mode, not here, so there is exactly one definition of the
+    # required phrase.
+    confirmation_text: str
+
+
+class FirstRunStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    acknowledged: bool
