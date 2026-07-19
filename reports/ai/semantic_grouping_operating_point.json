@@ -1,5 +1,5 @@
 {
-  "commit_sha": "e3d22d24bb73cc4075796da4b7232b6db6f7faf0",
+  "commit_sha": "b69a0b4889f2476b40ae3ab8b81b0d086f7ace89",
   "command": "uv run pytest evals/test_ai_semantic_grouping_gold.py -v -s",
   "fixture_path": "data\\ai_datasets\\copydays\\extracted",
   "num_blocks": 40,
