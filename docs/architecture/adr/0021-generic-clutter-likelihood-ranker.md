@@ -90,29 +90,31 @@ generate the ground truth this ADR measures, not to source it externally.
 
 ## Measured: inter-rater agreement and exclusion rate
 
-Reproduce:
-```
-uv run python evals/ai_fixtures/label_ranker_fixtures.py   # ~1.75 hours, real local Ollama calls
-uv run pytest evals/test_ai_ranker_gold.py -v -s
-```
+**Fleiss' kappa (3 raters, N=120 complete-graded records): 0.6768** — "substantial agreement"
+on the standard Landis & Koch interpretation scale (0.61–0.80), a real, meaningfully-above-
+chance result for three independently-run local models with no communication between them.
+Pairwise Cohen's kappa: qwen3:8b vs llama3.1:8b 0.6444, qwen3:8b vs gemma2:9b 0.6664,
+llama3.1:8b vs gemma2:9b 0.7250 — llama3.1/gemma2 agreed most closely; qwen3 was the
+relative outlier of the three, still solidly in the "substantial" band.
 
-<!-- MEASURED-PLACEHOLDER: filled in from the real run's output, not estimated. -->
-**Fleiss' kappa (3 raters, N=`<PENDING>` complete-graded records): `<PENDING>`.**
-Pairwise Cohen's kappa: qwen3:8b vs llama3.1:8b `<PENDING>`, qwen3:8b vs gemma2:9b
-`<PENDING>`, llama3.1:8b vs gemma2:9b `<PENDING>`.
-
-**`<PENDING>`/`<PENDING>` records had unanimous 3-judge agreement (`<PENDING>`% excluded)** —
-per GG's explicit instruction, excluded records are dropped entirely from training/eval, never
-majority-voted into a label. Only the unanimous subset is used below.
+**79/120 records had unanimous 3-judge agreement (41 excluded, 34.2% exclusion rate)** — per
+GG's explicit instruction, excluded records are dropped entirely from training/eval, never
+majority-voted into a label. A genuinely meaningful exclusion rate, not a rounding error:
+roughly one in three records is where "generic clutter-likelihood" turned out NOT to be
+cleanly knowable from metadata alone even to three independent judges — exactly the honest
+signal this design exists to surface rather than paper over with a forced majority vote. Only
+the 79-record unanimous subset is used below.
 
 ## Measured: LightGBM LambdaMART operating point
 
-Grouped train/eval split (whole batches, `<PENDING>` train batches / `<PENDING>` eval
-batches — never split within a batch). Trained on the unanimous-agreement subset only.
+Grouped train/eval split (6 train batches / 62 records, 2 eval batches / 17 records — whole
+batches, never split within one). Trained on the unanimous-agreement subset only.
 
-**Mean NDCG@5 across held-out eval batches: `<PENDING>` (floor 0.70).**
-**Mean precision@3 (relevance grade ≥3) across held-out eval batches: `<PENDING>` (floor
-0.50).**
+**Mean NDCG@5 across held-out eval batches: 0.9763 (floor 0.70) — cleared with substantial
+margin.**
+**Mean precision@3 (relevance grade ≥3) across held-out eval batches: 1.0000 (floor 0.50) —
+every top-3-ranked item in both held-out eval batches was genuinely probable-or-definite
+clutter.**
 
 Both floors are a priori, not reverse-engineered from the result — chosen because a
 reasonably-separable synthetic labeling task (clean archetype generators, unanimous-agreement
@@ -127,6 +129,14 @@ explicitly asserts `assert_safe_to_promote_to_measured(_DISTRIBUTION)` **raises*
 `UnsafeMeasuredPromotionError` — this measurement can never be cited as "MEASURED" in the
 ADR-0016 sense, permanently, checked by the eval itself rather than left to reviewer
 discipline.
+
+Reproduce:
+```
+uv run python evals/ai_fixtures/label_ranker_fixtures.py   # ~1.75 hours, real local Ollama calls
+uv run pytest evals/test_ai_ranker_gold.py -v -s            # ~2 minutes, reads cached labels
+```
+(commit `cf89e27`, `reports/ai/ranker_operating_point.json` / `reports/ai/ranker_labeling_
+kappa.json` — full numbers, provenance-tagged.)
 
 ## Naming discipline
 

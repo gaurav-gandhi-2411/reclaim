@@ -1,0 +1,10 @@
+{
+  "models": [
+    "qwen3:8b",
+    "llama3.1:8b",
+    "gemma2:9b"
+  ],
+  "total_records": 120,
+  "complete_records": 120,
+  "labeled_records_path": "data\\ai_datasets\\ranker_labels\\labeled_records.jsonl"
+}
