@@ -38,6 +38,36 @@ jobs:
       - name: Pytest (fast unit tests — SafetyValidator hard gate runs in eval.yml)
         run: uv run pytest --cov --cov-report=term-missing
 
+  ai-layer-with-extras:
+    # Hard Gate 3 (reclaim-ai-features-spec.md §8/§0.3): proves the "ai extras installed"
+    # profile in a clean environment this session doesn't control by hand — complements
+    # lint-and-test above, which runs WITHOUT --extra ai and proves the core tool installs
+    # and passes everything without it (tests/test_ai_optional_extra.py also proves that
+    # profile directly via simulated import-blocking, so it's covered even in this job).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with the ai extra)
+        run: uv sync --frozen --all-groups --extra ai
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Pytest + AI safety gate
+        run: uv run pytest tests/ evals/test_ai_safety_gate.py -v
+
   frontend-xss-regression:
     runs-on: windows-latest
     steps:

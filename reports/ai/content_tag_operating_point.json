@@ -1,0 +1,45 @@
+{
+  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "command": "uv run pytest evals/test_ai_content_tag_gold.py -v -s",
+  "fixture_path": "data/ai_datasets/gutenberg_texts (document) + src/reclaim/** (code) + evals/ai_fixtures/build_content_tag_fixtures.py (receipt/chat/transient_ui, synthetic)",
+  "shipped_per_tag": {
+    "receipt": {
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "code": {
+      "precision": 0.8333333333333334,
+      "recall": 0.975609756097561
+    },
+    "chat": {
+      "precision": 0.6666666666666666,
+      "recall": 1.0
+    },
+    "document": {
+      "precision": 1.0,
+      "recall": 0.6583333333333333
+    },
+    "transient_ui": {
+      "precision": 1.0,
+      "recall": 1.0
+    }
+  },
+  "diagnostic_quality_threshold": 0.35,
+  "diagnostic_safety_threshold": 1.05,
+  "sample_counts": {
+    "receipt": 32,
+    "code": 41,
+    "chat": 32,
+    "document": 120,
+    "transient_ui": 30,
+    "unknown": 8
+  },
+  "keep_biased_tags": [
+    "chat",
+    "code",
+    "document",
+    "receipt",
+    "unknown"
+  ],
+  "note": "Provisional (synthetic-only distribution, ADR-0019) \u2014 never promoted to MEASURED. transient_ui precision is the safety-critical gate; other tags' precision/recall are quality signals only, since any misclassification among them stays keep-biased and never becomes deletion-eligible."
+}

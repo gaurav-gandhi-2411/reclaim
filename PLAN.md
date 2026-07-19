@@ -932,6 +932,335 @@ retention + restore, now with an explicit `purge` command for expired entries.
   (not trusting the claim) and did a final real-identity integrity check before sign-off.
   Committed `0f2385e`.
 
+### 2026-07-18 — Applied-AI layer kicks off: hard gates 1-3 complete
+- New track, spec-driven by `reclaim-ai-features-spec.md` (committed as-is, `6d03cdd`). Work
+  happens on `feat/ai-layer` — branch-only per explicit instruction, never merged past branch
+  protection without GG's review. New ADR series continues at 0011 (deterministic-engine ADRs
+  0001-0010 are a separate, already-shipped track).
+- Build order requires the EvalHarness + the §7.5 adversarial safety eval to land and pass,
+  independently verified, BEFORE any model is wired in — done first, against scaffolding only
+  (no pHash/CLIP/etc. exists yet at this point). Gate 1: `src/reclaim/ai/` package
+  (`AICluster`/`AIClusterMember`/`AIReviewQueue`, deliberately field-disjoint from
+  `reclaim.models.Candidate`) + `eval_harness.py` (BCubed, PR-curve, provenance) +
+  `evals/test_ai_safety_gate.py` (13 cases: AST import-graph scan, AttributeError-before-any-
+  disk-io proof, two adversarial-config injection attempts rejected by pydantic
+  `extra="forbid"`, reserved-namespace grep, construction-time invariants). Gate 2 (structural
+  separation): same AST scan + `tests/test_ai_safety_reuse.py` proving the AI layer reuses the
+  real `SafetyValidator`, not a reimplementation, against real fixture files. Gate 3 (optional
+  extra): `pyproject.toml`'s `[project.optional-dependencies] ai`, lazy-guarded imports
+  (`reclaim.ai._optional.require`), both install profiles tested
+  (`tests/test_ai_optional_extra.py`), new CI job `ai-layer-with-extras`.
+- Independent verifier pass on Gate 1 found one real gap before sign-off: the AST import-scan
+  helper missed the `from reclaim import executor` form (only checked `ImportFrom.module`, not
+  `module.alias` combinations) — fixed immediately with a regression test
+  (`test_imported_module_names_catches_the_from_reclaim_import_executor_form`), re-verified,
+  then committed. Verifier also independently re-derived §0/§6/§7.5 from the spec itself before
+  judging the code against it, and tried its own adversarial case (an indirect re-export chain)
+  — found the AST scan is per-file, not full transitive-closure, and documented that as a known
+  limitation (mitigated by the type-level AttributeError proof, which holds regardless of how
+  a stray reference to the executor might arrive).
+- ADR-0011 records the architecture + verifies Feature 1a Track A's three new dependencies'
+  licenses via real `importlib.metadata` (not memory): imagehash BSD-2-Clause,
+  opencv-python-headless Apache-2.0, pillow MIT-CMU, all transitive deps (numpy/scipy/
+  pywavelets) also permissive. Zero model weights bundled by this feature (pHash/dHash are
+  algorithms, not learned weights), so the license table is exhaustive for it.
+- All 386 tests green (was 327 before this session started), ruff/mypy clean on both install
+  profiles. Committed `4c738e7`.
+- Next: Feature 1a Track A (pHash/dHash near-identical clustering + classical keep-best
+  scorer) — the first real feature, per build order.
+
+### 2026-07-18 — Feature 1a Track A + gold-set labeling tool
+- Feature 1a Track A shipped: `src/reclaim/ai/{phash,keep_best,image_similarity}.py` (pHash/
+  dHash prefilter + Hamming union-find clustering + classical sharpness/resolution/exposure
+  keep-best scorer, no NIMA — spec says add only if measured to beat classical, nothing did
+  that measurement). `evals/ai_fixtures/build_image_similarity_fixtures.py` (deterministic,
+  seed=42, no binary images committed) + `evals/test_ai_image_similarity.py` (PR-curve
+  operating-point derivation at target precision >=0.95, BCubed clustering floor, keep-best
+  safety metric + top-1 agreement, end-to-end safety-filtered proof). An early fixture
+  revision zeroed out the resolution signal by resizing every variant back to identical
+  dimensions (produced an arbitrary 0.667 top-1 agreement); fixed the fixture, not the
+  scorer's weights — see CASE_STUDY's new AI-layer section for why that distinction mattered.
+  ADR-0012 records the measured-but-provisional threshold (Hamming distance 2, precision 1.0
+  on synthetic fixtures) and the CI gate's deliberately looser, margined value (10).
+  Independent verifier constructed adversarial cases outside the test suite (1x1 pixel
+  images, all-black/all-white, corrupted files, threshold-boundary sweeps) — all handled
+  sanely. Committed `ae57723`.
+- Gold-set labeling tool shipped (delivered per the autonomy boundary, NOT run against real
+  photos): `src/reclaim/ai/labeling.py` (LabelStore, append-only JSONL; `discover_label_
+  candidates` reuses the real Track A pipeline, not a separate implementation, at a looser
+  default threshold so borderline cases get reviewed) + `src/reclaim/ai/labeling_app.py`
+  (loopback-only FastAPI review UI reusing `reclaim.api.security` wholesale — same Host/
+  Origin/CSRF guard as the main dashboard, not a lesser bar for "just a dev tool") +
+  `scripts/ai_label_tool.py` (CLI launcher). ADR-0013.
+  **Caught a real vulnerability in this feature's own first draft**, same class as the
+  dashboard XSS fixed earlier this session: an inline `onclick="selectKeep('...', i, '...')"`
+  handler with `html.escape()`-wrapped filenames interpolated into the JS string literal —
+  HTML-escaping a quote doesn't protect a JS string literal in an inline event-handler
+  attribute (the browser HTML-decodes the attribute before parsing it as JS). Fixed to
+  data-*-attributes-plus-delegated-listener before any test was written against the
+  vulnerable version.
+  **Verified live, not just unit-tested**: launched the tool against a synthetic photo
+  directory, drove it through chrome-devtools in a real browser end to end (select keeper,
+  confirm, reload, confirm persistence and updated counts, reject a different cluster,
+  confirm empty state), then confirmed via `curl` that the running server actually rejects a
+  spoofed Host header and a missing CSRF token. Independent verifier separately constructed
+  its own adversarial filenames and image-route inputs (path traversal, negative/non-numeric
+  indices) against the fixed version. Committed `9656760`.
+- 402 tests green (was 327 before this session's AI-layer work started), all 4 AI ADRs
+  (0011-0013 plus the earlier architecture one) verified independently before landing. Full
+  eval suite (deterministic safety hard gate + all AI evals) reconfirmed green as a final
+  checkpoint. CASE_STUDY gained an AI-layer section.
+- Remaining build order (not attempted this session, per "one feature at a time, report
+  before next"): Feature 1b (MinHash doc near-dup + version-chain), Feature 1a Track B (CLIP
+  semantic grouping, only after Track A's pipeline is proven — it is), Feature 2 (screenshot
+  burst + OCR, privacy-locked), Feature 3 (feedback logging + LambdaMART ranker, label-gated).
+  Real gold-set labeling (running `scripts/ai_label_tool.py` against GG's actual photos) is
+  an explicit follow-up requiring GG's own time, not something this session can or should do
+  on his behalf.
+
+### 2026-07-19 — Labeling protocol audit, before real labeling started
+- GG asked for the protocol to be confirmed against 4 statistical-soundness requirements
+  BEFORE running it for real — sampling coverage of the full distance range (not just easy
+  positives), a diagnosable keep-best label schema (WHY, not just WHICH), a volume/balance
+  target, and commit-keyed/versioned persistence. Audited against the actual code, not memory:
+  all four were real gaps, not just documentation gaps. Fixed, verified independently, then
+  reported — per GG's explicit "don't change the tool unless a gap exists."
+- `discover_label_candidates` now samples three independent strata (`near_duplicate` —
+  unchanged existing pipeline; `boundary` — pairwise Hamming 11-25; `negative_control` —
+  pairwise >=26), `LabelDecision` gained `keep_reasons` (human-checked, never auto-derived
+  from the classical scorer), `compute_progress()` tracks total + per-stratum counts against
+  documented targets (300 total, 40 minimum per non-near_duplicate stratum), and every
+  decision is stamped with a real `commit_sha` + `schema_version`. ADR-0014.
+- Verified live a second time (chrome-devtools): a 16-image synthetic directory correctly
+  produced candidates in all three strata with real measured distances; a confirmed label with
+  two reason codes round-tripped correctly including a `commit_sha` matching real repo HEAD;
+  progress persisted correctly across a reload. Independent verifier separately re-confirmed
+  all four gaps were genuinely real (not invented busywork) and probed the two subtlest risks
+  itself (stale/memoized commit_sha; old-schema label files crashing the reader) — both clean.
+  Committed `a40ba70`.
+- Still not run against GG's real photos — that's next, on him, now that the protocol is
+  confirmed sound.
+
+### 2026-07-19 — Feature 1a operating point measured on a real public dataset (INRIA Copydays)
+- GG redirected: source ground truth from public human-labeled datasets FIRST, before GG's own
+  (still-empty) gold set, and reserve LLM-as-labeler only for features with no public dataset
+  available, always with a measured error rate — never as the source of a shipped number.
+- Evaluated 5 candidates (California-ND, UKBench, INRIA Holidays, Copydays, MIR-Flickr/NUS-WIDE
+  near-dup subsets) against license + task-match + scriptable-download criteria. California-ND
+  was the best conceptual match but disqualified on download: password-gated zip, password by
+  emailing a 2013-era author, not scriptable. **INRIA Copydays selected** — purpose-built for
+  copy detection, INRIA "as-is" research license, graduated attack severities. Original host
+  (`pascal.inrialpes.fr`) is dead (real TCP timeout); used Meta/FAIR's mirror instead
+  (`dl.fbaipublicfiles.com`) — rejected an unofficial Hugging Face mirror that shipped
+  `trust_remote_code=True` with zero actual image bytes. ADR-0015.
+- Downloaded `original` (157 photos) + `strong` (229 adversarial-attacked derivatives) — the
+  milder graduated `jpeg`/`crop` splits weren't reachable on the FAIR mirror; disclosed as a
+  real coverage gap, not smoothed over.
+- **Real PR curve, 74,305 pairwise Hamming distances (314 positive / 73,991 negative), zero
+  synthetic data, zero LLM labels: operating point = max_hamming_distance 14, precision 0.9600,
+  recall 0.0764.** ADR-0012 promoted from PROVISIONAL to MEASURED. The low recall is honestly
+  flagged as a floor measured against Copydays' single hardest attack tier (print-and-scan/
+  blur/paint), not a representative estimate of ordinary consumer-duplicate recall — precision
+  carries no such caveat. CI's fast synthetic-fixture regression gate relocked at 14 (was an
+  arbitrary-margin 10); confirmed still passes cleanly against the synthetic fixtures' clean
+  separation.
+- **Keep-best measured against the same real dataset**: each Copydays block's untouched
+  original vs. its attacked derivatives is real (non-fabricated) preference ground truth.
+  0.8726 top-1 agreement, 1.0000 never-worst-quartile safety rate across all 157 blocks. The 20
+  disagreement blocks written to `reports/ai/copydays_keep_best_disagreements.json` for GG's
+  optional one-click review — not auto-resolved.
+- AVA (general-aesthetic-correlation check) explicitly skipped and the reasoning recorded, not
+  silently dropped: 32GB torrent / 49GB HF zip of individual photographers' contest images, two
+  orders of magnitude larger than Copydays for a secondary check, licensing murkier than
+  Copydays' blanket INRIA grant. The more operationally important half of the instruction (real
+  preference ground truth, disagreements surfaced not fabricated) was fully delivered via
+  Copydays instead.
+- LLM-as-labeler fallback assessed and found unnecessary for Feature 1a: both required signals
+  (near-dup ground truth, keep-best preference ground truth) are fully covered by Copydays' own
+  construction-verified labels. Zero LLM involvement anywhere in this feature's ground truth.
+- Full suite reconfirmed green: `evals/` 33 passed (446.70s, includes the new real-dataset
+  eval), `tests/` unaffected. New files: `evals/ai_fixtures/fetch_copydays.py` (idempotent,
+  checksum-verified downloader), `evals/ai_fixtures/copydays_loader.py` (pair discovery),
+  `evals/test_ai_copydays_gold.py` (the real measurement — deliberately NOT in the default CI
+  sweep; local/on-demand only, same posture as `data/real-disk-run/`'s real-disk validation).
+  ADR-0015 (new), ADR-0012 (promoted).
+- Per GG's explicit "hold build-order 1b/Track B/Feature 2/Feature 3 until 1a's operating point
+  closes on the public dataset" — 1a's operating point is now closed on the public dataset.
+  Next build-order item unblocked but not started this session.
+
+### 2026-07-19 — Recall 0.0764 was a dataset artifact, not a pHash limitation; resolved
+- GG caught a real problem in the measurement above before trusting it: 0.0764 recall was
+  measured ONLY against Copydays' `strong` split — its single hardest, deliberately adversarial
+  attack tier (print-and-scan/blur/paint), not Feature 1a's actual target (ordinary consumer
+  duplicate accumulation). Flagged as not shippable until resolved: recover the milder
+  graduated splits, or generate the realistic transformations programmatically with known
+  ground truth, and report recall per tier plus the full precision/recall tradeoff, not just
+  the single ≥0.95 point.
+- Second search for Copydays' `jpeg`/`crop` splits (Kaggle, Zenodo, Academic Torrents, Wayback
+  Machine for those two specific files, two more mirror platforms) confirmed ADR-0015's
+  original finding — still unreachable. Went with programmatic generation instead, applied to
+  Copydays' own 157 REAL original photos (not synthetic drawn shapes):
+  `evals/ai_fixtures/build_realistic_recompression_tiers.py` — 5 deterministic, named profiles
+  (mild recompress, mild resize, moderate resize+recompress, moderate PNG round-trip,
+  messaging-app-style resave: downscale to ≤1600px, quality 75, metadata stripped) = 785
+  realistic positive pairs from real photographic content.
+- **Result: at the same locked threshold (14), recall on mild/moderate/messaging_app is
+  1.0000/1.0000/1.0000 (was 0.0764 measuring the wrong distribution) with precision 0.9987.**
+  The `hard` (Copydays `strong`) tier's 9.6% recall is real, kept, reported separately — and
+  confirmed irrelevant to Feature 1a's actual target failure mode, not a feature gap.
+- Full realistic-distribution PR tradeoff computed at precision ≥0.95/0.90/0.85 — all three
+  collapse to the same point (distance 2, precision 1.0, recall 1.0), since recall saturates at
+  1.0 well before precision would need to drop that far. Conclusion: no case for loosening
+  toward 0.90 precision — there's no recall left to buy, only false positives to add.
+  `max_hamming_distance = 14` reaffirmed, now justified as deliberate margin (0.13 points of
+  precision) beyond the bare-minimum-2 needed for the 5 tested profiles, not as a
+  precision/recall compromise.
+- Track B (CLIP) trigger assessed and NOT triggered: pHash already achieves near-perfect
+  precision+recall on the realistic distribution, so there's no Track-A recall gap for
+  embeddings to close. Track B remains independently justified by its own semantic-grouping
+  mission, not by a rescue need that doesn't exist. Recorded as the actual answer to the "do
+  embeddings earn their compute" question for Track A specifically.
+- ADR-0012 rewritten with the realistic-distribution section, per-tier table, full tradeoff,
+  and the operating-point rationale tied to the recommend-only review-queue design. New files:
+  `evals/ai_fixtures/build_realistic_recompression_tiers.py`,
+  `evals/test_ai_copydays_realistic_distribution.py`.
+
+### 2026-07-19 — Eval gate hardening (ADR-0016), then Feature 1b built with the lesson applied from the start
+- Before building 1b, GG asked for the eval GATE itself hardened with 1a's recall-artifact
+  lesson: a precision-only gate let a feature pass CI while catching <8% of dupes. Added a
+  required `min_recall` floor alongside `target_precision` to `select_operating_point`, and a
+  required `DistributionDeclaration` (validated: non-empty description, non-empty
+  untested-variation note, can't claim realistic+adversarial at once) plus
+  `assert_safe_to_promote_to_measured` — structurally forbids an adversarial-tail-only or
+  synthetic-only distribution from justifying MEASURED status. The historical mistake became a
+  permanent regression test: `evals/test_ai_copydays_gold.py`'s hard-tier curve now asserts
+  the gate REJECTS it. ADR-0016 (policy), ADR-0012 retroactively disclosed ("5 transforms
+  measured, uncommon transforms unmeasured"). Verifier signed off. 22 new eval_harness tests.
+- **Feature 1b (document near-dup + version-chain) built following 1a's pattern exactly**:
+  MinHash/LSH (`datasketch`, MIT) Stage-1 prefilter over word shingles → all-MiniLM-L6-v2
+  (`sentence-transformers`, Apache-2.0) Stage-2 confirmation on the RESIDUAL only → version-
+  chain ordering via filename-pattern heuristic (vN/final/Windows (N)/copy) + mtime fallback.
+  Local text extraction (`.txt`/`.md`/`.docx`/`.pdf`) never logs content anywhere, structurally
+  (no logging calls in `document_text.py` at all). Caught and fixed a real bug before it
+  reached the eval: `\bfinal\b` doesn't match inside "report_final" because `\w` (what `\b`
+  boundaries on) includes underscore — the spec's own example filename would have silently
+  mis-ranked.
+- `NEAR_DUP_DOCUMENT`/`VERSION_CHAIN` joined `_DELETION_SUGGESTION_ELIGIBLE_TRACKS` (spec §2).
+  Verified this doesn't weaken the safety gate (the most important test in the layer):
+  `SEMANTIC_IMAGE` stays browse-only, 3 new regression tests (2 per-track + 1 queue-level
+  4-track partition test) prove the new tracks gate on an identified keeper the same way
+  `NEAR_IDENTICAL_IMAGE` already did.
+- **Dataset assessment** (GG named PAN plagiarism, Quora Question Pairs, PAWS): QQP rejected —
+  Quora's ToS carries a non-commercial restriction, inappropriate for a project with stated
+  commercialization ambitions. PAWS is real and clean-licensed but adversarial *by
+  construction and by name* (word-scrambled/back-translated negatives) — used only as a
+  disclosed secondary boundary check, never the MEASURED basis. PAN-PC-11 (CC-BY-4.0, open,
+  strong task match) found but not used — 1.7GB across RAR archives, no extraction tooling in
+  this environment, not worth a new dependency for. **Went with the proven ADR-0012 pattern
+  instead**: 8 public-domain Gutenberg books (zero licensing risk), chunked into 120 real
+  document-length pieces, 3 deterministic realistic transform profiles (mild whitespace
+  cleanup, moderate paragraph trim+reorder, collab-tool-paste flattening) = 360 real positive
+  pairs + 7,140 clean cross-book negatives.
+- **Measured MinHash Jaccard threshold: 0.2** (bare-minimum measured was 0.1328, precision
+  1.0/recall 1.0; chosen production value adds margin — max real negative observed was only
+  0.0234, so 0.2 still has >8x headroom — costing 3 of 360 pairs of recall, 0.9917 aggregate).
+  `assert_safe_to_promote_to_measured` called and passes on this distribution.
+- **Embedding threshold: 0.6**, disclosed as NOT independently PR-curve-derived — a real,
+  honest finding: at MinHash threshold 0.2, Stage 1 alone already achieves 100% precision on
+  the measured distribution, leaving no ambiguous residual for Stage 2 to discriminate
+  against. Set as a safety margin below the lowest genuine-positive similarity observed
+  (0.6467). PAWS-Wiki's real 8,000-pair PR curve showed ≥0.90 precision is NOT achievable on
+  its adversarial construction at all — reported honestly as a boundary-tier finding, not
+  Feature 1b's real-world number.
+- **Version-chain: 1.0 exact-order accuracy, 1.0 Kendall's tau** across 8 constructed chains
+  (no public dataset fits this Reclaim-specific filename-convention problem). Disclosed gap:
+  none of the 8 chains pit filename-pattern rank against mtime in genuine conflict.
+  `eval_harness.py` gained `kendall_tau`/`exact_order_accuracy` (spec §7.2), reusable for
+  Feature 3's ranker later.
+- New deps: `datasketch` (MIT), `sentence-transformers` (Apache-2.0), `python-docx` (MIT),
+  `pypdf` (BSD-3-Clause) — all lazy-imported `ai` extras; `pyarrow` (Apache-2.0) dev-only,
+  reads PAWS parquet, never in production code paths.
+- ADR-0017 (dataset + all three operating points + license summary). 454 tests green; fast
+  synthetic CI evals (1a + 1b combined) 26/26 green.
+
+### 2026-07-19 — Templated-document blind spot closes 1b; a second metrics-integrity incident becomes a permanent harness rule
+- GG flagged that measuring against edited Gutenberg prose alone can't surface real document
+  clutter's actual failure mode — heavy templating (resumes/invoices/reports share section
+  headers and boilerplate while being genuinely different documents). Built a templated tier
+  (3 synthetic-but-realistic templates, 459 same-template-different-content negatives, 162
+  positive pairs). At the prose-measured thresholds (0.2/0.6): **71% false-positive rate**
+  (precision 0.2893) on templated documents — a real, serious finding.
+- Fixed with a stricter JOINT threshold (minhash=0.1, embedding=0.95), gated on BOTH tiers
+  independently — real cost: prose recall drops 0.9917→0.8694, templated recall lands 0.7963.
+- **A real methodological bug caught while measuring the fix, not after**: the eval's first
+  version pooled prose's 7,140 negatives and templated's 459 into one combined precision calc
+  — read 0.9524 (passing), while the templated tier ALONE was actually 0.8634 (failing),
+  hidden by the large prose pool diluting the small tier's real false positives. GG's own
+  instruction ("gate on precision AND recall for BOTH tiers") is what caught this — not
+  narrative discipline, the eval's own per-tier assertion failed, correctly, the first run.
+- Per GG's explicit instruction, this became a permanent structural harness rule, not a
+  one-off fix: `eval_harness.py` gained `select_operating_point_per_tier`/
+  `select_joint_operating_point_per_tier` — no code path pools tiers before computing a ratio.
+  Regression test reproduces the exact 0.9524/0.8634 incident and asserts the naive pooled
+  function WOULD accept it while the per-tier function REJECTS it. ADR-0018.
+- **Version-chain safety property**: GG asked to confirm the ordering can't confidently
+  suggest deletion when filename-version rank and mtime DISAGREE about which file is latest
+  (e.g. `report_final.docx` modified BEFORE `report_v2.docx`). Added `version_signals_agree` —
+  when signals disagree, no member is marked keeper, demoting the cluster to browse-only.
+  Measured 0 safety violations across a dedicated 4-chain conflict fixture including the named
+  scenario, plus a control chain proving the check doesn't cry wolf on ordinary chains.
+
+### 2026-07-19 — Feature 2: screenshot burst detection + OCR content-tag classifier
+- Burst detection (dimensions + capture-time proximity ≤60s [disclosed policy] + pHash ≤14
+  [reused from ADR-0012, not re-measured]) — all three rules must agree, not majority vote.
+- OCR via `rapidocr-onnxruntime` (Apache-2.0, pip-only — chosen over Tesseract specifically to
+  avoid the first system-binary dependency in the AI layer). Zero logging calls anywhere in
+  the three modules that touch raw OCR text, verified by AST scan AND a runtime canary-string
+  log-capture test (every logger forced to DEBUG, canary never appears in any record).
+- Content-tag classifier (receipt/document/code/chat/transient_ui + UNKNOWN): dataset search
+  rejected both SROIE (gated registration, ambiguous mirror license) and RVL-CDIP (`"other"`
+  license, real tobacco-litigation-records provenance) — same license discipline as
+  QQP/California-ND. Used real Gutenberg prose (document) + Reclaim's own source (code) +
+  disclosed synthetic (receipt/chat/transient_ui) instead.
+- **Measured, per-tier gated (ADR-0018 discipline), on the SHIPPED classifier** (not a swept
+  threshold): transient_ui precision 1.0/recall 1.0 (the safety-critical number — the ONLY
+  deletion-eligible tag), receipt 1.0/1.0, code 0.826/0.974, chat 0.667/1.0 (disclosed
+  weakness, still safe — keep-biased either way), document 1.0/0.658. Zero real-content
+  samples ever classified transient_ui.
+- **Caught and fixed a real false-positive risk during the build**: sparse OCR gibberish
+  (`"xk qz 42"`) initially cleared the confidence floor as transient_ui purely for being
+  short — fixed by capping the sparseness bonus below the floor.
+- **Follow-up requested separately**: GG asked to confirm the OCR-FAILURE path (not just the
+  gibberish path) is closed — a real receipt/document/code/chat screenshot that OCRs poorly
+  (blur/low-contrast/crop) could theoretically degrade into the same sparse-text shape as
+  gibberish. Built a real-image degradation tier (4 content types × 4 degradations, real
+  `rapidocr` + the real shipped classifier): **0 of 16 ever classified transient_ui**; 12 of 16
+  degraded to near-empty OCR output, all 12 correctly resolved UNKNOWN. Closed, no code change
+  needed beyond the sparse-bonus fix already in place — this follow-up was the proof, not a
+  new fix.
+- `AITrack.SCREENSHOT_BURST` joined `_DELETION_SUGGESTION_ELIGIBLE_TRACKS`, but conditionally
+  — a keeper is only ever set when EVERY burst member tags transient_ui, same conditional-
+  keeper pattern as version-chain's `version_signals_agree`. ADR-0019 (+ follow-up section).
+
+### 2026-07-19 — Feature 3: feedback-logging only, ranker deliberately deferred
+- Per GG's explicit instruction: build ONLY the feedback store (Track B dropped, LambdaMART
+  ranker NOT built — "there's no data to train on"). `feedback_store.py`: append-only JSONL,
+  commit-keyed + schema-versioned exactly like `labeling.LabelStore`, feature vector = size,
+  ext, path_class (cloud_sync_placeholder > git_repo > downloads/desktop/documents/temp >
+  other), mtime/ctime (NO atime, structurally absent from the type), cluster stats, category,
+  cloud_sync_flag, sibling-decision context (computed from the store's own prior history per
+  cluster).
+- `cold_start_priority.py`: transparent, non-ML heuristic (size × mtime-staleness ×
+  location-weight × cluster-membership, per spec's own formula) — `is_heuristic=True`
+  hardcoded on every result so nothing can mistake it for a model's prediction. No LightGBM
+  dependency added anywhere. The ranker's activation gate (≥500 decisions) and time-split
+  eval protocol are documented in ADR-0020 as a future PR's obligations, not implemented.
+- This closes the applied-AI layer's build order: 1a + 1b + 2 + feedback-logging.
+  `AITrack.RANKED_CLUTTER`/`SEMANTIC_IMAGE` remain documented, unimplemented placeholders.
+- Full suite reconfirmed green (tests/ + evals/), CASE_STUDY updated with the templated-
+  document/ADR-0018 incident, the version-chain safety property, Feature 2 (+ follow-up), and
+  Feature 3, plus a summary of the four structural harness invariants the incidents produced.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

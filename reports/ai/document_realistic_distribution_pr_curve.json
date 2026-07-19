@@ -1,0 +1,22 @@
+{
+  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "command": "uv run pytest evals/test_ai_document_gold.py -v -s",
+  "fixture_path": "data/ai_datasets/gutenberg_texts (8 public-domain books, ADR-0017) + evals/ai_fixtures/build_document_realistic_tiers.py",
+  "distribution": {
+    "description": "3 deterministic transform profiles (mild whitespace cleanup, moderate paragraph trim+reorder, collab-tool-paste flattening+truncation) applied to 120 real document-length chunks from 8 public-domain Gutenberg books",
+    "is_realistic": true,
+    "untested_variation_note": "does not cover: format-conversion artifacts from real docx/pdf extraction (hyphen-break, header/footer injection), multi-generation edit chains beyond one transform, translation/back-translation paraphrase, heavy manual rewrite, or documents shorter than ~300 words \u2014 see ADR-0017's PAWS-Wiki cross-check for a real, human/machine-labeled boundary tier on short-text paraphrase specifically (reported separately, never the basis for this measurement's MEASURED status)"
+  },
+  "operating_point": {
+    "jaccard_threshold": 0.1328125,
+    "precision": 1.0,
+    "recall": 1.0
+  },
+  "per_tier_recall_at_threshold": {
+    "mild": 1.0,
+    "moderate": 1.0,
+    "collab_paste": 1.0
+  },
+  "min_recall_floor": 0.5,
+  "target_precision": 0.95
+}

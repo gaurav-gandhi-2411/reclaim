@@ -1,0 +1,151 @@
+{
+  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "command": "uv run pytest evals/test_ai_copydays_gold.py -v -s",
+  "fixture_path": "data/ai_datasets/copydays (INRIA Copydays, ADR-0015)",
+  "total_blocks": 157,
+  "top1_agreement": 0.8726114649681529,
+  "never_worst_quartile_safety_rate": 1.0,
+  "disagreements": [
+    {
+      "block_id": "2003",
+      "original": "data\\ai_datasets\\copydays\\extracted\\200300.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\200302.jpg",
+      "original_combined_score": 19.17217696307584,
+      "picked_combined_score": 24.690854918594773
+    },
+    {
+      "block_id": "2010",
+      "original": "data\\ai_datasets\\copydays\\extracted\\201000.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\201001.jpg",
+      "original_combined_score": 23.93933210911705,
+      "picked_combined_score": 25.96303047143727
+    },
+    {
+      "block_id": "2014",
+      "original": "data\\ai_datasets\\copydays\\extracted\\201400.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\201401.jpg",
+      "original_combined_score": 26.389613764250335,
+      "picked_combined_score": 26.756347062076767
+    },
+    {
+      "block_id": "2021",
+      "original": "data\\ai_datasets\\copydays\\extracted\\202100.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\202101.jpg",
+      "original_combined_score": 27.433174723391154,
+      "picked_combined_score": 27.436834813766673
+    },
+    {
+      "block_id": "2026",
+      "original": "data\\ai_datasets\\copydays\\extracted\\202600.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\202602.jpg",
+      "original_combined_score": 26.44362759531866,
+      "picked_combined_score": 26.71542246015785
+    },
+    {
+      "block_id": "2028",
+      "original": "data\\ai_datasets\\copydays\\extracted\\202800.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\202801.jpg",
+      "original_combined_score": 21.890888649880935,
+      "picked_combined_score": 23.13299709763232
+    },
+    {
+      "block_id": "2032",
+      "original": "data\\ai_datasets\\copydays\\extracted\\203200.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\203201.jpg",
+      "original_combined_score": 21.254917893339144,
+      "picked_combined_score": 23.493647384542278
+    },
+    {
+      "block_id": "2042",
+      "original": "data\\ai_datasets\\copydays\\extracted\\204200.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\204201.jpg",
+      "original_combined_score": 19.443348205016918,
+      "picked_combined_score": 21.903836057619607
+    },
+    {
+      "block_id": "2047",
+      "original": "data\\ai_datasets\\copydays\\extracted\\204700.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\204702.jpg",
+      "original_combined_score": 24.283280352191774,
+      "picked_combined_score": 24.550793247752765
+    },
+    {
+      "block_id": "2053",
+      "original": "data\\ai_datasets\\copydays\\extracted\\205300.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\205301.jpg",
+      "original_combined_score": 26.590571309237614,
+      "picked_combined_score": 26.609355603707606
+    },
+    {
+      "block_id": "2057",
+      "original": "data\\ai_datasets\\copydays\\extracted\\205700.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\205702.jpg",
+      "original_combined_score": 23.91721628691845,
+      "picked_combined_score": 24.40740936723388
+    },
+    {
+      "block_id": "2061",
+      "original": "data\\ai_datasets\\copydays\\extracted\\206100.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\206101.jpg",
+      "original_combined_score": 18.878828801979253,
+      "picked_combined_score": 21.952055855016006
+    },
+    {
+      "block_id": "2093",
+      "original": "data\\ai_datasets\\copydays\\extracted\\209300.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\209302.jpg",
+      "original_combined_score": 24.28696427500755,
+      "picked_combined_score": 27.495103273303418
+    },
+    {
+      "block_id": "2102",
+      "original": "data\\ai_datasets\\copydays\\extracted\\210200.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\210202.jpg",
+      "original_combined_score": 20.611523808915273,
+      "picked_combined_score": 24.925490301135795
+    },
+    {
+      "block_id": "2103",
+      "original": "data\\ai_datasets\\copydays\\extracted\\210300.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\210301.jpg",
+      "original_combined_score": 26.300253854839777,
+      "picked_combined_score": 26.837344347471376
+    },
+    {
+      "block_id": "2105",
+      "original": "data\\ai_datasets\\copydays\\extracted\\210500.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\210501.jpg",
+      "original_combined_score": 23.848535490608633,
+      "picked_combined_score": 25.297154489131113
+    },
+    {
+      "block_id": "2109",
+      "original": "data\\ai_datasets\\copydays\\extracted\\210900.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\210901.jpg",
+      "original_combined_score": 19.76113053126511,
+      "picked_combined_score": 22.35270715276742
+    },
+    {
+      "block_id": "2122",
+      "original": "data\\ai_datasets\\copydays\\extracted\\212200.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\212201.jpg",
+      "original_combined_score": 27.082519256869006,
+      "picked_combined_score": 27.616720909200083
+    },
+    {
+      "block_id": "2132",
+      "original": "data\\ai_datasets\\copydays\\extracted\\213200.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\213202.jpg",
+      "original_combined_score": 22.71660114754091,
+      "picked_combined_score": 24.01456257518628
+    },
+    {
+      "block_id": "2138",
+      "original": "data\\ai_datasets\\copydays\\extracted\\213800.jpg",
+      "scorer_picked": "data\\ai_datasets\\copydays\\extracted\\213803.jpg",
+      "original_combined_score": 20.662697148459383,
+      "picked_combined_score": 23.41469799383502
+    }
+  ],
+  "note": "Every case where the classical keep-best scorer picked an attacked Copydays variant over the real original. Not auto-resolved \u2014 this file is for GG's optional one-click confirmation, per the explicit instruction not to fabricate preference labels."
+}
