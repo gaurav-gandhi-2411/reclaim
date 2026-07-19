@@ -24,8 +24,9 @@ dependencies = [
 # `uv sync --extra ai` adds them. Grows incrementally as each spec feature lands — Feature 1a
 # Track A (pHash/dHash + classical keep-best) needs the first three; Feature 1b (MinHash/LSH
 # document near-dup + sentence-embedding residual + version-chain) adds the rest (ADR-0017
-# covers licenses). Still to come: open-clip-torch + hnswlib for 1a Track B, rapidocr/
-# pytesseract for Feature 2, lightgbm for Feature 3.
+# covers licenses); Feature 2 (screenshot burst + OCR content-tag classifier) adds rapidocr
+# (ADR-0019); the generic clutter-likelihood ranker (ADR-0021) adds numpy + lightgbm. Still
+# to come: open-clip-torch + hnswlib for 1a Track B (ADR-0022).
 ai = [
     "imagehash>=4.3",             # BSD-2-Clause — pHash/dHash perceptual hashing
     "opencv-python-headless>=4.9", # Apache-2.0 — Laplacian-variance sharpness scoring
@@ -41,6 +42,13 @@ ai = [
     # `cv2` module; whichever installs last determines the on-disk build, but this has not
     # been observed to break any existing `cv2` usage (keep_best.py's headless-only calls —
     # Laplacian variance, grayscale imread — work identically either way). See ADR-0019.
+    "numpy>=1.26",                 # BSD-3-Clause — cosine-similarity math (text_embeddings.py,
+    # Feature 1b) and clutter-ranker feature-array construction (clutter_ranker.py, ADR-0021);
+    # already a transitive dependency of sentence-transformers/lightgbm, listed explicitly
+    # since it's imported directly via `require()`, not just relied on indirectly.
+    "lightgbm>=4.7.0",              # MIT — generic clutter-likelihood LambdaMART ranker
+    # (Feature 3/ADR-0021). Zero GPU requirement, CPU training/inference — satisfies the
+    # zero-cost/local-first default same as every other AI-layer dependency.
 ]
 
 [project.scripts]
@@ -61,6 +69,10 @@ dev = [
     "mypy>=1.13",
     "pyarrow>=17.0",  # Apache-2.0 — reads the PAWS-Wiki gold-set parquet files
     # (ADR-0017's measurement tooling only, never imported by src/reclaim/**)
+    "ollama>=0.6.2",  # MIT — local-LLM labeling client (evals/ai_fixtures/ranker_llm_judge.py,
+    # ADR-0021 measurement tooling only, never imported by src/reclaim/**). Talks exclusively
+    # to a local Ollama server (http://localhost:11434) — zero paid API, ANTHROPIC_API_KEY
+    # never read or set anywhere this package is used.
 ]
 
 [tool.ruff]

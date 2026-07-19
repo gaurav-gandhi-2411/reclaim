@@ -9,9 +9,13 @@ from reclaim.ai.eval_harness import (
     UnsafeMeasuredPromotionError,
     assert_safe_to_promote_to_measured,
     bcubed_precision_recall,
+    cohens_kappa,
     current_commit_sha,
     exact_order_accuracy,
+    fleiss_kappa,
     kendall_tau,
+    ndcg_at_k,
+    precision_at_k,
     precision_recall_curve,
     select_joint_operating_point,
     select_joint_operating_point_per_tier,
@@ -513,3 +517,106 @@ def test_kendall_tau_rejects_mismatched_item_sets() -> None:
 
 def test_kendall_tau_single_item_is_trivially_one() -> None:
     assert kendall_tau(["a"], ["a"]) == 1.0
+
+
+# --- fleiss_kappa / cohens_kappa (ADR-0021's cross-LLM labeling agreement measure) ----------
+
+
+def test_fleiss_kappa_perfect_agreement_is_one() -> None:
+    assert fleiss_kappa([[0, 0, 0], [4, 4, 4], [2, 2, 2]]) == pytest.approx(1.0)
+
+
+def test_fleiss_kappa_hand_computed_partial_agreement() -> None:
+    """4 items, 3 raters, categories {0,1}. item1=[0,0,0] item2=[1,1,1] item3=[0,0,1]
+    item4=[0,1,1]. Hand-derived: P_bar=2/3, P_bar_e=1/2, kappa=(2/3-1/2)/(1/2)=1/3."""
+    ratings = [[0, 0, 0], [1, 1, 1], [0, 0, 1], [0, 1, 1]]
+    assert fleiss_kappa(ratings) == pytest.approx(1 / 3)
+
+
+def test_fleiss_kappa_rejects_unequal_rater_counts() -> None:
+    with pytest.raises(ValueError, match="same number of raters"):
+        fleiss_kappa([[0, 0, 0], [1, 1]])
+
+
+def test_fleiss_kappa_rejects_fewer_than_two_raters() -> None:
+    with pytest.raises(ValueError, match="at least 2 raters"):
+        fleiss_kappa([[0], [1]])
+
+
+def test_fleiss_kappa_rejects_empty_items() -> None:
+    with pytest.raises(ValueError, match="zero items"):
+        fleiss_kappa([])
+
+
+def test_cohens_kappa_hand_computed() -> None:
+    """rater_a=[0,0,1,1] rater_b=[0,1,1,1]. p_o=3/4 (agree on items 1,3,4). rater_a
+    proportions (0.5,0.5), rater_b proportions (0.25,0.75). p_e=0.5*0.25+0.5*0.75=0.5.
+    kappa=(0.75-0.5)/(1-0.5)=0.5."""
+    assert cohens_kappa([0, 0, 1, 1], [0, 1, 1, 1]) == pytest.approx(0.5)
+
+
+def test_cohens_kappa_perfect_agreement_is_one() -> None:
+    assert cohens_kappa([0, 1, 2, 3], [0, 1, 2, 3]) == pytest.approx(1.0)
+
+
+def test_cohens_kappa_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError, match="same items"):
+        cohens_kappa([0, 1], [0, 1, 2])
+
+
+def test_cohens_kappa_rejects_empty_input() -> None:
+    with pytest.raises(ValueError, match="zero items"):
+        cohens_kappa([], [])
+
+
+# --- ndcg_at_k / precision_at_k (ADR-0021's ranking-quality metrics) ------------------------
+
+
+def test_ndcg_at_k_ideal_order_is_one() -> None:
+    assert ndcg_at_k([4, 0, 0], 3) == pytest.approx(1.0)
+
+
+def test_ndcg_at_k_hand_computed_non_ideal_order() -> None:
+    """predicted=[0,4,0] (the relevance-4 item ranked 2nd, not 1st). DCG =
+    (2^0-1)/log2(2) + (2^4-1)/log2(3) + (2^0-1)/log2(4) = 0 + 15/log2(3) + 0. IDCG (order
+    [4,0,0]) = 15. NDCG = (15/log2(3))/15 = 1/log2(3) ~= 0.630930."""
+    import math
+
+    assert ndcg_at_k([0, 4, 0], 3) == pytest.approx(1 / math.log2(3))
+
+
+def test_ndcg_at_k_all_zero_relevance_is_one() -> None:
+    assert ndcg_at_k([0, 0, 0], 3) == pytest.approx(1.0)
+
+
+def test_ndcg_at_k_rejects_non_positive_k() -> None:
+    with pytest.raises(ValueError, match="k must be positive"):
+        ndcg_at_k([1, 2], 0)
+
+
+def test_ndcg_at_k_rejects_empty_input() -> None:
+    with pytest.raises(ValueError, match="zero items"):
+        ndcg_at_k([], 3)
+
+
+def test_precision_at_k_hand_computed() -> None:
+    """predicted=[4,3,1,0,2], k=3, floor=3 -> top3=[4,3,1], 2 of 3 clear the floor."""
+    assert precision_at_k([4, 3, 1, 0, 2], 3, relevance_floor=3) == pytest.approx(2 / 3)
+
+
+def test_precision_at_k_all_clear_floor_is_one() -> None:
+    assert precision_at_k([4, 4, 4], 3, relevance_floor=1) == pytest.approx(1.0)
+
+
+def test_precision_at_k_none_clear_floor_is_zero() -> None:
+    assert precision_at_k([0, 0, 0], 3, relevance_floor=4) == pytest.approx(0.0)
+
+
+def test_precision_at_k_rejects_non_positive_k() -> None:
+    with pytest.raises(ValueError, match="k must be positive"):
+        precision_at_k([1, 2], 0, relevance_floor=1)
+
+
+def test_precision_at_k_rejects_empty_input() -> None:
+    with pytest.raises(ValueError, match="zero items"):
+        precision_at_k([], 3, relevance_floor=1)
