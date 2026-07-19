@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -522,6 +523,141 @@ def kendall_tau(predicted_order: Sequence[str], true_order: Sequence[str]) -> fl
             elif agreement < 0:
                 discordant += 1
     return (concordant - discordant) / total_pairs
+
+
+def fleiss_kappa(item_ratings: Sequence[Sequence[int]]) -> float:
+    """Fleiss' kappa for inter-rater agreement across N items, each rated by the SAME number
+    of raters n (>= 2) on a fixed set of categorical labels — the generic clutter-likelihood
+    ranker's (ADR-0021) cross-LLM labeling agreement measure, standard formula (Fleiss, 1971):
+
+        kappa = (P_bar - P_bar_e) / (1 - P_bar_e)
+
+    where P_bar is the mean per-item observed agreement and P_bar_e is the expected
+    agreement by chance, derived from each category's overall assignment frequency across
+    all raters and items. 1.0 = perfect agreement, 0.0 = chance-level agreement, negative =
+    worse than chance. `item_ratings[i]` is one item's list of category labels, one per
+    rater (small non-negative integers, e.g. a 0-4 ordinal grade) — every item must have the
+    same rater count, and this function does not assume any particular category is
+    "correct"; it measures agreement, not accuracy against a ground truth.
+    """
+    if not item_ratings:
+        raise ValueError("cannot compute Fleiss' kappa over zero items")
+    rater_counts = {len(ratings) for ratings in item_ratings}
+    if len(rater_counts) != 1:
+        raise ValueError(
+            f"every item must have the same number of raters — found counts {rater_counts}"
+        )
+    n = rater_counts.pop()
+    if n < 2:
+        raise ValueError(f"Fleiss' kappa requires at least 2 raters per item, got {n}")
+
+    categories = sorted({label for ratings in item_ratings for label in ratings})
+    num_items = len(item_ratings)
+
+    # n_ij: how many of item i's n raters assigned category j.
+    category_counts_per_item = [
+        [ratings.count(category) for category in categories] for ratings in item_ratings
+    ]
+
+    per_item_agreement = [
+        (sum(count * count for count in counts) - n) / (n * (n - 1))
+        for counts in category_counts_per_item
+    ]
+    p_bar = sum(per_item_agreement) / num_items
+
+    total_assignments = num_items * n
+    category_proportions = [
+        sum(counts[j] for counts in category_counts_per_item) / total_assignments
+        for j in range(len(categories))
+    ]
+    p_bar_e = sum(p * p for p in category_proportions)
+
+    if p_bar_e == 1.0:
+        return 1.0  # every rater always picked the same single category — no variance to
+        # measure disagreement against; perfect agreement is the only honest answer, not a
+        # division by zero.
+    return (p_bar - p_bar_e) / (1 - p_bar_e)
+
+
+def cohens_kappa(rater_a: Sequence[int], rater_b: Sequence[int]) -> float:
+    """Cohen's kappa for pairwise inter-rater agreement between exactly two raters over the
+    same N items — the 2-rater complement to `fleiss_kappa` (ADR-0021), standard formula:
+
+        kappa = (p_o - p_e) / (1 - p_e)
+
+    where p_o is observed agreement proportion and p_e is chance-expected agreement derived
+    from each rater's own marginal category-assignment frequencies.
+    """
+    if len(rater_a) != len(rater_b):
+        raise ValueError(
+            f"both raters must have rated the same items — got {len(rater_a)} vs "
+            f"{len(rater_b)} ratings"
+        )
+    if not rater_a:
+        raise ValueError("cannot compute Cohen's kappa over zero items")
+
+    num_items = len(rater_a)
+    observed_agreement = sum(1 for a, b in zip(rater_a, rater_b, strict=True) if a == b)
+    p_o = observed_agreement / num_items
+
+    categories = sorted(set(rater_a) | set(rater_b))
+    p_e = sum(
+        (rater_a.count(category) / num_items) * (rater_b.count(category) / num_items)
+        for category in categories
+    )
+
+    if p_e == 1.0:
+        return 1.0  # both raters always picked the same single category — no variance to
+        # measure disagreement against; see fleiss_kappa's identical edge case.
+    return (p_o - p_e) / (1 - p_e)
+
+
+def ndcg_at_k(predicted_order: Sequence[float], k: int) -> float:
+    """Normalized Discounted Cumulative Gain at rank k — the generic clutter-likelihood
+    ranker's (ADR-0021) ranking-quality metric. `predicted_order` is the TRUE relevance grade
+    (e.g. the 0-4 clutter-likelihood label) of each item, already sorted into the order the
+    ranker under test PRODUCED (most-recommended-first) — this function only computes the
+    gain/discount/normalization, it does not do any sorting itself, so the caller's sort
+    order is exactly what's measured.
+
+    DCG@k = sum_{i=1}^{k} (2^rel_i - 1) / log2(i + 1); NDCG@k = DCG@k / IDCG@k, where IDCG@k
+    is DCG@k of the ideal (relevance-descending) ordering of the same items. 1.0 = the
+    ranker's ordering achieves the best possible gain in the top k; 0.0 = every top-k item
+    had zero relevance.
+    """
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    if not predicted_order:
+        raise ValueError("cannot compute NDCG over zero items")
+
+    def _dcg(relevances: Sequence[float]) -> float:
+        return sum(
+            (2**relevance - 1) / math.log2(index + 2)
+            for index, relevance in enumerate(relevances[:k])
+        )
+
+    ideal_order = sorted(predicted_order, reverse=True)
+    ideal_dcg = _dcg(ideal_order)
+    if ideal_dcg == 0.0:
+        return 1.0  # every item (in the top k or otherwise) has zero relevance -- there is
+        # no gain any ordering could have achieved, so the ranker didn't fail to achieve one.
+    return _dcg(predicted_order) / ideal_dcg
+
+
+def precision_at_k(predicted_order: Sequence[float], k: int, *, relevance_floor: float) -> float:
+    """Fraction of the top-k items (by the ranker's PRODUCED order — same convention as
+    `ndcg_at_k`: already sorted, this function doesn't sort) whose true relevance grade meets
+    or exceeds `relevance_floor` — "of what the ranker surfaced first, how much was actually
+    likely clutter." A companion to NDCG (which rewards getting the ORDER right); this
+    measures the more operationally relevant "was the top of the queue actually useful"
+    question directly.
+    """
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
+    if not predicted_order:
+        raise ValueError("cannot compute precision@k over zero items")
+    top_k = predicted_order[:k]
+    return sum(1 for relevance in top_k if relevance >= relevance_floor) / len(top_k)
 
 
 def current_commit_sha(repo_root: Path | None = None) -> str:

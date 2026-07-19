@@ -166,6 +166,41 @@ def test_browse_only_track_cannot_carry_a_deletion_suggestion() -> None:
         )
 
 
+def test_ranked_clutter_track_cannot_carry_a_deletion_suggestion() -> None:
+    """The generic clutter-likelihood ranker (ADR-0021): AITrack.RANKED_CLUTTER is a
+    PRIORITIZATION-only track — it re-orders the review queue by predicted clutter-
+    likelihood, it never identifies a "keeper" the way a near-dup/version-chain track does.
+    Structurally the same guarantee as SEMANTIC_IMAGE above, tested explicitly under its own
+    name since a future reader searching for "ranker safety" should find this directly rather
+    than having to infer it's covered by the generic browse-only test."""
+    member = AIClusterMember(path=Path("clutter.tmp"), size_bytes=100, is_recommended_keep=True)
+    with pytest.raises(ValueError, match="browse/ranking-only"):
+        AICluster(
+            cluster_id="ranked-clutter-1",
+            track=AITrack.RANKED_CLUTTER,
+            members=(member,),
+            raw_score=3.7,
+            score_kind="clutter_likelihood_lambdamart",
+            rationale="test",
+        )
+
+
+def test_ranked_clutter_track_never_suggests_deletion_even_with_a_high_score() -> None:
+    """A high clutter-likelihood raw_score alone (unlike a deletion-eligible track's
+    is_recommended_keep flag) must never flip suggests_deletion True -- the ranker's whole
+    contract is "prioritize review," never "identify what to delete." """
+    member = AIClusterMember(path=Path("clutter.tmp"), size_bytes=100)
+    cluster = AICluster(
+        cluster_id="ranked-clutter-1",
+        track=AITrack.RANKED_CLUTTER,
+        members=(member,),
+        raw_score=4.0,  # maximum plausible clutter-likelihood score
+        score_kind="clutter_likelihood_lambdamart",
+        rationale="test",
+    )
+    assert cluster.suggests_deletion is False
+
+
 def test_near_identical_track_with_a_keeper_does_suggest_deletion() -> None:
     keep = AIClusterMember(path=Path("a.jpg"), size_bytes=100, is_recommended_keep=True)
     drop = AIClusterMember(path=Path("b.jpg"), size_bytes=100, is_recommended_keep=False)

@@ -1,0 +1,25 @@
+{
+  "commit_sha": "bf2f4429b7d6eea3902a85d3dd8a6fbf1246f8dc",
+  "command": "uv run pytest evals/test_ai_ranker_gold.py -v -s",
+  "fixture_path": "data\\ai_datasets\\ranker_labels\\labeled_records.jsonl",
+  "judge_models": [
+    "qwen3:8b",
+    "llama3.1:8b",
+    "gemma2:9b"
+  ],
+  "fleiss_kappa_3_raters": 0.6768056772759337,
+  "pairwise_cohens_kappa": {
+    "qwen3:8b_vs_llama3.1:8b": 0.6443934614281618,
+    "qwen3:8b_vs_gemma2:9b": 0.6663790624101237,
+    "llama3.1:8b_vs_gemma2:9b": 0.7250334160779073
+  },
+  "complete_records": 120,
+  "unanimous_agreement_records": 79,
+  "excluded_disagreement_records": 41,
+  "exclusion_rate": 0.3416666666666667,
+  "train_batches": 6,
+  "eval_batches": 2,
+  "mean_ndcg_at_5": 0.9762640703460439,
+  "mean_precision_at_3": 1.0,
+  "note": "GENERIC clutter-likelihood ranker -- labels are LLM CONSENSUS on a knowable, non-personal property, NOT human ground truth and NOT any real person's actual decisions. Permanently PROVISIONAL (is_synthetic_only=True) -- assert_safe_to_promote_to_measured raises for this distribution, verified by this eval, not just narrated."
+}
