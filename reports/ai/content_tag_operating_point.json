@@ -1,5 +1,5 @@
 {
-  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "commit_sha": "e0da7240b33c1ed4c29f354fe4ea9685f305085c",
   "command": "uv run pytest evals/test_ai_content_tag_gold.py -v -s",
   "fixture_path": "data/ai_datasets/gutenberg_texts (document) + src/reclaim/** (code) + evals/ai_fixtures/build_content_tag_fixtures.py (receipt/chat/transient_ui, synthetic)",
   "shipped_per_tag": {

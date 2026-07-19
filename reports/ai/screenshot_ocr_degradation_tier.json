@@ -1,5 +1,5 @@
 {
-  "commit_sha": "626a78b997a7af400a874eab8afae521844e6485",
+  "commit_sha": "e0da7240b33c1ed4c29f354fe4ea9685f305085c",
   "command": "uv run pytest evals/test_ai_screenshot_ocr_degradation_gate.py -v -s",
   "fixture": "in-memory PIL degradation of receipt/document/code/chat renders",
   "rows": [

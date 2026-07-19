@@ -1,5 +1,5 @@
 {
-  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "commit_sha": "e0da7240b33c1ed4c29f354fe4ea9685f305085c",
   "command": "uv run pytest evals/test_ai_copydays_gold.py -v -s",
   "fixture_path": "data/ai_datasets/copydays (INRIA Copydays, ADR-0015)",
   "total_blocks": 157,

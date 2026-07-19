@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import statistics
 import time
 from pathlib import Path
 
@@ -13,6 +14,13 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows
 
 _NUM_SUBDIRS = 25
 _FILES_PER_SUBDIR = 160  # ~4000 files total
+_TRIALS = 5  # median-of-N (house rule 81: fix or delete a flaky test, don't widen the margin
+# to paper over it). A single (full, incremental) timing pair is one sample from a noisy
+# distribution -- one GC pause, one other process/test borrowing CPU for 100ms, and a real
+# 90%-of-full-scan incremental rescan reads as "dramatically slower," a false flake, not a
+# real regression. The median of 5 independent trials is robust to exactly that: an outlier
+# trial (jitter in either direction) can't move the median unless a MAJORITY of trials are
+# affected, which is what an actual regression would look like, not what one bad tick does.
 
 # Conservative smoke-test floor: an order of magnitude below the spec's real target
 # (>=100K files/min == ~1667 files/sec on GG's actual SSD). This only proves the scanner
@@ -57,39 +65,64 @@ def test_full_scan_clears_conservative_floor_and_incremental_skips_all_writes(
     only be honestly taken on GG's actual SSD with a real large tree, never on a
     shared/virtualized CI runner (see reclaim-spec.md "Perf budget" and house rule 65b on
     metric provenance).
+
+    Timing assertions run on the MEDIAN of `_TRIALS` independent (full, incremental) pairs,
+    not a single sample — a fresh `ScanIndex` per trial (same on-disk tree, reused — building
+    it is the expensive, non-timed setup step) so each trial's "full scan" is genuinely a full
+    scan against an empty index, not accidentally incremental against a warm one from a prior
+    trial.
     """
     root = tmp_path / "perf_root"
     file_count = _build_tree(root)
 
-    db_path = tmp_path / "index.sqlite3"
-    with ScanIndex(db_path) as index:
-        full_start = time.perf_counter()
-        full_stats = scan_tree(root, index, incremental=False)
-        full_elapsed = time.perf_counter() - full_start
+    full_elapsed_samples: list[float] = []
+    incremental_elapsed_samples: list[float] = []
 
-        incremental_start = time.perf_counter()
-        incremental_stats = scan_tree(root, index, incremental=True)
-        incremental_elapsed = time.perf_counter() - incremental_start
+    for trial in range(_TRIALS):
+        db_path = tmp_path / f"index_{trial}.sqlite3"
+        with ScanIndex(db_path) as index:
+            full_start = time.perf_counter()
+            full_stats = scan_tree(root, index, incremental=False)
+            full_elapsed = time.perf_counter() - full_start
 
-    files_per_second = file_count / full_elapsed
+            incremental_start = time.perf_counter()
+            incremental_stats = scan_tree(root, index, incremental=True)
+            incremental_elapsed = time.perf_counter() - incremental_start
+
+        assert full_stats.entries_total >= file_count
+        # The deterministic proof the incremental-skip mechanism works: zero rows written
+        # when nothing on disk changed. Not a timing assertion, checked every trial — it
+        # can't flake on CI-runner jitter, so there's no reason to only check it once.
+        assert incremental_stats.files_written == 0
+        assert incremental_stats.files_unchanged == full_stats.entries_total
+
+        full_elapsed_samples.append(full_elapsed)
+        incremental_elapsed_samples.append(incremental_elapsed)
+
+    median_full_elapsed = statistics.median(full_elapsed_samples)
+    median_incremental_elapsed = statistics.median(incremental_elapsed_samples)
+    median_files_per_second = file_count / median_full_elapsed
+
     print(  # noqa: T201 -- perf smoke numbers; run with `pytest -s` to see them
-        f"\n[scanner perf smoke] files={file_count} full={full_elapsed:.3f}s "
-        f"({files_per_second:.0f} files/sec, CI-runner smoke number only) "
-        f"incremental={incremental_elapsed:.3f}s "
-        f"({incremental_elapsed / full_elapsed:.2%} of full)"
+        f"\n[scanner perf smoke] files={file_count} trials={_TRIALS} "
+        f"full_samples={[f'{s:.3f}' for s in full_elapsed_samples]} "
+        f"incremental_samples={[f'{s:.3f}' for s in incremental_elapsed_samples]} "
+        f"median_full={median_full_elapsed:.3f}s "
+        f"({median_files_per_second:.0f} files/sec, CI-runner smoke number only) "
+        f"median_incremental={median_incremental_elapsed:.3f}s "
+        f"({median_incremental_elapsed / median_full_elapsed:.2%} of median full)"
     )
 
-    assert full_stats.entries_total >= file_count
-    # The deterministic proof the incremental-skip mechanism works: zero rows written when
-    # nothing on disk changed. Not a timing assertion, so it can't flake on CI-runner jitter.
-    assert incremental_stats.files_written == 0
-    assert incremental_stats.files_unchanged == full_stats.entries_total
-    assert files_per_second >= _MIN_FILES_PER_SECOND_SMOKE_FLOOR, (
-        f"full scan rate {files_per_second:.0f} files/sec fell below the conservative CI "
-        f"smoke floor of {_MIN_FILES_PER_SECOND_SMOKE_FLOOR} files/sec -- this floor is not "
-        "the real spec perf number, just a regression tripwire"
+    assert median_files_per_second >= _MIN_FILES_PER_SECOND_SMOKE_FLOOR, (
+        f"median full-scan rate {median_files_per_second:.0f} files/sec across {_TRIALS} "
+        f"trials fell below the conservative CI smoke floor of "
+        f"{_MIN_FILES_PER_SECOND_SMOKE_FLOOR} files/sec -- this floor is not the real spec "
+        "perf number, just a regression tripwire"
     )
-    assert incremental_elapsed < full_elapsed * _MAX_INCREMENTAL_WALL_TIME_SANITY_MULTIPLE, (
-        f"incremental rescan ({incremental_elapsed:.3f}s) was dramatically slower than the "
-        f"full scan ({full_elapsed:.3f}s), which shouldn't happen even accounting for jitter"
+    sanity_bound = median_full_elapsed * _MAX_INCREMENTAL_WALL_TIME_SANITY_MULTIPLE
+    assert median_incremental_elapsed < sanity_bound, (
+        f"median incremental rescan ({median_incremental_elapsed:.3f}s across {_TRIALS} "
+        f"trials) was dramatically slower than the median full scan "
+        f"({median_full_elapsed:.3f}s), which shouldn't happen even accounting for jitter -- "
+        "the median-of-5 design means this is very unlikely to be a fluke"
     )
