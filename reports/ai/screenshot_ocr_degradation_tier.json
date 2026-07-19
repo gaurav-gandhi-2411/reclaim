@@ -1,0 +1,194 @@
+{
+  "commit_sha": "33818e5f26e2f3edd10bf37c019ca171f7e2f5db",
+  "command": "uv run pytest evals/test_ai_screenshot_ocr_degradation_gate.py -v -s",
+  "fixture": "in-memory PIL degradation of receipt/document/code/chat renders",
+  "rows": [
+    {
+      "content_kind": "receipt",
+      "degradation": "blur_heavy",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "receipt",
+      "degradation": "low_contrast",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "receipt",
+      "degradation": "cropped",
+      "extracted_char_count": 31,
+      "predicted_tag": "receipt",
+      "score": 1.5
+    },
+    {
+      "content_kind": "receipt",
+      "degradation": "combined_worst_case",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "document",
+      "degradation": "blur_heavy",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "document",
+      "degradation": "low_contrast",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "document",
+      "degradation": "cropped",
+      "extracted_char_count": 98,
+      "predicted_tag": "chat",
+      "score": 1.5
+    },
+    {
+      "content_kind": "document",
+      "degradation": "combined_worst_case",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "code",
+      "degradation": "blur_heavy",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "code",
+      "degradation": "low_contrast",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "code",
+      "degradation": "cropped",
+      "extracted_char_count": 30,
+      "predicted_tag": "code",
+      "score": 1.5
+    },
+    {
+      "content_kind": "code",
+      "degradation": "combined_worst_case",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "blur_heavy",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "low_contrast",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "cropped",
+      "extracted_char_count": 40,
+      "predicted_tag": "chat",
+      "score": 2.5
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "combined_worst_case",
+      "extracted_char_count": 0,
+      "predicted_tag": "unknown",
+      "score": 0.0
+    }
+  ],
+  "near_empty_rows": [
+    {
+      "content_kind": "receipt",
+      "degradation": "blur_heavy",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "receipt",
+      "degradation": "low_contrast",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "receipt",
+      "degradation": "combined_worst_case",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "document",
+      "degradation": "blur_heavy",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "document",
+      "degradation": "low_contrast",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "document",
+      "degradation": "combined_worst_case",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "code",
+      "degradation": "blur_heavy",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "code",
+      "degradation": "low_contrast",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "code",
+      "degradation": "combined_worst_case",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "blur_heavy",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "low_contrast",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    },
+    {
+      "content_kind": "chat",
+      "degradation": "combined_worst_case",
+      "extracted": null,
+      "predicted_tag": "unknown"
+    }
+  ],
+  "note": "Zero degraded real-content sample tagged TRANSIENT_UI; every near-empty OCR result tagged UNKNOWN. Closes F2's one real over-deletion path."
+}

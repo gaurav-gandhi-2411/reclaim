@@ -236,6 +236,43 @@ def test_version_chain_track_with_a_keeper_does_suggest_deletion() -> None:
     assert chain.suggests_deletion is True
 
 
+def test_screenshot_burst_track_with_a_keeper_does_suggest_deletion() -> None:
+    """Feature 2: SCREENSHOT_BURST joined the deletion-eligible set, but ONLY conditionally
+    (screenshot_review.py's orchestration only ever sets a keeper when every member's OCR
+    content tag is transient-UI) -- at the AICluster level tested here, the track itself is
+    deletion-eligible the same mechanical way NEAR_IDENTICAL_IMAGE/NEAR_DUP_DOCUMENT/
+    VERSION_CHAIN are; the content-tag gating is tested separately in
+    tests/test_ai_screenshot_review.py."""
+    keep = AIClusterMember(path=Path("shot2.png"), size_bytes=100, is_recommended_keep=True)
+    drop = AIClusterMember(path=Path("shot1.png"), size_bytes=100)
+    cluster = AICluster(
+        cluster_id="burst-1",
+        track=AITrack.SCREENSHOT_BURST,
+        members=(keep, drop),
+        raw_score=2.0,
+        score_kind="max_pairwise_hamming_distance",
+        rationale="test",
+    )
+    assert cluster.suggests_deletion is True
+
+
+def test_screenshot_burst_track_without_a_keeper_is_browse_only_not_a_suggestion() -> None:
+    """The mixed-content-tag case: a burst track cluster with no member marked as keeper
+    (screenshot_review.py's conditional gate withheld it) must not be treated as a deletion
+    suggestion just because the track itself is deletion-eligible."""
+    unscored_a = AIClusterMember(path=Path("shot1.png"), size_bytes=100)
+    unscored_b = AIClusterMember(path=Path("shot2.png"), size_bytes=100)
+    cluster = AICluster(
+        cluster_id="burst-1",
+        track=AITrack.SCREENSHOT_BURST,
+        members=(unscored_a, unscored_b),
+        raw_score=2.0,
+        score_kind="max_pairwise_hamming_distance",
+        rationale="test",
+    )
+    assert cluster.suggests_deletion is False
+
+
 def test_review_queue_partitions_deletion_suggestions_from_browse_only() -> None:
     keep = AIClusterMember(path=Path("a.jpg"), size_bytes=100, is_recommended_keep=True)
     drop = AIClusterMember(path=Path("b.jpg"), size_bytes=100)
@@ -264,11 +301,12 @@ def test_review_queue_partitions_deletion_suggestions_from_browse_only() -> None
     assert [c.cluster_id for c in queue.browse_only()] == ["semantic-1"]
 
 
-def test_review_queue_partitions_all_four_tracks_correctly() -> None:
-    """Feature 1b's two new deletion-eligible tracks (NEAR_DUP_DOCUMENT, VERSION_CHAIN) land
-    in the same deletion_suggestions() view as NEAR_IDENTICAL_IMAGE, and a browse-only track
-    stays out of it — proven at the AIReviewQueue level, not just AICluster.suggests_deletion
-    in isolation, since the queue's partitioning is what a future UI would actually read."""
+def test_review_queue_partitions_all_five_tracks_correctly() -> None:
+    """Feature 1b's two deletion-eligible tracks (NEAR_DUP_DOCUMENT, VERSION_CHAIN) and
+    Feature 2's SCREENSHOT_BURST all land in the same deletion_suggestions() view as
+    NEAR_IDENTICAL_IMAGE, and a browse-only track stays out of it — proven at the
+    AIReviewQueue level, not just AICluster.suggests_deletion in isolation, since the queue's
+    partitioning is what a future UI would actually read."""
     image_dup = AICluster(
         cluster_id="image-1",
         track=AITrack.NEAR_IDENTICAL_IMAGE,
@@ -304,6 +342,17 @@ def test_review_queue_partitions_all_four_tracks_correctly() -> None:
         score_kind="min_pairwise_content_similarity_within_chain",
         rationale="version chain",
     )
+    burst = AICluster(
+        cluster_id="burst-1",
+        track=AITrack.SCREENSHOT_BURST,
+        members=(
+            AIClusterMember(path=Path("s1.png"), size_bytes=100),
+            AIClusterMember(path=Path("s2.png"), size_bytes=100, is_recommended_keep=True),
+        ),
+        raw_score=2.0,
+        score_kind="max_pairwise_hamming_distance",
+        rationale="screenshot burst",
+    )
     browse = AICluster(
         cluster_id="semantic-1",
         track=AITrack.SEMANTIC_IMAGE,
@@ -314,13 +363,14 @@ def test_review_queue_partitions_all_four_tracks_correctly() -> None:
     )
 
     queue = AIReviewQueue()
-    for cluster in (image_dup, document_dup, chain, browse):
+    for cluster in (image_dup, document_dup, chain, burst, browse):
         queue.add(cluster)
 
     assert {c.cluster_id for c in queue.deletion_suggestions()} == {
         "image-1",
         "document-1",
         "chain-1",
+        "burst-1",
     }
     assert [c.cluster_id for c in queue.browse_only()] == ["semantic-1"]
 

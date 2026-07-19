@@ -19,20 +19,31 @@ class AITrack(StrEnum):
     suggestion (spec §0.7/§2: "near-identical ... may produce a deletion suggestion; semantic
     similarity is browse-grouping only" for images, and "deletion suggestions only for
     high-similarity near-dups; version-chains are ordered recommendations" for documents) —
-    see `AICluster.suggests_deletion`. `SEMANTIC_IMAGE`/`SCREENSHOT_BURST`/`RANKED_CLUTTER`
-    remain browse/ranking-only placeholders for future features (1a-Track-B/2/3).
+    see `AICluster.suggests_deletion`. `SEMANTIC_IMAGE`/`RANKED_CLUTTER` remain browse/
+    ranking-only placeholders for future features (1a-Track-B/3). `SCREENSHOT_BURST` is
+    deletion-eligible at the TRACK level, but Feature 2's orchestration
+    (`screenshot_review.build_screenshot_burst_clusters`) only ever sets a keeper when EVERY
+    member's OCR content tag is `content_tagger.ContentTag.TRANSIENT_UI` — a burst containing
+    any receipt/document/code/chat/unknown content downgrades that specific cluster to
+    browse-only, same conditional-keeper posture as `VERSION_CHAIN`'s `version_signals_agree`.
     """
 
     NEAR_IDENTICAL_IMAGE = "near_identical_image"  # Feature 1a Track A — deletion-eligible
     SEMANTIC_IMAGE = "semantic_image"  # Feature 1a Track B — browse-only, future
     NEAR_DUP_DOCUMENT = "near_dup_document"  # Feature 1b — deletion-eligible (high-similarity)
     VERSION_CHAIN = "version_chain"  # Feature 1b — deletion-eligible (keep-latest recommendation)
-    SCREENSHOT_BURST = "screenshot_burst"  # Feature 2 — browse-only, future
+    SCREENSHOT_BURST = "screenshot_burst"  # Feature 2 — deletion-eligible, gated on
+    # transient-UI content tag only (see class docstring)
     RANKED_CLUTTER = "ranked_clutter"  # Feature 3 — ranking-only, future
 
 
 _DELETION_SUGGESTION_ELIGIBLE_TRACKS = frozenset(
-    {AITrack.NEAR_IDENTICAL_IMAGE, AITrack.NEAR_DUP_DOCUMENT, AITrack.VERSION_CHAIN}
+    {
+        AITrack.NEAR_IDENTICAL_IMAGE,
+        AITrack.NEAR_DUP_DOCUMENT,
+        AITrack.VERSION_CHAIN,
+        AITrack.SCREENSHOT_BURST,
+    }
 )
 
 
