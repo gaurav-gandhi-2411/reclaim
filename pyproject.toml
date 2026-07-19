@@ -24,8 +24,9 @@ dependencies = [
 # `uv sync --extra ai` adds them. Grows incrementally as each spec feature lands — Feature 1a
 # Track A (pHash/dHash + classical keep-best) needs the first three; Feature 1b (MinHash/LSH
 # document near-dup + sentence-embedding residual + version-chain) adds the rest (ADR-0017
-# covers licenses). Still to come: open-clip-torch + hnswlib for 1a Track B, rapidocr/
-# pytesseract for Feature 2, lightgbm for Feature 3.
+# covers licenses); Feature 2 adds rapidocr (ADR-0019); the generic clutter-likelihood ranker
+# adds numpy + lightgbm (ADR-0021); Track B (semantic image grouping, browse-only) adds
+# open-clip-torch + faiss-cpu (ADR-0022).
 ai = [
     "imagehash>=4.3",             # BSD-2-Clause — pHash/dHash perceptual hashing
     "opencv-python-headless>=4.9", # Apache-2.0 — Laplacian-variance sharpness scoring
@@ -41,6 +42,28 @@ ai = [
     # `cv2` module; whichever installs last determines the on-disk build, but this has not
     # been observed to break any existing `cv2` usage (keep_best.py's headless-only calls —
     # Laplacian variance, grayscale imread — work identically either way). See ADR-0019.
+    "torch>=2.0",                   # Apache-2.0/BSD/MIT component mix (PyTorch's own summary:
+    # BSD-style) — imported directly via `require("torch", ...)` in image_embeddings.py's
+    # inference call (`torch.no_grad()`); already a transitive dependency of both
+    # sentence-transformers and open-clip-torch, listed explicitly per this file's own
+    # discipline (see the `numpy` entry above) rather than left implicit.
+    "open-clip-torch>=3.3.0",       # MIT — CLIP ViT-B/32 semantic image embeddings (Track B,
+    # ADR-0022). Considered against Apple's MobileCLIP: rejected — MobileCLIP's CODE is MIT
+    # but its pretrained WEIGHTS are gated under Apple's "ML Research Model" Terms of Use,
+    # which explicitly excludes "commercial exploitation, product development, or use in any
+    # commercial product or service" — a hard prohibition, not ambiguity, and also not
+    # pip-installable (requires cloning the repo + manual checkpoint download). OpenCLIP's
+    # ViT-B/32 "openai" checkpoint is MIT end-to-end (code + weights), pip-only,
+    # ~338MB, depends only on PyTorch (itself permissively licensed — Apache-2.0/BSD/MIT
+    # component mix) and torchvision (BSD) — both already resolvable via `open-clip-torch`
+    # alone, no extra pins needed.
+    "faiss-cpu>=1.14.3",             # MIT — ANN cosine-similarity search over CLIP embeddings.
+    # hnswlib (the spec's other named option) was tried first and rejected on pip-
+    # installability grounds: it has no prebuilt wheel for this Python/platform combination
+    # and needs to compile from source, requiring MSVC Build Tools (not installed) — exactly
+    # the "needs a system binary" problem this project's dependency discipline avoids
+    # (same reasoning that chose rapidocr-onnxruntime over Tesseract for Feature 2).
+    # faiss-cpu ships a prebuilt Windows wheel, zero extra setup.
 ]
 
 [project.scripts]

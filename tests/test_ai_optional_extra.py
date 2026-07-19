@@ -52,6 +52,9 @@ _ALL_GATED_MODULE_NAMES = {
     "sentence_transformers",
     "numpy",
     "rapidocr_onnxruntime",
+    "open_clip",
+    "torch",
+    "faiss",
 }
 
 
