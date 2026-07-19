@@ -1,5 +1,5 @@
 {
-  "commit_sha": "cf89e270ffab1cc1c98ff652d8e7c5c782d2bfc9",
+  "commit_sha": "bf2f4429b7d6eea3902a85d3dd8a6fbf1246f8dc",
   "command": "uv run pytest evals/test_ai_ranker_gold.py -v -s",
   "fixture_path": "data\\ai_datasets\\ranker_labels\\labeled_records.jsonl",
   "judge_models": [
