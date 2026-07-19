@@ -4,6 +4,10 @@ import ast
 import logging
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from PIL import Image, ImageDraw, ImageFont
 
 from reclaim.ai.screenshot_ocr import extract_screenshot_text

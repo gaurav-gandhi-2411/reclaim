@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from PIL import Image, ImageDraw, ImageFont
 
 from reclaim.ai.models import AITrack

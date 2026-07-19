@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from ai_fixtures.build_document_similarity_fixtures import build_document_similarity_fixtures
 
 from reclaim.ai.document_keep_best import select_document_keep
@@ -60,6 +61,7 @@ def _all_pairwise_jaccard_scored(records: list) -> list[tuple[float, bool]]:
 def test_minhash_operating_point_meets_target_precision_on_synthetic_fixtures(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("datasketch")
     cases = build_document_similarity_fixtures(tmp_path)
     records = []
     for case in cases:
@@ -99,6 +101,7 @@ def test_minhash_operating_point_meets_target_precision_on_synthetic_fixtures(
 def test_clustering_bcubed_precision_recall_meets_floor_at_provisional_threshold(
     tmp_path: Path,
 ) -> None:
+    pytest.importorskip("datasketch")
     min_similarity = 0.3  # provisional; see ADR-0017 for the measured value
     cases = build_document_similarity_fixtures(tmp_path)
 
@@ -176,6 +179,8 @@ def test_keep_best_never_selects_a_non_largest_member(tmp_path: Path) -> None:
 
 
 def test_end_to_end_build_near_dup_document_clusters_respects_safety(tmp_path: Path) -> None:
+    pytest.importorskip("datasketch")
+    pytest.importorskip("sentence_transformers")
     cases = build_document_similarity_fixtures(tmp_path)
     all_paths = [tmp_path / case.relative_path for case in cases]
 

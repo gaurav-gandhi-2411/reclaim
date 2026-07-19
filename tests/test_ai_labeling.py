@@ -98,6 +98,9 @@ def test_label_store_file_never_created_until_first_append(tmp_path: Path) -> No
 
 
 def _make_patterned_image(path: Path, seed_color: tuple[int, int, int]) -> None:
+    import pytest
+
+    pytest.importorskip("PIL")
     from PIL import Image, ImageDraw
 
     path.parent.mkdir(parents=True, exist_ok=True)

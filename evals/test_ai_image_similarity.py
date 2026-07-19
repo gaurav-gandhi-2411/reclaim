@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from ai_fixtures.build_image_similarity_fixtures import build_image_similarity_fixtures
 
 from reclaim.ai.eval_harness import (

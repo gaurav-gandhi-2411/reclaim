@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("PIL")
+pytest.importorskip("torch")
+
 from ai_fixtures.copydays_loader import discover_copydays_images
 
 from reclaim.ai.eval_harness import (

@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("imagehash")
+pytest.importorskip("cv2")
+
 from ai_fixtures.copydays_loader import (
     CopydaysImage,
     all_pairs,

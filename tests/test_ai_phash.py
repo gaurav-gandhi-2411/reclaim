@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from PIL import Image, ImageDraw
 
 from reclaim.ai.phash import cluster_by_hamming_distance, compute_image_hashes, hamming_distance

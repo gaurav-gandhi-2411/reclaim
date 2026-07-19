@@ -35,8 +35,11 @@ jobs:
       - name: Mypy
         run: uv run mypy
 
-      - name: Pytest (fast unit tests — SafetyValidator hard gate runs in eval.yml)
-        run: uv run pytest --cov --cov-report=term-missing
+      - name: Pytest (fast unit tests — AI-extra-dependent tests skip cleanly here; deterministic + AI safety gates run in eval.yml)
+        run: uv run pytest --cov --cov-report=term-missing --junitxml=pytest-results.xml
+
+      - name: Fail if this job collected/ran zero tests
+        run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
 
   ai-layer-with-extras:
     # Hard Gate 3 (reclaim-ai-features-spec.md §8/§0.3): proves the "ai extras installed"
@@ -66,7 +69,10 @@ jobs:
         run: uv run mypy
 
       - name: Pytest + AI safety gate
-        run: uv run pytest tests/ evals/test_ai_safety_gate.py -v
+        run: uv run pytest tests/ evals/test_ai_safety_gate.py -v --junitxml=pytest-results.xml
+
+      - name: Fail if this job collected/ran zero tests
+        run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
 
   frontend-xss-regression:
     runs-on: windows-latest

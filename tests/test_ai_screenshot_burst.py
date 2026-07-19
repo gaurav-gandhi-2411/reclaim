@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from PIL import Image, ImageDraw
 
 from reclaim.ai.screenshot_burst import (

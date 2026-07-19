@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("PIL")
+
 from ai_fixtures.build_realistic_recompression_tiers import build_realistic_tiers
 from ai_fixtures.copydays_loader import discover_copydays_images
 

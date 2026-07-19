@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("sentence_transformers")
+
 from ai_fixtures.paws_loader import load_paws_labeled_final
 
 from reclaim.ai.eval_harness import (

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("datasketch")
+pytest.importorskip("sentence_transformers")
+
 from reclaim.ai.document_similarity import build_near_dup_document_clusters
 from reclaim.config import Config, SafetyConfig
 from reclaim.safety import SafetyValidator

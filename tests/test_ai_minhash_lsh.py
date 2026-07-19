@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("datasketch")
+
 from reclaim.ai.minhash_lsh import (
     cluster_by_jaccard_similarity,
     compute_document_minhash,

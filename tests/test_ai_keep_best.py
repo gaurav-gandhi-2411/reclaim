@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("PIL")
+
 from PIL import Image, ImageFilter
 
 from reclaim.ai.keep_best import QualityScore, score_image_quality, select_keep

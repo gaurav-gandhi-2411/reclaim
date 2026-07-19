@@ -113,6 +113,11 @@ def test_categorical_feature_indices_point_at_the_bucketed_string_fields() -> No
 
 
 def test_cluster_ranker_raises_actionable_error_when_no_model_exists(tmp_path: Path) -> None:
+    """Requires lightgbm itself to be installed -- otherwise `ClutterRanker.__init__` raises
+    `AIExtraNotInstalledError` for the missing PACKAGE before it ever gets to check whether
+    the model FILE exists, which is a different, already-covered scenario
+    (tests/test_ai_optional_extra.py)."""
+    pytest.importorskip("lightgbm")
     with pytest.raises(FileNotFoundError, match=r"label_ranker_fixtures\.py"):
         ClutterRanker(model_path=tmp_path / "does_not_exist.txt")
 

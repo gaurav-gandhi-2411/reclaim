@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("datasketch")
+pytest.importorskip("sentence_transformers")
+
 from ai_fixtures.build_document_realistic_tiers import (
     build_all_chunks,
     build_realistic_document_variants,

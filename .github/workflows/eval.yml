@@ -42,5 +42,18 @@ jobs:
           uv run python scripts/git_guard.py config --global user.email "fixture@reclaim.test"
           uv run python scripts/git_guard.py config --global user.name "Reclaim Fixture Builder"
 
-      - name: SafetyValidator hard gate (evals/test_safety_gate.py)
-        run: uv run pytest evals/ -v
+      # Scoped explicitly to the two safety-gate files, not the whole evals/ directory: every
+      # other evals/*.py file is a gold-set/operating-point measurement that needs the [ai]
+      # extra (torch/PIL/numpy/datasketch/...) to even collect, and this job deliberately does
+      # NOT install it — those measurements run in ci.yml's ai-layer-with-extras job instead
+      # (`pytest tests/ evals/test_ai_safety_gate.py -v`, extras installed there). Neither
+      # safety-gate file needs the ai extra: test_safety_gate.py tests the deterministic
+      # engine's SafetyValidator hard gate directly; test_ai_safety_gate.py constructs
+      # AICluster/AIClusterMember objects with hardcoded scores to prove the structural
+      # recommend-only guarantee — it never runs a real model, so it doesn't need lightgbm/
+      # torch/etc. either. Verified: both collect and pass 24/24 with zero ai deps installed.
+      - name: Safety gates -- deterministic (test_safety_gate.py) + AI recommend-only (test_ai_safety_gate.py)
+        run: uv run pytest evals/test_safety_gate.py evals/test_ai_safety_gate.py -v --junitxml=pytest-results.xml
+
+      - name: Fail if this job collected/ran zero tests
+        run: uv run python scripts/check_junit_nonzero.py pytest-results.xml

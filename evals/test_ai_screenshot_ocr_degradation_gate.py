@@ -4,6 +4,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("PIL")
+
 from ai_fixtures.build_content_tag_fixtures import chat_texts, code_texts, receipt_texts
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 

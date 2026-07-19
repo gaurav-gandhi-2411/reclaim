@@ -4,8 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pytest
+
+pytest.importorskip("numpy")
+
+import numpy as np
 
 from reclaim.ai.clutter_ranker import (
     CATEGORICAL_FEATURE_INDICES,

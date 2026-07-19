@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("docx")
+
 import docx
 
 from reclaim.ai.document_text import extract_text, is_supported_document
