@@ -87,6 +87,16 @@ nothing to compare against when the tiers mapping itself is empty). Fixed with a
 - This does not retroactively invalidate any SINGLE-tier measurement already in this repo
   (ADR-0012's Copydays hard-tier curve, ADR-0015's realistic-distribution curve, ADR-0017's
   original prose-only measurement) — those were never pooled across tiers to begin with.
+- **Honestly disclosed residual risk**: `select_operating_point`/`select_joint_operating_point`
+  (the original single-distribution functions) are still fully valid and still exist — nothing
+  stops a future caller from concatenating multiple tiers' pairs and passing the pooled result
+  to them anyway, reproducing the exact incident this ADR fixes. Neither function can detect
+  pooled input from the data alone (there is no signal in a flat list of pairs that says "this
+  came from more than one source"), so this cannot be closed with a runtime guard — both
+  docstrings now carry an explicit "STOP: is this pooled?" warning naming this ADR and the
+  `_per_tier` alternative, but the actual backstop remains code-review discipline, same as any
+  API that can be misused by a caller ignoring its documented contract. Noted here rather than
+  presented as fully solved.
 
 ## Test coverage
 

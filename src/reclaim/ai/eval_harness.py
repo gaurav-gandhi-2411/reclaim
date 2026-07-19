@@ -201,6 +201,15 @@ def select_operating_point(
     explicitly reviewed, may ever be presented as a final operating point. This function has
     no way to know which kind of data it was given, so it never claims non-provisional on
     its own — the caller's ADR is what actually makes that determination and must say so.
+
+    STOP: does `curve` represent ONE declared distribution, or did you concatenate/pool pairs
+    from more than one named tier before calling this? If more than one, DO NOT use this
+    function — use `select_operating_point_per_tier` instead. This is not a hypothetical
+    warning: ADR-0018 documents a real incident where pooling multiple tiers' pairs through
+    this exact function (well, its 2D sibling, but the same mistake is equally possible here)
+    hid a small tier's real precision failure behind a large tier's clean aggregate number.
+    This function has no way to detect pooled input from the data alone, so it cannot refuse
+    it for you — the caller is the only line of defense.
     """
     eligible = [point for point in curve if point.precision >= target_precision]
     if not eligible:
@@ -256,6 +265,15 @@ def select_joint_operating_point(
 
     Returns `None` if no grid combination clears both floors — callers MUST handle this
     explicitly, never silently falling back to an unqualified combination.
+
+    STOP: do `positive_pairs`/`negative_pairs` represent ONE declared distribution, or did you
+    concatenate/pool pairs from more than one named tier before calling this? If more than
+    one, DO NOT use this function — use `select_joint_operating_point_per_tier` instead. This
+    is the exact mistake ADR-0018 documents: a real incident where pooling a large tier's
+    clean negatives with a small tier's real precision failure produced a combined number
+    (0.9524) that hid the small tier's true precision (0.8634). This function has no way to
+    detect pooled input from the data alone, so it cannot refuse it for you — the caller is
+    the only line of defense.
     """
     best: JointOperatingPoint | None = None
     for stage1_threshold in stage1_candidates:
