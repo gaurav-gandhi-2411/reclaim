@@ -199,7 +199,12 @@ much larger, cleanly-separated prose negative pool. The eval's own per-tier gate
 caught this (the test failed, correctly, the first time it ran) — proving GG's explicit
 instruction ("gate on precision AND recall for both tiers") wasn't just followed narratively
 but is what actually caught a real bug in the measurement itself. The eval was rewritten to
-grid-search with both tiers gated independently from the start, not pooled.
+grid-search with both tiers gated independently from the start, not pooled — and this stopped
+being a one-off fix in this file: **ADR-0018 turned it into a permanent, structural harness
+rule** (`eval_harness.select_joint_operating_point_per_tier`, with a regression test
+reproducing these exact 0.9524/0.8634 numbers), since "never aggregate across declared tiers"
+is a general metrics-integrity invariant, not specific to this feature. This eval now calls
+that shared harness function rather than the hand-rolled grid search described below.
 
 **Both stages' code and docstrings updated to reflect this**: `minhash_lsh.py`'s
 `cluster_by_jaccard_similarity` docstring now explicitly warns that `min_similarity=0.1` is
@@ -233,12 +238,39 @@ fail to match inside underscore-separated filenames like `report_final.docx`, be
 ("final_v2_FINAL.docx") would have been mis-ranked. Fixed to treat `_`/`-`/space/`.` as real
 separators (`src/reclaim/ai/version_chain.py`).
 
-**Disclosed limitation:** a perfect score on 8 constructed chains does not mean the heuristic
-is bulletproof — none of these chains deliberately pit filename-pattern rank against mtime in
-*conflict* (e.g., a numerically "later" version with an *earlier* mtime, which could plausibly
-happen if someone reverted to an old draft and renamed it). This is a real, disclosed gap in
-the fixture, not a claim of exhaustive coverage — a good target for a future, more adversarial
-fixture revision if GG's own files ever surface such a case.
+**Disclosed limitation, now closed: the filename-rank-vs-mtime conflict case.** None of the 8
+ordering-accuracy chains above deliberately pit filename-pattern rank against mtime in
+conflict (e.g., a numerically "later"/"final" version with an *earlier* mtime — plausible if
+someone reverted to an old draft, or reopened an earlier version and kept editing without
+renaming it). GG named this gap explicitly and required a concrete safety property before
+1b could close: **version-chain is the one Feature 1b path that can suggest deleting a file
+the user still considers current** (not just an accumulated duplicate) — so when the two
+independent ordering signals disagree about which file is latest, the feature must not
+confidently pick one anyway.
+
+**Fix: `version_signals_agree` (`src/reclaim/ai/version_chain.py`)** compares every pair of
+files that both carry a recognizable filename-version rank; if any pair's filename-implied
+order contradicts its mtime-implied order, it returns `False`. `build_version_chain_cluster`
+only sets `is_recommended_keep` on the latest-ordered file when signals agree — when they
+disagree, **no member is marked as keeper**, which (via `AICluster.suggests_deletion`'s
+existing logic) makes the whole cluster browse-only: still returned, still ordered, still
+visible for manual review, but never framed as a deletion suggestion.
+
+**Measured: 0 safety violations across a dedicated conflict fixture** (`evals/ai_fixtures/
+build_version_chain_fixtures.py::materialize_version_chain_conflict_fixtures`, 4 chains —
+`uv run pytest evals/test_ai_version_chain_gate.py -v -s`):
+
+| chain | scenario | has_conflict | suggests_deletion |
+|---|---|:---:|:---:|
+| `final_older_than_v2` | the exact case GG named: `report_final.docx` modified BEFORE `report_v2.docx` | True | **False** (correct) |
+| `v3_older_than_v1` | a numerically-later version with an earlier mtime | True | **False** (correct) |
+| `one_conflicting_pair_among_three` | only ONE pair conflicts in an otherwise-plausible 3-file chain | True | **False** (correct) |
+| `genuinely_agreeing_control` | ordinary chain, same offset-based fixture construction, no conflict | False | **True** (correct — proves the check doesn't cry wolf) |
+
+Files with no recognizable filename pattern are excluded from the conflict check entirely
+(they carry no filename signal to conflict with mtime in the first place — see
+`test_version_signals_agree_ignores_files_with_no_filename_pattern`), and tied ranks/mtimes
+are treated as agreement, not conflict, since a tie is not evidence of disagreement.
 
 ## Zero-cost/local + license summary of new dependencies
 
@@ -299,8 +331,10 @@ document content can never reach a log line by accident.
 - Re-acquiring PAN-PC-11 (RAR extraction tooling), a real public templated-document corpus (none
   found among the license-clean options assessed), or GG's own gold-set labels (still unrun) are
   all legitimate future upgrades to this measurement, not blockers.
-- The version-chain fixture's lack of pattern/mtime CONFLICT cases is a known, disclosed gap —
-  not asserted as covered.
+- The version-chain fixture's original lack of pattern/mtime CONFLICT cases is now closed
+  (see "Version-chain ordering" above): `version_signals_agree` blocks a deletion suggestion
+  whenever the two signals disagree, measured at 0 safety violations across a dedicated
+  4-chain conflict fixture including GG's exact named scenario.
 - Per GG's explicit "report before Track B/2/3" — this ADR (including this follow-up) is that
   report's technical backing.
 
@@ -308,11 +342,12 @@ document content can never reach a log line by accident.
 
 **Synthetic (CI, every run):** `evals/test_ai_document_similarity_gate.py` (4 cases — PR-curve
 selection machinery, BCubed floor, keep-best, end-to-end safety-filtered orchestration),
-`evals/test_ai_version_chain_gate.py` (1 case, 8 chains), `tests/test_ai_document_text.py` (8),
-`tests/test_ai_minhash_lsh.py` (5), `tests/test_ai_version_chain.py` (9),
+`evals/test_ai_version_chain_gate.py` (2 cases — 8-chain ordering accuracy, and the 4-chain
+signal-disagreement safety check), `tests/test_ai_document_text.py` (8),
+`tests/test_ai_minhash_lsh.py` (5), `tests/test_ai_version_chain.py` (15 — including 6 for
+`version_signals_agree`/the disagreement-blocks-deletion safety property),
 `tests/test_ai_document_keep_best.py` (3), `tests/test_ai_document_similarity.py` (3),
-`tests/test_ai_eval_harness.py` (+13 for `kendall_tau`/`exact_order_accuracy`/
-`select_joint_operating_point`).
+`tests/test_ai_eval_harness.py` (per ADR-0018).
 
 **Real (local, on-demand, not in CI):** `evals/test_ai_document_gold.py` (2 cases — the
 original prose-only MinHash measurement + embedding confirmation-recall check, kept for

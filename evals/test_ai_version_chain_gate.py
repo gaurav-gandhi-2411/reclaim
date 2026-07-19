@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ai_fixtures.build_version_chain_fixtures import (
+    materialize_version_chain_conflict_fixtures,
     materialize_version_chain_fixtures,
     true_order_for,
 )
@@ -13,7 +14,7 @@ from reclaim.ai.eval_harness import (
     exact_order_accuracy,
     kendall_tau,
 )
-from reclaim.ai.version_chain import order_version_chain
+from reclaim.ai.version_chain import build_version_chain_cluster, order_version_chain
 
 # Feature 1b's version-chain ordering eval (spec §7.2: exact-order accuracy + Kendall's tau).
 # Against a constructed, disclosed fixture set (see build_version_chain_fixtures.py's
@@ -89,3 +90,64 @@ def test_order_version_chain_exact_accuracy_and_kendall_tau(tmp_path: Path) -> N
         "floor -- the filename-pattern heuristic needs investigation, not a threshold tweak"
     )
     assert mean_kendall_tau >= 0.8
+
+
+def test_version_chain_deletion_suggestion_only_fires_when_signals_agree(tmp_path: Path) -> None:
+    """GG's explicit instruction: version-chain is the one Feature 1b path that can delete a
+    genuinely-wanted file, so this is the safety-critical gate for that entire track — a
+    deletion suggestion may fire ONLY when filename-version rank and modification-time agree
+    on the ordering. Includes the exact scenario GG named (report_final.docx older than
+    report_v2.docx) plus a real control case in the same fixture shape, proving the check
+    doesn't cry wolf on ordinary chains."""
+    chains = materialize_version_chain_conflict_fixtures(tmp_path)
+    assert len(chains) == 4
+
+    results: list[tuple[str, bool, bool]] = []  # (chain_id, expected_conflict, suggested_deletion)
+    for chain_id, paths, expected_conflict in chains:
+        cluster = build_version_chain_cluster(chain_id, paths, min_content_similarity=0.9)
+        results.append((chain_id, expected_conflict, cluster.suggests_deletion))
+
+    print(f"\n=== Version-chain signal-disagreement safety check ({len(chains)} chains) ===")  # noqa: T201
+    for chain_id, expected_conflict, suggested_deletion in results:
+        status = "correctly BLOCKED" if expected_conflict else "correctly ALLOWED"
+        if expected_conflict == suggested_deletion:  # conflict AND still suggested = failure
+            status = "!!! SAFETY VIOLATION !!!"
+        print(  # noqa: T201
+            f"  {chain_id:32s} has_conflict={expected_conflict!s:5s} "
+            f"suggests_deletion={suggested_deletion!s:5s} -> {status}"
+        )
+
+    violations = [
+        chain_id
+        for chain_id, expected_conflict, suggested_deletion in results
+        if expected_conflict and suggested_deletion
+    ]
+    assert not violations, (
+        f"SAFETY VIOLATION: {violations} suggested a deletion despite a real filename-version "
+        "vs. mtime disagreement — this is exactly the case that can delete a file the user "
+        "considers current, and must never happen"
+    )
+
+    non_conflict_ids = [
+        chain_id for chain_id, expected_conflict, _ in results if not expected_conflict
+    ]
+    non_conflict_still_works = [
+        chain_id
+        for chain_id, expected_conflict, suggested_deletion in results
+        if not expected_conflict and not suggested_deletion
+    ]
+    assert not non_conflict_still_works, (
+        f"{non_conflict_still_works}: a genuinely agreeing chain failed to produce a "
+        "deletion suggestion -- the safety check is over-triggering, not just under-triggering"
+    )
+    assert len(non_conflict_ids) >= 1  # sanity: the control case actually exists in the fixture
+
+    print(  # noqa: T201
+        EvalReport(
+            metric_name="version_chain_signal_disagreement_safety_violations",
+            value=float(len(violations)),
+            commit_sha=current_commit_sha(),
+            command=_COMMAND,
+            fixture_path=_FIXTURE,
+        )
+    )
