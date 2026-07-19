@@ -34,6 +34,10 @@ config.toml
 # never committed.
 data/ai_labels/
 
+# Feature 3 feedback log (reclaim.ai.feedback_store) — real, personal accept/reject/keep
+# decisions + file paths from GG's own disk, never committed. Same posture as data/ai_labels/.
+data/ai_feedback/
+
 # Public research datasets downloaded for operating-point selection (ADR-0015) — third-party
 # copyrighted images (INRIA Copydays), never committed; re-downloaded by
 # evals/ai_fixtures/fetch_copydays.py on demand.
