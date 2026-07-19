@@ -201,6 +201,25 @@ def test_ranked_clutter_track_never_suggests_deletion_even_with_a_high_score() -
     assert cluster.suggests_deletion is False
 
 
+def test_semantic_image_track_never_suggests_deletion_even_with_a_high_similarity() -> None:
+    """Track B (ADR-0022): a near-perfect cosine similarity (0.99) alone must never flip
+    suggests_deletion True -- SEMANTIC_IMAGE is browse-tidiness only, never a deletion
+    suggestion, regardless of how visually/semantically close a group's members are."""
+    members = (
+        AIClusterMember(path=Path("beach1.jpg"), size_bytes=100),
+        AIClusterMember(path=Path("beach2.jpg"), size_bytes=100),
+    )
+    cluster = AICluster(
+        cluster_id="semantic-1",
+        track=AITrack.SEMANTIC_IMAGE,
+        members=members,
+        raw_score=0.01,  # a max_pairwise_distance of 0.01 -- i.e. 0.99 cosine similarity
+        score_kind="max_pairwise_cosine_distance",
+        rationale="test",
+    )
+    assert cluster.suggests_deletion is False
+
+
 def test_near_identical_track_with_a_keeper_does_suggest_deletion() -> None:
     keep = AIClusterMember(path=Path("a.jpg"), size_bytes=100, is_recommended_keep=True)
     drop = AIClusterMember(path=Path("b.jpg"), size_bytes=100, is_recommended_keep=False)

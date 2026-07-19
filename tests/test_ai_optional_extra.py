@@ -53,6 +53,9 @@ _ALL_GATED_MODULE_NAMES = {
     "numpy",
     "rapidocr_onnxruntime",
     "lightgbm",
+    "open_clip",
+    "torch",
+    "faiss",
 }
 
 

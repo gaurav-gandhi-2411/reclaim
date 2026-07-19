@@ -1,0 +1,12 @@
+{
+  "commit_sha": "e3d22d24bb73cc4075796da4b7232b6db6f7faf0",
+  "command": "uv run pytest evals/test_ai_semantic_grouping_gold.py -v -s",
+  "fixture_path": "data\\ai_datasets\\copydays\\extracted",
+  "num_blocks": 40,
+  "num_images": 98,
+  "similarity_threshold": 0.82,
+  "bcubed_precision": 0.7897473275024296,
+  "bcubed_recall": 0.7142857142857143,
+  "bcubed_f1": 0.7501234590692802,
+  "note": "Track B (semantic image grouping) -- browse-only, never a deletion suggestion. Measured on real INRIA Copydays blocks as a disclosed proxy for 'genuinely different photos of the same scene' -- see untested_variation_note in the eval source for the honest gap."
+}
