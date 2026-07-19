@@ -400,6 +400,192 @@ that gave clean precision, Stage 1 alone already caught everything — there was
 residual left for Stage 2 to resolve on this measurement. That got written down as exactly what
 it is, not smoothed into a confident-sounding number the embedding stage never actually earned.
 
+## Never pool across tiers — a second incident, the same shape, a different mechanism
+
+The templated-document follow-up to Feature 1b produced the project's second recall-artifact-
+shaped incident, and it's worth separating from the first because the *mechanism* was
+different, not just the symptom. The Gutenberg-prose measurement above was real and correctly
+gated — but it measured edited *prose*, and prose has no structural analog to what a resume,
+invoice, or report actually looks like. Two different people's resumes share section headers
+("OBJECTIVE," "EXPERIENCE"), standard connective phrasing, and formatting scaffolding while
+being genuinely unrelated documents — exactly the shape of false-positive risk word-shingle
+MinHash is vulnerable to and prose never exercises. Measured against a new templated tier (3
+synthetic-but-realistic templates, 459 same-template-different-content negative pairs), the
+shipped thresholds produced **71% false positives** — a feature that would confidently call
+two different people's resumes duplicates roughly seven times out of ten it flagged anything.
+
+**The fix (a stricter joint threshold, gated on both tiers independently) is not the
+interesting part. The bug caught while building the fix is.** The first version of the
+re-measurement pooled the prose tier's 7,140 clean negatives and the templated tier's 459
+negatives into one combined precision calculation. That pooled number read **0.9524
+precision** — comfortably clearing the 0.95 target. The templated tier **alone**, at the exact
+same threshold, was actually **0.8634 precision** — a real, serious failure the pooled number
+hid completely, because the large prose tier's thousands of cleanly-rejected negatives
+mathematically diluted the small tier's real false positives into statistical insignificance.
+This is the *same shape* of mistake as the Copydays recall artifact (a real number that looks
+fine while hiding a real problem) but a *different mechanism*: the first incident was
+measuring only one unrepresentative distribution and calling it representative; this one was
+measuring several distributions correctly and then destroying the signal by pooling them
+before computing the metric.
+
+**Both are now structurally forbidden, not just documented as lessons.** `eval_harness.py`
+gained `select_operating_point_per_tier`/`select_joint_operating_point_per_tier` — tier-gated
+analogs that have no code path capable of concatenating counts across tiers before computing a
+ratio; a candidate threshold only qualifies if *every* declared tier clears both floors
+independently. The real incident became a permanent regression test that reconstructs the
+exact 342/18/0/7140 and 158/4/25/434 counts, first proves the naive pooled function *would*
+accept the bad operating point (reproducing the bug as a documented fact, not a strawman), then
+proves the per-tier function rejects it — if that test ever starts passing with a non-`None`
+result, the gating logic has silently regressed. A code reviewer (human or automated) seeing a
+hand-rolled multi-tier precision loop in any future eval file now has a specific, named thing
+to flag.
+
+## When two signals about "which file is latest" disagree, silence isn't a compromise
+
+Version-chain ordering is the one path in the whole AI layer that can recommend deleting a
+file the user still considers current — not an accumulated near-duplicate, the actual live
+draft. Filename pattern (`v1`/`v2`/`final`/`(1)`/`copy`) and modification time are two
+*independent* signals about which file in a chain is latest, and the build brief's own
+fixtures never deliberately pitted them against each other. The scenario that matters is
+concrete: `report_final.docx`, modified BEFORE `report_v2.docx` — the filename claims "final"
+is the latest version; the timestamp says otherwise. Nothing about that disagreement is exotic
+— reverting to an old draft and continuing to edit it without renaming produces exactly this.
+
+The fix is not "pick the signal we trust more." It's `version_signals_agree`: every pair of
+files that both carry a recognizable filename rank gets compared against their mtime order; if
+any pair's filename-implied order contradicts its mtime-implied order, the whole chain's
+ordering is flagged as untrustworthy. `build_version_chain_cluster` only marks a keeper when
+signals agree — when they disagree, no member is marked, which (via the same
+`suggests_deletion` mechanism used everywhere else) demotes the cluster to browse-only: still
+returned, still ordered, still visible for manual review, just never framed as a confident
+deletion suggestion. Measured against a dedicated 4-chain conflict fixture including the exact
+named scenario: **0 safety violations**, and a control chain with no real conflict still
+correctly produces a keeper — proving the check doesn't cry wolf on ordinary chains, not just
+that it catches the adversarial one.
+
+This pattern — a track that's mechanically deletion-eligible, but whose orchestration
+withholds the keeper flag under a specific, testable disagreement condition — became the
+template Feature 2 reused directly, not a one-off fix specific to filenames.
+
+## Feature 2 — a screenshot burst is not a duplicate, and OCR failure is not a safe default
+
+Screenshot-burst detection layers a new risk on top of near-duplicate clustering: the content
+of a screenshot determines whether deleting the rest of a burst is safe at all. A burst of six
+near-identical "still loading" screenshots is disposable clutter; a burst of six near-identical
+screenshots of a receipt, mid-scroll, is not — and the two can be visually almost
+indistinguishable by pHash alone. Burst detection itself reused, deliberately, an
+already-measured signal rather than inventing a new one: three rules — matching dimensions,
+capture-time proximity, and pHash within the exact Hamming-distance bound the Copydays
+measurement already established — all three must agree, not a majority vote, and the pHash
+threshold was not re-derived from scratch; re-measuring "screenshots taken moments apart" would
+have been measuring the same near-identical-image problem Track A already solved. The one new
+parameter, a 60-second capture-time window, is disclosed as a policy choice, not a measured
+one, because no real usage telemetry exists to derive it from.
+
+**The content-tag classifier is where "bias STRONGLY toward keep" had to become code, not just
+a sentence in a spec.** Five tags — receipt, document, code, chat, transient-UI — and by
+explicit design, only `transient-UI` is ever deletion-eligible; `KEEP_BIASED_TAGS` structurally
+excludes it and includes everything else, including the low-confidence `UNKNOWN` fallback
+(ambiguity is exactly when caution matters most, not a reason to guess). A dataset search for
+this exact taxonomy came up empty on public data with a clean license — SROIE's canonical
+receipt corpus sits behind gated registration and its GitHub mirror's MIT tag almost certainly
+covers the mirror's scripts, not the underlying receipt photographs; RVL-CDIP's document
+corpus reports a bare `"license": ["other"]` on Hugging Face, tracing back to real
+tobacco-litigation business records. Both rejected on the same license-ambiguity grounds
+Copydays' unofficial mirror and Quora Question Pairs were rejected on earlier. Two of five
+classes still got real content instead of pure synthesis: Gutenberg prose for `document`,
+Reclaim's own source tree for `code` — zero licensing risk, real text, not fabricated.
+
+**A real false-positive risk was caught by testing the classifier against itself, not by
+inspection.** The first version of the transient-UI scorer gave short/sparse text a confidence
+bonus large enough to clear the classification threshold on its own — meaning three words of
+OCR noise with zero transient-UI vocabulary (`"xk qz 42"`) confidently tagged as `transient-UI`,
+the one deletion-eligible tag, purely for being short. Caught while building the eval, not
+after shipping: capping that bonus below the confidence floor closed it, verified both as a
+unit-level regression test and against a dedicated pool of ambiguous OCR-noise fixtures
+(`"OK"`, stray punctuation, gibberish) that all now correctly resolve to `UNKNOWN`.
+
+**That fix was proven against synthetic short strings — which is not the same as proving it
+against a real photo that happens to OCR badly**, and closing that specific gap was a separate,
+later, explicitly requested pass. A genuinely meaningful screenshot — a receipt, a document, a
+chat — degraded by an ordinary real-world capture defect (dark/low-contrast, out-of-focus
+blur, a partial/cut-off crop) produces the same shape of sparse, fragmented OCR output as
+gibberish does, and nothing about the synthetic fix proved that path was closed too. Four real
+content types, rendered as real images and degraded four realistic ways each through the real
+`rapidocr` engine and the real, shipped classifier — not a simulation — produced **0 of 16
+degraded real-content images ever classified transient-UI**. Twelve of the sixteen degraded all
+the way to zero-character OCR output; every one of those twelve resolved to `UNKNOWN`, exactly
+the required behavior: *OCR found little* must mean *I can't tell*, never *transient, therefore
+deletable*. A separate, image-independent check locked in the same invariant directly —
+`None`, empty, whitespace, and a handful of one-to-two-character stray-OCR strings all resolve
+to `UNKNOWN` — so the property holds even if no future image fixture happens to degrade that
+far on a given run.
+
+**The OCR text itself never had anywhere to leak, structurally, not by policy.** The three
+modules that ever touch raw OCR output contain zero logging or print calls, verified by an AST
+scan that would fail on a hidden or aliased logging call, not just an obvious one — and a
+runtime test goes further: a real OCR extraction on an image containing a unique canary string,
+every Python logger forced open at `DEBUG`, asserts the canary appears in **zero** captured log
+records, proving the guarantee holds even against loggers Reclaim's own code didn't call
+directly (a dependency's internal logging included). A second version of the same test proves
+the canary never appears anywhere in the actual `AICluster` objects a caller receives back —
+checked via `repr()` over the whole result as a structural catch-all, not just the fields
+expected to matter.
+
+## Feature 3 — logging decisions before there's anything to train
+
+The honest version of "the tool learns from your decisions" is not a model trained on a
+handful of clicks. It's a decision log, versioned and commit-keyed the same way the gold-set
+labeling tool's own label store already is, that accumulates real, timestamped training rows —
+and an explicit refusal to train anything until there's enough of them to split into a genuine
+past/future evaluation. Every accept/reject/keep decision gets logged with its feature vector:
+size, extension, a location classification (cloud-sync placeholder, git repo, a recognized
+special folder, or "other," in that priority order), modification and creation time, cluster
+statistics (how big the group was, whether this member was the recommended keeper), the AI
+track it came from, a cloud-sync flag, and — the one feature that needs the store's own history
+to compute — how the user has already decided about this cluster's other members, since a
+cluster where three siblings were already accepted for removal is real evidence the fourth is
+clutter too, in a way no single file's own attributes could capture alone. Access-time is not
+just omitted from that list; it's structurally absent from the type, because NTFS commonly
+disables last-access-time tracking system-wide, which would make it an unreliable feature even
+where it existed.
+
+**Nothing about a ranker got built.** No LightGBM import exists anywhere in this codebase; the
+label-gate (500 real decisions before training anything is attempted) and the time-split
+evaluation discipline (train on the past, evaluate on strictly later decisions — never let a
+future decision leak backward into a training set) are documented as a future PR's obligations,
+not implemented as dead code waiting to be switched on. In the meantime, the review queue is
+ordered by a heuristic that is loudly, structurally not a model: `compute_cold_start_priority`
+multiplies log-compressed size and staleness by a location weight and a cluster-size bonus, and
+every result carries an `is_heuristic` field hardcoded to `True` — not because a docstring says
+so, but so a UI or a log line has something to actually assert against if it ever needs to
+prove the number it's showing isn't a prediction.
+
+## Four invariants the harness now enforces structurally, not narratively
+
+Four incidents across three features produced four rules that no longer depend on anyone
+remembering them:
+
+1. **Precise-but-useless is not a passing gate.** `select_operating_point` requires a recall
+   floor alongside the precision target — a threshold that's precise because it flags almost
+   nothing is rejected, not accepted, the exact failure that let Feature 1a's first operating
+   point clear CI while catching under 8% of real duplicates.
+2. **Never pool precision/recall across a declared tier boundary.** `select_operating_point_
+   per_tier`/`select_joint_operating_point_per_tier` compute every tier's metrics from only
+   that tier's own data, with a regression test reproducing the exact 0.9524-pooled/
+   0.8634-real-templated-tier incident that motivated it — permanently, so the mistake can't
+   silently recur in a future eval file.
+3. **A number is only "MEASURED" if the distribution behind it is honestly realistic.**
+   `assert_safe_to_promote_to_measured` refuses that word for any adversarial-tail-only or
+   synthetic-only distribution — Copydays' `strong` split and the content-tag classifier's
+   partly-synthetic fixture both stay honestly labeled PROVISIONAL, forever, structurally, not
+   by discipline.
+4. **A track can be mechanically deletion-eligible and still withhold the keeper flag under a
+   specific, testable disagreement condition.** Version-chain's filename-vs-mtime conflict
+   check and screenshot-burst's mixed-content-tag check are the same pattern applied twice —
+   an AICluster only ever suggests deletion once a keeper has actually been identified, and
+   the orchestration is free to simply never identify one when the safety condition isn't met.
+
 ## Honest metrics
 
 | metric | value | source |

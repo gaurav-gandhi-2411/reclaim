@@ -1183,6 +1183,84 @@ retention + restore, now with an explicit `purge` command for expired entries.
 - ADR-0017 (dataset + all three operating points + license summary). 454 tests green; fast
   synthetic CI evals (1a + 1b combined) 26/26 green.
 
+### 2026-07-19 — Templated-document blind spot closes 1b; a second metrics-integrity incident becomes a permanent harness rule
+- GG flagged that measuring against edited Gutenberg prose alone can't surface real document
+  clutter's actual failure mode — heavy templating (resumes/invoices/reports share section
+  headers and boilerplate while being genuinely different documents). Built a templated tier
+  (3 synthetic-but-realistic templates, 459 same-template-different-content negatives, 162
+  positive pairs). At the prose-measured thresholds (0.2/0.6): **71% false-positive rate**
+  (precision 0.2893) on templated documents — a real, serious finding.
+- Fixed with a stricter JOINT threshold (minhash=0.1, embedding=0.95), gated on BOTH tiers
+  independently — real cost: prose recall drops 0.9917→0.8694, templated recall lands 0.7963.
+- **A real methodological bug caught while measuring the fix, not after**: the eval's first
+  version pooled prose's 7,140 negatives and templated's 459 into one combined precision calc
+  — read 0.9524 (passing), while the templated tier ALONE was actually 0.8634 (failing),
+  hidden by the large prose pool diluting the small tier's real false positives. GG's own
+  instruction ("gate on precision AND recall for BOTH tiers") is what caught this — not
+  narrative discipline, the eval's own per-tier assertion failed, correctly, the first run.
+- Per GG's explicit instruction, this became a permanent structural harness rule, not a
+  one-off fix: `eval_harness.py` gained `select_operating_point_per_tier`/
+  `select_joint_operating_point_per_tier` — no code path pools tiers before computing a ratio.
+  Regression test reproduces the exact 0.9524/0.8634 incident and asserts the naive pooled
+  function WOULD accept it while the per-tier function REJECTS it. ADR-0018.
+- **Version-chain safety property**: GG asked to confirm the ordering can't confidently
+  suggest deletion when filename-version rank and mtime DISAGREE about which file is latest
+  (e.g. `report_final.docx` modified BEFORE `report_v2.docx`). Added `version_signals_agree` —
+  when signals disagree, no member is marked keeper, demoting the cluster to browse-only.
+  Measured 0 safety violations across a dedicated 4-chain conflict fixture including the named
+  scenario, plus a control chain proving the check doesn't cry wolf on ordinary chains.
+
+### 2026-07-19 — Feature 2: screenshot burst detection + OCR content-tag classifier
+- Burst detection (dimensions + capture-time proximity ≤60s [disclosed policy] + pHash ≤14
+  [reused from ADR-0012, not re-measured]) — all three rules must agree, not majority vote.
+- OCR via `rapidocr-onnxruntime` (Apache-2.0, pip-only — chosen over Tesseract specifically to
+  avoid the first system-binary dependency in the AI layer). Zero logging calls anywhere in
+  the three modules that touch raw OCR text, verified by AST scan AND a runtime canary-string
+  log-capture test (every logger forced to DEBUG, canary never appears in any record).
+- Content-tag classifier (receipt/document/code/chat/transient_ui + UNKNOWN): dataset search
+  rejected both SROIE (gated registration, ambiguous mirror license) and RVL-CDIP (`"other"`
+  license, real tobacco-litigation-records provenance) — same license discipline as
+  QQP/California-ND. Used real Gutenberg prose (document) + Reclaim's own source (code) +
+  disclosed synthetic (receipt/chat/transient_ui) instead.
+- **Measured, per-tier gated (ADR-0018 discipline), on the SHIPPED classifier** (not a swept
+  threshold): transient_ui precision 1.0/recall 1.0 (the safety-critical number — the ONLY
+  deletion-eligible tag), receipt 1.0/1.0, code 0.826/0.974, chat 0.667/1.0 (disclosed
+  weakness, still safe — keep-biased either way), document 1.0/0.658. Zero real-content
+  samples ever classified transient_ui.
+- **Caught and fixed a real false-positive risk during the build**: sparse OCR gibberish
+  (`"xk qz 42"`) initially cleared the confidence floor as transient_ui purely for being
+  short — fixed by capping the sparseness bonus below the floor.
+- **Follow-up requested separately**: GG asked to confirm the OCR-FAILURE path (not just the
+  gibberish path) is closed — a real receipt/document/code/chat screenshot that OCRs poorly
+  (blur/low-contrast/crop) could theoretically degrade into the same sparse-text shape as
+  gibberish. Built a real-image degradation tier (4 content types × 4 degradations, real
+  `rapidocr` + the real shipped classifier): **0 of 16 ever classified transient_ui**; 12 of 16
+  degraded to near-empty OCR output, all 12 correctly resolved UNKNOWN. Closed, no code change
+  needed beyond the sparse-bonus fix already in place — this follow-up was the proof, not a
+  new fix.
+- `AITrack.SCREENSHOT_BURST` joined `_DELETION_SUGGESTION_ELIGIBLE_TRACKS`, but conditionally
+  — a keeper is only ever set when EVERY burst member tags transient_ui, same conditional-
+  keeper pattern as version-chain's `version_signals_agree`. ADR-0019 (+ follow-up section).
+
+### 2026-07-19 — Feature 3: feedback-logging only, ranker deliberately deferred
+- Per GG's explicit instruction: build ONLY the feedback store (Track B dropped, LambdaMART
+  ranker NOT built — "there's no data to train on"). `feedback_store.py`: append-only JSONL,
+  commit-keyed + schema-versioned exactly like `labeling.LabelStore`, feature vector = size,
+  ext, path_class (cloud_sync_placeholder > git_repo > downloads/desktop/documents/temp >
+  other), mtime/ctime (NO atime, structurally absent from the type), cluster stats, category,
+  cloud_sync_flag, sibling-decision context (computed from the store's own prior history per
+  cluster).
+- `cold_start_priority.py`: transparent, non-ML heuristic (size × mtime-staleness ×
+  location-weight × cluster-membership, per spec's own formula) — `is_heuristic=True`
+  hardcoded on every result so nothing can mistake it for a model's prediction. No LightGBM
+  dependency added anywhere. The ranker's activation gate (≥500 decisions) and time-split
+  eval protocol are documented in ADR-0020 as a future PR's obligations, not implemented.
+- This closes the applied-AI layer's build order: 1a + 1b + 2 + feedback-logging.
+  `AITrack.RANKED_CLUTTER`/`SEMANTIC_IMAGE` remain documented, unimplemented placeholders.
+- Full suite reconfirmed green (tests/ + evals/), CASE_STUDY updated with the templated-
+  document/ADR-0018 incident, the version-chain safety property, Feature 2 (+ follow-up), and
+  Feature 3, plus a summary of the four structural harness invariants the incidents produced.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
