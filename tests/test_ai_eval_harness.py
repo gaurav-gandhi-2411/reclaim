@@ -13,6 +13,7 @@ from reclaim.ai.eval_harness import (
     exact_order_accuracy,
     kendall_tau,
     precision_recall_curve,
+    select_joint_operating_point,
     select_operating_point,
 )
 
@@ -192,6 +193,70 @@ def test_select_operating_point_accepts_recall_exactly_at_the_floor() -> None:
         source_description="test",
     )
     assert result is not None
+    assert result.recall == pytest.approx(1.0)
+
+
+def test_select_joint_operating_point_finds_and_gate_when_neither_stage_alone_separates() -> None:
+    """The whole reason this function exists (ADR-0017's templated-document finding): stage 1
+    alone can't separate these (positives and negatives overlap on stage1_score), stage 2
+    alone can't either (same overlap on stage2_score) -- but the AND of BOTH conditions
+    cleanly separates every positive from every negative. positives: (0.9, 0.5), (0.5, 0.9).
+    negatives: (0.9, 0.3), (0.3, 0.9) -- each negative is high on exactly one stage, mimicking
+    a document that shares boilerplate (high stage1) OR reads semantically similar in
+    isolation (high stage2) but not both."""
+    positives = [(0.9, 0.5), (0.5, 0.9)]
+    negatives = [(0.9, 0.3), (0.3, 0.9)]
+    result = select_joint_operating_point(
+        positives,
+        negatives,
+        stage1_candidates=[0.3, 0.5, 0.7, 0.9],
+        stage2_candidates=[0.3, 0.5, 0.7, 0.9],
+        target_precision=1.0,
+        min_recall=1.0,
+        distribution=_distribution(),
+        source_description="test",
+    )
+    assert result is not None
+    assert result.precision == pytest.approx(1.0)
+    assert result.recall == pytest.approx(1.0)
+    assert result.stage1_threshold <= 0.5
+    assert result.stage2_threshold <= 0.5
+
+
+def test_select_joint_operating_point_returns_none_when_no_grid_point_qualifies() -> None:
+    positives = [(0.5, 0.5)]
+    negatives = [(0.9, 0.9)]  # dominates every candidate threshold -> precision never reaches 1.0
+    result = select_joint_operating_point(
+        positives,
+        negatives,
+        stage1_candidates=[0.1, 0.5],
+        stage2_candidates=[0.1, 0.5],
+        target_precision=1.0,
+        min_recall=1.0,
+        distribution=_distribution(),
+        source_description="test",
+    )
+    assert result is None
+
+
+def test_select_joint_operating_point_picks_highest_recall_among_qualifying_combinations() -> None:
+    """Two thresholds both clear target_precision=1.0 with zero false positives; the looser
+    one (lower thresholds) should win since it has higher recall."""
+    positives = [(0.9, 0.9), (0.6, 0.6)]
+    negatives = [(0.3, 0.3)]
+    result = select_joint_operating_point(
+        positives,
+        negatives,
+        stage1_candidates=[0.5, 0.8],
+        stage2_candidates=[0.5, 0.8],
+        target_precision=1.0,
+        min_recall=0.0,
+        distribution=_distribution(),
+        source_description="test",
+    )
+    assert result is not None
+    assert result.stage1_threshold == pytest.approx(0.5)
+    assert result.stage2_threshold == pytest.approx(0.5)
     assert result.recall == pytest.approx(1.0)
 
 

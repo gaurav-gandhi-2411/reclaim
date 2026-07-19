@@ -105,10 +105,16 @@ def cluster_by_jaccard_similarity(
     clustering semantics as `phash.cluster_by_hamming_distance`, just similarity instead of
     distance, and a MINIMUM to clear instead of a MAXIMUM). Singleton "clusters" are dropped.
 
-    `min_similarity` is MEASURED at 0.2 on a real, realistic public-domain document
-    distribution — see ADR-0017. Still a caller-supplied parameter, not a default hardcoded
-    here. O(n^2) pairwise comparison, same scale reasoning as
-    `phash.cluster_by_hamming_distance`: this runs on the residual after exact-hash dedup.
+    `min_similarity` is MEASURED at 0.1 — jointly WITH the Stage-2 embedding confirmation at
+    cosine >= 0.95, never alone (see ADR-0017's follow-up). This function is Stage 1 only: a
+    caller that clusters by this threshold WITHOUT also running Stage-2 confirmation
+    (text_embeddings.py) on the result is measured to produce disastrous precision on
+    templated documents (resumes/invoices/reports) — 0.1 alone is looser than even the
+    original prose-only threshold (0.2), and is safe only because Stage 2's much stricter
+    0.95 cosine gate is what actually protects precision now, not this stage. Still a
+    caller-supplied parameter, not a default hardcoded here. O(n^2) pairwise comparison, same
+    scale reasoning as `phash.cluster_by_hamming_distance`: this runs on the residual after
+    exact-hash dedup.
     """
     union_find = _UnionFind(len(records))
     for i in range(len(records)):

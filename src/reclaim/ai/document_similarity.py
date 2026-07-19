@@ -48,8 +48,12 @@ def build_near_dup_document_clusters(
     num_perm: int = 128,
 ) -> list[AICluster]:
     """`minhash_threshold`/`embedding_threshold` are the near-dup-document operating points —
-    MEASURED at 0.2 / 0.6 respectively on a real, realistic public-domain document distribution
-    (see ADR-0017). Still caller-supplied parameters, not defaults hardcoded here. Unreadable/
+    MEASURED at 0.1 / 0.95 respectively, jointly, gated independently on BOTH a prose and a
+    templated-document distribution (see ADR-0017's follow-up: measuring MinHash against prose
+    alone missed a real failure mode — shared boilerplate in templated documents like resumes/
+    invoices/reports pushed genuinely different documents' Jaccard similarity well above the
+    original prose-only threshold of 0.2, and the original embedding threshold of 0.6 didn't
+    catch it either). Still caller-supplied parameters, not defaults hardcoded here. Unreadable/
     unsupported files are skipped, never raised for.
     """
     eligible_paths = filter_paths_through_safety_validator(document_paths, safety)

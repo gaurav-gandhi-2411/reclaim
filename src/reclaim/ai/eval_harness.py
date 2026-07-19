@@ -218,6 +218,74 @@ def select_operating_point(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class JointOperatingPoint:
+    """The 2D analog of `OperatingPoint` for a two-stage AND-gated pipeline (spec's own
+    architecture: a cheap Stage-1 prefilter, then a Stage-2 check on the residual — a pair is
+    only accepted if it clears BOTH). A single 1D PR curve can't represent this joint decision
+    boundary; `select_joint_operating_point` grid-searches it directly instead."""
+
+    stage1_threshold: float
+    stage2_threshold: float
+    precision: float
+    recall: float
+    is_provisional: bool
+    source_description: str
+    distribution: DistributionDeclaration
+
+
+def select_joint_operating_point(
+    positive_pairs: Sequence[tuple[float, float]],
+    negative_pairs: Sequence[tuple[float, float]],
+    *,
+    stage1_candidates: Sequence[float],
+    stage2_candidates: Sequence[float],
+    target_precision: float,
+    min_recall: float,
+    distribution: DistributionDeclaration,
+    source_description: str,
+) -> JointOperatingPoint | None:
+    """Grid-searches `stage1_candidates x stage2_candidates` for the AND-gated threshold pair
+    (a pair is "flagged" iff `stage1_score >= t1 AND stage2_score >= t2`) with the highest
+    recall among combinations that clear both `target_precision` and `min_recall` — same
+    selection philosophy as `select_operating_point` (highest recall meeting both floors),
+    extended to two jointly-applied thresholds instead of one. `positive_pairs`/
+    `negative_pairs` are each a sequence of `(stage1_score, stage2_score)` per real pair —
+    both scores must already be "higher = more similar" (callers negate a distance metric
+    before calling this, same convention as `precision_recall_curve`).
+
+    Returns `None` if no grid combination clears both floors — callers MUST handle this
+    explicitly, never silently falling back to an unqualified combination.
+    """
+    best: JointOperatingPoint | None = None
+    for stage1_threshold in stage1_candidates:
+        for stage2_threshold in stage2_candidates:
+            true_positives = sum(
+                1 for s1, s2 in positive_pairs if s1 >= stage1_threshold and s2 >= stage2_threshold
+            )
+            false_positives = sum(
+                1 for s1, s2 in negative_pairs if s1 >= stage1_threshold and s2 >= stage2_threshold
+            )
+            flagged = true_positives + false_positives
+            if flagged == 0:
+                continue
+            precision = true_positives / flagged
+            recall = true_positives / len(positive_pairs) if positive_pairs else 0.0
+            if precision < target_precision or recall < min_recall:
+                continue
+            if best is None or recall > best.recall:
+                best = JointOperatingPoint(
+                    stage1_threshold=stage1_threshold,
+                    stage2_threshold=stage2_threshold,
+                    precision=precision,
+                    recall=recall,
+                    is_provisional=True,
+                    source_description=source_description,
+                    distribution=distribution,
+                )
+    return best
+
+
 def exact_order_accuracy(predicted_order: Sequence[str], true_order: Sequence[str]) -> float:
     """1.0 if `predicted_order` matches `true_order` exactly (same items, same sequence),
     else 0.0 — the strict version-chain-ordering metric (spec §7.2), complementary to

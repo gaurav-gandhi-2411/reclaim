@@ -1,5 +1,18 @@
 # 0017. Feature 1b: document near-dup (MinHash/LSH + MiniLM) and version-chain operating points
 
+## Status update — the shipped MinHash/embedding thresholds changed after a templated-document follow-up
+
+**`minhash_threshold`/`embedding_threshold` are now `0.1` / `0.95` (jointly, gated on BOTH a
+prose and a templated-document tier), not the `0.2` / `0.6` this ADR originally measured.**
+GG flagged that measuring against edited literary prose alone can't surface real document
+clutter's actual failure mode — heavy TEMPLATING (resumes, invoices, reports, decks), where
+genuinely different documents share large blocks of identical boilerplate. Measured against a
+new templated-document tier, the original thresholds produced a **71% false-positive rate**
+(precision 0.2893) — a real, serious finding. See "Follow-up: the templated-document blind
+spot" below for the full measurement; the sections immediately following this one are kept
+as-written for history (they were true of the prose-only measurement) but are **no longer the
+shipped operating point** — read the follow-up section for what actually ships.
+
 ## Context
 
 Following Feature 1a's pattern exactly, per GG's explicit instruction — and applying ADR-0016's
@@ -109,6 +122,99 @@ prefilter already approved). Citing this PAWS result as "Feature 1b's real preci
 the exact ADR-0012-incident mistake this ADR is built to avoid — `_ADVERSARIAL_DISTRIBUTION`'s
 `is_adversarial_tail_only=True` flag exists specifically to prevent that.
 
+## Follow-up: the templated-document blind spot (and why prose-only measurement couldn't see it)
+
+**Why this exists.** Everything above was measured against edited *prose* — real book text
+with realistic edits applied. GG's insight: prose has no structural analog to what a resume,
+invoice, or report actually looks like. Two different people's resumes share section headers
+("OBJECTIVE," "EXPERIENCE," "EDUCATION," "SKILLS"), standard connective phrasing ("results-
+driven professional," "led cross-functional initiatives"), and formatting scaffolding — while
+being genuinely unrelated documents. Word-shingle MinHash is exactly the kind of algorithm
+this can fool: high shingle overlap from shared boilerplate can push two unrelated documents'
+Jaccard similarity well above a threshold tuned on prose, where no comparable shared-structure
+problem exists at all.
+
+**Built a templated-document tier** (`evals/ai_fixtures/build_templated_document_fixtures.py`):
+3 synthetic-but-structurally-realistic templates (resume, invoice, report-memo), each with
+substantial real boilerplate (the kind an actual template carries) and a pool of varying
+synthetic fields (20 first names, 20 last names, 12 companies, 8 job titles, 6 degrees/schools,
+8 line-item types — no real PII) large enough that any two instances share no specific
+personal/business detail. 18 instances per template = 54 base documents. **Negatives**: every
+same-template, different-instance pair — `C(18,2) x 3 = 459` pairs, the exact failure mode
+being tested (genuinely different documents, heavy shared boilerplate). **Positives**: the same
+3 realistic transform profiles from the prose tier (mild/moderate/collab_paste) applied to each
+of the 54 base documents = 162 true near-dup pairs.
+
+**The predicted failure reproduced immediately and severely.** Same-template-different-content
+Jaccard similarity: resume pairs averaged **0.51** (max 0.65), invoice pairs up to 0.62, report
+pairs up to **0.84** — all far above the prose-measured threshold of 0.2.
+**At the originally-shipped thresholds (`minhash=0.2`, `embedding=0.6`): precision on the
+templated tier was 0.2893** (398 false positives out of 560 flagged pairs) — a feature that
+would confidently tell a user two different people's resumes are duplicates, roughly 7 times
+out of 10 it flags anything. Reproduce:
+```
+uv run pytest evals/test_ai_document_templated_gold.py -v -s
+```
+
+**A second, more sobering finding: Stage 2 (embeddings) does NOT cleanly solve this alone
+either.** The build brief predicted embeddings "can distinguish same template, different
+content semantically where MinHash can't" — measured, that's only partly true. The maximum
+cosine similarity among templated negatives was **0.976**, which is *higher* than the minimum
+cosine similarity among some genuine positive pairs (moderate-tier prose positives went as low
+as 0.6467). `all-MiniLM-L6-v2` truncates at 256 tokens — for a ~300-400 word document, the
+model sees most or all of the shared boilerplate, and a general-purpose sentence embedding
+pooled over mostly-identical text is dominated by that shared structure, not by the smaller
+proportion of genuinely distinguishing detail (names, numbers, specific claims). Neither stage
+alone is sufficient for templated documents.
+
+**What DOES work: a much stricter JOINT (AND-gated) threshold, gated independently on both
+tiers — at a real, measured recall cost.** `eval_harness.select_joint_operating_point` (a new,
+unit-tested, reusable 2D analog of `select_operating_point` for exactly this two-stage
+AND-gated shape) was added, then a per-tier-INDEPENDENT grid search was run directly in the
+eval (not the pooled/aggregate version — see the important correction below). Grid search
+result, gated so BOTH tiers clear the ≥0.95 precision target and the 0.5 recall floor
+independently:
+
+| minhash_threshold | embedding_threshold | prose precision | prose recall | templated precision | templated recall |
+|---:|---:|---:|---:|---:|---:|
+| 0.2 (old) | 0.6 (old) | 1.0000 | 0.9917 | **0.2893** | 0.9938 |
+| **0.1 (new)** | **0.95 (new)** | 1.0000 | **0.8694** | **0.9627** | **0.7963** |
+
+**`minhash_threshold = 0.1`, `embedding_threshold = 0.95` is now Feature 1b's shipped
+operating point.** The honest cost: prose recall drops from 0.9917 to 0.8694 (mostly
+`moderate`-tier pairs whose embedding similarity fell below the new, much stricter 0.95 bar),
+and templated recall is 0.7963 — a real, measured, disclosed price for safety across both
+distributions, not a free win. This is the spec's own stated priority in action ("precision is
+favored over recall throughout: a false 'these are duplicates' ... is the expensive error") —
+a resume/invoice/report false-positive is exactly that expensive error, and it costs real
+recall to prevent.
+
+**A real methodological bug caught and fixed during this measurement, worth recording:** the
+first version of this eval pooled prose's 7,140 negatives and the templated tier's 459
+negatives into one combined precision calculation via `select_joint_operating_point`. That
+pooled aggregate was itself misleading — a threshold combination that looked like it cleared
+0.95 precision in aggregate (0.9524) actually had only **0.8634** precision on the templated
+tier alone, because the templated tier's false positives were mathematically swamped by the
+much larger, cleanly-separated prose negative pool. The eval's own per-tier gate assertion
+caught this (the test failed, correctly, the first time it ran) — proving GG's explicit
+instruction ("gate on precision AND recall for both tiers") wasn't just followed narratively
+but is what actually caught a real bug in the measurement itself. The eval was rewritten to
+grid-search with both tiers gated independently from the start, not pooled.
+
+**Both stages' code and docstrings updated to reflect this**: `minhash_lsh.py`'s
+`cluster_by_jaccard_similarity` docstring now explicitly warns that `min_similarity=0.1` is
+**only** safe when paired with Stage 2's `0.95` cosine confirmation — used alone (bypassing
+Stage 2), it is *looser* than even the original, already-inadequate prose-only threshold of
+0.2, and would be worse on templated documents, not better.
+
+**Disclosed scope of this follow-up**: 3 template types only (resume/invoice/report-memo), not
+real decks/spreadsheets/forms or templates with a different boilerplate-to-content ratio;
+synthetic filler content, not sampled from a public templated-document corpus (none of the
+license-clean options assessed for the original ADR — Gutenberg, PAWS — contain templated
+documents; this is a disclosed, constructed fixture, same posture as the version-chain
+fixture). `_COMBINED_DISTRIBUTION`'s `untested_variation_note` carries this as a machine-checked
+field, not just prose.
+
 ## Version-chain ordering: exact-order accuracy + Kendall's tau
 
 No public dataset fits this sub-problem — "which order did files get renamed in" is a
@@ -173,16 +279,30 @@ document content can never reach a log line by accident.
 
 ## Consequences
 
-- Feature 1b's shipped defaults: `minhash_threshold = 0.2` (MEASURED, real, ADR-0016-compliant),
-  `embedding_threshold = 0.6` (confirmation-safety-margin, not independently PR-curve-derived —
-  disclosed as such), version-chain ordering via `order_version_chain` (measured 1.0/1.0 on a
-  disclosed constructed fixture, not a public dataset).
-- Re-acquiring PAN-PC-11 (RAR extraction tooling) or GG's own gold-set labels (still unrun) are
-  both legitimate future upgrades to this measurement, not blockers — the current measurement is
-  real and defensible, not a placeholder.
+- **Feature 1b's shipped defaults are now `minhash_threshold = 0.1`, `embedding_threshold =
+  0.95`** (MEASURED jointly, real, ADR-0016-compliant, gated independently on a prose AND a
+  templated-document tier — see the follow-up section above). The originally-measured `0.2` /
+  `0.6` values are superseded, not just supplemented — citing them as Feature 1b's operating
+  point anywhere would now be stale and unsafe. Version-chain ordering via
+  `order_version_chain` (measured 1.0/1.0 on a disclosed constructed fixture) is unaffected by
+  this follow-up — it doesn't use MinHash/embeddings at all.
+- **The recall cost is real and should inform future work, not be treated as free.** 0.87
+  prose recall / 0.80 templated recall at the new joint threshold is a genuine tradeoff for
+  precision safety, not a rounding error. A future, more capable Stage 2 (e.g., a model that
+  weights distinguishing details — names, numbers — over shared structure, or a dedicated
+  field-level/named-entity diffing signal instead of whole-document embedding similarity)
+  could plausibly recover recall without sacrificing the templated-tier precision this follow-
+  up required — a legitimate, disclosed future improvement, not attempted in this pass.
+  Per-document-type-aware thresholds (detecting "this looks templated" and applying a stricter
+  gate only then) is another legitimate future direction not pursued here — the single global
+  threshold chosen is the honest, simpler, currently-shipped answer.
+- Re-acquiring PAN-PC-11 (RAR extraction tooling), a real public templated-document corpus (none
+  found among the license-clean options assessed), or GG's own gold-set labels (still unrun) are
+  all legitimate future upgrades to this measurement, not blockers.
 - The version-chain fixture's lack of pattern/mtime CONFLICT cases is a known, disclosed gap —
   not asserted as covered.
-- Per GG's explicit "report before Track B/2/3" — this ADR is that report's technical backing.
+- Per GG's explicit "report before Track B/2/3" — this ADR (including this follow-up) is that
+  report's technical backing.
 
 ## Test coverage
 
@@ -191,10 +311,15 @@ selection machinery, BCubed floor, keep-best, end-to-end safety-filtered orchest
 `evals/test_ai_version_chain_gate.py` (1 case, 8 chains), `tests/test_ai_document_text.py` (8),
 `tests/test_ai_minhash_lsh.py` (5), `tests/test_ai_version_chain.py` (9),
 `tests/test_ai_document_keep_best.py` (3), `tests/test_ai_document_similarity.py` (3),
-`tests/test_ai_eval_harness.py` (+10 for `kendall_tau`/`exact_order_accuracy`).
+`tests/test_ai_eval_harness.py` (+13 for `kendall_tau`/`exact_order_accuracy`/
+`select_joint_operating_point`).
 
 **Real (local, on-demand, not in CI):** `evals/test_ai_document_gold.py` (2 cases — the
-MinHash MEASURED operating point + per-tier recall, and the embedding confirmation-recall
-check), `evals/test_ai_paws_embedding_gold.py` (1 case — the disclosed adversarial boundary-tier
-check). Same not-in-default-CI-sweep posture as `evals/test_ai_copydays_gold.py`, same reason
-(network + real-dataset dependency shouldn't gate every push).
+original prose-only MinHash measurement + embedding confirmation-recall check, kept for
+history, no longer the shipped basis), `evals/test_ai_paws_embedding_gold.py` (1 case — the
+disclosed adversarial boundary-tier check), `evals/test_ai_document_templated_gold.py` (1
+case — **the follow-up measurement that actually governs Feature 1b's shipped operating
+point**: the templated-tier precision-collapse proof, the per-tier-gated joint grid search,
+and the chosen `(0.1, 0.95)` threshold). Same not-in-default-CI-sweep posture as
+`evals/test_ai_copydays_gold.py`, same reason (network + real-dataset dependency shouldn't
+gate every push).

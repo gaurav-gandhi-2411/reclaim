@@ -59,14 +59,14 @@ def chunk_book(text: str, book_id: str, *, n_chunks: int = _CHUNKS_PER_BOOK) -> 
     return chunks
 
 
-def _mild_whitespace_cleanup(text: str) -> str:
+def mild_whitespace_cleanup(text: str) -> str:
     """The lightest touch: whitespace/formatting normalization only, content unchanged — the
     "re-saved through a different text editor" case."""
     normalized = re.sub(r"[ \t]+", " ", text)
     return "\n".join(line.rstrip() for line in normalized.splitlines()).strip()
 
 
-def _moderate_paragraph_trim_and_reorder(text: str, rng: random.Random) -> str:
+def moderate_paragraph_trim_and_reorder(text: str, rng: random.Random) -> str:
     """A meaningfully revised copy: drop the last paragraph (trimmed), swap the order of two
     others — the "restructured but still recognizably the same document" case."""
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
@@ -78,7 +78,7 @@ def _moderate_paragraph_trim_and_reorder(text: str, rng: random.Random) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _collab_tool_paste(text: str) -> str:
+def collab_tool_paste(text: str) -> str:
     """Simulates the single most common real-world lossy re-transmission of document text:
     copy-pasting into a chat/email/collab-tool strips paragraph structure (everything
     collapses to a flat run of whitespace-separated text) and often truncates to whatever was
@@ -106,11 +106,11 @@ def build_realistic_document_variants(
     for chunk in chunks:
         for profile, tier in _PROFILES:
             if profile == "mild_whitespace_cleanup":
-                text = _mild_whitespace_cleanup(chunk.text)
+                text = mild_whitespace_cleanup(chunk.text)
             elif profile == "moderate_paragraph_trim_and_reorder":
-                text = _moderate_paragraph_trim_and_reorder(chunk.text, rng)
+                text = moderate_paragraph_trim_and_reorder(chunk.text, rng)
             elif profile == "collab_tool_paste":
-                text = _collab_tool_paste(chunk.text)
+                text = collab_tool_paste(chunk.text)
             else:  # pragma: no cover - exhaustive over _PROFILES above
                 raise AssertionError(f"unhandled profile {profile}")
             variants.append(

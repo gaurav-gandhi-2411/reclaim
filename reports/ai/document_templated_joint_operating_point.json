@@ -1,0 +1,21 @@
+{
+  "commit_sha": "408f9edffcc9fc3c3a141f9689bef29e9b053e3a",
+  "command": "uv run pytest evals/test_ai_document_templated_gold.py -v -s",
+  "fixture_path": "data/ai_datasets/gutenberg_texts (ADR-0017) + evals/ai_fixtures/build_templated_document_fixtures.py (ADR-0017 follow-up)",
+  "shipped_thresholds_templated_precision_baseline": 0.2892857142857143,
+  "joint_operating_point": {
+    "minhash_threshold": 0.1,
+    "embedding_threshold": 0.95
+  },
+  "per_tier": {
+    "prose": {
+      "precision": 1.0,
+      "recall": 0.8694444444444445
+    },
+    "templated": {
+      "precision": 0.9626865671641791,
+      "recall": 0.7962962962962963
+    }
+  },
+  "note": "Replaces the prior (0.2, 0.6) thresholds -- those were measured on prose only and produce a 28.9% precision catastrophe on templated documents. See ADR-0017's follow-up section for the full writeup."
+}
