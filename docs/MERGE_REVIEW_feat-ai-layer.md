@@ -46,7 +46,7 @@ per-feature update required:
   no_ai_layer_parameter` — **PASS**. No dashboard/CLI wiring exists yet at all; `apply_batch`/
   `Candidate` have no AI-related parameter or field.
 
-**Full result: 19/19 passed** (`uv run pytest evals/test_ai_safety_gate.py -v`, commit
+**Full result: 18/18 passed** (`uv run pytest evals/test_ai_safety_gate.py -v`, commit
 `36ddbd0`). No AI candidate can reach `apply_batch` or the deterministic Tier-A path across all
 four features integrated.
 
@@ -126,7 +126,7 @@ Structural, not conventional: `AICluster`/`AIClusterMember` share zero field nam
 because the object literally lacks the field, not because a convention was followed), an AST
 scan re-verified on every CI run that no file under `src/reclaim/ai/` imports the executor or
 `send2trash`, and `pydantic`'s `extra="forbid"` closes the named adversarial config-injection
-path. Re-confirmed against the fully assembled branch in §1 above — 19/19 safety-gate tests
+path. Re-confirmed against the fully assembled branch in §1 above — 18/18 safety-gate tests
 pass with all four features integrated, not just per-feature in isolation.
 
 ### Residual risks, disclosed
@@ -177,7 +177,7 @@ uv run ruff format --check .                                # PASS (all files)
 uv run mypy                                                  # PASS (45 source files, strict)
 uv run pytest tests/ -q                                      # 512 passed, 2 skipped
 uv run pytest evals/ -q --ignore=evals/test_dedup.py         # 50 passed
-uv run pytest evals/test_ai_safety_gate.py -v                # 19 passed
+uv run pytest evals/test_ai_safety_gate.py -v                # 18 passed
 uv sync --frozen --all-groups --extra ai                     # clean
 (isolated venv, core deps only) reclaim.cli + reclaim.ai.*   # import clean, degrade correctly
 ```
