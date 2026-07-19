@@ -18,6 +18,7 @@ from reclaim.ai.eval_harness import (
     EvalReport,
     assert_safe_to_promote_to_measured,
     current_commit_sha,
+    select_joint_operating_point_per_tier,
 )
 from reclaim.ai.minhash_lsh import compute_document_minhash, jaccard_similarity
 from reclaim.ai.text_embeddings import compute_document_embedding, cosine_similarity
@@ -25,15 +26,17 @@ from reclaim.ai.text_embeddings import compute_document_embedding, cosine_simila
 # ADR-0017 follow-up: GG flagged that measuring MinHash's operating point against edited
 # Gutenberg prose can't surface the failure mode real document clutter actually has — resumes,
 # invoices, reports, and decks are heavily TEMPLATED, so genuinely DIFFERENT documents can
-# share large blocks of identical boilerplate. This eval adds that tier and grid-searches the
-# JOINT (MinHash Jaccard, embedding cosine) operating point, gated on BOTH tiers
-# INDEPENDENTLY — a first version pooled prose (7,140 negatives) and templated (459
-# negatives) into one aggregate precision via `eval_harness.select_joint_operating_point`
-# (kept in eval_harness.py as a reusable single-distribution primitive, unit-tested, just not
-# the right tool here), and that pooled number was itself misleading: the templated tier's
-# false positives got mathematically swamped by the much larger prose negative pool. This file
-# grid-searches directly instead, requiring both tiers to independently clear the precision
-# and recall floors before a candidate threshold pair even qualifies.
+# share large blocks of identical boilerplate. This eval adds that tier and selects the JOINT
+# (MinHash Jaccard, embedding cosine) operating point via `eval_harness.
+# select_joint_operating_point_per_tier`, gated on BOTH tiers INDEPENDENTLY. That harness
+# function exists because THIS eval's first version pooled prose (7,140 negatives) and
+# templated (459 negatives) into one aggregate precision via the single-distribution
+# `select_joint_operating_point` — and that pooled number was itself misleading: the templated
+# tier's false positives got mathematically swamped by the much larger prose negative pool.
+# ADR-0018 turned that incident into a permanent, structural harness rule (never aggregate
+# across declared tiers) rather than a one-off fix in this file — see
+# `tests/test_ai_eval_harness.py::test_select_joint_operating_point_per_tier_rejects_the_
+# real_adr0017_incident` for the regression test reproducing the exact numbers.
 #
 # Not in the default CI sweep (network + multi-minute embedding compute). Reproduce with:
 #   uv run python evals/ai_fixtures/fetch_gutenberg_texts.py
@@ -173,47 +176,43 @@ def test_joint_operating_point_across_prose_and_templated_tiers() -> None:
         "reproducing the boilerplate-collision failure mode and needs investigation"
     )
 
-    # --- Joint grid search, gated on BOTH tiers INDEPENDENTLY, not the pooled aggregate ---
-    # A first version of this eval pooled prose (7,140 negatives) and templated (459
-    # negatives) into one combined precision calculation via select_joint_operating_point --
-    # and that pooled aggregate was itself misleading: the templated tier's false positives
-    # got mathematically swamped by the much larger prose negative pool, so a point that
-    # looked like it cleared 0.95 precision in aggregate (0.9524) actually had only 0.8634
-    # precision on the templated tier alone. This is caught here, deliberately, by gating each
-    # tier independently in the grid search itself -- exactly the discipline GG asked for
-    # ("gate on precision AND recall for both tiers"), not just at the end as a check on
-    # whatever the aggregate search happened to produce.
+    # --- Joint grid search via the reusable, ADR-0018-hardened harness primitive ---
+    # This eval originally hand-rolled this grid search inline, and its FIRST version pooled
+    # prose (7,140 negatives) and templated (459 negatives) into one combined precision
+    # calculation -- misleading, because the templated tier's false positives got
+    # mathematically swamped by the much larger prose negative pool (a point that looked like
+    # 0.9524 precision in aggregate was actually only 0.8634 on the templated tier alone).
+    # That incident is now a structural, permanent harness rule (ADR-0018): `eval_harness.
+    # select_joint_operating_point_per_tier` has NO code path that pools tiers together --
+    # every tier's precision/recall is computed from only that tier's own pairs, always. This
+    # eval now calls that shared primitive instead of re-implementing the gate inline, so the
+    # fix lives in one tested place, not copy-pasted into every future multi-tier eval.
     grid = [round(0.05 * n, 2) for n in range(2, 20)]  # 0.10 .. 0.95
     cosine_grid = [round(0.80 + 0.005 * n, 3) for n in range(0, 40)]  # 0.800 .. 0.995
-    tiers = (("prose", prose_pos, prose_neg), ("templated", templated_pos, templated_neg))
 
-    best: tuple[float, float, dict[str, dict[str, float]]] | None = None
-    for t1 in grid:
-        for t2 in cosine_grid:
-            per_tier: dict[str, dict[str, float]] = {}
-            qualifies = True
-            for label, pos, neg in tiers:
-                tp = sum(1 for j, c in pos if j >= t1 and c >= t2)
-                fp = sum(1 for j, c in neg if j >= t1 and c >= t2)
-                precision = tp / (tp + fp) if (tp + fp) else 0.0
-                recall = tp / len(pos)
-                per_tier[label] = {"precision": precision, "recall": recall}
-                if precision < _TARGET_PRECISION or recall < _MIN_RECALL_FLOOR:
-                    qualifies = False
-            if not qualifies:
-                continue
-            min_recall_across_tiers = min(m["recall"] for m in per_tier.values())
-            if best is None or min_recall_across_tiers > min(m["recall"] for m in best[2].values()):
-                best = (t1, t2, per_tier)
-
-    assert best is not None, (
+    operating_point = select_joint_operating_point_per_tier(
+        {"prose": (prose_pos, prose_neg), "templated": (templated_pos, templated_neg)},
+        stage1_candidates=grid,
+        stage2_candidates=cosine_grid,
+        target_precision=_TARGET_PRECISION,
+        min_recall=_MIN_RECALL_FLOOR,
+        distribution=_COMBINED_DISTRIBUTION,
+        source_description=(
+            f"prose + templated, gated per-tier (ADR-0018), commit {current_commit_sha()}"
+        ),
+    )
+    assert operating_point is not None, (
         "no joint (minhash, embedding) threshold clears both the precision target and the "
         "recall floor on BOTH the prose and templated tiers independently — a real, "
         "reportable finding about the two-stage pipeline's viability on templated documents, "
         "not a bug to paper over"
     )
     assert_safe_to_promote_to_measured(_COMBINED_DISTRIBUTION)
-    t1, t2, per_tier_report = best
+    t1, t2 = operating_point.stage1_threshold, operating_point.stage2_threshold
+    per_tier_report = {
+        name: {"precision": metrics.precision, "recall": metrics.recall}
+        for name, metrics in operating_point.per_tier.items()
+    }
 
     report = EvalReport(
         metric_name="document_joint_operating_point_minhash_threshold",
@@ -228,9 +227,9 @@ def test_joint_operating_point_across_prose_and_templated_tiers() -> None:
         print(  # noqa: T201
             f"  tier={label}: precision={metrics['precision']:.4f} recall={metrics['recall']:.4f}"
         )
-        # Redundant with the grid search's own qualification check above, but asserted again
-        # explicitly here (spec discipline: the CI gate must fail loudly if this regresses,
-        # not just silently accept whatever the grid search happened to return).
+        # Redundant with select_joint_operating_point_per_tier's own qualification check, but
+        # asserted again explicitly here (spec discipline: the CI gate must fail loudly if
+        # this regresses, not just silently accept whatever the harness happened to return).
         assert metrics["precision"] >= _TARGET_PRECISION
         assert metrics["recall"] >= _MIN_RECALL_FLOOR
 

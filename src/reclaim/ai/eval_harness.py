@@ -286,6 +286,180 @@ def select_joint_operating_point(
     return best
 
 
+# --- Metrics-integrity invariant (ADR-0018): NEVER aggregate precision/recall across
+# distinct declared tiers. A real incident (ADR-0017's templated-document follow-up) pooled a
+# large, cleanly-separated tier (7,140 prose negatives, 0 false positives) with a small tier
+# that had a real precision failure (459 templated negatives, 25 false positives) into one
+# combined calculation — 500 true positives / 25 false positives across the pool reads as
+# 0.9524 precision, which cleared the 0.95 target, while the small tier ALONE was actually at
+# 0.8634 precision (158 TP / 25 FP within that tier), a real failure the pooled number hid
+# completely. The large tier's clean negatives mathematically diluted the small tier's real
+# problem. The functions below have NO code path that computes a number across pooled tiers —
+# every tier's precision/recall is computed from ONLY that tier's own pairs, always, and a
+# candidate threshold only qualifies if EVERY declared tier clears both floors independently.
+# This is why `select_operating_point`/`select_joint_operating_point` above remain valid: they
+# are correct and honest for a SINGLE declared distribution. The moment a caller has more than
+# one named tier, it must use the `_per_tier` variants below — there is no correct way to pool.
+
+
+@dataclass(frozen=True, slots=True)
+class TierMetrics:
+    precision: float
+    recall: float
+
+
+@dataclass(frozen=True, slots=True)
+class TierGatedOperatingPoint:
+    """The 1D analog of `OperatingPoint`, gated across multiple named tiers independently —
+    see the metrics-integrity invariant above. `per_tier` records every tier's own precision/
+    recall at the chosen threshold; there is no aggregate/pooled number anywhere on this type."""
+
+    threshold: float
+    per_tier: Mapping[str, TierMetrics]
+    is_provisional: bool
+    source_description: str
+    distribution: DistributionDeclaration
+
+
+@dataclass(frozen=True, slots=True)
+class TierGatedJointOperatingPoint:
+    """The 2D analog of `TierGatedOperatingPoint` — see `select_joint_operating_point_per_tier`."""
+
+    stage1_threshold: float
+    stage2_threshold: float
+    per_tier: Mapping[str, TierMetrics]
+    is_provisional: bool
+    source_description: str
+    distribution: DistributionDeclaration
+
+
+def select_operating_point_per_tier(
+    tiers: Mapping[str, tuple[Sequence[float], Sequence[float]]],
+    *,
+    candidates: Sequence[float],
+    higher_score_is_more_similar: bool = True,
+    target_precision: float,
+    min_recall: float,
+    distribution: DistributionDeclaration,
+    source_description: str,
+) -> TierGatedOperatingPoint | None:
+    """`tiers` maps a tier name to `(positive_scores, negative_scores)` for that tier ONLY —
+    never pool scores from different tiers into one sequence before calling this (that's
+    exactly the mistake this function exists to make structurally impossible here). Sweeps
+    `candidates`; a threshold qualifies only if EVERY tier's own precision/recall clears both
+    `target_precision` and `min_recall` independently. Among qualifying thresholds, picks the
+    one maximizing the MINIMUM recall across tiers (not the mean — a threshold that's
+    excellent for one tier and merely adequate for another should not be preferred over one
+    that's good for both, since the weaker tier is the one actually at risk).
+
+    Returns `None` if no threshold clears every tier — callers MUST handle this explicitly.
+    """
+    if not tiers:
+        raise ValueError(
+            "tiers must not be empty — gating on zero declared tiers is meaningless, and "
+            "silently returning None here would be indistinguishable from 'no threshold "
+            "qualified', a different and more useful signal"
+        )
+    best: TierGatedOperatingPoint | None = None
+    for threshold in candidates:
+        per_tier: dict[str, TierMetrics] = {}
+        qualifies = True
+        for tier_name, (positive_scores, negative_scores) in tiers.items():
+            if higher_score_is_more_similar:
+                true_positives = sum(1 for s in positive_scores if s >= threshold)
+                false_positives = sum(1 for s in negative_scores if s >= threshold)
+            else:
+                true_positives = sum(1 for s in positive_scores if s <= threshold)
+                false_positives = sum(1 for s in negative_scores if s <= threshold)
+            flagged = true_positives + false_positives
+            precision = true_positives / flagged if flagged else 0.0
+            recall = true_positives / len(positive_scores) if positive_scores else 0.0
+            per_tier[tier_name] = TierMetrics(precision=precision, recall=recall)
+            if precision < target_precision or recall < min_recall:
+                qualifies = False
+        if not qualifies:
+            continue
+        min_recall_across_tiers = min(metrics.recall for metrics in per_tier.values())
+        if best is None or min_recall_across_tiers > min(
+            metrics.recall for metrics in best.per_tier.values()
+        ):
+            best = TierGatedOperatingPoint(
+                threshold=threshold,
+                per_tier=per_tier,
+                is_provisional=True,
+                source_description=source_description,
+                distribution=distribution,
+            )
+    return best
+
+
+def select_joint_operating_point_per_tier(
+    tiers: Mapping[str, tuple[Sequence[tuple[float, float]], Sequence[tuple[float, float]]]],
+    *,
+    stage1_candidates: Sequence[float],
+    stage2_candidates: Sequence[float],
+    target_precision: float,
+    min_recall: float,
+    distribution: DistributionDeclaration,
+    source_description: str,
+) -> TierGatedJointOperatingPoint | None:
+    """The 2D (joint, AND-gated two-stage) analog of `select_operating_point_per_tier` — see
+    the metrics-integrity invariant above `TierMetrics`. `tiers` maps a tier name to
+    `(positive_pairs, negative_pairs)` for that tier ONLY, each pair being
+    `(stage1_score, stage2_score)`. A `(t1, t2)` grid point only qualifies if EVERY tier's own
+    precision/recall clears both floors independently; among qualifying points, picks the one
+    maximizing the minimum recall across tiers.
+
+    This is the function `evals/test_ai_document_templated_gold.py` uses — ADR-0017's own
+    incident (a hand-rolled version of exactly this grid search, first written without
+    per-tier gating) is why this exists as a reusable, tested harness primitive instead of
+    something every eval re-implements ad hoc.
+    """
+    if not tiers:
+        raise ValueError(
+            "tiers must not be empty — gating on zero declared tiers is meaningless, and "
+            "silently returning None here would be indistinguishable from 'no threshold "
+            "qualified', a different and more useful signal"
+        )
+    best: TierGatedJointOperatingPoint | None = None
+    for stage1_threshold in stage1_candidates:
+        for stage2_threshold in stage2_candidates:
+            per_tier: dict[str, TierMetrics] = {}
+            qualifies = True
+            for tier_name, (positive_pairs, negative_pairs) in tiers.items():
+                true_positives = sum(
+                    1
+                    for s1, s2 in positive_pairs
+                    if s1 >= stage1_threshold and s2 >= stage2_threshold
+                )
+                false_positives = sum(
+                    1
+                    for s1, s2 in negative_pairs
+                    if s1 >= stage1_threshold and s2 >= stage2_threshold
+                )
+                flagged = true_positives + false_positives
+                precision = true_positives / flagged if flagged else 0.0
+                recall = true_positives / len(positive_pairs) if positive_pairs else 0.0
+                per_tier[tier_name] = TierMetrics(precision=precision, recall=recall)
+                if precision < target_precision or recall < min_recall:
+                    qualifies = False
+            if not qualifies:
+                continue
+            min_recall_across_tiers = min(metrics.recall for metrics in per_tier.values())
+            if best is None or min_recall_across_tiers > min(
+                metrics.recall for metrics in best.per_tier.values()
+            ):
+                best = TierGatedJointOperatingPoint(
+                    stage1_threshold=stage1_threshold,
+                    stage2_threshold=stage2_threshold,
+                    per_tier=per_tier,
+                    is_provisional=True,
+                    source_description=source_description,
+                    distribution=distribution,
+                )
+    return best
+
+
 def exact_order_accuracy(predicted_order: Sequence[str], true_order: Sequence[str]) -> float:
     """1.0 if `predicted_order` matches `true_order` exactly (same items, same sequence),
     else 0.0 — the strict version-chain-ordering metric (spec §7.2), complementary to
