@@ -1,5 +1,5 @@
 {
-  "commit_sha": "e0da7240b33c1ed4c29f354fe4ea9685f305085c",
+  "commit_sha": "7668ae1094fd26914d5b4803c7bc68e4ff11aa18",
   "command": "uv run pytest evals/test_ai_document_gold.py -v -s",
   "fixture_path": "data/ai_datasets/gutenberg_texts (8 public-domain books, ADR-0017) + evals/ai_fixtures/build_document_realistic_tiers.py",
   "distribution": {
