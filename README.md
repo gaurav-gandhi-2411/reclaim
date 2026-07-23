@@ -124,9 +124,35 @@ double-click Windows installer aimed at people who won't read the source first:
   `uv sync --extra ai` / `pip install reclaim[ai]` (a separate Python environment — the
   Nuitka-compiled `reclaim.exe` cannot `pip install` into itself; see ADR-0024's consequences
   section for this disclosed gap).
-- **Unsigned.** Expect a SmartScreen/antivirus prompt on first run — this is normal for a
-  freshly-built, unsigned binary and is not a compromise signal for a binary built from this
-  source. Code-signing options are assessed (cost/UX, not implemented) in Stage 2 Part C.
+### First run: SmartScreen and antivirus prompts (expected, not a compromise signal)
+
+**This installer and `reclaim.exe` are unsigned.** Stage 2 Part C assessed code-signing options
+(Azure Trusted Signing, ~$9.99/month, vs. staying unsigned) and the project shipped unsigned —
+there's no revenue or user base yet to justify a recurring cost, and nothing about staying
+unsigned today blocks signing later (see "Staying signing-agnostic" below). Two prompts are
+expected as a direct consequence, and neither means the binary is unsafe:
+
+- **Windows SmartScreen**, on first launch of `reclaim-setup.exe` (and/or `reclaim.exe`
+  directly): *"Windows protected your PC" -> "Microsoft Defender SmartScreen prevented an
+  unrecognized app from starting."* Click **More info**, then **Run anyway**. This is not a
+  virus scan verdict — it's SmartScreen's reputation check, which any freshly-built or
+  low-download-count binary fails regardless of actual safety, signed or not.
+- **Antivirus false positives.** Some AV engines flag freshly-compiled, unsigned Nuitka/
+  PyInstaller-style binaries heuristically (packed-executable + no publisher signature is a
+  common malware shape, even though this build is neither packed nor obfuscated) — this project
+  has already hit one AV/quarantine false-positive on a freshly-built binary during earlier
+  testing. If your AV quarantines `reclaim.exe` or `reclaim-setup.exe`: restore it from
+  quarantine, then add an exclusion for the install folder (Windows Security ->
+  Virus & threat protection -> Manage settings -> Add or remove exclusions -> Folder). Only do
+  this for a binary you built yourself from this source or downloaded from this repository —
+  never for a binary from an untrusted source.
+
+**Staying signing-agnostic.** The packaging pipeline (`packaging/reclaim.iss`) has no
+`SignTool`/`SignedUninstaller` directive today — it builds and runs unsigned as-is. Adding
+signing later needs no rework: a `signtool.exe` step on `entry_point.dist/reclaim.exe` before
+Inno Setup packages it, plus a `SignTool=` line in `reclaim.iss` to also sign
+`reclaim-setup.exe` itself. Neither `entry_point.py`, the build command, nor any safety-relevant
+code changes either way.
 
 Build it yourself:
 
