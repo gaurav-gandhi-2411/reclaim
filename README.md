@@ -5,19 +5,29 @@ hard safety gate that runs before any candidate is generated, and fully recovera
 (vault + manifest, dry-run by default). No ML — see `docs/CASE_STUDY.md` for what's actually
 wired in vs. specced for later. Full design: `reclaim-spec.md`. Build history: `PLAN.md`.
 
-**Status:** single-user / technical-reviewer install. Not yet packaged for a general public
-audience — see "Distribution status" below.
+**Status:** Stage 2 shipped a double-click Windows installer with safe mode on by default —
+see "Distribution status" below for the full picture, including what safe mode restricts and
+why the installer is unsigned.
 
 ## Install
 
-Requires Python 3.12 and Windows (the scanner and executor are NTFS-specific by design — junction/
-reparse-point handling, `\\?\` long-path moves, Recycle Bin integration).
+Requires Windows (the scanner and executor are NTFS-specific by design — junction/reparse-point
+handling, `\\?\` long-path moves, Recycle Bin integration).
+
+**Option A — the installer (no Python required).** Build `packaging/reclaim-setup.exe` yourself
+per the "Distribution status" section below (this project doesn't publish prebuilt binaries —
+it's unsigned, and building it yourself from source is the trust model this stage assumes).
+Installs per-user, no admin prompt, and adds a Start Menu shortcut that launches the dashboard.
+Ships core-only (deterministic engine, no AI-layer dependencies) and defaults to safe mode.
+
+**Option B — from source (Python 3.12, for development or the optional AI layer):**
 
 ```powershell
-# from a released version once published, or from a local clone either way:
 uv tool install .
 # or, if you use pipx instead of uv:
 pipx install .
+# for the applied-AI layer too (near-dup detection, semantic grouping, the clutter ranker):
+uv tool install ".[ai]"
 ```
 
 This installs one `reclaim` executable on your PATH. Verify it:
