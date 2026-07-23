@@ -712,9 +712,7 @@ def test_is_model_cache_path_matches_configured_root_or_hf_structure() -> None:
     hf_path = Path("C:/some/other/hub/models--org--name/blobs/abc123")
     assert _is_model_cache_path(hf_path, []) is True
 
-    assert (
-        _is_model_cache_path(Path("C:/Users/dev/Documents/file.bin"), [configured_root]) is False
-    )
+    assert _is_model_cache_path(Path("C:/Users/dev/Documents/file.bin"), [configured_root]) is False
 
 
 def _make_conda_env(root: Path) -> Path:
