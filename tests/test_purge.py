@@ -8,11 +8,12 @@ import pytest
 from reclaim.config import Config, SafetyConfig
 from reclaim.executor import (
     QuarantineManifestEntry,
+    SafeModeViolationError,
     SafetyInvariantError,
     append_manifest_entries,
     fold_latest_manifest_entries,
 )
-from reclaim.models import Tier
+from reclaim.models import Mode, Tier
 from reclaim.purge import purge_expired
 from reclaim.safety import SafetyValidator
 
@@ -276,6 +277,187 @@ def test_purge_skips_recycle_bin_and_direct_delete_entries(tmp_path: Path) -> No
         now=_NOW,
     )
     assert report.files_processed == 0
+
+
+# --- Stage 2 safety boundary: mode=Mode.SAFE forbids purge entirely, unconditionally -----------
+
+
+def test_purge_expired_raises_safe_mode_violation_before_reading_manifest(tmp_path: Path) -> None:
+    """purge_expired's own `if mode == Mode.SAFE` guard -- the "Stage 2 safety boundary" for a
+    machine with real vaulted entries from an earlier power-mode session, later switched back to
+    safe mode. Must refuse immediately, before any eligibility scan or I/O, even though the
+    manifest here genuinely contains a real, purge-eligible vault entry."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(tmp_path)
+    append_manifest_entries(manifest_path, [entry])
+    assert entry.vault_path is not None
+
+    with pytest.raises(SafeModeViolationError):
+        purge_expired(
+            apply=True,
+            manifest_path=manifest_path,
+            vault_dir=tmp_path / "vault",
+            safety=_safety(),
+            now=_NOW,
+            mode=Mode.SAFE,
+        )
+
+    assert entry.vault_path.exists()  # untouched -- refused before any filesystem mutation
+    latest = fold_latest_manifest_entries(manifest_path)
+    assert len(latest) == 1
+    assert latest[0].purged is False  # no manifest entry appended for this refusal
+
+
+def test_purge_expired_safe_mode_refusal_applies_to_dry_run_too(tmp_path: Path) -> None:
+    """The safe-mode refusal is unconditional regardless of `apply` -- even a dry-run preview
+    must not be allowed to report on vault entries while in safe mode."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(tmp_path)
+    append_manifest_entries(manifest_path, [entry])
+
+    with pytest.raises(SafeModeViolationError):
+        purge_expired(
+            apply=False,
+            manifest_path=manifest_path,
+            vault_dir=tmp_path / "vault",
+            safety=_safety(),
+            now=_NOW,
+            mode=Mode.SAFE,
+        )
+
+
+def test_purge_expired_safe_mode_violation_never_reads_the_manifest_at_all(
+    tmp_path: Path,
+) -> None:
+    """Refuses before ANY manifest I/O: a manifest_path that doesn't even exist on disk still
+    raises SafeModeViolationError, never a FileNotFoundError from attempting to read it first."""
+    nonexistent_manifest = tmp_path / "does_not_exist.jsonl"
+
+    with pytest.raises(SafeModeViolationError):
+        purge_expired(
+            apply=True,
+            manifest_path=nonexistent_manifest,
+            vault_dir=tmp_path / "vault",
+            safety=_safety(),
+            now=_NOW,
+            mode=Mode.SAFE,
+        )
+
+
+# --- Real-delete OSError per-item failure isolation ---------------------------------------------
+
+
+def test_purge_apply_real_delete_oserror_isolates_one_failed_item_from_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `unlink_clear_readonly`/`shutil.rmtree` OSError path during a REAL purge (unlike
+    `apply_batch`, which already has several monkeypatched-failure tests, this path had none)
+    must isolate one item's failure -- the rest of the batch still purges successfully."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    good_entry = _vault_entry(
+        tmp_path,
+        vault_path=tmp_path / "vault" / "good.bin",
+        original_path=tmp_path / "good_gone.bin",
+        size_bytes=10,
+    )
+    bad_entry = _vault_entry(
+        tmp_path,
+        vault_path=tmp_path / "vault" / "bad.bin",
+        original_path=tmp_path / "bad_gone.bin",
+        size_bytes=20,
+    )
+    append_manifest_entries(manifest_path, [good_entry, bad_entry])
+    assert good_entry.vault_path is not None
+    assert bad_entry.vault_path is not None
+
+    import reclaim.purge as purge_module
+
+    real_unlink = purge_module.unlink_clear_readonly
+
+    def _flaky_unlink(path: str) -> None:
+        if "bad.bin" in path:
+            raise OSError("simulated: permission denied deleting this one vault item")
+        real_unlink(path)
+
+    monkeypatch.setattr(purge_module, "unlink_clear_readonly", _flaky_unlink)
+
+    report = purge_expired(
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_processed == 2
+    assert report.files_succeeded == 1
+    assert report.files_failed == 1
+    assert not good_entry.vault_path.exists()  # the succeeding item still actually purged
+    assert bad_entry.vault_path.exists()  # untouched -- failure isolated to this one item
+
+    failed_items = [item for item in report.items if not item.succeeded]
+    succeeded_items = [item for item in report.items if item.succeeded]
+    assert len(failed_items) == 1
+    assert failed_items[0].original_path == bad_entry.original_path
+    assert failed_items[0].error is not None
+    assert len(succeeded_items) == 1
+    assert succeeded_items[0].original_path == good_entry.original_path
+
+    latest = {e.original_path: e for e in fold_latest_manifest_entries(manifest_path)}
+    assert latest[good_entry.original_path].purged is True
+    assert latest[bad_entry.original_path].purged is False  # never marked purged
+
+
+def test_purge_apply_real_delete_oserror_on_directory_isolates_failed_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same batch-isolation guarantee for the directory (`shutil.rmtree`) branch, not just the
+    single-file (`unlink_clear_readonly`) branch above."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    good_entry = _vault_entry(
+        tmp_path,
+        is_dir=True,
+        vault_path=tmp_path / "vault" / "good_dir",
+        original_path=tmp_path / "good_gone",
+        size_bytes=10,
+    )
+    bad_entry = _vault_entry(
+        tmp_path,
+        is_dir=True,
+        vault_path=tmp_path / "vault" / "bad_dir",
+        original_path=tmp_path / "bad_gone",
+        size_bytes=20,
+    )
+    append_manifest_entries(manifest_path, [good_entry, bad_entry])
+
+    import shutil as shutil_module
+
+    import reclaim.purge as purge_module
+
+    real_rmtree = shutil_module.rmtree
+
+    def _flaky_rmtree(path: str, onexc: object = None) -> None:
+        if "bad_dir" in path:
+            raise OSError("simulated: permission denied deleting this one vault directory")
+        real_rmtree(path, onexc=onexc)
+
+    monkeypatch.setattr(purge_module.shutil, "rmtree", _flaky_rmtree)
+
+    report = purge_expired(
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW,
+    )
+
+    assert report.files_processed == 2
+    assert report.files_succeeded == 1
+    assert report.files_failed == 1
+    assert good_entry.vault_path is not None
+    assert bad_entry.vault_path is not None
+    assert not good_entry.vault_path.exists()
+    assert bad_entry.vault_path.exists()  # untouched -- failure isolated to this one item
 
 
 # --- ADR-0001: mandatory pre-purge safety re-check ---------------------------------------------

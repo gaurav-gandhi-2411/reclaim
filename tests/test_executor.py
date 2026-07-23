@@ -14,13 +14,15 @@ from reclaim.executor import (
     QuarantineManifestEntry,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
+    SafeModeViolationError,
     SafetyInvariantError,
+    VaultIntegrityError,
     _latest_entries_for_batch,
     apply_batch,
     long_path,
     restore_batch,
 )
-from reclaim.models import Candidate, Tier, Verdict
+from reclaim.models import Candidate, Mode, Tier, Verdict
 from reclaim.safety import SafetyValidator
 
 _NOW = 1_700_000_000.0
@@ -265,6 +267,122 @@ def test_vault_restore_refuses_to_overwrite_existing_destination(tmp_path: Path)
     assert restore_report.items[0].error is not None
     assert "already exists" in restore_report.items[0].error
     assert target.read_bytes() == b"unrelated-new-content"  # never clobbered
+
+
+# --- restore_batch per-item (OSError, VaultIntegrityError) failure isolation --------------------
+
+
+def test_restore_batch_isolates_one_failed_item_from_the_rest_of_the_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The try/except around `_atomic_move` inside `restore_batch`'s vault_entries loop: with
+    2+ restorable vault entries in one batch, a failure targeting one specific entry (by path)
+    must not abort restoring the others."""
+    good_target = tmp_path / "good.bin"
+    good_target.write_bytes(b"good-content")
+    bad_target = tmp_path / "bad.bin"
+    bad_target.write_bytes(b"bad-content")
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    apply_report = apply_batch(
+        [_candidate(good_target, retention_days=30), _candidate(bad_target, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+    assert apply_report.files_succeeded == 2
+    assert not good_target.exists()
+    assert not bad_target.exists()
+
+    import reclaim.executor as executor_module
+
+    real_atomic_move = executor_module._atomic_move
+
+    def _flaky_atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+        if dst == bad_target:
+            raise OSError("simulated: permission denied restoring this one entry")
+        real_atomic_move(src, dst, is_dir=is_dir)
+
+    monkeypatch.setattr(executor_module, "_atomic_move", _flaky_atomic_move)
+
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
+
+    assert restore_report.files_processed == 2
+    assert restore_report.files_succeeded == 1
+    assert restore_report.files_failed == 1
+    assert good_target.exists()
+    assert good_target.read_bytes() == b"good-content"
+    assert not bad_target.exists()  # the failed restore never moved anything back
+
+    by_path = {item.original_path: item for item in restore_report.items}
+    assert by_path[good_target].succeeded is True
+    assert by_path[bad_target].succeeded is False
+    assert by_path[bad_target].error is not None
+
+    latest = {
+        e.original_path: e for e in _latest_entries_for_batch(manifest_path, apply_report.batch_id)
+    }
+    assert latest[good_target].restored is True
+    assert latest[bad_target].restored is False  # never marked restored
+
+
+def test_restore_batch_isolated_failure_survives_vault_integrity_error_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same isolation guarantee for the other exception type this except clause catches --
+    `VaultIntegrityError`, not just plain `OSError`."""
+    from reclaim.executor import VaultIntegrityError
+
+    good_target = tmp_path / "good.bin"
+    good_target.write_bytes(b"good-content")
+    bad_target = tmp_path / "bad.bin"
+    bad_target.write_bytes(b"bad-content")
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    apply_report = apply_batch(
+        [_candidate(good_target, retention_days=30), _candidate(bad_target, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    import reclaim.executor as executor_module
+
+    real_atomic_move = executor_module._atomic_move
+
+    def _flaky_atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+        if dst == bad_target:
+            raise VaultIntegrityError("simulated: parity mismatch restoring this one entry")
+        real_atomic_move(src, dst, is_dir=is_dir)
+
+    monkeypatch.setattr(executor_module, "_atomic_move", _flaky_atomic_move)
+
+    restore_report = restore_batch(
+        apply_report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
+
+    assert restore_report.files_succeeded == 1
+    assert restore_report.files_failed == 1
+    assert good_target.exists()
+    assert not bad_target.exists()
 
 
 # --- ADR-0004: long-path-safe, atomic-or-nothing vault/restore moves ---------------------------
@@ -577,6 +695,246 @@ def test_restore_batch_not_found_raises() -> None:
             manifest_path=Path("does_not_exist.jsonl"),
             safety=_safety(),
         )
+
+
+# --- Stage 2 safety boundary: apply_batch's own mode=Mode.SAFE guard ---------------------------
+
+
+def test_apply_batch_raises_safe_mode_violation_for_vault_method_bypassing_caller_resolution(
+    tmp_path: Path,
+) -> None:
+    """apply_batch's own last-line-of-defense guard: both real callers (CLI, API) already
+    pre-resolve method to "recycle_bin" before calling apply_batch, so this raise path is never
+    exercised in practice -- call directly with method="vault" while mode=Mode.SAFE (bypassing
+    that pre-resolution) and confirm it refuses the entire batch before any filesystem
+    mutation."""
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"content")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    with pytest.raises(SafeModeViolationError):
+        apply_batch(
+            [_candidate(target)],
+            safety=_safety(),
+            apply=True,
+            method="vault",
+            mode=Mode.SAFE,
+            vault_dir=tmp_path / "vault",
+            manifest_path=manifest_path,
+            now=_NOW,
+        )
+
+    assert target.exists()  # untouched
+    assert target.read_bytes() == b"content"
+    assert not manifest_path.exists()  # nothing written
+
+
+def test_apply_batch_safe_mode_with_recycle_bin_method_succeeds_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one combination safe mode allows: method="recycle_bin" with mode=Mode.SAFE applies
+    normally, exercising send2trash rather than being refused."""
+    import reclaim.executor as executor_module
+
+    calls: list[str] = []
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: calls.append(path))
+
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"content")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target)],
+        safety=_safety(),
+        apply=True,
+        method="recycle_bin",
+        mode=Mode.SAFE,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert calls == [str(target)]
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].method == "recycle_bin"
+
+
+# --- ADR-0004: single-file `shutil.copy2` fallback + cleanup-on-failure -------------------------
+
+
+def test_single_file_copy2_fallback_succeeds_when_rename_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The single-FILE `shutil.copy2` fallback's happy path (unlike the directory/copytree
+    fallback, which already has a real-content long-path success test): forcing `os.rename` to
+    fail routes into `copy2`, which succeeds cleanly -- source removed, destination byte-
+    identical, restore round-trips."""
+    src = tmp_path / "source_file.bin"
+    original_content = b"cross-volume-fallback-content" * 20
+    src.write_bytes(original_content)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copy2 fallback path")
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+
+    report = apply_batch(
+        [_candidate(src, size_bytes=len(original_content), retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 1
+    assert not src.exists()  # source removed by the copy-then-unlink fallback
+    vault_item = report.items[0]
+    assert vault_item.vault_path is not None
+    assert vault_item.vault_path.read_bytes() == original_content
+
+    restore_report = restore_batch(
+        report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=vault_dir,
+        safety=_safety(),
+        now=_NOW + 1,
+    )
+    assert restore_report.files_succeeded == 1
+    assert src.exists()
+    assert src.read_bytes() == original_content
+
+
+def test_single_file_copy2_fallback_propagates_error_and_cleans_up_partial_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The single-FILE (not directory) cross-volume fallback in `_atomic_move`: force
+    `os.rename` to fail (routing into the `shutil.copy2` branch), then force `shutil.copy2`
+    itself to fail partway. Proves the atomic-or-nothing guarantee for the file branch, mirroring
+    the directory/copytree tests above: the exception propagates, the partial destination copy
+    is cleaned up, and the source is left completely untouched."""
+    src = tmp_path / "source_file.bin"
+    original_content = b"do-not-touch-source" * 50
+    src.write_bytes(original_content)
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copy2 fallback path")
+
+    def _fake_copy2(_src_path: str, dst_path: str, **_kwargs: object) -> str:
+        Path(dst_path).write_bytes(b"partial-garbage")  # simulate a failed/interrupted copy
+        raise OSError("simulated: copy2 fails partway through")
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.shutil, "copy2", _fake_copy2)
+
+    report = apply_batch(
+        [_candidate(src, size_bytes=len(original_content), retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 0
+    assert report.files_failed == 1
+    assert src.exists()  # source completely untouched
+    assert src.read_bytes() == original_content
+    leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
+    assert leftover == [], f"orphaned partial-copy debris: {leftover}"
+    assert _latest_entries_for_batch(manifest_path, report.batch_id) == []  # never claimed done
+
+
+def test_single_file_copy2_fallback_size_mismatch_raises_integrity_error_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `copy2` that raises no exception but silently produces a size-mismatched destination
+    (simulated via a monkeypatched `os.path.getsize` on the destination) must still be caught by
+    the size-parity check -- `VaultIntegrityError`, source untouched, partial copy cleaned up."""
+    src = tmp_path / "source_file.bin"
+    src.write_bytes(b"real-content-here")
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copy2 fallback path")
+
+    real_getsize = executor_module.os.path.getsize
+
+    def _fake_getsize(path: str) -> int:
+        size = real_getsize(path)
+        # Only lie about the destination's size (inside vault_dir); the source's real pre_size
+        # measurement must stay truthful, or the mismatch this test wants would never trigger.
+        if str(vault_dir) in path:
+            return size + 1
+        return size
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.os.path, "getsize", _fake_getsize)
+
+    report = apply_batch(
+        [_candidate(src, size_bytes=17, retention_days=30)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 0
+    assert report.files_failed == 1
+    assert "mismatch" in (report.items[0].error or "")
+    assert src.exists()
+    assert src.read_bytes() == b"real-content-here"
+    leftover = list(vault_dir.rglob("*")) if vault_dir.exists() else []
+    assert leftover == [], f"orphaned partial-copy debris: {leftover}"
+
+
+def test_atomic_move_single_file_copy2_fallback_cleanup_failure_is_only_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sanity check that VaultIntegrityError itself (not the ADR-0004 directory variant) is the
+    concrete exception type raised for the single-file size-mismatch case, by calling
+    `_atomic_move` directly rather than through `apply_batch`'s broad `except Exception`."""
+    from reclaim.executor import _atomic_move
+
+    src = tmp_path / "source_file.bin"
+    src.write_bytes(b"content")
+    dst = tmp_path / "vault" / "dest_file.bin"
+
+    import reclaim.executor as executor_module
+
+    def _fake_rename(_src: str, _dst: str) -> None:
+        raise OSError("simulated: force the copy2 fallback path")
+
+    real_getsize = executor_module.os.path.getsize
+
+    def _fake_getsize(path: str) -> int:
+        if "dest_file" in path:
+            return real_getsize(path) + 1
+        return real_getsize(path)
+
+    monkeypatch.setattr(executor_module.os, "rename", _fake_rename)
+    monkeypatch.setattr(executor_module.os.path, "getsize", _fake_getsize)
+
+    with pytest.raises(VaultIntegrityError, match="mismatch"):
+        _atomic_move(src, dst, is_dir=False)
+
+    assert src.exists()
+    assert not dst.exists()
 
 
 # --- Defense in depth: BLOCKED candidate ------------------------------------------------------
