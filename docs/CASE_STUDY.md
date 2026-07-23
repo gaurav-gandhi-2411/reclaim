@@ -1,5 +1,7 @@
 # Reclaim: what it costs to let an agent delete files
 
+Repo: [github.com/gaurav-gandhi-2411/reclaim](https://github.com/gaurav-gandhi-2411/reclaim)
+
 Reclaim is a Windows disk-cleanup tool: scan a drive, propose what's safe to remove, delete it.
 That one-line description hides the actual engineering problem. An agent that deletes files for
 a living has exactly one job that matters more than finding space to reclaim: never destroying
