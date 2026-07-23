@@ -18,7 +18,7 @@ from reclaim.config import (
 )
 from reclaim.detectors import generate_candidates
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, Tier
+from reclaim.models import Candidate, Mode, Tier
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
@@ -27,13 +27,23 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows
 
 def _config(root: Path, *, categories: CategoriesConfig) -> Config:
     """Fixture-relative protected roots — see test_safety_gate.py's `golden_tree_config` for
-    the same pattern — so real C:\\Windows is never touched during development/CI."""
+    the same pattern — so real C:\\Windows is never touched during development/CI.
+
+    `mode=Mode.POWER`: this eval predates ADR-0023 (Stage 2 safe mode) and its whole point is
+    the enabled-vs-disabled Tier A/B comparison below — safe mode forces every candidate to
+    Tier B regardless of category-enabled state (ADR-0023 guarantee 3), which would collapse
+    that comparison to nothing. Explicit, not ambient: `Config.mode` defaults to `Mode.SAFE`
+    (the honest default for an unresolved log), so this eval silently broke the day that
+    default changed. Same fix/reasoning as `tests/test_api.py::_make_app`'s pre-seeded
+    power-mode log for the same class of pre-Stage-2 test.
+    """
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(
             protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"],
         ),
         categories=categories,
+        mode=Mode.POWER,
     )
 
 

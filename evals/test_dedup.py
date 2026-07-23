@@ -12,7 +12,7 @@ from fixtures.build_dedup_tree import build_dedup_fixture_tree
 from reclaim.config import CategoriesConfig, Config, DuplicatesConfig, SafetyConfig
 from reclaim.dedup import find_duplicate_clusters, generate_duplicate_candidates
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, DuplicateCluster, Tier
+from reclaim.models import Candidate, DuplicateCluster, Mode, Tier
 from reclaim.safety import SafetyValidator
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,13 +40,23 @@ def _config(root: Path, *, duplicates_enabled: bool) -> Config:
 
     `min_reclaim_bytes=0`: this golden-fixture tree uses small test files by design (fast,
     deterministic byte content); the real 1MB materiality-gate default is tested in isolation
-    in `test_index.py`, not conflated with this pipeline-correctness fixture."""
+    in `test_index.py`, not conflated with this pipeline-correctness fixture.
+
+    `mode=Mode.POWER`: this eval predates ADR-0023 (Stage 2 safe mode) and its point is the
+    duplicates-enabled-vs-disabled Tier A/B comparison — safe mode forces every candidate to
+    Tier B regardless of category-enabled state (ADR-0023 guarantee 3), which would collapse
+    that comparison to nothing. Explicit, not ambient: `Config.mode` defaults to `Mode.SAFE`
+    (the honest default for an unresolved log), so this eval silently broke the day that
+    default changed. Same fix/reasoning as `tests/test_api.py::_make_app`'s pre-seeded
+    power-mode log for the same class of pre-Stage-2 test.
+    """
     root_posix = root.as_posix()
     return Config(
         safety=SafetyConfig(protected_roots=[f"{root_posix}/Windows", f"{root_posix}/Windows/*"]),
         categories=CategoriesConfig(
             duplicates=DuplicatesConfig(enabled=duplicates_enabled, min_reclaim_bytes=0)
         ),
+        mode=Mode.POWER,
     )
 
 

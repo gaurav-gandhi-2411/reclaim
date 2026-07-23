@@ -18,7 +18,7 @@ from reclaim.dedup import generate_duplicate_candidates
 from reclaim.detectors import generate_candidates
 from reclaim.executor import apply_batch, restore_batch
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, Tier
+from reclaim.models import Candidate, Mode, Tier
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
@@ -36,6 +36,14 @@ def _config(root: Path) -> Config:
     impossible (a `direct_delete` entry can never be restored). This eval's purpose is proving
     the vault+restore mechanics work end-to-end, not pinning `dev_artifacts`' retention default
     — so `retention_days=30` is set explicitly here to keep that proof intact.
+
+    `mode=Mode.POWER`: this eval predates ADR-0023 (Stage 2 safe mode) and specifically proves
+    Tier A auto-quarantine + vault/restore mechanics — behavior that only exists in power mode
+    (safe mode forces every candidate to Tier B, per ADR-0023 guarantee 3). Explicit, not
+    ambient: `Config.mode` defaults to `Mode.SAFE` (the honest default for an unresolved log),
+    so this eval silently broke the day that default changed, since it never stated which mode
+    it meant to test. Same fix/reasoning as `tests/test_api.py::_make_app`'s pre-seeded
+    power-mode log for the same class of pre-Stage-2 test.
     """
     root_posix = root.as_posix()
     return Config(
@@ -44,6 +52,7 @@ def _config(root: Path) -> Config:
             dev_artifacts=DevArtifactsConfig(enabled=True, retention_days=30),
             large_logs=LargeLogsConfig(enabled=True, min_size_bytes=1_000, stale_days=30),
         ),
+        mode=Mode.POWER,
     )
 
 
