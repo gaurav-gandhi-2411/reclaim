@@ -1408,6 +1408,31 @@ retention + restore, now with an explicit `purge` command for expired entries.
   the dashboard [restore_batch refuses recycle_bin batches], no screenshots, scan path needs
   typing [quick-pick buttons added this branch]). Fixes await GG's prioritization.
 
+### 2026-07-23 — Launch fixes P0-P2 merged; CI-blocking ino-overflow bug found and fixed; AI-UI pass in flight
+- `fix/launch-readiness` merged to main: version unified to 1.1.0 + consistency gate test
+  (pyproject/iss/README/FastAPI app version — the v1.0.0 release had shipped metadata saying
+  0.1.0); PRIVACY.md (code-verified zero-telemetry claims + the [ai]-extra model-download
+  footnote); user-first README (Windows-only at the download link, terminal-free walkthrough,
+  restore = Windows Recycle Bin as primary path); uninstaller data-removal prompt (default No,
+  never on silent); dashboard footer version + static check-for-updates link; SUPPORT.md;
+  CONTRIBUTING.md; docs/index.html landing page. GitHub Pages enabled (main:/docs) →
+  https://gaurav-gandhi-2411.github.io/reclaim/. Screenshots deferred until AI-UI merges.
+- **CI was red on every push to the public repo** (including the very first) — root cause a
+  real product bug, not the new work: unsigned-64 `st_ino` on GitHub's Windows runners
+  overflowed SQLite's signed INTEGER and aborted the whole scan (`fix/sqlite-ino-overflow`,
+  merged: symmetric wrap/unwrap at the DB boundary, boundary tests at 2**63/2**64-1).
+  Lesson recorded honestly: feat/launch-ux was merged before its push-triggered CI had ever
+  run green — the failure predated the branch, but merge-on-unverified-CI is the exact rule
+  70a gate 2 exists for; watch CI on the public repo from now on.
+- **Follow-up found, not yet fixed**: 3 end-to-end evals (`test_dedup_pipeline_end_to_end`,
+  `test_candidate_generation_end_to_end`, `test_executor_end_to_end_real_scan_apply_restore`)
+  are environment-sensitive to the safe-mode default — they fail wherever no
+  data/mode_log.jsonl exists (they predate ADR-0023 and implicitly expect power-mode tiering).
+  Not in any CI job, so not CI-blocking; they should explicitly seed a power-mode log the way
+  tests/test_api.py::_make_app does.
+- feat/ai-ui (ADR-0025 + wiring reclaim.ai.presentation into the dashboard) running in an
+  isolated worktree; branch-only, unmerged, report pending.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
