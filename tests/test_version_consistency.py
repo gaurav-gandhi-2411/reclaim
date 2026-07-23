@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-"""Version-consistency gate.
-
-The v1.0.0 release shipped an installer whose metadata said 0.1.0 — pyproject.toml, the Inno
-Setup script, and the README's documented Nuitka command had all drifted from the release tag.
-This test makes that class of mismatch a CI failure instead of a launch-audit finding: every
-place a version string is declared must agree with pyproject.toml's, which is the single source
-of truth. (The git tag itself can't be checked here — it doesn't exist until release time; the
-release checklist in packaging/reclaim.iss's header comment covers that step.)
-"""
-
+# Version-consistency gate.
+#
+# The v1.0.0 release shipped an installer whose metadata said 0.1.0 — pyproject.toml, the Inno
+# Setup script, and the README's documented Nuitka command had all drifted from the release tag.
+# This test makes that class of mismatch a CI failure instead of a launch-audit finding: every
+# place a version string is declared must agree with pyproject.toml's, which is the single source
+# of truth. (The git tag itself can't be checked here — it doesn't exist until release time; the
+# release checklist in packaging/reclaim.iss's header comment covers that step.)
 import re
 import tomllib
 from pathlib import Path

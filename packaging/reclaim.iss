@@ -59,3 +59,42 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent unchecked
+
+[Code]
+// Reclaim's data (scan index, quarantine vault, mode/apply logs — see the [Icons] comment above
+// for why these are relative paths under {app}\data) survives a normal uninstall by default: the
+// [Files] section above only ever lists the Nuitka --standalone build output, never {app}\data,
+// so Inno Setup's own file-removal pass never touches it. This handler adds the explicit,
+// opt-in "also delete my data" step GG's uninstall spec calls for, asked only after the program
+// files are already gone (usPostUninstall) so a Cancel/No leaves a fully-working, reinstallable
+// data folder behind.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DataDir: String;
+  Response: Integer;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    // A silent uninstall (/VERYSILENT or /SILENT) has no one to answer a MsgBox — asking would
+    // either hang or auto-answer unpredictably, so silent runs always preserve data/ instead,
+    // matching this installer's "leave data behind by default" posture end to end.
+    if UninstallSilent then
+      Exit;
+
+    DataDir := ExpandConstant('{app}\data');
+    if DirExists(DataDir) then
+    begin
+      Response := MsgBox(
+        'Reclaim leaves its data folder behind by default (scan history, the quarantine vault, ' +
+        'and logs) so you can reinstall without losing anything -- including any files still ' +
+        'held in Reclaim''s vault that you have not restored yet.' + #13#10 + #13#10 +
+        'Also delete this data folder now?' + #13#10 + #13#10 +
+        'Choose No if you are not sure, or if you still have files in the vault you might want ' +
+        'back.',
+        mbConfirmation, MB_YESNO or MB_DEFBUTTON2
+      );
+      if Response = IDYES then
+        DelTree(DataDir, True, True, True);
+    end;
+  end;
+end;
