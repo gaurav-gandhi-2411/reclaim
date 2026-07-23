@@ -385,6 +385,32 @@ class QuarantineListResponse(BaseModel):
     batches: list[QuarantineBatchOut]
 
 
+class RecoveryItemOut(BaseModel):
+    """One crash-orphaned intent (ADR-0026), classified against real on-disk state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: str
+    batch_id: str
+    original_path: str
+    outcome: str
+    detail: str
+
+
+class RecoveryStatusResponse(BaseModel):
+    """Read-only preview (`reclaim.recovery.compute_reconciliation`) — never writes anything;
+    a genuine reconcile still requires `reclaim recover --apply` from the CLI. `needs_review`
+    items are the ones worth a banner; `completed`/`aborted` items are informational (they'll
+    resolve themselves the next time anything runs `reclaim recover --apply`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scanned_intents: int
+    already_resolved: int
+    pending: list[RecoveryItemOut]
+    has_needs_review: bool
+
+
 class RestoreItemOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

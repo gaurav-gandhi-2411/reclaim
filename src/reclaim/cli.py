@@ -279,6 +279,36 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mode_subparsers.add_parser("safe", help="Switch back to safe mode. No confirmation needed.")
 
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Detect and reconcile crash-orphaned quarantine operations — an apply/restore/"
+        "purge interrupted mid-item by a kill or crash before its completion was logged "
+        "(ADR-0026). Dry-run by default (reports only); pass --apply to write the reconciling "
+        "manifest records. Never moves or deletes a file — only classifies what already "
+        "happened by inspecting real on-disk state and appends the manifest record that "
+        "reflects it.",
+    )
+    recover_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the reconciling manifest records. Without this flag, nothing is written — "
+        "a full report of what would be reconciled is printed instead (dry-run is the default).",
+    )
+    recover_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+    recover_parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine) — used to verify a "
+        "recorded vault_path actually resolves inside it before trusting it (same "
+        "zip-slip-equivalent guard 'reclaim undo' already applies).",
+    )
+
     serve_parser = subparsers.add_parser(
         "serve",
         help="Run the localhost-only FastAPI dashboard (scan/review/apply/undo in a browser). "
@@ -746,6 +776,31 @@ def _run_purge(args: argparse.Namespace) -> int:
     return 0 if report.files_failed == 0 else 1
 
 
+def _run_recover(args: argparse.Namespace) -> int:
+    from reclaim.recovery import compute_reconciliation, reconcile_manifest
+
+    fn = reconcile_manifest if args.apply else compute_reconciliation
+    report = fn(manifest_path=args.manifest, vault_dir=args.vault_dir)
+
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    print(  # noqa: T201
+        f"reclaim recover [{mode}] scanned_intents={report.scanned_intents} "
+        f"already_resolved={report.already_resolved} reconciled={len(report.reconciled)}"
+    )
+    for item in report.reconciled:
+        print(  # noqa: T201
+            f"  {item.outcome.upper()}: {item.operation} {item.original_path} — {item.detail}"
+        )
+    needs_review = [item for item in report.reconciled if item.outcome == "needs_review"]
+    if needs_review:
+        print(  # noqa: T201
+            f"reclaim recover: {len(needs_review)} item(s) need manual review — see NEEDS_REVIEW "
+            "lines above",
+            file=sys.stderr,
+        )
+    return 0 if not needs_review else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -759,6 +814,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_purge(args)
     if args.command == "mode":
         return _run_mode(args)
+    if args.command == "recover":
+        return _run_recover(args)
     if args.command == "serve":
         return _run_serve(args)
     if args.command == "dashboard":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,8 @@ from reclaim.executor import (
     QuarantineManifestEntry,
     SafeModeViolationError,
     SafetyInvariantError,
-    append_manifest_entries,
+    _append_and_sync,
+    _open_manifest_for_sync,
     fold_latest_manifest_entries,
     long_path,
     rmtree_clear_readonly,
@@ -269,29 +271,91 @@ def purge_expired(
     )
 
     items: list[PurgeItemResult] = []
-    updated_entries: list[QuarantineManifestEntry] = []
-    for entry, stale in eligible:
-        if entry.vault_path is None:
-            # Unreachable in practice: `_purge_eligible_entries` only ever selects
-            # `method="vault"` entries, which always carry a `vault_path`. Guards mypy's None
-            # narrowing and, if manifest data were ever corrupted, fails loudly per-item rather
-            # than crashing the whole purge run.
-            items.append(
-                PurgeItemResult(
-                    original_path=entry.original_path,
-                    vault_path=None,
-                    category=entry.category,
-                    category_group=entry.category_group,
-                    size_bytes=entry.size_bytes,
-                    succeeded=False,
-                    error="manifest entry has method=vault but no vault_path recorded",
-                    stale=stale,
+    # ADR-0026: one manifest handle held open for the whole run, only if apply=True and there's
+    # at least one entry that might attempt a delete — mirrors executor.py's approach.
+    manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if apply and eligible else None
+    try:
+        for entry, stale in eligible:
+            if entry.vault_path is None:
+                # Unreachable in practice: `_purge_eligible_entries` only ever selects
+                # `method="vault"` entries, which always carry a `vault_path`. Guards mypy's
+                # None narrowing and, if manifest data were ever corrupted, fails loudly
+                # per-item rather than crashing the whole purge run.
+                items.append(
+                    PurgeItemResult(
+                        original_path=entry.original_path,
+                        vault_path=None,
+                        category=entry.category,
+                        category_group=entry.category_group,
+                        size_bytes=entry.size_bytes,
+                        succeeded=False,
+                        error="manifest entry has method=vault but no vault_path recorded",
+                        stale=stale,
+                    )
                 )
-            )
-            continue
-        vault_path = entry.vault_path
+                continue
+            vault_path = entry.vault_path
 
-        if not apply:
+            if not apply:
+                items.append(
+                    PurgeItemResult(
+                        original_path=entry.original_path,
+                        vault_path=vault_path,
+                        category=entry.category,
+                        category_group=entry.category_group,
+                        size_bytes=entry.size_bytes,
+                        succeeded=True,
+                        error=None,
+                        stale=stale,
+                    )
+                )
+                continue
+
+            if manifest_fh is None:  # unreachable: opened above whenever apply=True and eligible
+                raise RuntimeError("purge_expired: manifest file handle unexpectedly not open")
+
+            # ADR-0026, phase 1: log the purge intent, fsynced, before deleting anything. A kill
+            # here leaves an intent whose source (vault_path) is untouched — reconciled as
+            # "aborted" (the delete never executed, entry stays `purged=False`).
+            intent_entry = entry.model_copy(
+                update={"phase": "intent", "intent_id": uuid.uuid4().hex, "operation": "purge"}
+            )
+            _append_and_sync(manifest_fh, intent_entry)
+
+            try:
+                if entry.is_dir:
+                    shutil.rmtree(long_path(vault_path), onexc=rmtree_clear_readonly)
+                else:
+                    unlink_clear_readonly(long_path(vault_path))
+            except OSError as exc:
+                logger.warning("purge.item_failed", path=str(vault_path), error=str(exc))
+                _append_and_sync(
+                    manifest_fh, intent_entry.model_copy(update={"phase": "aborted"})
+                )
+                items.append(
+                    PurgeItemResult(
+                        original_path=entry.original_path,
+                        vault_path=vault_path,
+                        category=entry.category,
+                        category_group=entry.category_group,
+                        size_bytes=entry.size_bytes,
+                        succeeded=False,
+                        error=str(exc),
+                        stale=stale,
+                    )
+                )
+                continue
+
+            # ADR-0026, phase 2: the vault copy is now permanently gone — log it done, fsynced.
+            # A kill between the two `_append_and_sync` calls above leaves an intent whose
+            # source (vault_path) is gone with no target to check — reconciled as "completed"
+            # (purged=True is synthesized by `reclaim.recovery`).
+            _append_and_sync(
+                manifest_fh,
+                intent_entry.model_copy(
+                    update={"phase": "done", "purged": True, "purged_at": now_ts}
+                ),
+            )
             items.append(
                 PurgeItemResult(
                     original_path=entry.original_path,
@@ -304,45 +368,9 @@ def purge_expired(
                     stale=stale,
                 )
             )
-            continue
-
-        try:
-            if entry.is_dir:
-                shutil.rmtree(long_path(vault_path), onexc=rmtree_clear_readonly)
-            else:
-                unlink_clear_readonly(long_path(vault_path))
-        except OSError as exc:
-            logger.warning("purge.item_failed", path=str(vault_path), error=str(exc))
-            items.append(
-                PurgeItemResult(
-                    original_path=entry.original_path,
-                    vault_path=vault_path,
-                    category=entry.category,
-                    category_group=entry.category_group,
-                    size_bytes=entry.size_bytes,
-                    succeeded=False,
-                    error=str(exc),
-                    stale=stale,
-                )
-            )
-            continue
-
-        items.append(
-            PurgeItemResult(
-                original_path=entry.original_path,
-                vault_path=vault_path,
-                category=entry.category,
-                category_group=entry.category_group,
-                size_bytes=entry.size_bytes,
-                succeeded=True,
-                error=None,
-                stale=stale,
-            )
-        )
-        updated_entries.append(entry.model_copy(update={"purged": True, "purged_at": now_ts}))
-
-    if updated_entries:
-        append_manifest_entries(resolved_manifest_path, updated_entries)
+    finally:
+        if manifest_fh is not None:
+            manifest_fh.close()
 
     disk_free_after = (
         _measure_disk_free(_vault_disk_usage_anchor(resolved_vault_dir)) if apply else None

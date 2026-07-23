@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TextIO
 
 import send2trash
 import structlog
@@ -114,14 +114,32 @@ class RestoreIntegrityError(RuntimeError):
     """
 
 
+ManifestPhase = Literal["intent", "done", "aborted", "needs_review"]
+ManifestOperation = Literal["apply", "restore", "purge"]
+
+
 class QuarantineManifestEntry(BaseModel):
     """One line in the append-only `data/quarantine/manifest.jsonl` log.
 
     The manifest is an event log, not a snapshot table: `apply_batch` appends one entry per
     quarantined item, and `restore_batch`/`purge_expired` append a second entry per updated
     item (same `batch_id`/`original_path` key, `restored`/`purged` fields set) rather than
-    rewriting history in place. Readers fold to "current state" by taking the last entry per
-    `(batch_id, original_path)` key — see `fold_latest_manifest_entries`.
+    rewriting history in place. Readers fold to "current state" by taking the last `phase="done"`
+    entry per `(batch_id, original_path)` key — see `fold_latest_manifest_entries`.
+
+    ADR-0026 (crash-safe two-phase manifest): every filesystem-mutating action (`apply_batch`'s
+    quarantine, `restore_batch`'s restore, `purge_expired`'s permanent delete) writes an
+    `phase="intent"` entry (fsynced) BEFORE touching the filesystem, then a `phase="done"` entry
+    (fsynced) after — or `phase="aborted"` if the action raised and was caught. `intent_id` pairs
+    an intent with its eventual done/aborted/needs_review entry across the two writes (never
+    reused across different operations, even for the same `(batch_id, original_path)` key).
+    `phase` defaults to `"done"` and `intent_id`/`operation` are optional, so every manifest line
+    written before this ADR (which had no intent/done split at all — the whole batch's action
+    already completed by the time anything was written) parses and folds exactly as before: an
+    old-format line has no way to be an orphaned intent, so defaulting it to `"done"` is not an
+    approximation, it's the literal truth for that line. A kill between the intent write and the
+    done/aborted write leaves an intent with no matching resolution — `reclaim.recovery` finds
+    these by replaying the raw manifest and reconciles each one against real on-disk state.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -156,6 +174,12 @@ class QuarantineManifestEntry(BaseModel):
     # deleted past its retention window — same append-only-event-log pattern as `restored`.
     purged: bool = False
     purged_at: float | None = None
+    # ADR-0026: see the class docstring. `phase="done"` is the only phase that participates in
+    # `fold_latest_manifest_entries`'s "current state" view (see that function) — intent/aborted/
+    # needs_review entries are visible only to `reclaim.recovery`'s raw-manifest replay.
+    phase: ManifestPhase = "done"
+    intent_id: str | None = None
+    operation: ManifestOperation = "apply"
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +272,15 @@ def _compute_vault_path(vault_dir: Path, batch_id: str, original_path: Path) -> 
     simpler and sufficient.
     """
     return vault_dir / batch_id / f"{uuid.uuid4().hex}_{original_path.name}"
+
+
+def _require_vault_path(vault_path: Path | None) -> Path:
+    """Narrows `vault_path` for the `method=="vault"` branch of `apply_batch`'s per-item loop,
+    where it is always already computed — unreachable in practice, but a real `raise` (not an
+    `assert`, which strips under `-O`) rather than trusting the None-check silently."""
+    if vault_path is None:
+        raise RuntimeError("apply_batch: vault method with no vault_path computed")
+    return vault_path
 
 
 def _disk_usage_anchor(vault_dir: Path, candidates: Sequence[Candidate]) -> Path | None:
@@ -472,13 +505,36 @@ def _category_breakdown(items: Sequence[ItemApplyResult]) -> dict[str, CategoryB
 def append_manifest_entries(
     manifest_path: Path, entries: Iterable[QuarantineManifestEntry]
 ) -> None:
-    """Public: reused by `purge.py`, which appends `purged=True` update entries the same
-    append-only way `apply_batch`/`restore_batch` already append `restored=True` ones."""
+    """Public: reused by `reclaim.recovery`'s reconciliation writes and by any remaining
+    non-per-item batch append. Does NOT fsync — callers on the crash-safety-critical path
+    (`apply_batch`/`restore_batch`/`purge_expired`'s per-item loops) use `_open_manifest_for_sync`
+    and `_append_and_sync` instead; see ADR-0026."""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with manifest_path.open("a", encoding="utf-8") as fh:
         for entry in entries:
             fh.write(entry.model_dump_json())
             fh.write("\n")
+
+
+def _open_manifest_for_sync(manifest_path: Path) -> TextIO:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    return manifest_path.open("a", encoding="utf-8")
+
+
+def _append_and_sync(fh: TextIO, entry: QuarantineManifestEntry) -> None:
+    """Writes one manifest line and forces it to durable storage before returning (ADR-0026).
+
+    `flush()` alone only moves the write from Python's buffer into the OS page cache — still
+    lost on a power failure (though survives a plain process kill, since the OS keeps the page
+    cache). `os.fsync(fh.fileno())` additionally forces the OS to write the page cache to the
+    physical device, which is what makes the intent/done ordering below meaningful across a
+    real crash, not just a caught exception. This is the per-item cost measured and reported in
+    `docs/architecture/adr/0026-crash-safe-manifest.md` — see that ADR before changing this.
+    """
+    fh.write(entry.model_dump_json())
+    fh.write("\n")
+    fh.flush()
+    os.fsync(fh.fileno())
 
 
 def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
@@ -497,12 +553,23 @@ def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
 
 def fold_latest_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
     """Folds the append-only event log to current state per `(batch_id, original_path)` — a
-    later line (e.g. a restore or purge update) supersedes an earlier one for the same key.
-    Public: `purge_expired` reuses this exact fold rule across the *whole* manifest (every
-    batch), not just one `batch_id` — see `_latest_entries_for_batch` for the batch-scoped use.
+    later `phase="done"` line (e.g. a restore or purge update) supersedes an earlier one for the
+    same key. Public: `purge_expired` reuses this exact fold rule across the *whole* manifest
+    (every batch), not just one `batch_id` — see `_latest_entries_for_batch` for the
+    batch-scoped use.
+
+    ADR-0026: entries with `phase != "done"` (an intent not yet resolved, an aborted attempt, or
+    an item flagged `needs_review` by `reclaim.recovery`) never enter this fold at all — an
+    unresolved intent must never be mistaken for a completed quarantine/restore/purge just
+    because it's the last line written for its key. This is what makes an orphaned intent
+    invisible to `purge_expired`/`restore_batch`/the dashboard until `reclaim recover` reconciles
+    it (or confirms it needs manual review) — silently absent is the safe failure mode here,
+    never silently trusted.
     """
     latest: dict[tuple[str, str], QuarantineManifestEntry] = {}
     for entry in read_manifest_entries(manifest_path):
+        if entry.phase != "done":
+            continue
         latest[(entry.batch_id, entry.original_path.as_posix())] = entry
     return list(latest.values())
 
@@ -724,92 +791,54 @@ def apply_batch(
     )
 
     items: list[ItemApplyResult] = []
-    manifest_entries: list[QuarantineManifestEntry] = []
-    for candidate in candidates:
-        item_method, item_retention_days = _effective_method_and_retention_days(
-            candidate,
-            method,
-            mode=mode,
-            size_guard_bytes=direct_delete_size_guard_bytes,
-            size_guard_retention_days=direct_delete_size_guard_retention_days,
-        )
-        item_retention_until = (
-            now_ts + item_retention_days * _SECONDS_PER_DAY
-            if item_retention_days is not None
-            else None
-        )
-
-        if not apply:
+    # ADR-0026: one manifest file handle held open for the whole batch (not re-opened per item)
+    # so the only added per-item filesystem cost is the fsync itself, not repeated `open()`
+    # syscalls. `None` in dry-run — dry-run makes zero filesystem calls of any kind, manifest
+    # writes included, same guarantee as before this change.
+    manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if apply else None
+    try:
+        for candidate in candidates:
+            item_method, item_retention_days = _effective_method_and_retention_days(
+                candidate,
+                method,
+                mode=mode,
+                size_guard_bytes=direct_delete_size_guard_bytes,
+                size_guard_retention_days=direct_delete_size_guard_retention_days,
+            )
+            item_retention_until = (
+                now_ts + item_retention_days * _SECONDS_PER_DAY
+                if item_retention_days is not None
+                else None
+            )
             vault_path = (
                 _compute_vault_path(resolved_vault_dir, batch_id, candidate.path)
                 if item_method == "vault"
                 else None
             )
-            items.append(
-                ItemApplyResult(
-                    path=candidate.path,
-                    category=candidate.category,
-                    category_group=candidate.category_group,
-                    size_bytes=candidate.size_bytes,
-                    tier=candidate.tier,
-                    method=item_method,
-                    succeeded=True,
-                    error=None,
-                    vault_path=vault_path,
-                )
-            )
-            continue
 
-        try:
-            if item_method == "vault":
-                vault_path = _compute_vault_path(resolved_vault_dir, batch_id, candidate.path)
-                _atomic_move(candidate.path, vault_path, is_dir=candidate.is_dir)
-            elif item_method == "recycle_bin":
-                send2trash.send2trash(str(candidate.path))
-                vault_path = None
-            else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
-                if candidate.is_dir:
-                    shutil.rmtree(long_path(candidate.path), onexc=rmtree_clear_readonly)
-                else:
-                    unlink_clear_readonly(long_path(candidate.path))
-                vault_path = None
-        except Exception as exc:  # broad on purpose: isolates one item's failure from the batch
-            logger.warning(
-                "executor.apply_item_failed",
-                path=str(candidate.path),
-                method=item_method,
-                error=str(exc),
-            )
-            items.append(
-                ItemApplyResult(
-                    path=candidate.path,
-                    category=candidate.category,
-                    category_group=candidate.category_group,
-                    size_bytes=candidate.size_bytes,
-                    tier=candidate.tier,
-                    method=item_method,
-                    succeeded=False,
-                    error=str(exc),
-                    vault_path=None,
+            if not apply:
+                items.append(
+                    ItemApplyResult(
+                        path=candidate.path,
+                        category=candidate.category,
+                        category_group=candidate.category_group,
+                        size_bytes=candidate.size_bytes,
+                        tier=candidate.tier,
+                        method=item_method,
+                        succeeded=True,
+                        error=None,
+                        vault_path=vault_path,
+                    )
                 )
-            )
-            continue
+                continue
 
-        items.append(
-            ItemApplyResult(
-                path=candidate.path,
-                category=candidate.category,
-                category_group=candidate.category_group,
-                size_bytes=candidate.size_bytes,
-                tier=candidate.tier,
-                method=item_method,
-                succeeded=True,
-                error=None,
-                vault_path=vault_path,
-            )
-        )
-        manifest_entries.append(
-            QuarantineManifestEntry(
+            if manifest_fh is None:  # unreachable: opened above whenever apply=True
+                raise RuntimeError("apply_batch: manifest file handle unexpectedly not open")
+
+            # ADR-0026, phase 1: log the intent, fsynced, BEFORE any filesystem mutation. A kill
+            # here leaves an intent whose source is untouched — `reclaim.recovery` reconciles it
+            # as "aborted" (source still present, action never executed).
+            intent_entry = QuarantineManifestEntry(
                 batch_id=batch_id,
                 original_path=candidate.path,
                 size_bytes=candidate.size_bytes,
@@ -824,11 +853,69 @@ def apply_batch(
                 retention_days=item_retention_days,
                 quarantined_at=now_ts,
                 retention_until=item_retention_until,
+                phase="intent",
+                intent_id=uuid.uuid4().hex,
+                operation="apply",
             )
-        )
+            _append_and_sync(manifest_fh, intent_entry)
 
-    if manifest_entries:
-        append_manifest_entries(resolved_manifest_path, manifest_entries)
+            try:
+                if item_method == "vault":
+                    resolved_vault_path = _require_vault_path(vault_path)
+                    _atomic_move(candidate.path, resolved_vault_path, is_dir=candidate.is_dir)
+                elif item_method == "recycle_bin":
+                    send2trash.send2trash(str(candidate.path))
+                else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
+                    if candidate.is_dir:
+                        shutil.rmtree(long_path(candidate.path), onexc=rmtree_clear_readonly)
+                    else:
+                        unlink_clear_readonly(long_path(candidate.path))
+            except Exception as exc:  # broad: isolates one item's failure from the batch
+                logger.warning(
+                    "executor.apply_item_failed",
+                    path=str(candidate.path),
+                    method=item_method,
+                    error=str(exc),
+                )
+                # ADR-0026, phase 2 (failure path): close out the intent explicitly rather than
+                # leaving it dangling — a caught, handled failure is not a crash, so there is
+                # nothing for `reclaim.recovery` to reconcile about this item.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                items.append(
+                    ItemApplyResult(
+                        path=candidate.path,
+                        category=candidate.category,
+                        category_group=candidate.category_group,
+                        size_bytes=candidate.size_bytes,
+                        tier=candidate.tier,
+                        method=item_method,
+                        succeeded=False,
+                        error=str(exc),
+                        vault_path=None,
+                    )
+                )
+                continue
+
+            # ADR-0026, phase 2 (success path): the action is now real on disk; log it done,
+            # fsynced. A kill between the two `_append_and_sync` calls above leaves an intent
+            # whose target now exists — `reclaim.recovery` reconciles it as "completed".
+            _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "done"}))
+            items.append(
+                ItemApplyResult(
+                    path=candidate.path,
+                    category=candidate.category,
+                    category_group=candidate.category_group,
+                    size_bytes=candidate.size_bytes,
+                    tier=candidate.tier,
+                    method=item_method,
+                    succeeded=True,
+                    error=None,
+                    vault_path=vault_path,
+                )
+            )
+    finally:
+        if manifest_fh is not None:
+            manifest_fh.close()
 
     disk_free_after = (
         _measure_disk_free(_disk_usage_anchor(resolved_vault_dir, candidates)) if apply else None
@@ -970,7 +1057,6 @@ def restore_batch(
             )
 
     items: list[RestoreItemResult] = []
-    updated_entries: list[QuarantineManifestEntry] = []
 
     for entry in direct_delete_entries:
         items.append(
@@ -1001,81 +1087,109 @@ def restore_batch(
             )
         )
 
-    for entry in vault_entries:
-        if entry.restored:
+    # ADR-0026: opened once for the whole restore call, only if there's a vault entry that might
+    # actually attempt a move — mirrors `apply_batch`'s single-handle-per-call approach.
+    manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if vault_entries else None
+    try:
+        for entry in vault_entries:
+            if entry.restored:
+                items.append(
+                    RestoreItemResult(
+                        original_path=entry.original_path,
+                        size_bytes=entry.size_bytes,
+                        succeeded=True,
+                        already_restored=True,
+                        error=None,
+                    )
+                )
+                continue
+
+            if entry.vault_path is None:
+                # Unreachable in practice: this loop only ever iterates `vault_entries`, which by
+                # construction always carries a `vault_path` (set by `apply_batch` whenever
+                # `method="vault"`). Guards mypy's None narrowing and, if manifest data were ever
+                # corrupted, fails loudly per-item rather than crashing the whole restore.
+                items.append(
+                    RestoreItemResult(
+                        original_path=entry.original_path,
+                        size_bytes=entry.size_bytes,
+                        succeeded=False,
+                        already_restored=False,
+                        error="manifest entry has method=vault but no vault_path recorded",
+                    )
+                )
+                continue
+
+            if os.path.exists(long_path(entry.original_path)):  # noqa: PTH110 -- \\?\, not Path
+                items.append(
+                    RestoreItemResult(
+                        original_path=entry.original_path,
+                        size_bytes=entry.size_bytes,
+                        succeeded=False,
+                        already_restored=False,
+                        error=(
+                            "destination already exists, refusing to overwrite: "
+                            f"{entry.original_path}"
+                        ),
+                    )
+                )
+                continue
+
+            if manifest_fh is None:  # unreachable: opened above whenever vault_entries non-empty
+                raise RuntimeError("restore_batch: manifest file handle unexpectedly not open")
+
+            # ADR-0026, phase 1: log the restore intent, fsynced, before moving anything. A kill
+            # here leaves an intent whose source (vault_path) is untouched — reconciled as
+            # "aborted" (the restore never executed, entry stays `restored=False`).
+            intent_entry = entry.model_copy(
+                update={"phase": "intent", "intent_id": uuid.uuid4().hex, "operation": "restore"}
+            )
+            _append_and_sync(manifest_fh, intent_entry)
+
+            try:
+                _atomic_move(entry.vault_path, entry.original_path, is_dir=entry.is_dir)
+            except (OSError, VaultIntegrityError) as exc:
+                logger.warning(
+                    "executor.restore_item_failed",
+                    path=str(entry.original_path),
+                    error=str(exc),
+                )
+                _append_and_sync(
+                    manifest_fh, intent_entry.model_copy(update={"phase": "aborted"})
+                )
+                items.append(
+                    RestoreItemResult(
+                        original_path=entry.original_path,
+                        size_bytes=entry.size_bytes,
+                        succeeded=False,
+                        already_restored=False,
+                        error=str(exc),
+                    )
+                )
+                continue
+
+            # ADR-0026, phase 2: the file is now back at original_path — log it done, fsynced.
+            # A kill between the two `_append_and_sync` calls above leaves an intent whose
+            # target (original_path) now exists and whose source (vault_path) is gone —
+            # reconciled as "completed" (restored=True is synthesized by `reclaim.recovery`).
+            _append_and_sync(
+                manifest_fh,
+                intent_entry.model_copy(
+                    update={"phase": "done", "restored": True, "restored_at": now_ts}
+                ),
+            )
             items.append(
                 RestoreItemResult(
                     original_path=entry.original_path,
                     size_bytes=entry.size_bytes,
                     succeeded=True,
-                    already_restored=True,
+                    already_restored=False,
                     error=None,
                 )
             )
-            continue
-
-        if entry.vault_path is None:
-            # Unreachable in practice: this loop only ever iterates `vault_entries`, which by
-            # construction always carries a `vault_path` (set by `apply_batch` whenever
-            # `method="vault"`). Guards mypy's None narrowing and, if manifest data were ever
-            # corrupted, fails loudly per-item rather than crashing the whole restore.
-            items.append(
-                RestoreItemResult(
-                    original_path=entry.original_path,
-                    size_bytes=entry.size_bytes,
-                    succeeded=False,
-                    already_restored=False,
-                    error="manifest entry has method=vault but no vault_path recorded",
-                )
-            )
-            continue
-
-        if os.path.exists(long_path(entry.original_path)):  # noqa: PTH110 -- \\?\ str, not Path
-            items.append(
-                RestoreItemResult(
-                    original_path=entry.original_path,
-                    size_bytes=entry.size_bytes,
-                    succeeded=False,
-                    already_restored=False,
-                    error=(
-                        f"destination already exists, refusing to overwrite: {entry.original_path}"
-                    ),
-                )
-            )
-            continue
-
-        try:
-            _atomic_move(entry.vault_path, entry.original_path, is_dir=entry.is_dir)
-        except (OSError, VaultIntegrityError) as exc:
-            logger.warning(
-                "executor.restore_item_failed",
-                path=str(entry.original_path),
-                error=str(exc),
-            )
-            items.append(
-                RestoreItemResult(
-                    original_path=entry.original_path,
-                    size_bytes=entry.size_bytes,
-                    succeeded=False,
-                    already_restored=False,
-                    error=str(exc),
-                )
-            )
-            continue
-
-        items.append(
-            RestoreItemResult(
-                original_path=entry.original_path,
-                size_bytes=entry.size_bytes,
-                succeeded=True,
-                already_restored=False,
-                error=None,
-            )
-        )
-        updated_entries.append(entry.model_copy(update={"restored": True, "restored_at": now_ts}))
-
-    if updated_entries:
-        append_manifest_entries(resolved_manifest_path, updated_entries)
+    finally:
+        if manifest_fh is not None:
+            manifest_fh.close()
 
     succeeded_items = [item for item in items if item.succeeded]
     unsupported_items = [item for item in items if item.restore_unsupported]

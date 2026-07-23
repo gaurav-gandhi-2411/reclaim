@@ -156,6 +156,21 @@ button {
 
 /* --- Scan bar -------------------------------------------------------------------------------- */
 
+.rc-recovery-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rc-space-3);
+  padding: var(--rc-space-3) var(--rc-space-5);
+  background: color-mix(in srgb, var(--rc-warning) 14%, var(--rc-surface));
+  border-bottom: 1px solid var(--rc-warning);
+  color: var(--rc-text);
+}
+
+.rc-recovery-banner p {
+  margin: 0;
+}
+
 .rc-scan-bar {
   display: flex;
   gap: var(--rc-space-2);
