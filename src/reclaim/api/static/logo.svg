@@ -7,8 +7,8 @@
     favicon.svg (kept legible at 16px) and re-drawn with flat rectangles in
     packaging/build_brand_assets.py so the packaged .ico/.bmp/.png brand assets match exactly.
     Literal hex values (not CSS custom properties) for the same standalone-document reason as
-    favicon.svg; these mirror tokens.css's --rc-cat-dev-artifacts / --rc-brand / --rc-bg exactly
-    (light mode), with a prefers-color-scheme override for dark surfaces.
+    favicon.svg; these mirror tokens.css's rc-cat-dev-artifacts, rc-brand, and rc-bg custom
+    properties exactly (light mode), with a prefers-color-scheme override for dark surfaces.
   -->
   <style>
     .rc-clay { fill: #c1512b; }

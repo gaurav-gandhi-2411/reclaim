@@ -134,6 +134,41 @@
     color: var(--rc-accent);
   }
 
+  .rc-gallery {
+    padding: var(--rc-space-6) 0;
+  }
+
+  .rc-gallery h2 {
+    margin: 0 0 var(--rc-space-2);
+  }
+
+  .rc-gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: var(--rc-space-5);
+    margin-top: var(--rc-space-5);
+  }
+
+  .rc-gallery-grid figure {
+    margin: 0;
+    background: var(--rc-surface);
+    border: 1px solid var(--rc-border);
+    border-radius: var(--rc-radius-lg);
+    overflow: hidden;
+  }
+
+  .rc-gallery-grid img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+
+  .rc-gallery-grid figcaption {
+    padding: var(--rc-space-3) var(--rc-space-4);
+    color: var(--rc-text-muted);
+    font-size: 0.95rem;
+  }
+
   .rc-feature p {
     margin: 0;
     color: var(--rc-text-muted);
@@ -207,6 +242,28 @@
             <a href="https://github.com/gaurav-gandhi-2411/reclaim/blob/main/PRIVACY.md">privacy statement</a>.
           </p>
         </article>
+      </section>
+
+      <section class="rc-gallery" aria-labelledby="gallery-heading">
+        <h2 id="gallery-heading">See it in action</h2>
+        <div class="rc-gallery-grid">
+          <figure>
+            <img src="./assets/screenshots/02-overview-quickclean.png" alt="Overview tab with Quick Clean showing a plain-language category and real measured size" loading="lazy" />
+            <figcaption>Plain-language groups, real measured sizes — never a made-up confidence score.</figcaption>
+          </figure>
+          <figure>
+            <img src="./assets/screenshots/04-ai-suggestions.png" alt="AI Suggestions tab showing a document version chain and near-duplicate photos" loading="lazy" />
+            <figcaption>AI suggestions stay recommend-only — a version chain and near-duplicate photos, each with a plain-language reason.</figcaption>
+          </figure>
+          <figure>
+            <img src="./assets/screenshots/06-ai-semantic-browse-only.png" alt="Semantic photo grouping and screenshot burst detection labeled browse only, with no delete affordance" loading="lazy" />
+            <figcaption>Browse-only by construction: no select/delete affordance at all when content might matter.</figcaption>
+          </figure>
+          <figure>
+            <img src="./assets/screenshots/09-quickclean-success.png" alt="Quick Clean success message stating files were moved to the Recycle Bin, not freed" loading="lazy" />
+            <figcaption>Moved vs. freed, never conflated — emptying the Recycle Bin is always a separate, manual step.</figcaption>
+          </figure>
+        </div>
       </section>
 
       <section class="rc-smartscreen" aria-labelledby="smartscreen-heading">
