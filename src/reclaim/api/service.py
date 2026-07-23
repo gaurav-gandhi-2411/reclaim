@@ -23,6 +23,8 @@ from reclaim.api.schemas import (
     FirstRunStatusResponse,
     ItemApplyResultOut,
     ModeStatusResponse,
+    OneClickCleanSummaryResponse,
+    OneClickGroupOut,
     PowerModeRequest,
     QuarantineBatchOut,
     QuarantineItemOut,
@@ -30,11 +32,14 @@ from reclaim.api.schemas import (
     RestoreItemOut,
     RestoreResponse,
     ScanStatusOut,
+    SuggestedScanRootOut,
+    SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapNodeOut,
     TreemapResponse,
     category_label,
     format_bytes,
+    plain_language_category,
 )
 from reclaim.api.state import AppState, ScanStatus
 from reclaim.dedup import (
@@ -84,6 +89,29 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
 
 
 # --- Scan --------------------------------------------------------------------------------
+
+
+def suggested_scan_roots(*, home: Path | None = None) -> SuggestedScanRootsResponse:
+    """Server-resolved default scan-root suggestions (Downloads, home folder) for the dashboard's
+    quick-pick scan buttons — non-technical users can't be expected to type a path, so this
+    fills in the common cases while the free-text `#scan-path` input stays available for
+    advanced use. `home` is injectable for tests; production callers always resolve it fresh
+    (never cached) since this reads real filesystem state, not app state.
+
+    Only ever suggests a folder that demonstrably exists on THIS machine right now — a
+    suggestion whose folder doesn't exist is omitted entirely (not shown disabled), since a
+    profile with no Downloads folder has nothing useful to click there anyway."""
+    resolved_home = home if home is not None else Path.home()
+    candidates = (
+        ("Downloads", resolved_home / "Downloads"),
+        ("Home folder", resolved_home),
+    )
+    roots = [
+        SuggestedScanRootOut(label=label, path=path.as_posix())
+        for label, path in candidates
+        if path.is_dir()
+    ]
+    return SuggestedScanRootsResponse(roots=roots)
 
 
 def to_scan_status_out(status: ScanStatus) -> ScanStatusOut:
@@ -356,6 +384,79 @@ def list_candidates(
         count=len(out),
         total_bytes=total_bytes,
         total_bytes_human=format_bytes(total_bytes),
+    )
+
+
+# One-click clean is scoped to categorically-safe groups ONLY — safe by the rebuild-command
+# definition ADR-0005's `REBUILDABLE_CATEGORY_GROUPS` already establishes for three of these
+# four, plus `crash_dumps` (never useful once the crash they document is resolved). Deliberately
+# excludes `duplicates` (keeps exactly one copy by design — which copy needs eyeballing, not a
+# one-click default), `model_caches` (large, sometimes gated/unrecoverable), `old_installers`/
+# `archive_pairs`/`large_logs` (all still go through per-item review), and every AI suggestion
+# (recommend-only by construction; see evals/test_ai_safety_gate.py) — those all stay in the
+# existing Review Queue's per-item confirmation flow, never auto-selected here.
+_ONE_CLICK_SAFE_CATEGORY_GROUPS: frozenset[str] = frozenset(
+    {"package_caches", "temp_and_browser_caches", "crash_dumps", "dev_artifacts"}
+)
+
+
+def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
+    """Groups the current scan's `_ONE_CLICK_SAFE_CATEGORY_GROUPS` candidates for the
+    dashboard's one-click clean button, in plain language (`plain_language_category`) with the
+    real measured size/count per group.
+
+    This is the SINGLE place that resolves "which categorically-safe items exist right now" to
+    an explicit path list — the dashboard's one-click apply flattens `OneClickGroupOut.paths`
+    across the selected groups and sends that list straight through to the existing
+    `POST /api/apply`'s `paths` field (with `tier="both"`, since safe mode forces every
+    candidate's tier to B — see ADR-0023 guarantee 3 — and the review-queue apply flow already
+    defaults tier to "A"). This is a UI/API presentation grouping only: it never bypasses
+    `apply_selection`'s safe-mode guard (a blanket tier/category-group selection with no
+    explicit `paths` is still refused regardless of what this function returns), and every
+    category/tier/method decision continues to run through the exact same `apply_batch` call
+    every other apply path uses.
+    """
+    with ScanIndex(state.db_path) as index:
+        if not index.has_any_records():
+            return OneClickCleanSummaryResponse(
+                has_scan=False,
+                groups=[],
+                total_bytes=0,
+                total_bytes_human=format_bytes(0),
+                total_file_count=0,
+            )
+        candidates = _all_candidates(index, state)
+
+    grouped: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        if candidate.category_group in _ONE_CLICK_SAFE_CATEGORY_GROUPS:
+            grouped[candidate.category_group].append(candidate)
+
+    groups: list[OneClickGroupOut] = []
+    for group, items in grouped.items():
+        plain_label, safety_reason = plain_language_category(group)
+        total_bytes = sum(item.size_bytes for item in items)
+        groups.append(
+            OneClickGroupOut(
+                category_group=group,
+                plain_label=plain_label,
+                safety_reason=safety_reason,
+                file_count=len(items),
+                total_bytes=total_bytes,
+                total_bytes_human=format_bytes(total_bytes),
+                paths=[item.path.as_posix() for item in items],
+            )
+        )
+    groups.sort(key=lambda g: g.total_bytes, reverse=True)
+
+    total_bytes = sum(g.total_bytes for g in groups)
+    total_file_count = sum(g.file_count for g in groups)
+    return OneClickCleanSummaryResponse(
+        has_scan=True,
+        groups=groups,
+        total_bytes=total_bytes,
+        total_bytes_human=format_bytes(total_bytes),
+        total_file_count=total_file_count,
     )
 
 

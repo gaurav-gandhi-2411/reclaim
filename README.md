@@ -1,3 +1,7 @@
+<p>
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/logo-lockup.png" alt="Reclaim" width="300" />
+</p>
+
 # Reclaim
 
 Rules-first Windows disk-cleanup tool. Deterministic detection for provably-safe categories, a
@@ -168,14 +172,23 @@ Build it yourself:
 
 ```powershell
 uv add --dev nuitka   # already recorded in pyproject.toml's dev group
+uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
 uv run python -m nuitka --standalone --assume-yes-for-downloads `
   --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=0.1.0 `
+  --windows-icon-from-ico=packaging/reclaim.ico `
+  --windows-console-mode=attach `
   --include-package=reclaim --include-package=uvicorn --include-package=fastapi `
   --include-package=starlette `
   --include-data-dir=src/reclaim/api/static=reclaim/api/static `
   --include-data-dir=src/reclaim/api/templates=reclaim/api/templates `
   --output-dir=packaging/build --output-filename=reclaim.exe `
   packaging/entry_point.py
+# --windows-console-mode=attach (not the default `force`, and not `disable`): the Start Menu /
+# desktop shortcut launches `reclaim.exe dashboard` with no console around it, so `attach` means
+# no console window pops up for that path. But `reclaim.exe scan ...` run from an existing
+# terminal still needs its stdout to land in that terminal — `disable` would silently drop it
+# (Nuitka: "doesn't create or use a console at all"), while `attach` uses whatever console
+# already exists and creates none otherwise. Verified against `python -m nuitka --help`.
 
 # Build from a CORE-ONLY environment (no [ai] extra) so nothing AI-related can leak into the
 # installer — Nuitka's static import analysis won't follow reclaim.ai's lazy

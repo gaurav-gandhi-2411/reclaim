@@ -46,6 +46,53 @@ def category_label(category_group: str) -> str:
     return _CATEGORY_LABELS.get(category_group, category_group.replace("_", " ").title())
 
 
+# Plain-language (name, safety-reason) pairs for the one-click clean summary — deliberately
+# distinct from `_CATEGORY_LABELS`/`category_label` above, which stay short and technical for
+# the Overview/Treemap/Review Queue views that predate this. `safety_reason` states WHY
+# something is safe to remove (the rebuild mechanism), never a confidence percentage (house
+# rule: no fabricated confidence anywhere in UI copy) — `None` means no specific reason beyond
+# what `rationale`/`rebuild_instruction` already say per-candidate.
+_PLAIN_LANGUAGE_CATEGORY: dict[str, tuple[str, str | None]] = {
+    "dev_artifacts": (
+        "Rebuildable developer files",
+        "Safe — your build tools recreate these automatically (e.g. npm install).",
+    ),
+    "package_caches": (
+        "Package manager caches",
+        "Safe — re-downloaded automatically when needed.",
+    ),
+    "temp_and_browser_caches": (
+        "Temporary & browser cache files",
+        "Safe — recreated automatically as you browse.",
+    ),
+    "crash_dumps": (
+        "Crash report files",
+        "Safe — only useful for debugging past crashes.",
+    ),
+    "old_installers": (
+        "Old installer downloads",
+        "The installed program keeps working — this is just the setup file.",
+    ),
+    "archive_pairs": (
+        "Extracted archives",
+        "You already extracted this — the archive itself is redundant.",
+    ),
+    "large_logs": ("Large log files", None),
+    "duplicates": ("Duplicate copies", "One copy is always kept."),
+}
+
+
+def plain_language_category(category_group: str) -> tuple[str, str | None]:
+    """Non-technical (name, safety_reason) pair for a `category_group` id, for the one-click
+    clean summary. Falls back to `category_label`'s technical label with no safety reason for
+    any `category_group` this mapping doesn't cover (e.g. `model_caches`, `other`, a future
+    `ai_`-namespaced group) so an unmapped id still renders something legible rather than a
+    raw snake_case id or a crash."""
+    if category_group in _PLAIN_LANGUAGE_CATEGORY:
+        return _PLAIN_LANGUAGE_CATEGORY[category_group]
+    return category_label(category_group), None
+
+
 # --- Scan --------------------------------------------------------------------------------
 
 
@@ -53,6 +100,19 @@ class ScanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
+
+
+class SuggestedScanRootOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    path: str
+
+
+class SuggestedScanRootsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    roots: list[SuggestedScanRootOut]
 
 
 class ScanStatusOut(BaseModel):
@@ -192,6 +252,36 @@ class CandidatesResponse(BaseModel):
     count: int
     total_bytes: int
     total_bytes_human: str
+
+
+# --- One-click clean (categorically-safe groups only) ----------------------------------------
+
+
+class OneClickGroupOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category_group: str
+    plain_label: str
+    safety_reason: str | None
+    file_count: int
+    total_bytes: int
+    total_bytes_human: str
+    # Explicit, enumerated paths for this group — the dashboard's one-click apply sends these
+    # straight through to `/api/apply`'s `paths` field, never a blanket tier/category-group
+    # selection (safe mode's `apply_selection` guard refuses that regardless; see
+    # `service.build_one_click_summary`'s docstring for why this endpoint is the single
+    # source of the group -> paths resolution, not a second copy of it in the frontend).
+    paths: list[str]
+
+
+class OneClickCleanSummaryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    has_scan: bool
+    groups: list[OneClickGroupOut]
+    total_bytes: int
+    total_bytes_human: str
+    total_file_count: int
 
 
 # --- Apply / dry-run -------------------------------------------------------------------------

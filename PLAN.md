@@ -1386,6 +1386,28 @@ retention + restore, now with an explicit `purge` command for expired entries.
   both install profiles, safe-mode boundary proof, packaging choices, residual risks. Do NOT
   merge — GG's explicit call.
 
+### 2026-07-23 — Launch prep: feat/launch-ux (UX + identity), signing report, launch audit
+- Branch `feat/launch-ux` (off main, unmerged): one-click clean flow (plain-language category
+  groups w/ real sizes + WHY-safe rationale, single-confirmation clean scoped to
+  package_caches/temp_and_browser_caches/crash_dumps/dev_artifacts only, explicit-paths apply
+  through the untouched safe-mode guard, moved-vs-freed copy) + `reclaim.ai.presentation`
+  plain-language translation layer (tested, NOT wired — scope finding: the AI layer has never
+  been wired into the live dashboard at all, ADR-0011 posture; wiring is its own future
+  architecture pass) + full brand-asset set (logo/ico/wizard bitmaps/OG/README header,
+  generated reproducibly by packaging/build_brand_assets.py). Two executor passes + one
+  independent verifier pass, all green: 584 tests, safe-mode 18/18, AI 21/21, XSS 3/3, zero
+  diff on executor/safety/mode/config/purge.
+- Signing (report only, NOT purchased): Azure Trusted Signing Basic ~$9.99/mo; GG must
+  personally create the Azure account/subscription, submit individual identity validation
+  (govt ID via Microsoft's partner, takes days), then signing gets wired into Nuitka+Inno.
+  v1.0.1 signed rebuild is BLOCKED on that — cannot sign without the account.
+- Launch audit findings reported (README dev-facing, no landing page, no PRIVACY statement
+  [code-verified: core has zero outbound network; AI extra downloads models on first use —
+  must disclose], no update check, no SUPPORT.md, uninstall leaves data/ undocumented,
+  version-string mismatch 0.1.0 vs v1.0.0 tag, safe-mode restore = Windows Recycle Bin not
+  the dashboard [restore_batch refuses recycle_bin batches], no screenshots, scan path needs
+  typing [quick-pick buttons added this branch]). Fixes await GG's prioritization.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

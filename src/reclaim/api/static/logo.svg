@@ -4,12 +4,11 @@
     terracotta (occupied ground); a chunk in the bottom-right has already been cleared, revealing
     pine green underneath. The small clay block floating top-right, outlined in the sand gap
     color, is the piece mid-lift — still occupied, but on its way out. Same geometry as
-    logo.svg (this is the tab-icon-sized copy); packaging/build_brand_assets.py re-draws it with
-    flat rectangles so the packaged .ico/.bmp/.png brand assets match exactly.
-    Literal hex values (not CSS custom properties) because a favicon is loaded as a standalone
-    document outside the app's stylesheet cascade; these mirror tokens.css's
-    --rc-cat-dev-artifacts / --rc-brand / --rc-bg values exactly (light mode) with a
-    prefers-color-scheme override for the dark-mode tab-bar case.
+    favicon.svg (kept legible at 16px) and re-drawn with flat rectangles in
+    packaging/build_brand_assets.py so the packaged .ico/.bmp/.png brand assets match exactly.
+    Literal hex values (not CSS custom properties) for the same standalone-document reason as
+    favicon.svg; these mirror tokens.css's --rc-cat-dev-artifacts / --rc-brand / --rc-bg exactly
+    (light mode), with a prefers-color-scheme override for dark surfaces.
   -->
   <style>
     .rc-clay { fill: #c1512b; }
@@ -21,10 +20,10 @@
       .rc-lift { fill: #d76b40; stroke: #1c1815; }
     }
   </style>
-  <clipPath id="rc-mark-clip">
+  <clipPath id="rc-logo-clip">
     <rect width="32" height="32" rx="7" />
   </clipPath>
-  <g clip-path="url(#rc-mark-clip)">
+  <g clip-path="url(#rc-logo-clip)">
     <rect class="rc-clay" x="0" y="0" width="32" height="32" />
     <rect class="rc-green" x="11" y="11" width="21" height="21" />
     <rect class="rc-lift" x="15" y="1" width="14" height="12" />

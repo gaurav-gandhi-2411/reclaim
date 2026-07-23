@@ -17,16 +17,21 @@
 
   <header class="rc-header">
     <a class="rc-brand-mark" href="/" aria-label="Reclaim home">
-      <img src="/static/favicon.svg" alt="" width="28" height="28" />
+      <img src="/static/logo.svg" alt="" width="28" height="28" />
       <span class="rc-wordmark">Reclaim</span>
     </a>
     <span class="rc-tagline">Rules-first disk cleanup — nothing deleted without review</span>
     <div class="rc-header-spacer"></div>
     <button id="mode-badge" type="button" class="rc-mode-badge" aria-haspopup="dialog">Loading mode…</button>
+    <button id="how-it-works-btn" type="button" class="rc-btn rc-btn-secondary">How this works</button>
     <button id="theme-toggle" type="button" class="rc-theme-toggle">Switch to dark</button>
   </header>
 
   <form id="scan-form" class="rc-scan-bar" aria-label="Scan a directory">
+    <div class="rc-quick-roots" id="quick-roots" hidden>
+      <span class="rc-quick-roots-label">Quick scan</span>
+      <div id="quick-roots-list" class="rc-quick-roots-list"></div>
+    </div>
     <div class="rc-field">
       <label for="scan-path">Path to scan</label>
       <input id="scan-path" name="path" type="text" placeholder="C:\Users\you\Downloads" required />
@@ -53,6 +58,25 @@
       </div>
       <div id="overview-state"></div>
       <div id="overview-content" hidden>
+        <section class="rc-quick-clean" aria-labelledby="quick-clean-heading">
+          <h2 id="quick-clean-heading">Quick Clean</h2>
+          <p>Categorically safe to remove — your tools recreate these automatically. Everything else stays in the Review Queue for a closer look before anything happens.</p>
+          <div id="quick-clean-state"></div>
+          <div id="quick-clean-content" hidden>
+            <div id="quick-clean-groups" class="rc-quick-clean-groups"></div>
+            <div class="rc-quick-clean-bar">
+              <p>
+                Total: <span id="quick-clean-total-count">0</span> item(s),
+                <span id="quick-clean-total-bytes">0 B</span>
+              </p>
+              <button id="quick-clean-btn" type="button" class="rc-btn rc-btn-primary" disabled>
+                Clean these now
+              </button>
+            </div>
+            <div id="quick-clean-result"></div>
+          </div>
+        </section>
+
         <dl id="stat-row" class="rc-stat-row"></dl>
         <h2>Categories</h2>
         <div id="category-grid" class="rc-card-grid"></div>
@@ -165,6 +189,7 @@
   <!-- Stage 2: shown once, before anything else is usable, until acknowledged. -->
   <div id="first-run-overlay" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="first-run-title" hidden>
     <div class="rc-overlay-panel">
+      <img class="rc-overlay-logo" src="/static/logo.svg" alt="" width="40" height="40" />
       <h2 id="first-run-title">Before you start</h2>
       <p>Reclaim scans your files and suggests things to delete — it never deletes anything without your review.</p>
       <ul>
@@ -176,6 +201,37 @@
       </ul>
       <p><a href="/LICENSE" target="_blank" rel="noopener">License &amp; no-warranty terms</a></p>
       <button id="first-run-acknowledge" type="button" class="rc-btn rc-btn-primary">I understand, continue</button>
+    </div>
+  </div>
+
+  <!-- One-click clean: single confirmation dialog listing the selected groups + total size,
+       required before the explicit-paths apply call fires (see app.js::confirmQuickClean). -->
+  <div id="quick-clean-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="quick-clean-dialog-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="quick-clean-dialog-title">Clean these now?</h2>
+      <p>This sends the exact items below to Reclaim — nothing else. In safe mode everything goes to the Windows Recycle Bin, never a permanent delete.</p>
+      <ul id="quick-clean-dialog-groups"></ul>
+      <p><strong>Total: <span id="quick-clean-dialog-total"></span></strong></p>
+      <div class="rc-dialog-actions">
+        <button id="quick-clean-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="quick-clean-confirm" type="button" class="rc-btn rc-btn-primary">Clean now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- "How this works" — plain-language explanation of the safety model, on demand. -->
+  <div id="how-it-works-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="how-it-works-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="how-it-works-title">How this works</h2>
+      <ul>
+        <li><strong>Deterministic rules do the safe cleaning.</strong> Every category shown here (developer build artifacts, package caches, temp/browser caches, crash reports, and similar) is detected by fixed, inspectable rules — never a probability score — and every rule states the mechanism that makes it safe (e.g. "rebuilds on next <code>npm install</code>").</li>
+        <li><strong>AI only ever suggests, never deletes.</strong> Anything an AI feature surfaces (similar photos, possible document drafts, screenshot bursts) is a recommendation you review — it can never reach the apply step on its own.</li>
+        <li><strong>In safe mode, everything goes to the Recycle Bin.</strong> Nothing is permanently deleted by default. Restore anything from Windows' own Recycle Bin at any time, the same as if you'd deleted it yourself — see the Quarantine &amp; Restore tab for a list of what's been moved.</li>
+        <li>Power mode (opt-in, typed confirmation required) unlocks permanent delete for rebuildable caches and the full toolset — you can switch back to safe mode at any time with no confirmation.</li>
+      </ul>
+      <div class="rc-dialog-actions">
+        <button id="how-it-works-close" type="button" class="rc-btn rc-btn-primary">Close</button>
+      </div>
     </div>
   </div>
 

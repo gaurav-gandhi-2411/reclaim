@@ -232,6 +232,24 @@ button {
   cursor: not-allowed;
 }
 
+.rc-quick-roots {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rc-space-1);
+}
+
+.rc-quick-roots-label {
+  font-size: var(--rc-text-sm);
+  font-weight: 600;
+  color: var(--rc-text-muted);
+}
+
+.rc-quick-roots-list {
+  display: flex;
+  gap: var(--rc-space-2);
+  flex-wrap: wrap;
+}
+
 .rc-scan-status {
   font-size: var(--rc-text-sm);
   color: var(--rc-text-muted);
@@ -360,6 +378,73 @@ button {
 .rc-category-card .rc-meta {
   color: var(--rc-text-muted);
   font-size: var(--rc-text-sm);
+}
+
+/* --- Quick Clean (one-click, categorically-safe groups only) ----------------------------------- */
+
+.rc-quick-clean {
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+  margin-bottom: var(--rc-space-5);
+  background: var(--rc-surface-alt);
+}
+
+.rc-quick-clean h2 {
+  margin: 0 0 var(--rc-space-1);
+  font-size: var(--rc-text-lg);
+}
+
+.rc-quick-clean > p {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+  margin: 0 0 var(--rc-space-3);
+}
+
+.rc-quick-clean-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--rc-space-3);
+  margin-bottom: var(--rc-space-3);
+}
+
+.rc-quick-clean-card {
+  background: var(--rc-surface);
+  border: 1px solid var(--rc-border);
+  border-left: 6px solid var(--rc-cat-other);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-3) var(--rc-space-4);
+}
+
+.rc-quick-clean-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--rc-space-2);
+}
+
+.rc-quick-clean-card-head h3 {
+  margin: 0;
+  font-size: var(--rc-text-base);
+}
+
+.rc-quick-clean-card .rc-bytes {
+  font-size: var(--rc-text-lg);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.rc-quick-clean-card .rc-meta {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+}
+
+.rc-quick-clean-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rc-space-3);
+  flex-wrap: wrap;
 }
 
 /* --- Tier / verdict badges --------------------------------------------------------------------- */
@@ -671,6 +756,11 @@ button {
   width: 100%;
   max-height: 85vh;
   overflow-y: auto;
+}
+
+.rc-overlay-logo {
+  display: block;
+  margin-bottom: var(--rc-space-3);
 }
 
 .rc-overlay-panel h2 {

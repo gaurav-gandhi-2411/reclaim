@@ -382,6 +382,128 @@ def test_duplicate_cluster_review_empty_before_any_scan(tmp_path: Path) -> None:
     assert body == {"has_scan": False, "clusters": []}
 
 
+# --- Stage: launch-UX one-click clean + suggested scan roots ---------------------------------
+
+
+def test_one_click_summary_empty_before_any_scan(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/clean/one-click-summary")
+    assert response.status_code == 200
+    assert response.json() == {
+        "has_scan": False,
+        "groups": [],
+        "total_bytes": 0,
+        "total_bytes_human": "0 B",
+        "total_file_count": 0,
+    }
+
+
+def test_one_click_summary_groups_only_categorically_safe_categories_in_plain_language(
+    tmp_path: Path,
+) -> None:
+    """`_build_tree` also produces a `large_logs` and a `duplicates` candidate — both must be
+    absent here even though they're real Tier A/B candidates elsewhere, since one-click clean is
+    scoped to `dev_artifacts`/`package_caches`/`temp_and_browser_caches`/`crash_dumps` only (see
+    `service._ONE_CLICK_SAFE_CATEGORY_GROUPS`)."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.get("/api/clean/one-click-summary")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["has_scan"] is True
+
+    group_ids = {g["category_group"] for g in body["groups"]}
+    assert group_ids == {"dev_artifacts"}  # large_logs/duplicates never one-click-eligible
+
+    dev_group = next(g for g in body["groups"] if g["category_group"] == "dev_artifacts")
+    assert dev_group["plain_label"] == "Rebuildable developer files"
+    assert dev_group["safety_reason"] == (
+        "Safe — your build tools recreate these automatically (e.g. npm install)."
+    )
+    assert dev_group["paths"] == [paths["node_modules_dir"].as_posix()]
+    assert dev_group["file_count"] == 1
+    assert dev_group["total_bytes"] == body["total_bytes"] == 5_000
+    assert body["total_file_count"] == 1
+
+
+def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recycle_bin(
+    tmp_path: Path,
+) -> None:
+    """Proves the one-click apply flow end to end: the group's enumerated `paths` (never a
+    blanket tier/category-group selection) sent through the SAME `/api/apply` endpoint and
+    `apply_selection` safe-mode guard every other apply path uses — with `tier="both"` since
+    safe mode forces every candidate's tier to B (ADR-0023 guarantee 3)."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app_safe_mode(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    summary = client.get("/api/clean/one-click-summary").json()
+    all_paths = [p for group in summary["groups"] for p in group["paths"]]
+    assert paths["node_modules_dir"].as_posix() in all_paths
+
+    response = client.post(
+        "/api/apply",
+        json={"tier": "both", "paths": all_paths, "method": "vault", "dry_run": False},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["apply"] is True
+    assert body["method"] == "recycle_bin"  # safe mode forces this regardless of the request
+    assert body["bytes_freed"] == 5_000
+    assert not paths["node_modules_dir"].exists()  # really moved, not just previewed
+
+
+def test_scan_suggested_roots_endpoint_returns_a_label_path_list(tmp_path: Path) -> None:
+    """API-level smoke test only — real Downloads/home folder presence is machine-dependent,
+    so the content assertions live in `test_suggested_scan_roots_only_lists_existing_folders`
+    below against an injected `home=`, not against this process's real `Path.home()`."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/scan/suggested-roots")
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body["roots"], list)
+    for root in body["roots"]:
+        assert set(root) == {"label", "path"}
+
+
+def test_suggested_scan_roots_only_lists_existing_folders(tmp_path: Path) -> None:
+    from reclaim.api.service import suggested_scan_roots
+
+    home_with_downloads = tmp_path / "home_with_downloads"
+    (home_with_downloads / "Downloads").mkdir(parents=True)
+    result = suggested_scan_roots(home=home_with_downloads)
+    labels = {root.label for root in result.roots}
+    assert labels == {"Downloads", "Home folder"}
+
+    home_without_downloads = tmp_path / "home_without_downloads"
+    home_without_downloads.mkdir()
+    result_no_downloads = suggested_scan_roots(home=home_without_downloads)
+    labels_no_downloads = {root.label for root in result_no_downloads.roots}
+    assert labels_no_downloads == {"Home folder"}  # Downloads omitted, never shown disabled
+
+
+def test_plain_language_category_matches_the_spec_mapping_and_falls_back_gracefully() -> None:
+    from reclaim.api.schemas import plain_language_category
+
+    label, reason = plain_language_category("dev_artifacts")
+    assert label == "Rebuildable developer files"
+    assert reason is not None and "npm install" in reason
+
+    label, reason = plain_language_category("large_logs")
+    assert label == "Large log files"
+    assert reason is None
+
+    # Unmapped id (e.g. model_caches, or a future ai_-namespaced group) falls back to the
+    # technical label with no fabricated safety reason, never a crash or a raw snake_case id.
+    label, reason = plain_language_category("model_caches")
+    assert label == "Model Weight Caches"
+    assert reason is None
+
+
 def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:
     root = tmp_path / "tree"
     paths = _build_tree(root)
