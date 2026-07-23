@@ -1352,6 +1352,40 @@ retention + restore, now with an explicit `purge` command for expired entries.
   `pip`-installable environment) — documented in ADR-0024's consequences, deferred to the
   installer README's eventual "power users" section.
 
+### 2026-07-23 — Stage 2 Part C: signing options reported, no spend, no ADR (per rule 19 — this isn't a committed decision)
+- Per explicit instruction, this pass is report-only: no certificate purchased, no signing
+  implemented. Confirmed the packaging pipeline is already signing-agnostic — `packaging/reclaim.iss`
+  has no `SignTool`/`SignedUninstaller` directive today, so it builds and runs unsigned as-is;
+  adding signing later is purely additive (a `signtool.exe` step on `entry_point.dist/reclaim.exe`
+  before Inno Setup packages it, plus a `SignTool=` line in `reclaim.iss` to also sign
+  `reclaim-setup.exe` itself) — no restructuring of `entry_point.py`, the build command, or any
+  safety-relevant code required either way.
+- **Option A — Azure Trusted Signing**: ~$9.99/month (Basic tier, ~$120/year) per public pricing
+  pages found this session — publisher trust, no SmartScreen warning, short-lived (~3-day)
+  auto-renewing certificates rather than a long-lived cert to protect. Public preview opened to
+  individual developers (not just registered businesses), but requires identity verification
+  (government-ID-based, via Microsoft's verification partner) — exact document list not
+  confirmed this session (page fetch timed out); would need to be checked at signup time, not
+  assumed.
+- **Option B — ship unsigned**, documented SmartScreen "More info -> Run anyway" note in the
+  installer README. Zero cost. Worse first-run UX (an extra click past a scary-looking warning)
+  and a real, previously-observed risk: this project already hit one AV/quarantine false
+  positive on a freshly-built unsigned binary during earlier testing (noted in the original
+  Stage 2 brief) — flagging this as a known, not hypothetical, cost of staying unsigned.
+- **Recommendation: Option B (ship unsigned) for now**, consistent with the project's zero-cost
+  default (CLAUDE.md's lean-startup resource order) — $120/year is not large in absolute terms,
+  but the instruction was explicit not to spend without GG's go-ahead, and there's no revenue or
+  user base yet to justify the recurring cost against. This is a low-regret deferral: nothing
+  about staying unsigned today blocks signing later (see the signing-agnostic pipeline note
+  above), so revisiting this once there's real install-base pain (AV false positives reported by
+  actual users, not just this session's dev-machine test) is a reasonable trigger, not "never."
+- **GG's decision needed**: whether to spend ~$120/year on Trusted Signing now or defer. Not
+  actioned either way pending that answer.
+- Next: the merge-review doc for `feat/stage2-public` (same format as
+  `docs/MERGE_REVIEW_feat-ai-ranker.md`) — safety-gate result on the branch merged onto main,
+  both install profiles, safe-mode boundary proof, packaging choices, residual risks. Do NOT
+  merge — GG's explicit call.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
