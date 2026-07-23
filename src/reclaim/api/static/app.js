@@ -134,8 +134,41 @@ function activateTab(viewName) {
 
 let pollHandle = null;
 
+async function loadQuickRoots() {
+  // Server-resolved default scan-root suggestions (Downloads, home folder) for non-technical
+  // users who can't be expected to type a path — the free-text input right below stays
+  // available regardless. Non-fatal on failure: same "fail open, advanced path always works"
+  // posture as loadModeStatus below.
+  const container = document.getElementById("quick-roots");
+  const list = document.getElementById("quick-roots-list");
+  try {
+    const data = await api("/api/scan/suggested-roots");
+    if (!data.roots || data.roots.length === 0) {
+      container.hidden = true;
+      return;
+    }
+    list.innerHTML = "";
+    for (const root of data.roots) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rc-btn rc-btn-secondary rc-quick-root-btn";
+      btn.textContent = root.label;
+      btn.dataset.path = root.path;
+      btn.addEventListener("click", () => {
+        document.getElementById("scan-path").value = root.path;
+        document.getElementById("scan-form").requestSubmit();
+      });
+      list.appendChild(btn);
+    }
+    container.hidden = false;
+  } catch {
+    container.hidden = true;
+  }
+}
+
 function initScanBar() {
   const form = document.getElementById("scan-form");
+  loadQuickRoots();
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const input = document.getElementById("scan-path");
@@ -235,6 +268,7 @@ async function loadOverview() {
     contentEl.hidden = false;
     renderSummaryStats(summary);
     renderCategoryCards(summary.categories);
+    loadQuickClean();
   } catch (err) {
     renderState(stateEl, "error", {
       title: "Could not load summary",
@@ -310,6 +344,196 @@ function renderCategoryCards(categories) {
     `;
     grid.appendChild(el);
   }
+}
+
+// --- Quick Clean (one-click, categorically-safe groups only) -----------------------------------
+
+// Populated by the last successful `/api/clean/one-click-summary` fetch — the confirm dialog
+// and the apply call both read from this rather than re-deriving group -> paths themselves, so
+// there is exactly one source for "what one-click clean is about to touch."
+let lastQuickCleanGroups = [];
+
+async function loadQuickClean() {
+  const stateEl = document.getElementById("quick-clean-state");
+  const contentEl = document.getElementById("quick-clean-content");
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Checking for safe-to-clean items…" });
+
+  try {
+    const data = await api("/api/clean/one-click-summary");
+    if (!data.has_scan) {
+      renderState(stateEl, "empty", {
+        title: "No scan yet",
+        message: "Run a scan from the bar above to see what's safe to clean automatically.",
+      });
+      return;
+    }
+    lastQuickCleanGroups = data.groups;
+    if (data.groups.length === 0) {
+      renderState(stateEl, "empty", {
+        title: "Nothing categorically safe to clean yet",
+        message:
+          "No package caches, temp/browser caches, crash reports, or rebuildable developer " +
+          "files were found in this scan. Check the Review Queue for everything else.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    renderQuickCleanGroups(data.groups);
+  } catch (err) {
+    renderState(stateEl, "error", {
+      title: "Could not check for safe-to-clean items",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadQuickClean,
+    });
+  }
+}
+
+// `group.plain_label`/`safety_reason`/`total_bytes_human` are all server-formatted strings from
+// a fixed lookup table (schemas.py::_PLAIN_LANGUAGE_CATEGORY), never a raw filesystem path —
+// safe to template into innerHTML the same way renderCategoryCards does above. `group.paths`
+// (raw filesystem paths) is NEVER rendered here at all — it only ever feeds the apply request
+// body (see confirmQuickClean) and the dialog's group-name list (openQuickCleanDialog, which
+// uses plain_label/counts via textContent, not paths).
+function renderQuickCleanGroups(groups) {
+  const container = document.getElementById("quick-clean-groups");
+  container.innerHTML = "";
+  for (const group of groups) {
+    const card = document.createElement("article");
+    card.className = "rc-quick-clean-card";
+    card.style.borderLeftColor = categoryColorVar(group.category_group);
+    card.innerHTML = `
+      <div class="rc-quick-clean-card-head">
+        <h3>${group.plain_label}</h3>
+        <span class="rc-bytes">${group.total_bytes_human}</span>
+      </div>
+      <div class="rc-meta">${group.file_count.toLocaleString()} item(s)</div>
+      ${group.safety_reason ? `<p class="rc-candidate-rationale">${group.safety_reason}</p>` : ""}
+    `;
+    container.appendChild(card);
+  }
+
+  const totalCount = groups.reduce((sum, g) => sum + g.file_count, 0);
+  const totalBytes = groups.reduce((sum, g) => sum + g.total_bytes, 0);
+  document.getElementById("quick-clean-total-count").textContent = String(totalCount);
+  document.getElementById("quick-clean-total-bytes").textContent = formatFromBytes(totalBytes);
+  document.getElementById("quick-clean-btn").disabled = groups.length === 0;
+}
+
+function openQuickCleanDialog() {
+  const list = document.getElementById("quick-clean-dialog-groups");
+  list.innerHTML = "";
+  let totalBytes = 0;
+  for (const group of lastQuickCleanGroups) {
+    const li = document.createElement("li");
+    li.textContent =
+      `${group.plain_label}: ${group.file_count.toLocaleString()} item(s), ` +
+      `${group.total_bytes_human}`;
+    list.appendChild(li);
+    totalBytes += group.total_bytes;
+  }
+  document.getElementById("quick-clean-dialog-total").textContent = formatFromBytes(totalBytes);
+  document.getElementById("quick-clean-dialog").hidden = false;
+}
+
+function closeQuickCleanDialog() {
+  document.getElementById("quick-clean-dialog").hidden = true;
+}
+
+async function confirmQuickClean() {
+  closeQuickCleanDialog();
+  const resultEl = document.getElementById("quick-clean-result");
+  const paths = lastQuickCleanGroups.flatMap((group) => group.paths);
+  if (paths.length === 0) return;
+
+  renderState(resultEl, "loading", { title: "Cleaning…" });
+  try {
+    // tier: "both" — safe mode forces every candidate's tier to B (ADR-0023 guarantee 3), and
+    // an explicit `paths` list is what makes this a valid safe-mode apply at all (apply_
+    // selection refuses a blanket tier/category-group selection with no paths regardless of
+    // this call's tier value). method: "vault" only matters in power mode — safe mode's
+    // apply_batch forces recycle_bin unconditionally no matter what's requested here.
+    const report = await api("/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ tier: "both", paths, method: "vault", dry_run: false }),
+    });
+    renderQuickCleanResult(resultEl, report);
+    loadQuickClean();
+  } catch (err) {
+    renderState(resultEl, "error", { title: "Clean failed", message: err.message });
+  }
+}
+
+function renderQuickCleanResult(container, report) {
+  container.innerHTML = "";
+  const panel = document.createElement("div");
+  panel.className = "rc-state-panel";
+  panel.dataset.kind = "success";
+  panel.setAttribute("role", "status");
+
+  const heading = document.createElement("strong");
+  heading.textContent = `Cleaned — batch ${report.batch_id}`;
+  panel.appendChild(heading);
+
+  // Every branch below states what ACTUALLY happened to the bytes — recycle_bin/vault are both
+  // moves (recoverable), never described as "freed"; only direct_delete really frees the space
+  // immediately. See house rule: never claim space was freed when it was only moved.
+  const summary = document.createElement("p");
+  summary.style.margin = "0";
+  if (report.method === "recycle_bin") {
+    summary.textContent =
+      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
+      "the Recycle Bin — empty the Recycle Bin to free the space.";
+  } else if (report.method === "vault") {
+    summary.textContent =
+      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
+      "the Reclaim vault — restorable from the Quarantine & Restore tab; the space is held " +
+      "until purged.";
+  } else {
+    summary.textContent =
+      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) permanently ` +
+      "freed.";
+  }
+  panel.appendChild(summary);
+
+  const detail = document.createElement("p");
+  detail.style.margin = "0";
+  detail.textContent =
+    `${report.files_succeeded}/${report.files_processed} item(s) succeeded, ` +
+    `${report.files_failed} failed.`;
+  panel.appendChild(detail);
+
+  const failures = report.items.filter((item) => !item.succeeded);
+  if (failures.length > 0) {
+    const failList = document.createElement("ul");
+    for (const item of failures) {
+      const li = document.createElement("li");
+      li.textContent = `FAILED: ${item.path} — ${item.error}`;
+      failList.appendChild(li);
+    }
+    panel.appendChild(failList);
+  }
+
+  container.appendChild(panel);
+}
+
+function initQuickClean() {
+  document.getElementById("quick-clean-btn").addEventListener("click", openQuickCleanDialog);
+  document.getElementById("quick-clean-cancel").addEventListener("click", closeQuickCleanDialog);
+  document.getElementById("quick-clean-confirm").addEventListener("click", confirmQuickClean);
+}
+
+// --- "How this works" ----------------------------------------------------------------------------
+
+function initHowItWorks() {
+  document.getElementById("how-it-works-btn").addEventListener("click", () => {
+    document.getElementById("how-it-works-dialog").hidden = false;
+  });
+  document.getElementById("how-it-works-close").addEventListener("click", () => {
+    document.getElementById("how-it-works-dialog").hidden = true;
+  });
 }
 
 // --- Treemap -----------------------------------------------------------------------------------
@@ -893,6 +1117,8 @@ function init() {
   initTabs();
   initScanBar();
   initReviewQueue();
+  initQuickClean();
+  initHowItWorks();
   initModeControls();
   initFirstRun();
   activateTab("overview");

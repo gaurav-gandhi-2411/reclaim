@@ -13,11 +13,13 @@ from reclaim.api.schemas import (
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
     ModeStatusResponse,
+    OneClickCleanSummaryResponse,
     PowerModeRequest,
     QuarantineListResponse,
     RestoreResponse,
     ScanRequest,
     ScanStatusOut,
+    SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapResponse,
 )
@@ -77,6 +79,11 @@ def scan_status(request: Request) -> ScanStatusOut:
         return service.to_scan_status_out(state.scan_status)
 
 
+@router.get("/scan/suggested-roots", response_model=SuggestedScanRootsResponse)
+def scan_suggested_roots() -> SuggestedScanRootsResponse:
+    return service.suggested_scan_roots()
+
+
 @router.get("/summary", response_model=SummaryResponse)
 def summary(request: Request) -> SummaryResponse:
     return service.build_summary(get_state(request))
@@ -96,6 +103,11 @@ def candidates(
             status_code=400, detail=f"tier must be one of A, B, both (got {tier!r})"
         )
     return service.list_candidates(get_state(request), tier=tier, category_group=category)
+
+
+@router.get("/clean/one-click-summary", response_model=OneClickCleanSummaryResponse)
+def clean_one_click_summary(request: Request) -> OneClickCleanSummaryResponse:
+    return service.build_one_click_summary(get_state(request))
 
 
 @router.get("/duplicate-clusters/review", response_model=DuplicateClusterReviewResponse)
