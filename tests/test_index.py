@@ -166,6 +166,89 @@ def test_physical_size_does_not_dedup_zero_sentinel_dev_ino() -> None:
     assert physical_size_bytes(records) == 300
 
 
+# --- Windows unsigned 64-bit dev/ino overflow (ReFS volumes, dev drives, GitHub's own Windows
+# CI runners): `os.stat().st_ino`/`st_dev` can exceed SQLite's signed 64-bit INTEGER max
+# (2**63 - 1), which used to raise `OverflowError: Python int too large to convert to SQLite
+# INTEGER` and abort the entire scan. `_to_db_int64`/`_from_db_int64` (index.py) wrap/unwrap via
+# two's-complement at the DB boundary; these tests go through the real `ScanIndex` store path,
+# never calling the private helpers directly.
+
+
+def test_huge_unsigned_ino_and_dev_roundtrip_through_real_store_without_overflow(
+    index: ScanIndex,
+) -> None:
+    """A file identity at the very top of the unsigned 64-bit range (`2**64 - 1`, the maximum
+    `st_ino`/`st_dev` a real Windows volume can report) must store and read back without
+    raising, and must round-trip to the exact original value."""
+    huge = 2**64 - 1
+    index.upsert_records([_record("C:/Data/a.txt", dev=huge, ino=huge)], scanned_at=1000.0)
+
+    record = index.get_record(Path("C:/Data/a.txt"))
+
+    assert record is not None
+    assert record.dev == huge
+    assert record.ino == huge
+
+
+def test_ino_at_signed_int64_max_boundary_roundtrips_unchanged(index: ScanIndex) -> None:
+    """`2**63 - 1` is SQLite's signed INTEGER max — the exact boundary where no wraparound is
+    needed at all. Confirms the boundary itself (not just values above it) round-trips."""
+    boundary = 2**63 - 1
+    index.upsert_records([_record("C:/Data/a.txt", dev=1, ino=boundary)], scanned_at=1000.0)
+
+    record = index.get_record(Path("C:/Data/a.txt"))
+
+    assert record is not None
+    assert record.ino == boundary
+
+
+def test_ino_one_past_signed_int64_max_wraps_and_roundtrips(index: ScanIndex) -> None:
+    """`2**63` is the first unsigned value that does NOT fit in a signed 64-bit INTEGER and
+    must be wrapped — the boundary case on the other side of `test_ino_at_signed_int64_max_
+    boundary_roundtrips_unchanged`."""
+    just_over = 2**63
+    index.upsert_records([_record("C:/Data/a.txt", dev=1, ino=just_over)], scanned_at=1000.0)
+
+    record = index.get_record(Path("C:/Data/a.txt"))
+
+    assert record is not None
+    assert record.ino == just_over
+
+
+def test_hardlink_dedup_groups_records_sharing_a_huge_dev_ino_pair(index: ScanIndex) -> None:
+    """Two records sharing an out-of-signed-range `(dev, ino)` pair (a real hardlink pair on a
+    volume with huge file IDs) must still be deduped to a single physical allocation — proves
+    the wraparound preserves EQUALITY end-to-end (store -> read -> compare), not just successful
+    storage."""
+    huge_dev, huge_ino = 2**64 - 1, 2**64 - 2
+    index.upsert_records(
+        [
+            _record("C:/Data/a.txt", size_bytes=100, dev=huge_dev, ino=huge_ino),
+            _record("C:/Data/b_hardlink.txt", size_bytes=100, dev=huge_dev, ino=huge_ino),
+        ],
+        scanned_at=1000.0,
+    )
+
+    assert physical_size_bytes(index.full_inventory()) == 100
+
+
+def test_hardlink_dedup_separates_records_with_different_huge_ino_values(
+    index: ScanIndex,
+) -> None:
+    """Two records with distinct huge `ino` values (same huge `dev`) must NOT be collapsed
+    together — the wraparound must preserve DISTINCTNESS as well as equality."""
+    huge_dev = 2**64 - 1
+    index.upsert_records(
+        [
+            _record("C:/Data/a.txt", size_bytes=100, dev=huge_dev, ino=2**64 - 2),
+            _record("C:/Data/b.txt", size_bytes=100, dev=huge_dev, ino=2**64 - 3),
+        ],
+        scanned_at=1000.0,
+    )
+
+    assert physical_size_bytes(index.full_inventory()) == 200
+
+
 # --- Stage 6 additions: has_any_records / direct_children -----------------------------------
 
 
