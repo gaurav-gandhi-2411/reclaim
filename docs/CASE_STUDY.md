@@ -15,6 +15,17 @@ once, by a real filesystem shape none of its tests modeled — and the project i
 only because the one operation that actually ran destructive was chosen to be reversible before
 anyone knew it would need to be. That is not a triumphant ending. It's the accurate one.
 
+What follows is the deterministic engine (rules, hashes, a real 3.1M-file disk), a security
+audit of the review UI itself, an applied-AI layer built safety-first across four features plus
+a cross-LLM-labeled ranker, and — the final chapter — a public installer, because the moment a
+tool like this stops being watched by the person who wrote it, "the safety system worked so far"
+stops being an answer anyone else can verify for themselves. **The residual-risk class is not
+closed, and this document says so explicitly rather than claiming otherwise**: safe mode is a
+structural boundary on *how* a mistake can manifest — Recycle-Bin-recoverable, always
+human-confirmed — not a claim that every detector's judgment is correct for every environment
+this project hasn't seen yet. That distinction, stated plainly instead of papered over, is the
+actual credential this project is offering.
+
 ## Architecture
 
 - **Rules-first.** No ML in the deletion path. Every candidate comes from a deterministic
@@ -38,6 +49,11 @@ anyone knew it would need to be. That is not a triumphant ending. It's the accur
   freed), a hardlink to a shared blob (0 bytes freed), or a stdlib file inside a shared Python
   interpreter build that a dozen unrelated projects depend on (deleting it breaks all of them,
   regardless of what bytes it shares with something else).
+- **Safe mode by default for anyone who isn't the author.** The public installer (Nuitka +
+  Inno Setup, core-only, 13.6MB) ships with a structural boundary, not a convention: Recycle-
+  Bin-only deletes, review-only candidates, and the highest-risk categories force-disabled,
+  independent of any config file — proven against the actual compiled binary, not just the
+  source tree, before it was allowed to be called done.
 
 ## The honesty arc — the centerpiece
 
@@ -561,10 +577,149 @@ every result carries an `is_heuristic` field hardcoded to `True` — not because
 so, but so a UI or a log line has something to actually assert against if it ever needs to
 prove the number it's showing isn't a prediction.
 
-## Four invariants the harness now enforces structurally, not narratively
+## The generic clutter-likelihood ranker — cross-LLM consensus, not majority vote
 
-Four incidents across three features produced four rules that no longer depend on anyone
-remembering them:
+Feature 3 above stopped deliberately short of a model, because personal preference isn't
+knowable from anywhere except a real person's real decisions, and there weren't 500 of them
+yet. A separate, later build asked a narrower, answerable question instead: not "does this
+user want this file gone," but "is this file the *kind* of thing that's usually safe to
+suggest" — a property that generalizes across users, the way "build artifacts are usually
+clutter" is true regardless of whose disk it is. That distinction isn't cosmetic — it's
+load-bearing enough that the ranker is named `clutter_likelihood`, not `preference`, and
+`ClutterLikelihoodScore.is_generic` is hardcoded `True` everywhere the type is constructed, the
+same pattern `is_heuristic` uses one section up: a field a caller can actually assert against,
+not a docstring's claim about itself.
+
+**Labels came from three independent local LLMs, not one model asked three times.** `qwen3:8b`
+(Alibaba), `llama3.1:8b` (Meta), and `gemma2:9b` (Google) — genuinely different model families,
+not three sizes of the same one — each rated synthetic file-record fixtures on a fixed 0–4
+clutter-likelihood rubric, entirely through a local Ollama server. Zero paid API calls anywhere
+in the labeling pipeline; the cost of three-judge consensus labeling on this feature was $0.
+
+**Real inter-rater statistics, not an assumed "the judges agree":** Fleiss' kappa across all
+three raters (N=120) came out to **0.6768** — "substantial agreement" on the standard
+Landis–Koch scale, not perfect, and reported as exactly that. Pairwise Cohen's kappa broke down
+which pair agreed most: `llama3.1:8b`/`gemma2:9b` at 0.7250, `qwen3:8b`/`gemma2:9b` at 0.6664,
+`qwen3:8b`/`llama3.1:8b` at 0.6444 — `qwen3` was the most frequent outlier of the three, a real
+finding about model behavior, not noise averaged away.
+
+**The disagreement wasn't voted away — it was excluded from training entirely.** 41 of 120
+records (34.2%) had no unanimous 3-judge agreement, and the ranker trains on the **79-record
+unanimous subset only** — roughly one in three records is exactly where "generic
+clutter-likelihood" turned out not to be as generic as the label taxonomy assumed, and papering
+over that with 2-of-3 majority voting would have taught the model to imitate the noisiest
+judge's tie-breaks instead of a real, agreed-upon property. A LightGBM LambdaMART ranker (MIT,
+CPU-only, zero GPU requirement — same zero-cost posture as every other dependency in this
+layer) trained on a grouped split (6 batches / 62 records train, 2 batches / 17 records eval,
+whole batches never split within one, so no cluster's records leak across the split) scored
+**NDCG@5 = 0.9763** (floor 0.70) and **precision@3 = 1.0000** (floor 0.50) on the held-out
+batches.
+
+**Permanently provisional, structurally, not by convention.** `_DISTRIBUTION.is_synthetic_only`
+is `True` — both the file records the judges rated and the labels themselves are
+synthetic/LLM-generated, not real personal decisions — and `assert_safe_to_promote_to_measured`
+(the same gate ADR-0016 built to close the Copydays recall-artifact incident) *raises* on this
+distribution by construction. There is no code path in this feature that can ever report itself
+as MEASURED. That's not a hedge added for this write-up; it's a function call in the eval suite
+that fails the build if anyone tries to relax it.
+
+## Track B — CLIP semantic grouping, justified on its own terms, not as a rescue
+
+Once Feature 1a's realistic-distribution remeasurement showed pHash catching 100% of ordinary
+resize/recompress duplicates, the obvious follow-up question was whether embeddings (Track B,
+CLIP-based semantic image grouping) were still worth building at all — if pHash already solves
+near-duplicate detection, what's left for a heavier model to earn its keep on? The measured
+answer: a different problem entirely. Track B never re-examines anything Track A already
+clustered — it groups the *residual* by semantic similarity (two different photos of the same
+beach, not two copies of the same photo), a browse-only feature with no deletion path, ever.
+
+**Model choice was a real licensing decision, not a default.** Apple's MobileCLIP was rejected
+outright despite matching the spec's suggestion — its pretrained weights carry an Apple "ML
+Research Model" Terms of Use that explicitly excludes "commercial exploitation, product
+development, or use in any commercial product or service," a hard prohibition inherited by any
+derivative, on top of not being pip-installable at all. OpenCLIP ViT-B/32 (MIT end-to-end, code
+and weights both) shipped instead — `pip install open_clip_torch`, one ~338MB checkpoint, zero
+gating. A real correctness bug surfaced during model loading itself: the `"openai"` pretrained
+checkpoint silently mismatches `ViT-B-32`'s default GELU activation (a cosmetic-looking warning
+that isn't cosmetic) — fixed by loading the `"ViT-B-32-quickgelu"` variant instead, verified
+against the warning disappearing, not assumed from the docs.
+
+**Measured on a real, disclosed distribution, per-tier gated the same way ADR-0018 requires
+everywhere else:** BCubed precision 0.7897, recall 0.7143 at similarity threshold 0.82, across
+98 real images. Gated on precision ≥ 0.70 (looser than dedup's 0.95 — the spec's own explicit
+framing that browse-tidiness carries a different risk profile than a deletion decision) AND
+recall ≥ 0.20, both cleared with real margin. The full precision/recall curve swept 0.70–1.00
+tells an honest, two-sided story instead of just the chosen operating point: below ~0.80,
+precision collapses fast (CLIP's semantic similarity is genuinely permissive at that range —
+this is the model being itself, not a bug); above ~0.90, precision is perfect but recall
+plateaus around 0.41–0.46, the ceiling of what "semantically similar" can mean before it starts
+demanding near-duplication again.
+
+## Shipping to strangers — safe mode as the last structural boundary
+
+Every mechanism in this case study so far was built, measured, and incident-hardened against
+one disk, watched by one person who wrote the code. The tool's next real change of trust model
+wasn't a new detector or a new AI feature — it was a public installer, aimed at people who will
+never read this document, never watch a dry-run report, and have no reason to trust a stranger's
+GitHub repo by default. The instruction for that pass was explicit and non-negotiable: safe mode
+had to be provable the same way the §7.5 AI-layer boundary is provable — a structural guarantee
+a test can assert against, not a default value some code path could accidentally bypass around.
+
+**Three independent guarantees, not one flag.** (1) `apply_batch`'s method resolution checks
+`mode == Mode.SAFE` *before* any other rule and returns `recycle_bin` unconditionally — the
+`vault` and `direct_delete` branches become unreachable by construction whenever mode is safe,
+not merely unreached in the cases a test happened to try. Proven the same way the §7.5 gate is
+proven: by monkeypatching `os.unlink` and `shutil.rmtree` to raise if called, then running a
+real `apply=True` batch and confirming nothing raises. (2) The three highest-risk category
+groups (`duplicates`, `model_caches`, `dev_artifacts` — the exact class of category that broke
+this project's own `.venv` in the incident above) are forced off regardless of what
+`config.toml` requests, via a config-resolution function kept deliberately separate from plain
+config parsing — the first version that merged the two broke ~240 pre-existing tests that had
+never been about safety mode at all, which is its own small lesson about not overloading one
+function with two concerns. (3) Every candidate is forced to review-only, and the API refuses a
+one-click "apply everything this tier matches" request with no explicit, human-picked paths.
+Power mode — today's full behavior — becomes an explicit, typed, case-sensitive, logged opt-in
+(`"I understand this can permanently delete files"`, checked for an *exact* match, no fuzzy
+matching, no partial credit for close enough), reversible back to safe with no gate at all,
+because becoming more conservative is never the dangerous direction.
+
+**The boundary had to survive being compiled, not just written.** A source-level test suite
+proving all of the above was necessary but not sufficient — a Nuitka-compiled, Inno-Setup-
+installed `reclaim.exe` is a different artifact than the Python this project has tested all
+along, and nothing guarantees a packager's static analysis, module bundling, or installer
+scripting preserves a safety property by accident. So the same 13-check proof ran twice against
+the actual compiled binary, not the dev tree: once against the raw Nuitka `--standalone` build,
+once through a real silent install → launch → silent uninstall cycle of the built installer
+(zero admin prompts at any step, matching this project's pre-existing "never runs elevated"
+invariant end to end) — fresh install defaults to safe, a real `--apply` batch against a
+config.toml explicitly trying to re-enable the forced-off categories still resolves to
+recycle-bin-only, and the typed-confirmation phrase is confirmed to be the only door to power
+mode, in the compiled artifact, not just the source.
+
+**The installer's own size became a measured decision, not a guess.** Two clean, isolated
+installs — no dev tooling, no assumptions — put core-only Reclaim at **13.6MB** and the full
+applied-AI dependency stack at **1,041.8MB**, with `torch` alone accounting for 464MB of that,
+shared by both the document-dedup and the CLIP-grouping features, so the "ship a little AI, hold
+back the heavy AI" split this pass was asked to consider turned out not to exist as a clean
+line — disclosed as a real finding, not engineered around silently. The installer that shipped
+carries the deterministic engine only (**18.2MB**, unsigned); every AI feature in this project is
+recommend-only or browse-only by construction, so a stranger's first install loses nothing
+essential by not carrying ~1GB of machine-learning dependencies it can add later with one
+command if it wants them.
+
+**Unsigned, and said so out loud.** Azure Trusted Signing was priced (~$9.99/month) and
+rejected for now — there's no revenue or user base yet to justify a recurring cost against, and
+nothing about shipping unsigned today forecloses signing later (the packaging pipeline has no
+signing directive one way or the other, so adding one is additive, not a rework). The
+consequence — a SmartScreen "more info → run anyway" click, and a real, previously-observed risk
+of an antivirus engine quarantining a freshly-built, unsigned binary — is documented plainly in
+the README as an expected first-run experience, not left as a surprise for the first stranger to
+hit it.
+
+## Five invariants the harness now enforces structurally, not narratively
+
+Five incidents across four features and one distribution-trust boundary produced five rules
+that no longer depend on anyone remembering them:
 
 1. **Precise-but-useless is not a passing gate.** `select_operating_point` requires a recall
    floor alongside the precision target — a threshold that's precise because it flags almost
@@ -576,15 +731,22 @@ remembering them:
    0.8634-real-templated-tier incident that motivated it — permanently, so the mistake can't
    silently recur in a future eval file.
 3. **A number is only "MEASURED" if the distribution behind it is honestly realistic.**
-   `assert_safe_to_promote_to_measured` refuses that word for any adversarial-tail-only or
-   synthetic-only distribution — Copydays' `strong` split and the content-tag classifier's
-   partly-synthetic fixture both stay honestly labeled PROVISIONAL, forever, structurally, not
-   by discipline.
+   `assert_safe_to_promote_to_measured` refuses that word for any adversarial-tail-only,
+   synthetic-only, *or LLM-consensus-only* distribution — Copydays' `strong` split, the
+   content-tag classifier's partly-synthetic fixture, and the clutter-likelihood ranker's
+   cross-LLM-labeled data all stay honestly labeled PROVISIONAL, forever, structurally, not by
+   discipline.
 4. **A track can be mechanically deletion-eligible and still withhold the keeper flag under a
    specific, testable disagreement condition.** Version-chain's filename-vs-mtime conflict
    check and screenshot-burst's mixed-content-tag check are the same pattern applied twice —
    an AICluster only ever suggests deletion once a keeper has actually been identified, and
    the orchestration is free to simply never identify one when the safety condition isn't met.
+5. **A safety mode is a boundary provable the same way a deletion-eligibility gate is provable,
+   not a default value.** Safe mode's recycle-bin-only guarantee is proven by monkeypatching
+   the actual destructive primitives (`os.unlink`, `shutil.rmtree`) to raise if ever called, the
+   identical technique the AI layer's `apply_batch`/`send2trash` import scan already used to
+   prove its own boundary — one proof technique, applied at two different layers of the same
+   codebase, not two different standards of rigor.
 
 ## Honest metrics
 
@@ -595,6 +757,12 @@ remembering them:
 | Unrelated vault content, also still pending (found while verifying the headline, not part of this apply) | 5,425,947,894 bytes — 5.05GB | `data/real-disk-run/quarantine/batch_1784296779_d5389247/` — 4 size-guard-downgraded `windows_temp` directories from an earlier apply, mid-30-day retention (expires 2026-08-16); confirmed on disk, confirmed excluded from the headline above, disclosed for completeness |
 | exact_duplicate candidates applied | 10,134 succeeded / 10,247 selected / 113 failed (all explained: access-denied, file-in-use, long-path, vanished-in-race) | `data/real-disk-run/exact_duplicate_real_apply.txt` |
 | Estimate corrections, same category | 48GB → 23.09GB → 4.26GB → 3.92GB | ADR-0006, ADR-0008, ADR-0009 |
+| Public installer, core-only (deterministic engine, no AI deps) | 13.6MB installed / 18.2MB installer | ADR-0024, clean isolated `uv venv` install + built `reclaim-setup.exe`, this session |
+| Public installer, full `[ai]` extra (measured, not shipped) | 1,041.8MB (`torch` alone 464MB) | ADR-0024, clean isolated `uv venv` install, this session |
+| Safe-mode-survives-packaging proof, against the compiled binary | 13/13 checks, twice (raw build + real install/run/uninstall cycle) | `packaging/test_packaged_safe_mode.ps1`, ADR-0023 |
+| Ranker cross-LLM label agreement | Fleiss' κ = 0.6768 (N=120); 79/120 (65.8%) unanimous, used for training | ADR-0021 |
+| Ranker held-out performance (unanimous-subset, grouped split) | NDCG@5 = 0.9763 (floor 0.70); precision@3 = 1.0000 (floor 0.50) | ADR-0021 |
+| Track B (CLIP) semantic grouping | BCubed precision 0.7897, recall 0.7143 at threshold 0.82 (98 images) | ADR-0022 |
 
 Every number above traces to a specific file in `data/real-disk-run/` produced by the actual
 run it describes — none of them is a recomputation or a rounded restatement. The 33.73GB
