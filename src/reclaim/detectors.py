@@ -10,7 +10,14 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import ScanIndex
-from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, Candidate, RawCandidate, Tier, Verdict
+from reclaim.models import (
+    REBUILDABLE_CATEGORY_GROUPS,
+    Candidate,
+    Mode,
+    RawCandidate,
+    Tier,
+    Verdict,
+)
 from reclaim.safety import SafetyValidator
 
 logger = structlog.get_logger(__name__)
@@ -759,6 +766,11 @@ def generate_candidates(
     `config.categories.*` group is enabled; otherwise it degrades to Tier B. Nothing
     non-blocked is ever silently dropped — every surviving candidate lands in Tier A or B.
 
+    Stage 2 safety boundary: when `config.mode` is `Mode.SAFE`, every surviving candidate is
+    forced to Tier B unconditionally — checked ahead of, and independent of, the `Verdict`/
+    category-enabled logic above, so safe mode's "no auto-delete, no batch-auto for ANY
+    category" guarantee does not depend on every detector's `suggested_tier` staying correct.
+
     Never materializes the whole inventory: each detector queries `index` directly for only
     the rows it needs, and the one `index.get_record()` call per surviving raw candidate below
     is a single indexed point lookup, not a re-scan.
@@ -781,7 +793,7 @@ def generate_candidates(
         result = safety.evaluate(record)
         if result.verdict == Verdict.BLOCKED:
             continue
-        if result.verdict == Verdict.REVIEW_ONLY:
+        if config.mode == Mode.SAFE or result.verdict == Verdict.REVIEW_ONLY:
             tier = Tier.B
         else:
             tier = rc.suggested_tier if _category_enabled(rc.category_group, config) else Tier.B

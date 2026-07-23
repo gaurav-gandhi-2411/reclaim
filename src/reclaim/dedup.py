@@ -22,6 +22,7 @@ from reclaim.models import (
     FileRecord,
     HashSkip,
     MaterialityExclusionStats,
+    Mode,
     Tier,
     Verdict,
 )
@@ -727,7 +728,12 @@ def generate_duplicate_candidates(
         )
         for duplicate in cluster.duplicates:
             result = member_results[duplicate.path]
-            if result.verdict == Verdict.REVIEW_ONLY or needs_review:
+            # Stage 2 safety boundary: forced to Tier B whenever config.mode is Mode.SAFE,
+            # independent of the REVIEW_ONLY/duplicates.enabled logic below — a second,
+            # redundant layer on top of `config.apply_safe_mode_category_overrides` already
+            # forcing `duplicates.enabled=False` upstream (detectors.py's generate_candidates
+            # docstring explains the same "don't depend on only one layer" reasoning).
+            if config.mode == Mode.SAFE or result.verdict == Verdict.REVIEW_ONLY or needs_review:
                 tier = Tier.B
             else:
                 tier = Tier.A if config.categories.duplicates.enabled else Tier.B

@@ -623,3 +623,96 @@ button {
   font-size: var(--rc-text-xs);
   padding: var(--rc-space-5);
 }
+
+/* --- Stage 2: mode badge + overlays ---------------------------------------------------------- */
+
+.rc-mode-badge {
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-2) var(--rc-space-3);
+  font-size: var(--rc-text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rc-mode-badge[data-mode="safe"] {
+  background: var(--rc-surface-alt);
+  color: var(--rc-text);
+  border-color: var(--rc-border);
+}
+
+.rc-mode-badge[data-mode="power"] {
+  background: var(--rc-danger);
+  color: white;
+  border-color: var(--rc-danger);
+}
+
+.rc-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  padding: var(--rc-space-5);
+}
+
+.rc-overlay[hidden] {
+  display: none;
+}
+
+.rc-overlay-panel {
+  background: var(--rc-surface);
+  border-radius: var(--rc-radius-lg);
+  box-shadow: var(--rc-shadow-md);
+  padding: var(--rc-space-6);
+  max-width: 560px;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.rc-overlay-panel h2 {
+  margin-top: 0;
+}
+
+.rc-overlay-panel ul {
+  padding-left: var(--rc-space-5);
+}
+
+.rc-overlay-panel li {
+  margin-bottom: var(--rc-space-2);
+}
+
+#power-mode-phrase {
+  display: block;
+  background: var(--rc-surface-alt);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-sm);
+  padding: var(--rc-space-2) var(--rc-space-3);
+  font-size: var(--rc-text-sm);
+}
+
+#power-mode-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--rc-space-2) var(--rc-space-3);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-sm);
+  font-size: var(--rc-text-base);
+  margin-top: var(--rc-space-2);
+}
+
+.rc-form-error {
+  color: var(--rc-danger);
+  font-size: var(--rc-text-sm);
+  min-height: 1.2em;
+}
+
+.rc-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--rc-space-3);
+  margin-top: var(--rc-space-4);
+}

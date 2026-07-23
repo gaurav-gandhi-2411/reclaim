@@ -1,0 +1,53 @@
+MIT License
+
+Copyright (c) 2026 Gaurav Gandhi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------------
+
+ADDITIONAL NOTICE — DATA-DELETION SOFTWARE, READ BEFORE USE
+
+Reclaim scans your filesystem and, when you apply a batch, moves or
+permanently deletes files it identifies as clutter. Some categories are
+configured for permanent deletion with no recovery mechanism other than
+rebuilding the affected artifact yourself (see the project's ADR-0001 and the
+in-app category descriptions). Automated file-deletion software can act on a
+misdetection, an unmodeled environment, or a configuration you did not intend.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW:
+
+1. THE AUTHOR PROVIDES NO WARRANTY THAT THIS SOFTWARE WILL CORRECTLY IDENTIFY,
+   CLASSIFY, OR SAFELY HANDLE ANY FILE ON YOUR SYSTEM.
+2. THE AUTHOR IS NOT LIABLE FOR ANY DATA LOSS, CORRUPTION, DOWNTIME, OR OTHER
+   DAMAGE — DIRECT, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL — ARISING FROM YOUR
+   USE OF THIS SOFTWARE, INCLUDING USE IN "POWER MODE" OR ANY MODE THAT
+   PERMITS PERMANENT DELETION.
+3. YOU ARE RESPONSIBLE FOR MAINTAINING YOUR OWN BACKUPS BEFORE RUNNING THIS
+   SOFTWARE, ESPECIALLY BEFORE ENABLING ANY MODE OR CATEGORY THAT PERMITS
+   PERMANENT, UNRECOVERABLE DELETION.
+4. This software defaults to a safe mode (Recycle-Bin-only, review-only
+   candidate generation, and a restricted category set) on every fresh
+   install. Switching out of safe mode is an explicit, typed, logged action
+   you take at your own risk — see the in-app first-run notice and
+   `docs/architecture/adr/0023-stage2-safe-mode-safety-boundary.md`.
+
+If this disclaimer conflicts with the MIT License text above on the subject of
+warranty or liability, this section governs, as it is more specific to the
+nature of this software.

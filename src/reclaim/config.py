@@ -8,6 +8,9 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from reclaim.mode import current_mode
+from reclaim.models import SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS, Mode
+
 # Absolute defaults for production; SafetyValidator tests substitute a fixture-relative
 # list so real C:\Windows etc. are never touched during development (spec: never scan or
 # modify the real disk during development).
@@ -312,15 +315,71 @@ class Config(BaseSettings):
 
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
+    # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
+    # log), never read from config.toml directly — a hand-edited config file must never be the
+    # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not
+    # just in `load_config`) so a bare `Config()` construction — every existing test, any future
+    # caller that doesn't go through `load_config` — is the conservative default, never an
+    # accidental power-mode config.
+    mode: Mode = Mode.SAFE
+
+
+def apply_safe_mode_category_overrides(categories: CategoriesConfig) -> CategoriesConfig:
+    """Forces every group in `SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS` off regardless of what was
+    requested, leaving every other category's `enabled` flag untouched. Iterates the shared
+    frozenset (rather than hardcoding the three names here too) so there is exactly one
+    definition of "which categories are forced off in safe mode," matching this module's own
+    `REBUILDABLE_CATEGORY_GROUPS` discipline in models.py.
+
+    Safe mode restricts WHICH categories can ever produce a candidate at all;
+    `executor.apply_batch`'s mode-aware routing separately restricts HOW anything from an
+    enabled category can ever be deleted — two independent layers, neither a substitute for
+    the other."""
+    updates = {
+        group: getattr(categories, group).model_copy(update={"enabled": False})
+        for group in SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS
+    }
+    return categories.model_copy(update=updates)
 
 
 def load_config(path: Path | None) -> Config:
-    """Load config from a TOML file, or return built-in defaults if `path` is None/missing."""
+    """Load config from a TOML file, or return built-in defaults if `path` is None/missing.
+
+    Pure TOML parsing only — does NOT resolve the live mode or apply any safe-mode category
+    override. Every existing caller (the huge majority of this test suite; any internal code
+    that needs "exactly what config.toml says," no policy layered on top) keeps working
+    unchanged. Real end-user entry points (the CLI, the dashboard) must call
+    `load_effective_config` instead — see its docstring for why the two are kept separate.
+    """
     if path is None or not path.exists():
         return Config()
     with path.open("rb") as fh:
         data = tomllib.load(fh)
     return Config.model_validate(data)
+
+
+def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Config:
+    """`load_config(path)`, then layers Stage 2's safety-boundary policy on top: this is what
+    the CLI and the dashboard call, never `load_config` directly, for anything that will
+    actually drive candidate generation or apply/purge against a real disk.
+
+    `mode` resolves from `reclaim.mode.current_mode()` (the mode-change log) when not given
+    explicitly — the explicit override exists for tests and any caller that already knows the
+    live mode without re-reading the log, never for silently overriding it in production.
+    Whenever the resolved mode is SAFE, `apply_safe_mode_category_overrides` is applied to the
+    returned config's categories, regardless of what config.toml itself requested — deliberately
+    kept as a separate function from `load_config` (rather than baked into it) so the hundreds
+    of existing tests/call sites exercising plain TOML-parsing behavior are never silently
+    affected by a mode this function alone is responsible for resolving.
+    """
+    config = load_config(path)
+    resolved_mode = mode if mode is not None else current_mode()
+    categories = (
+        apply_safe_mode_category_overrides(config.categories)
+        if resolved_mode == Mode.SAFE
+        else config.categories
+    )
+    return config.model_copy(update={"mode": resolved_mode, "categories": categories})
 
 
 @lru_cache(maxsize=1)

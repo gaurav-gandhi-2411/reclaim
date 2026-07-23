@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from reclaim.config import load_config
+from reclaim.config import load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
 from reclaim.elevation import ElevatedProcessError, assert_not_elevated
@@ -15,12 +15,21 @@ from reclaim.executor import (
     QuarantineMethod,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
+    SafeModeViolationError,
     SafetyInvariantError,
     apply_batch,
     restore_batch,
 )
+from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Tier
+from reclaim.mode import (
+    DEFAULT_MODE_LOG_PATH,
+    ModeSwitchDeniedError,
+    current_mode,
+    switch_to_power_mode,
+    switch_to_safe_mode,
+)
+from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode, Tier
 from reclaim.purge import purge_expired
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
@@ -151,6 +160,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
     )
+    apply_parser.add_argument(
+        "--mode-log",
+        type=Path,
+        default=None,
+        help=f"Override the mode-change log path (default: {DEFAULT_MODE_LOG_PATH}) — the "
+        "live safe/power mode is resolved from this log, never from config.toml.",
+    )
 
     purge_parser = subparsers.add_parser(
         "purge",
@@ -197,6 +213,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "(dev_artifacts/package_caches/temp_and_browser_caches/crash_dumps) — never touches a "
         "model_caches/duplicates/other vault entry even if one happened to also be eligible.",
     )
+    purge_parser.add_argument(
+        "--mode-log",
+        type=Path,
+        default=None,
+        help=f"Override the mode-change log path (default: {DEFAULT_MODE_LOG_PATH}) — purge "
+        "unconditionally refuses while the live mode is safe, regardless of manifest content.",
+    )
 
     undo_parser = subparsers.add_parser("undo", help="Restore a previously quarantined batch.")
     undo_parser.add_argument("batch_id", help="Batch id printed by a prior 'reclaim apply' run.")
@@ -229,6 +252,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "missing) — used to build the live SafetyValidator the pre-restore integrity check "
         "runs against.",
     )
+
+    mode_parser = subparsers.add_parser(
+        "mode",
+        help="Show or switch the safety mode (safe/power). Safe is the default for every "
+        "fresh install: recommend/review-only, Recycle-Bin-only, dangerous categories off. "
+        "Power unlocks the full behavior (vault/direct-delete/auto-apply) and requires typed "
+        "confirmation to enter; reverting to safe never requires confirmation.",
+    )
+    mode_parser.add_argument(
+        "--mode-log",
+        type=Path,
+        default=None,
+        help=f"Override the mode-change log path (default: {DEFAULT_MODE_LOG_PATH}).",
+    )
+    mode_subparsers = mode_parser.add_subparsers(dest="mode_action")
+    mode_power_parser = mode_subparsers.add_parser(
+        "power",
+        help="Switch to power mode. Requires --confirm with the exact required phrase.",
+    )
+    mode_power_parser.add_argument(
+        "--confirm",
+        required=True,
+        help='Must exactly equal "I understand this can permanently delete files" — a typo '
+        "means not confirmed, never close enough.",
+    )
+    mode_subparsers.add_parser("safe", help="Switch back to safe mode. No confirmation needed.")
 
     serve_parser = subparsers.add_parser(
         "serve",
@@ -285,6 +334,19 @@ def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=None,
         help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+    parser.add_argument(
+        "--mode-log",
+        type=Path,
+        default=None,
+        help=f"Override the mode-change log path (default: {DEFAULT_MODE_LOG_PATH}).",
+    )
+    parser.add_argument(
+        "--first-run-state",
+        type=Path,
+        default=None,
+        help=f"Override the first-run-acknowledged marker path (default: "
+        f"{DEFAULT_FIRST_RUN_STATE_PATH}).",
     )
 
 
@@ -417,7 +479,10 @@ def _run_apply(args: argparse.Namespace) -> int:
         return 1
 
     config_path: Path = args.config
-    config = load_config(config_path if config_path.exists() else None)
+    mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
+    config = load_effective_config(
+        config_path if config_path.exists() else None, mode=current_mode(mode_log)
+    )
 
     hash_skips: list[HashSkip] = []
     materiality: MaterialityExclusionStats | None = None
@@ -447,13 +512,18 @@ def _run_apply(args: argparse.Namespace) -> int:
             "tier/root-eligible candidate(s) kept, the rest deferred to a later run."
         )
 
-    method: QuarantineMethod = args.method
+    # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally regardless
+    # of what's passed here) — resolved automatically rather than requiring the user to already
+    # know to pass --method recycle_bin, so a plain `reclaim apply --apply` just works under
+    # the default safe mode instead of failing on the --method flag's own "vault" default.
+    method: QuarantineMethod = "recycle_bin" if config.mode == Mode.SAFE else args.method
     try:
         report = apply_batch(
             selected,
             safety=safety,
             apply=args.apply,
             method=method,
+            mode=config.mode,
             vault_dir=args.vault_dir,
             manifest_path=args.manifest,
             direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
@@ -461,7 +531,7 @@ def _run_apply(args: argparse.Namespace) -> int:
                 config.safety.direct_delete_size_guard_retention_days
             ),
         )
-    except SafetyInvariantError as exc:
+    except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
         return 1
 
@@ -515,12 +585,22 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     _loopback_host(args.host)
 
     config_path: Path = args.config
+    # Raw config, deliberately — AppState.effective_config resolves the live mode (and, when
+    # safe, the category override) fresh on every request, not once at server startup, so a
+    # mode switch via the API takes effect immediately without a restart. See AppState's
+    # docstring for why create_app must never receive an already-mode-resolved config here.
     config = load_config(config_path if config_path.exists() else None)
+    mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
+    first_run_state = (
+        args.first_run_state if args.first_run_state is not None else DEFAULT_FIRST_RUN_STATE_PATH
+    )
     app = create_app(
         db_path=args.db,
         config=config,
         vault_dir=args.vault_dir,
         manifest_path=args.manifest,
+        mode_log_path=mode_log,
+        first_run_state_path=first_run_state,
         host=args.host,
         port=args.port,
     )
@@ -539,6 +619,39 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
 
 def _run_dashboard(args: argparse.Namespace) -> int:
     return _run_serve(args, open_browser=True)
+
+
+def _run_mode(args: argparse.Namespace) -> int:
+    mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
+    action = getattr(args, "mode_action", None)
+
+    if action is None:
+        live = current_mode(mode_log)
+        print(f"reclaim mode: {live.value}")  # noqa: T201
+        return 0
+
+    if action == "power":
+        try:
+            entry = switch_to_power_mode(args.confirm, log_path=mode_log)
+        except ModeSwitchDeniedError as exc:
+            print(f"reclaim mode: {exc}", file=sys.stderr)  # noqa: T201
+            return 1
+        print(  # noqa: T201
+            f"reclaim mode: switched {entry.from_mode.value} -> {entry.to_mode.value} "
+            f"at {entry.changed_at}"
+        )
+        return 0
+
+    if action == "safe":
+        entry = switch_to_safe_mode(log_path=mode_log)
+        print(  # noqa: T201
+            f"reclaim mode: switched {entry.from_mode.value} -> {entry.to_mode.value} "
+            f"at {entry.changed_at}"
+        )
+        return 0
+
+    print(f"reclaim mode: unknown action {action!r}", file=sys.stderr)  # noqa: T201
+    return 1
 
 
 def _run_undo(args: argparse.Namespace) -> int:
@@ -589,7 +702,9 @@ def _run_purge(args: argparse.Namespace) -> int:
         return 1
 
     config_path: Path = args.config
-    config = load_config(config_path if config_path.exists() else None)
+    mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
+    live_mode = current_mode(mode_log)
+    config = load_effective_config(config_path if config_path.exists() else None, mode=live_mode)
     safety = SafetyValidator(config)
 
     try:
@@ -599,8 +714,9 @@ def _run_purge(args: argparse.Namespace) -> int:
             vault_dir=args.vault_dir,
             safety=safety,
             only_rebuildable=args.rebuildable_only,
+            mode=live_mode,
         )
-    except SafetyInvariantError as exc:
+    except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim purge: {exc}", file=sys.stderr)  # noqa: T201
         return 1
 
@@ -641,6 +757,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_undo(args)
     if args.command == "purge":
         return _run_purge(args)
+    if args.command == "mode":
+        return _run_mode(args)
     if args.command == "serve":
         return _run_serve(args)
     if args.command == "dashboard":

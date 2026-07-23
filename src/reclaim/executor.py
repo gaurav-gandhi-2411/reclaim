@@ -14,7 +14,7 @@ import send2trash
 import structlog
 from pydantic import BaseModel, ConfigDict
 
-from reclaim.models import Candidate, Tier, Verdict
+from reclaim.models import Candidate, Mode, Tier, Verdict
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path
 
@@ -47,6 +47,18 @@ class SafetyInvariantError(RuntimeError):
     Stage 3/4's `generate_candidates`/`generate_duplicate_candidates` — this is a last line of
     defense, not redundant paranoia. Hitting it means an invariant was violated upstream, so the
     whole batch is refused rather than silently dropping the offending item and continuing.
+    """
+
+
+class SafeModeViolationError(RuntimeError):
+    """Raised by `apply_batch`/`purge.purge_expired` when the live mode is `Mode.SAFE` and the
+    call would otherwise reach a permanent-delete or non-Recycle-Bin code path.
+
+    Stage 2's safety boundary: unlike `SafetyInvariantError` (a BLOCKED candidate slipped
+    through upstream filtering — should never happen, defense in depth) this is the EXPECTED,
+    routine outcome of a caller misusing the API while safe mode is active — e.g. requesting
+    `method="vault"` — never a sign of a bug. Refuses the entire call before any filesystem
+    mutation, same as every other whole-call refusal in this module.
     """
 
 
@@ -505,10 +517,21 @@ def _effective_method_and_retention_days(
     candidate: Candidate,
     method: QuarantineMethod,
     *,
+    mode: Mode,
     size_guard_bytes: int,
     size_guard_retention_days: int,
 ) -> tuple[QuarantineMethod, int | None]:
-    """A batch's `method` parameter only governs candidates whose category has a real
+    """Stage 2 safety boundary, checked FIRST, before any other branch in this function: when
+    `mode` is `Mode.SAFE`, the result is unconditionally `("recycle_bin", candidate.
+    retention_days)` — regardless of the candidate's own `retention_days`, regardless of
+    `method`, regardless of every other rule below. This is what makes `apply_batch`'s
+    `vault`/`direct_delete` branches structurally unreachable in safe mode: `item_method` can
+    only ever be `"recycle_bin"` when this function is ever called with `mode=Mode.SAFE`, by
+    construction, not by a value that merely happens to always come out that way today. See
+    `tests/test_executor.py::test_safe_mode_never_produces_vault_or_direct_delete_method` for
+    the exhaustive proof (every retention_days value, every requested method).
+
+    A batch's `method` parameter only governs candidates whose category has a real
     retention window; permanent deletion is a property of the *category* (ADR-0001), not a
     per-run choice, so a `retention_days is None` candidate normally always direct-deletes
     regardless of what the caller requested for the rest of the batch.
@@ -538,6 +561,9 @@ def _effective_method_and_retention_days(
     that isn't one of the four known-rebuildable groups) keeps the safer `size_guard_retention_
     days` default.
     """
+    if mode == Mode.SAFE:
+        return "recycle_bin", candidate.retention_days
+
     if candidate.retention_days is None:
         if candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt:
             retention_days = 0 if candidate.rebuildable else size_guard_retention_days
@@ -607,6 +633,7 @@ def apply_batch(
     safety: SafetyValidator,
     apply: bool = False,
     method: QuarantineMethod = "vault",
+    mode: Mode = Mode.POWER,
     vault_dir: Path | None = None,
     manifest_path: Path | None = None,
     now: float | None = None,
@@ -615,6 +642,17 @@ def apply_batch(
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
+
+    `mode` defaults to `Mode.POWER` — this function's own default preserves every existing
+    caller's exact current behavior (this test suite's ~600 tests included); real end-user
+    entry points (the CLI, the dashboard) must pass the LIVE mode explicitly, sourced from
+    `reclaim.mode.current_mode()` via `config.load_effective_config`. When `mode` is
+    `Mode.SAFE`: (1) this call refuses immediately, before any I/O, if `method` isn't
+    `"recycle_bin"` — see `SafeModeViolationError`; (2) every candidate's effective method is
+    unconditionally `"recycle_bin"` regardless of its own `retention_days` (see
+    `_effective_method_and_retention_days`) — the `vault` and `direct_delete` branches in the
+    per-candidate loop below are structurally unreachable whenever `mode=Mode.SAFE`, not merely
+    unreached in practice.
 
     Dry-run is the default (`apply=False`, spec design principle 5): makes zero mutating
     filesystem calls — no moves, no `send2trash`/`unlink`/`rmtree` calls, no manifest writes,
@@ -658,6 +696,13 @@ def apply_batch(
             f"never requested for a whole batch: got {method!r}"
         )
 
+    if mode == Mode.SAFE and method != "recycle_bin":
+        raise SafeModeViolationError(
+            f"apply_batch was called with mode=Mode.SAFE and method={method!r} — safe mode "
+            "only ever allows the Recycle Bin, never vault (this tool's own quarantine "
+            "directory) and never direct-delete. Refusing the entire batch, touching nothing."
+        )
+
     blocked = [c for c in candidates if c.safety_verdict == Verdict.BLOCKED]
     if blocked:
         raise SafetyInvariantError(
@@ -684,6 +729,7 @@ def apply_batch(
         item_method, item_retention_days = _effective_method_and_retention_days(
             candidate,
             method,
+            mode=mode,
             size_guard_bytes=direct_delete_size_guard_bytes,
             size_guard_retention_days=direct_delete_size_guard_retention_days,
         )

@@ -789,6 +789,102 @@ async function restoreBatch(batchId) {
   }
 }
 
+// --- Stage 2: mode badge + power-mode dialog --------------------------------------------------
+
+function renderModeBadge(mode) {
+  const badge = document.getElementById("mode-badge");
+  if (!badge) return;
+  badge.dataset.mode = mode;
+  badge.textContent = mode === "power" ? "Power mode" : "Safe mode";
+}
+
+async function loadModeStatus() {
+  try {
+    const status = await api("/api/mode");
+    renderModeBadge(status.mode);
+    document.getElementById("power-mode-phrase").textContent = status.required_power_confirmation;
+  } catch {
+    // Non-fatal: the badge just stays in its loading state if this fails.
+  }
+}
+
+async function switchToSafeMode() {
+  try {
+    const status = await api("/api/mode/safe", { method: "POST" });
+    renderModeBadge(status.mode);
+  } catch {
+    // Reverting to safe mode never requires confirmation and should never fail in practice;
+    // if it does, the badge simply stays on whatever it last successfully rendered.
+  }
+}
+
+function openPowerModeDialog() {
+  const dialog = document.getElementById("power-mode-dialog");
+  const input = document.getElementById("power-mode-input");
+  document.getElementById("power-mode-error").textContent = "";
+  input.value = "";
+  dialog.hidden = false;
+  input.focus();
+}
+
+function closePowerModeDialog() {
+  document.getElementById("power-mode-dialog").hidden = true;
+}
+
+async function confirmPowerMode() {
+  const input = document.getElementById("power-mode-input");
+  const error = document.getElementById("power-mode-error");
+  try {
+    const status = await api("/api/mode/power", {
+      method: "POST",
+      body: JSON.stringify({ confirmation_text: input.value }),
+    });
+    renderModeBadge(status.mode);
+    closePowerModeDialog();
+  } catch (err) {
+    error.textContent = err.message || "That didn't match the required phrase exactly.";
+  }
+}
+
+function initModeControls() {
+  const badge = document.getElementById("mode-badge");
+  if (badge) {
+    badge.addEventListener("click", () => {
+      if (badge.dataset.mode === "power") {
+        switchToSafeMode();
+      } else {
+        openPowerModeDialog();
+      }
+    });
+  }
+  document.getElementById("power-mode-cancel").addEventListener("click", closePowerModeDialog);
+  document.getElementById("power-mode-confirm").addEventListener("click", confirmPowerMode);
+  loadModeStatus();
+}
+
+// --- Stage 2: first-run screen -----------------------------------------------------------------
+
+async function initFirstRun() {
+  const overlay = document.getElementById("first-run-overlay");
+  try {
+    const status = await api("/api/first-run");
+    if (!status.acknowledged) {
+      overlay.hidden = false;
+    }
+  } catch {
+    // Fail open: a broken status check must never trap the user behind an overlay they can't
+    // dismiss — the acknowledge button below still works regardless.
+  }
+  document.getElementById("first-run-acknowledge").addEventListener("click", async () => {
+    try {
+      await api("/api/first-run/acknowledge", { method: "POST" });
+    } catch {
+      // Non-fatal — the overlay still closes; worst case it reappears next launch.
+    }
+    overlay.hidden = true;
+  });
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
@@ -797,6 +893,8 @@ function init() {
   initTabs();
   initScanBar();
   initReviewQueue();
+  initModeControls();
+  initFirstRun();
   activateTab("overview");
 }
 
