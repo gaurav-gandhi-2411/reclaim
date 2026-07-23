@@ -1444,6 +1444,46 @@ the exact branch being merged, not just checks already known to be red.
 - feat/ai-ui (ADR-0025 + wiring reclaim.ai.presentation into the dashboard) running in an
   isolated worktree; branch-only, unmerged, report pending.
 
+### 2026-07-23 (late) — feat/ai-ui merged, screenshots captured, v1.1.0 released
+- `feat/ai-ui` (ADR-0025) merged via PR #2 after CI confirmed green (personally read the
+  safety-gate diff before merging: narrowed test, not weakened — CLI still banned from
+  `reclaim.ai`, service.py's import is now a positive assertion, `_build_user_selected_
+  candidate` proven via source inspection to never reference AICluster/AIClusterMember).
+- CI-gate rule (added last checkpoint) immediately caught two real gaps: this repo's
+  workflows only trigger on `push: branches: [main]` or `pull_request` — a plain branch push
+  runs NO CI, so every merge this session went through a PR first. The merge-gate hook itself
+  also enforces rule 70a mechanically: blocked PR #1 once (missing the reviewable/generated
+  diff-split statement, gate 3b), PR #2 once (2,351 lines, all reviewable, genuinely over the
+  ~400-line ceiling — GG merged it himself after reviewing), and PR #3 once (`docs/`-prefixed
+  branch name isn't in the allowed feat/fix/chore/wave-N list, gate 1) — renamed to
+  `fix/logo-svg-and-screenshots`, reopened as PR #4, merged clean.
+- **Real bug found while capturing screenshots, not a cosmetic one**: logo.svg/favicon.svg
+  contained a literal `--` inside an XML comment — invalid per the XML spec. Chrome silently
+  fails to render such an SVG at all when loaded via `<img>` (`naturalWidth` stayed 0
+  everywhere the logo appeared; no console error pointed at the cause). Found by opening the
+  SVG directly, which surfaces the real parser error. Fixed in both files.
+- **Privacy-consistency catch, not just a bug**: the first screenshot pass used a demo tree
+  under this session's scratchpad path, nested under the real Windows username already
+  scrubbed from git history for privacy two tasks ago. Recaptured the entire set against a
+  demo tree at a clean, short, non-personal drive-root path before committing any screenshot
+  to the public repo.
+- 10 screenshots captured against a disposable demo tree (never a real disk): first-run, Quick
+  Clean, AI Suggestions (version chain + near-dup images + labeled cosine-similarity technical
+  detail), browse-only semantic grouping + screenshot burst (zero select/delete affordance,
+  confirmed visually not just by code), Storage Treemap, Quarantine & Restore (showing the real
+  "restore via Windows Recycle Bin, not this tab" message), Quick Clean success (moved-vs-freed
+  wording), light theme. Added to README.md and a new gallery section in docs/index.html.
+- **v1.1.0 released**: rebuilt from a fresh clean core-only venv (version already unified at
+  1.1.0 from the earlier launch-readiness pass), same Nuitka --standalone + Inno Setup
+  pipeline as v1.0.0, now also carrying the icon (`--windows-icon-from-ico`) and
+  `--windows-console-mode=attach` from the brand-assets work. 13/13 safe-mode checks passed
+  twice (raw build + real silent install/serve/uninstall cycle, zero admin prompts). SHA-256
+  verified byte-identical after downloading the published asset back.
+  https://github.com/gaurav-gandhi-2411/reclaim/releases/tag/v1.1.0
+- All fully-merged local branches cleaned up (feat/ai-ui, feat/launch-ux, the two doc/fix
+  branches, merge-preview-ai-ui); stale remote branches from merged PRs left alone (never
+  delete unasked).
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
