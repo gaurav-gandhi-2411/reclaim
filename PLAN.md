@@ -24,6 +24,17 @@ always the rebuild command, never the vault — see the ADR for the full rationa
 defense-in-depth re-checks that gate this. Every other category is unchanged: vault + 30-day
 retention + restore, now with an explicit `purge` command for expired entries.
 
+**Standing rule (added 2026-07-23, self-flagged incident):** no branch merges to `main` until
+that branch's own push-triggered CI run is green on the remote — regardless of whether a
+failure looks pre-existing or unrelated. `feat/launch-ux` was merged before its CI had ever run
+against a real GitHub Actions worker (the repo had just gone public); the run then failed on
+two genuine environment bugs (unsigned-64 `st_ino` overflowing SQLite; CLI tests refusing to
+run on GitHub's elevated Windows runners). No harm landed, but "probably pre-existing" is a
+guess made before checking. Going forward: push, wait for the run, confirm every required job
+green; if a job is red, fix it or get GG's explicit approval to waive it for that merge — never
+assume the waiver. Hard extension of rule 70a gate 2 to cover checks that haven't run yet on
+the exact branch being merged, not just checks already known to be red.
+
 ## Stage order (riskiest assumption first)
 
 | # | Stage | Status | CI gate |
