@@ -175,6 +175,37 @@ def _prefix_range(prefix: str) -> tuple[str, str]:
     return f"{prefix}/", f"{prefix}0"
 
 
+_SQLITE_INT64_MAX = 2**63 - 1
+
+
+def _to_db_int64(value: int) -> int:
+    """Maps an unsigned 64-bit filesystem identifier (`st_dev`/`st_ino`) into SQLite's signed
+    64-bit `INTEGER` range via two's-complement wraparound, at the DB write boundary.
+
+    Windows' `st_ino`/`st_dev` are unsigned 64-bit values that can exceed
+    `2**63 - 1` on ReFS volumes, dev drives, and (confirmed in CI) GitHub's own Windows
+    runners — `sqlite3` raises `OverflowError: Python int too large to convert to SQLite
+    INTEGER` the moment such a value is bound as a query parameter, aborting the whole scan.
+    dev/ino are only ever used for EQUALITY (hardlink-identity grouping — ADR-0006's
+    `physical_size_bytes`, `idx_files_dev_ino`), never ordering or arithmetic, so a bit-for-bit
+    reversible wraparound (undone by `_from_db_int64`) preserves every semantic that matters:
+    two equal unsigned values wrap to the same signed value and stay equal; two distinct
+    values wrap to distinct signed values and stay distinct.
+    """
+    if value > _SQLITE_INT64_MAX:
+        return value - 2**64
+    return value
+
+
+def _from_db_int64(value: int) -> int:
+    """Inverse of `_to_db_int64` — restores the original unsigned 64-bit `st_dev`/`st_ino`
+    value from what's stored in SQLite, so a `FileRecord` read back from the index compares
+    equal to a live `os.stat()` value for the same file, not just to other DB-sourced records."""
+    if value < 0:
+        return value + 2**64
+    return value
+
+
 def _row_to_record(row: sqlite3.Row) -> FileRecord:
     git_repo_root = row["git_repo_root"]
     return FileRecord(
@@ -187,8 +218,8 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         git_repo_clean=bool(row["git_repo_clean"]),
         mtime=row["mtime"],
         ctime=row["ctime"],
-        dev=row["dev"],
-        ino=row["ino"],
+        dev=_from_db_int64(row["dev"]),
+        ino=_from_db_int64(row["ino"]),
     )
 
 
@@ -201,8 +232,8 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
         record.ctime,
         record.ext,
         record.attributes,
-        record.dev,
-        record.ino,
+        _to_db_int64(record.dev),
+        _to_db_int64(record.ino),
         int(record.is_dir),
         int(record.is_cloud_placeholder),
         int(record.is_reparse_point),
