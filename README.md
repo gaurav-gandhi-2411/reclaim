@@ -174,7 +174,7 @@ Build it yourself:
 uv add --dev nuitka   # already recorded in pyproject.toml's dev group
 uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
 uv run python -m nuitka --standalone --assume-yes-for-downloads `
-  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=0.1.0 `
+  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=1.1.0 `
   --windows-icon-from-ico=packaging/reclaim.ico `
   --windows-console-mode=attach `
   --include-package=reclaim --include-package=uvicorn --include-package=fastapi `
