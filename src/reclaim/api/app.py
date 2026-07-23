@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import metadata
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -27,6 +28,22 @@ _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
 
 _templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+
+def _installed_version() -> str:
+    """Resolves the installed `reclaim` distribution version for display (dashboard footer).
+
+    Reads from `importlib.metadata` (the installed package's own record — same source `pip
+    show`/`uv pip show` use) rather than duplicating the version string from `pyproject.toml`,
+    so there is exactly one place it can drift out of date: the package metadata itself. Falls
+    back to `"dev"` for a source checkout with no installed distribution record (e.g. running
+    straight out of the repo without `uv tool install .`/`pip install -e .`) — this must never
+    raise and block the dashboard from rendering.
+    """
+    try:
+        return metadata.version("reclaim")
+    except metadata.PackageNotFoundError:
+        return "dev"
 
 
 def create_app(
@@ -59,7 +76,7 @@ def create_app(
     State lives on `app.state.reclaim` (an `AppState`), never a module-level global — see
     `AppState`'s docstring for why that's the right call for this single-user, localhost tool.
     """
-    app = FastAPI(title="Reclaim", version="0.1.0")
+    app = FastAPI(title="Reclaim", version=_installed_version())
     # Created eagerly (not lazily inside a route) so every read-only endpoint (summary,
     # treemap, candidates) can open `ScanIndex(db_path)` even before the first scan has run —
     # `sqlite3.connect` fails outright if the parent directory doesn't exist yet.
@@ -100,7 +117,9 @@ def create_app(
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def index(request: Request) -> HTMLResponse:
         return _templates.TemplateResponse(
-            request, "index.html", {"csrf_token": app.state.reclaim.csrf_token}
+            request,
+            "index.html",
+            {"csrf_token": app.state.reclaim.csrf_token, "reclaim_version": _installed_version()},
         )
 
     @app.get("/LICENSE", include_in_schema=False)

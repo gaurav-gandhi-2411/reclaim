@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Reclaim — free up disk space you can actually trust</title>
+<meta name="description" content="Reclaim finds files on your Windows PC that are safe to remove, shows you why, and never deletes anything without your review. Safe by default, fully local, no telemetry." />
+<style>
+  /* Design tokens, inlined from src/reclaim/api/static/tokens.css so this standalone GitHub
+     Pages page shares Reclaim's actual visual identity without depending on the app's asset
+     pipeline (this file must stay self-contained: no CDN fonts, no external requests). */
+  :root {
+    --rc-bg: #faf6f0;
+    --rc-surface: #ffffff;
+    --rc-surface-alt: #f2ece2;
+    --rc-border: #ded3c2;
+    --rc-text: #2a2420;
+    --rc-text-muted: #6b5d52;
+    --rc-text-on-brand: #ffffff;
+    --rc-brand: #2f6b52;
+    --rc-brand-hover: #24543f;
+    --rc-accent: #c1512b;
+    --rc-focus-ring: #1f6f9e;
+    --rc-radius-md: 8px;
+    --rc-radius-lg: 14px;
+    --rc-space-2: 8px;
+    --rc-space-3: 12px;
+    --rc-space-4: 16px;
+    --rc-space-5: 24px;
+    --rc-space-6: 32px;
+    --rc-space-7: 48px;
+    --rc-font-sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--rc-bg);
+    color: var(--rc-text);
+    font-family: var(--rc-font-sans);
+    line-height: 1.5;
+  }
+
+  a { color: var(--rc-brand); }
+  a:hover { color: var(--rc-brand-hover); }
+
+  a:focus-visible,
+  button:focus-visible {
+    outline: 3px solid var(--rc-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .rc-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .rc-wrap {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 var(--rc-space-5);
+  }
+
+  header.rc-hero {
+    text-align: center;
+    padding: var(--rc-space-7) 0 var(--rc-space-6);
+  }
+
+  .rc-logo {
+    width: 220px;
+    height: auto;
+    margin-bottom: var(--rc-space-4);
+  }
+
+  .rc-hero h1 {
+    font-size: 2rem;
+    margin: 0 0 var(--rc-space-3);
+  }
+
+  .rc-hero p.rc-value-prop {
+    font-size: 1.15rem;
+    color: var(--rc-text-muted);
+    max-width: 640px;
+    margin: 0 auto var(--rc-space-5);
+  }
+
+  .rc-download-btn {
+    display: inline-block;
+    background: var(--rc-brand);
+    color: var(--rc-text-on-brand);
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 1.05rem;
+    padding: var(--rc-space-3) var(--rc-space-6);
+    border-radius: var(--rc-radius-md);
+    box-shadow: var(--rc-shadow-md);
+  }
+
+  .rc-download-btn:hover,
+  .rc-download-btn:focus-visible {
+    background: var(--rc-brand-hover);
+    color: var(--rc-text-on-brand);
+  }
+
+  .rc-platform-note {
+    margin: var(--rc-space-3) 0 0;
+    font-weight: 600;
+    color: var(--rc-text-muted);
+  }
+
+  .rc-features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--rc-space-5);
+    padding: var(--rc-space-6) 0;
+  }
+
+  .rc-feature {
+    background: var(--rc-surface);
+    border: 1px solid var(--rc-border);
+    border-radius: var(--rc-radius-lg);
+    padding: var(--rc-space-5);
+  }
+
+  .rc-feature h2 {
+    font-size: 1.1rem;
+    margin: 0 0 var(--rc-space-2);
+    color: var(--rc-accent);
+  }
+
+  .rc-feature p {
+    margin: 0;
+    color: var(--rc-text-muted);
+  }
+
+  .rc-smartscreen {
+    background: var(--rc-surface-alt);
+    border: 1px solid var(--rc-border);
+    border-radius: var(--rc-radius-lg);
+    padding: var(--rc-space-5);
+    margin-bottom: var(--rc-space-6);
+  }
+
+  .rc-smartscreen h2 {
+    font-size: 1.1rem;
+    margin-top: 0;
+  }
+
+  footer.rc-footer {
+    border-top: 1px solid var(--rc-border);
+    padding: var(--rc-space-5) 0 var(--rc-space-7);
+    text-align: center;
+    color: var(--rc-text-muted);
+    font-size: 0.9rem;
+  }
+
+  footer.rc-footer nav a {
+    margin: 0 var(--rc-space-2);
+  }
+</style>
+</head>
+<body>
+  <a class="rc-visually-hidden" href="#main-content">Skip to main content</a>
+
+  <div class="rc-wrap">
+    <header class="rc-hero">
+      <img class="rc-logo" src="./assets/logo-lockup.png" alt="Reclaim logo" />
+      <h1>Free up disk space you can actually trust</h1>
+      <p class="rc-value-prop">
+        Reclaim finds files that are safe to remove — caches your tools rebuild, temp files,
+        duplicate copies — shows you exactly why, and never deletes anything without your
+        review.
+      </p>
+      <a class="rc-download-btn" href="https://github.com/gaurav-gandhi-2411/reclaim/releases/latest">
+        Download for Windows
+      </a>
+      <p class="rc-platform-note">Windows 10/11 only.</p>
+    </header>
+
+    <main id="main-content">
+      <section class="rc-features" aria-label="Key features">
+        <article class="rc-feature">
+          <h2>Safe by default</h2>
+          <p>
+            Every install starts in safe mode: deletes go to the Recycle Bin, nothing applies
+            automatically, and the riskiest categories stay off until you opt in.
+          </p>
+        </article>
+        <article class="rc-feature">
+          <h2>You see why</h2>
+          <p>
+            Every suggestion comes with a plain-language reason (e.g. "rebuilds on next
+            <code>npm install</code>") — never a fake confidence score standing in for an
+            explanation.
+          </p>
+        </article>
+        <article class="rc-feature">
+          <h2>Fully local</h2>
+          <p>
+            No telemetry, no analytics, no account, no server side at all. Read the full
+            <a href="https://github.com/gaurav-gandhi-2411/reclaim/blob/main/PRIVACY.md">privacy statement</a>.
+          </p>
+        </article>
+      </section>
+
+      <section class="rc-smartscreen" aria-labelledby="smartscreen-heading">
+        <h2 id="smartscreen-heading">About that Windows warning</h2>
+        <p>
+          Windows will likely show a SmartScreen prompt ("Windows protected your PC") the first
+          time you run the installer — this is expected for a small, unsigned, low-download-count
+          app, not a virus verdict. Click <strong>More info</strong> then <strong>Run
+          anyway</strong>. See the
+          <a href="https://github.com/gaurav-gandhi-2411/reclaim#first-run-smartscreen-and-antivirus-prompts-expected-not-a-compromise-signal">README's SmartScreen section</a>
+          for the full explanation, including why the project stays unsigned for now.
+        </p>
+      </section>
+    </main>
+
+    <footer class="rc-footer">
+      <nav aria-label="Reclaim links">
+        <a href="https://github.com/gaurav-gandhi-2411/reclaim">GitHub</a>
+        <span aria-hidden="true">·</span>
+        <a href="https://github.com/gaurav-gandhi-2411/reclaim/blob/main/PRIVACY.md">Privacy</a>
+        <span aria-hidden="true">·</span>
+        <a href="https://github.com/gaurav-gandhi-2411/reclaim/blob/main/SUPPORT.md">Support</a>
+        <span aria-hidden="true">·</span>
+        <a href="https://github.com/gaurav-gandhi-2411/reclaim/blob/main/docs/CASE_STUDY.md">Case study</a>
+      </nav>
+      <p>Built by Gaurav Gandhi. Reclaim runs entirely on your own machine.</p>
+    </footer>
+  </div>
+</body>
+</html>

@@ -709,6 +709,18 @@ button {
   padding: var(--rc-space-5);
 }
 
+.rc-footer p {
+  margin: 0;
+}
+
+.rc-footer .rc-footer-meta {
+  margin-top: var(--rc-space-1);
+}
+
+.rc-footer-meta a {
+  color: var(--rc-text-muted);
+}
+
 /* --- Stage 2: mode badge + overlays ---------------------------------------------------------- */
 
 .rc-mode-badge {

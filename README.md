@@ -4,6 +4,98 @@
 
 # Reclaim
 
+Reclaim finds files on your Windows PC that are safe to remove — caches your tools rebuild
+automatically, temp files, and duplicate copies — and shows you exactly why each one is safe
+before anything happens. Nothing is ever deleted without your review, and by default everything
+Reclaim removes goes to the Windows Recycle Bin, so it's always recoverable the same way as if
+you'd deleted it yourself.
+
+## Download
+
+**[Download Reclaim for Windows -> latest release](https://github.com/gaurav-gandhi-2411/reclaim/releases/latest)**
+&nbsp;—&nbsp; **Windows only (Windows 10/11).**
+
+Download `reclaim-setup.exe` from the page above and run it. No admin prompt, no account, no
+sign-up, nothing installed beyond the app itself.
+
+Windows will likely show a SmartScreen warning the first time you run it ("Windows protected your
+PC") — this is expected for a small, unsigned, low-download-count app, not a virus verdict. Click
+**More info** -> **Run anyway**. Full explanation, including the antivirus false-positive some
+scanners raise on freshly-built binaries: see
+["First run: SmartScreen and antivirus prompts"](#first-run-smartscreen-and-antivirus-prompts-expected-not-a-compromise-signal)
+further down.
+
+## First run
+
+1. Run the installer — no admin prompt, installs into your own user folder.
+2. Open **Reclaim** from the Start Menu.
+3. Your browser opens automatically to the Reclaim dashboard.
+4. A one-time screen explains safe mode before anything else is usable — read it, then continue.
+5. Pick a folder to scan: use one of the quick-pick buttons (e.g. Downloads, Temp) or type a
+   path yourself.
+6. Click **Scan** — this only reads your files; it changes nothing on disk.
+7. Review the plain-language groups Reclaim finds — each one states why it's considered safe
+   (e.g. "rebuilds automatically on your next `npm install`"). Either use **Quick Clean** to
+   handle the safe groups in one confirmation, or open the Review Queue to look at individual
+   items first.
+8. Whatever you clean is **moved to the Recycle Bin** — empty the Recycle Bin afterward to
+   actually free up the disk space.
+
+## Safe mode
+
+Safe mode is on for every fresh install, and it isn't just a default that could quietly slip —
+it's a structural guarantee (see [ADR-0023](docs/architecture/adr/0023-stage2-safe-mode-safety-boundary.md)
+for the full technical proof):
+
+- **Every delete goes to the Recycle Bin.** Never a permanent delete, no matter what you select.
+- **Nothing applies automatically.** You always pick what to clean and confirm it — Reclaim never
+  acts on its own.
+- **The riskiest categories stay off** (exact-duplicate detection, ML model caches, and
+  dev-environment folders) until you explicitly opt in to power mode.
+- **Power mode is a typed opt-in, and reversible.** It unlocks the full toolset (permanent delete
+  for rebuildable caches, auto-apply) only after you type an exact confirmation phrase in the
+  dashboard. You can switch back to safe mode at any time, with no confirmation required.
+
+## How to restore something
+
+**Primary path: Windows' own Recycle Bin.** In safe mode (the default for every install),
+everything Reclaim removes goes to the Recycle Bin — restoring it is exactly like recovering
+anything else you deleted yourself: open the **Recycle Bin**, find the file, right-click ->
+**Restore**.
+
+The dashboard's **Quarantine & Restore** tab restores a different thing: Reclaim's own internal
+vault, which is only used in power mode. It cannot restore Recycle-Bin batches (safe mode's
+default method) by design — Windows already owns that recovery path, and Reclaim doesn't
+duplicate it. If you're on safe mode (the default), the Recycle Bin above is the path you want.
+
+## Uninstalling
+
+Uninstalling Reclaim from Windows' "Add or remove programs" leaves your `data` folder (scan
+history, the quarantine vault, logs) in place by default, and asks whether you also want to
+delete it — because that folder can still hold files parked in Reclaim's vault from power mode
+that you haven't restored yet. Choose **No** (the default) if you're at all unsure; choose
+**Yes** to remove everything Reclaim ever wrote to disk. Running the uninstaller silently
+(`/VERYSILENT`) always preserves your data, regardless of that prompt.
+
+## Screenshots
+
+*(Coming soon — the dashboard's visual layer is mid-merge from the AI-UI branch; real
+screenshots land once that merges, rather than being faked ahead of it.)*
+
+`![Dashboard screenshot placeholder]`
+
+## Questions, bugs, and privacy
+
+- **Something go wrong, or found a bug?** See [SUPPORT.md](SUPPORT.md) for how to report it and
+  what to include.
+- **Want to know exactly what Reclaim does and doesn't send anywhere?** See
+  [PRIVACY.md](PRIVACY.md) — short version: nothing leaves your machine.
+- **Want to contribute code?** See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+# For developers
+
 Rules-first Windows disk-cleanup tool. Deterministic detection for provably-safe categories, a
 hard safety gate that runs before any candidate is generated, and fully recoverable actions
 (vault + manifest, dry-run by default). No ML — see `docs/CASE_STUDY.md` for what's actually
@@ -13,18 +105,12 @@ wired in vs. specced for later. Full design: `reclaim-spec.md`. Build history: `
 see "Distribution status" below for the full picture, including what safe mode restricts and
 why the installer is unsigned.
 
-## Install
+## Install from source
 
 Requires Windows (the scanner and executor are NTFS-specific by design — junction/reparse-point
-handling, `\\?\` long-path moves, Recycle Bin integration).
-
-**Option A — the installer (no Python required).** Build `packaging/reclaim-setup.exe` yourself
-per the "Distribution status" section below (this project doesn't publish prebuilt binaries —
-it's unsigned, and building it yourself from source is the trust model this stage assumes).
-Installs per-user, no admin prompt, and adds a Start Menu shortcut that launches the dashboard.
-Ships core-only (deterministic engine, no AI-layer dependencies) and defaults to safe mode.
-
-**Option B — from source (Python 3.12, for development or the optional AI layer):**
+handling, `\\?\` long-path moves, Recycle Bin integration). For the double-click installer, use
+the [Download](#download) section above instead — this is for development or the optional AI
+layer, which the installer doesn't ship (see "Distribution status" below for why).
 
 ```powershell
 uv tool install .
@@ -40,7 +126,7 @@ This installs one `reclaim` executable on your PATH. Verify it:
 reclaim --help
 ```
 
-## First run
+## CLI quick start
 
 ```powershell
 # 1. Scan a directory (read-only — builds a local SQLite inventory index, touches nothing else).
@@ -65,7 +151,7 @@ reclaim apply "C:\Users\you\Downloads"
 reclaim apply "C:\Users\you\Downloads" --apply --tier A
 ```
 
-## Restoring a batch
+## Restoring a batch (CLI / power-mode detail)
 
 Every `apply` prints a `batch_id`. Most categories vault into `data/quarantine/` with a 30-day
 (or category-specific) retention window before permanent deletion; a few deterministically
@@ -78,7 +164,9 @@ for which is which before you apply.
 # From the CLI:
 reclaim undo <batch_id>
 
-# Or from the dashboard's Quarantine & Restore tab — same manifest, same guarantee.
+# Or from the dashboard's Quarantine & Restore tab — same manifest, same guarantee, but only for
+# vault-quarantined batches (power mode's default method). Under safe mode's default
+# recycle_bin method, restore is Windows' own Recycle Bin — see "How to restore something" above.
 ```
 
 Restore refuses to write outside the file's original location or a manifest entry whose vault
@@ -129,6 +217,10 @@ double-click Windows installer aimed at people who won't read the source first:
   prompt (matches `reclaim.elevation.assert_not_elevated`'s "never runs elevated" invariant end
   to end), and adds a Start Menu / optional desktop shortcut that launches
   `reclaim.exe dashboard`.
+- **Prebuilt releases are published** on [GitHub Releases](https://github.com/gaurav-gandhi-2411/reclaim/releases/latest)
+  (`reclaim-setup.exe`, starting at v1.0.0) — that's the artifact the Download section at the
+  top of this README links to. The build-it-yourself instructions below remain useful for
+  verifying the binary yourself from source, or for building a fresh copy.
 - **Core-only, by design.** The installer ships the deterministic engine only — no AI-layer
   dependencies. Measured (clean `uv venv` install, this session): core `site-packages` is
   **13.6 MB**; the `[ai]` extra adds **~1,028 MB** (`torch` alone is 464 MB, shared by both
@@ -174,7 +266,7 @@ Build it yourself:
 uv add --dev nuitka   # already recorded in pyproject.toml's dev group
 uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
 uv run python -m nuitka --standalone --assume-yes-for-downloads `
-  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=0.1.0 `
+  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=1.1.0 `
   --windows-icon-from-ico=packaging/reclaim.ico `
   --windows-console-mode=attach `
   --include-package=reclaim --include-package=uvicorn --include-package=fastapi `

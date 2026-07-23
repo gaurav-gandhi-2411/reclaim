@@ -1,6 +1,6 @@
 [project]
 name = "reclaim"
-version = "0.1.0"
+version = "1.1.0"
 description = "Rules-first Windows disk-cleanup tool with hard safety gates and fully recoverable actions."
 authors = [
     { name = "Gaurav Gandhi", email = "gaurav.gandhi2411@gmail.com" }

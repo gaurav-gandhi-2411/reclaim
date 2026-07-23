@@ -184,7 +184,14 @@
     </section>
   </main>
 
-  <footer class="rc-footer">Reclaim runs entirely on 127.0.0.1 — nothing here leaves your machine.</footer>
+  <footer class="rc-footer">
+    <p>Reclaim runs entirely on 127.0.0.1 — nothing here leaves your machine.</p>
+    <p class="rc-footer-meta">
+      <span>Reclaim v{{ reclaim_version }}</span>
+      <span aria-hidden="true"> · </span>
+      <a href="https://github.com/gaurav-gandhi-2411/reclaim/releases" target="_blank" rel="noopener">Check for updates</a>
+    </p>
+  </footer>
 
   <!-- Stage 2: shown once, before anything else is usable, until acknowledged. -->
   <div id="first-run-overlay" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="first-run-title" hidden>
