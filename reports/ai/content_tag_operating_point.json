@@ -1,5 +1,5 @@
 {
-  "commit_sha": "7668ae1094fd26914d5b4803c7bc68e4ff11aa18",
+  "commit_sha": "02add405801c8d369d75b31568141b74fb370145",
   "command": "uv run pytest evals/test_ai_content_tag_gold.py -v -s",
   "fixture_path": "data/ai_datasets/gutenberg_texts (document) + src/reclaim/** (code) + evals/ai_fixtures/build_content_tag_fixtures.py (receipt/chat/transient_ui, synthetic)",
   "shipped_per_tag": {
@@ -8,11 +8,11 @@
       "recall": 1.0
     },
     "code": {
-      "precision": 0.8431372549019608,
-      "recall": 0.9772727272727273
+      "precision": 0.8545454545454545,
+      "recall": 1.0
     },
     "chat": {
-      "precision": 0.6666666666666666,
+      "precision": 0.6808510638297872,
       "recall": 1.0
     },
     "document": {
@@ -28,7 +28,7 @@
   "diagnostic_safety_threshold": 1.05,
   "sample_counts": {
     "receipt": 32,
-    "code": 44,
+    "code": 47,
     "chat": 32,
     "document": 120,
     "transient_ui": 30,
