@@ -8,7 +8,7 @@
     flat rectangles so the packaged .ico/.bmp/.png brand assets match exactly.
     Literal hex values (not CSS custom properties) because a favicon is loaded as a standalone
     document outside the app's stylesheet cascade; these mirror tokens.css's
-    --rc-cat-dev-artifacts / --rc-brand / --rc-bg values exactly (light mode) with a
+    rc-cat-dev-artifacts, rc-brand, and rc-bg custom properties exactly (light mode) with a
     prefers-color-scheme override for the dark-mode tab-bar case.
   -->
   <style>
