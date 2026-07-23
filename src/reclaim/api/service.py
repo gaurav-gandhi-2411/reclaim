@@ -9,7 +9,15 @@ from pathlib import Path
 
 import structlog
 
+from reclaim.ai import presentation
+from reclaim.ai.models import AICluster
+from reclaim.api import ai_orchestration
 from reclaim.api.schemas import (
+    AIAnalysisStatusOut,
+    AIClusterMemberOut,
+    AISuggestionOut,
+    AISuggestionsResponse,
+    AITrackSkipOut,
     ApplyRequest,
     ApplyResponse,
     CandidateOut,
@@ -41,7 +49,7 @@ from reclaim.api.schemas import (
     format_bytes,
     plain_language_category,
 )
-from reclaim.api.state import AppState, ScanStatus
+from reclaim.api.state import AIAnalysisStatus, AppState, ScanStatus
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -64,8 +72,9 @@ from reclaim.mode import (
     switch_to_power_mode,
     switch_to_safe_mode,
 )
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier
-from reclaim.scanner import scan_tree
+from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier, Verdict
+from reclaim.safety import SafetyValidator
+from reclaim.scanner import GitRepoCache, build_record_for_path, scan_tree
 
 logger = structlog.get_logger(__name__)
 
@@ -169,6 +178,9 @@ def run_scan(state: AppState, root: Path, started_at: float) -> None:
             files_pruned=stats.files_pruned,
             elapsed_seconds=stats.elapsed_seconds,
         )
+        # ADR-0025: a new completed scan invalidates any cached AI analysis -- callers compare
+        # this against `AIAnalysisStatus.scan_generation` to detect a stale cache.
+        state.scan_generation += 1
 
 
 # --- Summary / category cards -------------------------------------------------------------
@@ -522,6 +534,53 @@ def list_duplicate_cluster_review(
 
 # --- Apply / dry-run -------------------------------------------------------------------------
 
+# ADR-0025: the retention window given to a `_build_user_selected_candidate` result when applied
+# in power mode with method="vault" -- irrelevant in safe mode, which forces recycle_bin
+# unconditionally regardless of any candidate's retention_days (see `apply_batch`'s own
+# docstring). 30 days matches this project's other reviewed-by-a-human category defaults
+# (e.g. dev_artifacts' test fixture retention in tests/test_api.py) rather than inventing a new
+# number.
+_USER_SELECTED_RETENTION_DAYS = 30
+
+
+def _build_user_selected_candidate(
+    path_str: str, *, safety: SafetyValidator, git_cache: GitRepoCache
+) -> Candidate | None:
+    """ADR-0025 decision 6: builds a fresh, independently `SafetyValidator`-evaluated `Candidate`
+    for a path the caller explicitly named that ISN'T already part of the deterministic
+    candidate set -- the common case for an AI-suggestion apply (an ordinary photo/document no
+    rule detector ever flags). Returns `None` (silently excluded, never an error) for a path
+    that no longer exists, is a directory, or fails a FRESH safety evaluation -- the same
+    "BLOCKED means excluded, not erroring the whole request" posture
+    `reclaim.ai.safety.filter_paths_through_safety_validator` and `detectors.generate_candidates`
+    already use. Always `Tier.B` (never A -- this path was never auto-quarantine-eligible) and
+    a real, disclosed `retention_days` so a power-mode vault apply gets a genuine restore
+    window."""
+    path = Path(path_str)
+    record = build_record_for_path(path, git_cache)
+    if record is None or record.is_dir:
+        return None
+    result = safety.evaluate(record)
+    if result.verdict != Verdict.ELIGIBLE:
+        return None
+    return Candidate(
+        path=path,
+        is_dir=False,
+        category="user_selected_file",
+        category_group="user_selected",
+        size_bytes=record.size_bytes,
+        tier=Tier.B,
+        rationale=(
+            "Individually selected (e.g. from the AI Suggestions view) -- safety-validated "
+            "independently, the same SafetyValidator pass every deterministic candidate goes "
+            "through, immediately before this apply."
+        ),
+        rebuild_instruction=None,
+        safety_verdict=result.verdict,
+        safety_reason_code=result.reason_code,
+        retention_days=_USER_SELECTED_RETENTION_DAYS,
+    )
+
 
 def _apply_response(report: BatchApplyReport) -> ApplyResponse:
     items = [
@@ -593,6 +652,22 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
         wanted = {Path(p).as_posix() for p in request.paths}
         selected = [c for c in selected if c.path.as_posix() in wanted]
 
+        # ADR-0025 decision 6: a requested path NOT already a deterministic candidate (the
+        # common case for an AI-suggestion apply) still gets a real, independent safety pass
+        # here and, if eligible, joins the batch at Tier B -- "acting on an AI suggestion flows
+        # through the exact same apply path as if hand-picked," not silently dropped just
+        # because no rule detector happened to flag it.
+        already_matched = {c.path.as_posix() for c in selected}
+        unmatched_paths = wanted - already_matched
+        if unmatched_paths:
+            git_cache = GitRepoCache()
+            for path_str in unmatched_paths:
+                user_selected = _build_user_selected_candidate(
+                    path_str, safety=state.safety, git_cache=git_cache
+                )
+                if user_selected is not None:
+                    selected.append(user_selected)
+
     # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally
     # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its
     # own method selector disabled/hidden depending on mode to avoid a confusing 400.
@@ -615,6 +690,183 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
         ),
     )
     return _apply_response(report)
+
+
+# --- AI suggestions (recommend-only; ADR-0025) ------------------------------------------------
+
+
+def has_scan_data(state: AppState) -> bool:
+    """Whether this process's index has any scanned records at all -- `POST /api/ai/analyze`'s
+    precondition check, kept in `service` (not `routes`) so `routes.py` never needs to import
+    `ScanIndex` directly, matching every other route's "call into service, stay thin" shape."""
+    with ScanIndex(state.db_path) as index:
+        return index.has_any_records()
+
+
+_AI_UNAVAILABLE_REASON = (
+    "AI features need the optional AI component — install with: pip install reclaim[ai] "
+    "(or `uv sync --extra ai` from a source checkout)."
+)
+
+
+def _ai_unavailable_status_out() -> AIAnalysisStatusOut:
+    return AIAnalysisStatusOut(
+        status="unavailable",
+        unavailable_reason=_AI_UNAVAILABLE_REASON,
+        scan_generation=None,
+        stale=False,
+        started_at=None,
+        finished_at=None,
+        error=None,
+        tracks_run=[],
+        tracks_skipped=[],
+        files_considered={},
+        files_capped={},
+    )
+
+
+def to_ai_status_out(
+    status: AIAnalysisStatus, *, current_scan_generation: int
+) -> AIAnalysisStatusOut:
+    """Pure formatter -- mirrors `to_scan_status_out`'s role for `ScanStatus`. `stale` is true
+    only once a NEWER scan generation exists than the one this status's analysis covered."""
+    stale = status.scan_generation is not None and status.scan_generation != current_scan_generation
+    return AIAnalysisStatusOut(
+        status=status.status,
+        unavailable_reason=None,
+        scan_generation=status.scan_generation,
+        stale=stale,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        error=status.error,
+        tracks_run=list(status.tracks_run),
+        tracks_skipped=[
+            AITrackSkipOut(track=track, reason=reason) for track, reason in status.tracks_skipped
+        ],
+        files_considered=dict(status.files_considered),
+        files_capped=dict(status.files_capped),
+    )
+
+
+def ai_status_out(state: AppState) -> AIAnalysisStatusOut:
+    """`GET /api/ai/status`'s body -- checks `ai_orchestration.ai_extra_available()` FIRST, before
+    touching any in-memory analysis state, so a core-only install reports "unavailable"
+    immediately rather than a stale/never-run "idle"."""
+    if not ai_orchestration.ai_extra_available():
+        return _ai_unavailable_status_out()
+    with state.lock:
+        status = state.ai_status
+        current_generation = state.scan_generation
+    return to_ai_status_out(status, current_scan_generation=current_generation)
+
+
+def _fail_ai_analysis(
+    state: AppState, *, scan_generation: int, started_at: float, error: str
+) -> None:
+    with state.lock:
+        state.ai_status = AIAnalysisStatus(
+            status="failed",
+            scan_generation=scan_generation,
+            started_at=started_at,
+            finished_at=time.time(),
+            error=error,
+        )
+
+
+def run_ai_analysis(state: AppState, scan_generation: int, started_at: float) -> None:
+    """Background-task body for `POST /api/ai/analyze` -- same threading/locking posture as
+    `run_scan` (Starlette dispatches sync background tasks on its own worker threadpool, so this
+    never blocks the event loop; `state.lock` guards every read/write of `ai_status`/
+    `ai_clusters` against a concurrent `GET /api/ai/status` poll).
+
+    A failure here (including "no scan root recorded for this session") is recorded on
+    `ai_status` (surfaced via the status endpoint), never raised into the background-task
+    machinery where it would just be logged and lost -- identical posture to `run_scan`."""
+    with state.lock:
+        root = state.scan_status.root
+    if root is None:
+        _fail_ai_analysis(
+            state,
+            scan_generation=scan_generation,
+            started_at=started_at,
+            error="no scan root recorded for this server session — run a new scan before "
+            "analyzing with AI",
+        )
+        return
+
+    try:
+        with ScanIndex(state.db_path) as index:
+            records = index.full_inventory(under=root)
+        analysis = ai_orchestration.run_ai_analysis(records=records, safety=state.safety)
+    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+        # the status endpoint, never crash silently into Starlette's background-task machinery.
+        logger.warning("api.ai_analysis_failed", error=str(exc))
+        _fail_ai_analysis(
+            state, scan_generation=scan_generation, started_at=started_at, error=str(exc)
+        )
+        return
+
+    with state.lock:
+        state.ai_clusters = analysis.clusters
+        state.ai_status = AIAnalysisStatus(
+            status="completed",
+            scan_generation=scan_generation,
+            started_at=started_at,
+            finished_at=time.time(),
+            tracks_run=list(analysis.tracks_run),
+            tracks_skipped=[(skip.track, skip.reason) for skip in analysis.tracks_skipped],
+            files_considered=dict(analysis.files_considered),
+            files_capped=dict(analysis.files_capped),
+        )
+
+
+def _ai_suggestion_out(cluster: AICluster) -> AISuggestionOut:
+    presented = presentation.present_cluster(cluster)
+    members = [
+        AIClusterMemberOut(
+            path=member.path.as_posix(),
+            size_bytes=member.size_bytes,
+            size_human=format_bytes(member.size_bytes),
+            is_recommended_keep=member.is_recommended_keep,
+            position=member.position,
+        )
+        for member in cluster.members
+    ]
+    return AISuggestionOut(
+        cluster_id=presented.cluster_id,
+        track=presented.track.value,
+        headline=presented.headline,
+        detail_lines=list(presented.detail_lines),
+        is_suggestion=presented.is_suggestion,
+        browse_only_note=presented.browse_only_note,
+        keep_path=presented.keep_path,
+        technical_detail=presented.technical_detail,
+        members=members,
+    )
+
+
+def build_ai_suggestions(state: AppState) -> AISuggestionsResponse:
+    """`GET /api/ai/suggestions`'s body -- calls `reclaim.ai.presentation.present_cluster` per
+    cached `AICluster`; no `AICluster`/`AIClusterMember` object ever crosses the Pydantic
+    response boundary (`AISuggestionOut` is a hand-mapped shape, not a pass-through)."""
+    if not ai_orchestration.ai_extra_available():
+        return AISuggestionsResponse(
+            status="unavailable",
+            unavailable_reason=_AI_UNAVAILABLE_REASON,
+            stale=False,
+            suggestions=[],
+        )
+    with state.lock:
+        status = state.ai_status
+        current_generation = state.scan_generation
+        clusters = list(state.ai_clusters)
+    stale = status.scan_generation is not None and status.scan_generation != current_generation
+    return AISuggestionsResponse(
+        status=status.status,
+        unavailable_reason=None,
+        stale=stale,
+        suggestions=[_ai_suggestion_out(cluster) for cluster in clusters],
+    )
 
 
 # --- Quarantine / restore --------------------------------------------------------------------

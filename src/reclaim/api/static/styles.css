@@ -293,6 +293,12 @@ button {
   border-color: var(--rc-brand);
 }
 
+.rc-state-panel[data-kind="unavailable"] {
+  border-style: solid;
+  border-color: var(--rc-text-muted);
+  background: var(--rc-surface-alt);
+}
+
 .rc-spinner {
   width: 18px;
   height: 18px;
@@ -639,6 +645,49 @@ button {
   display: flex;
   align-items: center;
   gap: var(--rc-space-2);
+}
+
+/* --- AI Suggestions (ADR-0025) --------------------------------------------------------------- */
+
+.rc-ai-browse-only-note {
+  font-style: italic;
+}
+
+.rc-ai-member-list {
+  list-style: none;
+  margin: var(--rc-space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--rc-space-2);
+}
+
+.rc-ai-member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rc-space-3);
+  flex-wrap: wrap;
+  padding: var(--rc-space-2);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-sm);
+}
+
+.rc-ai-member-meta {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+  white-space: nowrap;
+}
+
+.rc-ai-technical-detail {
+  margin-top: var(--rc-space-3);
+  font-size: var(--rc-text-sm);
+  color: var(--rc-text-muted);
+}
+
+.rc-ai-technical-detail summary {
+  cursor: pointer;
+  color: var(--rc-text);
 }
 
 /* --- Quarantine ---------------------------------------------------------------------------------- */

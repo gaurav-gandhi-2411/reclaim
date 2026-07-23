@@ -110,6 +110,7 @@ const VIEW_LOADERS = {
   overview: loadOverview,
   treemap: loadTreemapView,
   review: loadReviewQueue,
+  "ai-suggestions": loadAISuggestions,
   quarantine: loadQuarantineView,
 };
 
@@ -827,7 +828,7 @@ function renderClusterTable(cluster) {
   return table;
 }
 
-export { renderClusterTable };
+export { renderClusterTable, renderAISuggestionCard };
 
 function updateApplyBar() {
   const countEl = document.getElementById("apply-selected-count");
@@ -928,6 +929,308 @@ function initReviewQueue() {
   document.getElementById("review-category-filter").addEventListener("change", loadReviewQueue);
   document.getElementById("apply-preview-btn").addEventListener("click", () => runApply(true));
   document.getElementById("apply-real-btn").addEventListener("click", () => runApply(false));
+}
+
+// --- AI Suggestions (recommend-only; ADR-0025) ---------------------------------------------------
+//
+// Clearly separate from the deterministic Quick Clean / Review Queue flows: this view's apply
+// bar sends selected paths to the exact same `/api/apply` every other apply path uses (see
+// `runAIApply` below) -- there is no second, AI-specific apply mechanism. Every raw filesystem
+// path here (member.path) is rendered via `textContent`/`dataset` only, mirroring
+// `renderClusterTable`'s XSS-safe discipline -- a file literally named `<img onerror=...>` is
+// real, reachable input for this tool.
+
+let aiPollHandle = null;
+const aiSelectedPaths = new Set();
+
+async function loadAISuggestions() {
+  const stateEl = document.getElementById("ai-suggestions-state");
+  const contentEl = document.getElementById("ai-suggestions-content");
+  const analyzeBtn = document.getElementById("ai-analyze-btn");
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Checking AI availability…" });
+
+  let status;
+  try {
+    status = await api("/api/ai/status");
+  } catch (err) {
+    analyzeBtn.disabled = true;
+    renderState(stateEl, "error", {
+      title: "Could not reach the AI status endpoint",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadAISuggestions,
+    });
+    return;
+  }
+
+  if (status.status === "unavailable") {
+    analyzeBtn.disabled = true;
+    renderState(stateEl, "unavailable", {
+      title: "AI features aren't installed",
+      message: status.unavailable_reason,
+    });
+    return;
+  }
+
+  analyzeBtn.disabled = false;
+
+  if (status.status === "running") {
+    renderState(stateEl, "loading", {
+      title: "Analyzing with AI…",
+      message:
+        "This can take a while the first time (image hashing, document text extraction, and " +
+        "— if installed — a one-time model download).",
+    });
+    if (!aiPollHandle) aiPollHandle = setInterval(pollAIStatus, 2000);
+    return;
+  }
+  if (aiPollHandle) {
+    clearInterval(aiPollHandle);
+    aiPollHandle = null;
+  }
+
+  if (status.status === "idle") {
+    renderState(stateEl, "empty", {
+      title: "No AI analysis yet",
+      message:
+        'Run a scan, then click "Analyze with AI" to look for near-duplicate photos, possible ' +
+        "document drafts, screenshot bursts, and similar-scene photo groups.",
+    });
+    return;
+  }
+
+  if (status.status === "failed") {
+    renderState(stateEl, "error", {
+      title: "AI analysis failed",
+      message: status.error || "Unknown error.",
+      actionLabel: "Try again",
+      onAction: startAIAnalysis,
+    });
+    return;
+  }
+
+  await loadAISuggestionsList(status);
+}
+
+async function pollAIStatus() {
+  const status = await api("/api/ai/status").catch(() => null);
+  if (!status || status.status === "running") return;
+  clearInterval(aiPollHandle);
+  aiPollHandle = null;
+  loadAISuggestions();
+}
+
+async function startAIAnalysis() {
+  const analyzeBtn = document.getElementById("ai-analyze-btn");
+  const stateEl = document.getElementById("ai-suggestions-state");
+  analyzeBtn.disabled = true;
+  try {
+    await api("/api/ai/analyze", { method: "POST" });
+  } catch (err) {
+    analyzeBtn.disabled = false;
+    renderState(stateEl, "error", {
+      title: "Could not start AI analysis",
+      message: err.message,
+      actionLabel: "Try again",
+      onAction: startAIAnalysis,
+    });
+    return;
+  }
+  loadAISuggestions();
+}
+
+async function loadAISuggestionsList(status) {
+  const stateEl = document.getElementById("ai-suggestions-state");
+  const contentEl = document.getElementById("ai-suggestions-content");
+  const staleNote = document.getElementById("ai-suggestions-stale-note");
+  try {
+    const data = await api("/api/ai/suggestions");
+    if (data.suggestions.length === 0) {
+      renderState(stateEl, "empty", {
+        title: "No AI suggestions found",
+        message:
+          "The last analysis didn't find any near-duplicate photos, draft documents, " +
+          "screenshot bursts, or similar-scene groups in this scan.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    staleNote.hidden = !data.stale;
+    renderAISuggestionsList(data.suggestions);
+    updateAIApplyBar();
+  } catch (err) {
+    renderState(stateEl, "error", {
+      title: "Could not load AI suggestions",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadAISuggestions,
+    });
+  }
+}
+
+// `suggestion.headline`/`detail_lines`/`browse_only_note`/`technical_detail` are all fixed,
+// server-authored prose from `reclaim.ai.presentation` (no user/filesystem data interpolated
+// into them) -- safe as plain text via `textContent`. Every `member.path` below is a raw
+// filesystem path and is rendered via `textContent` ONLY, never innerHTML.
+function renderAISuggestionsList(suggestions) {
+  const list = document.getElementById("ai-suggestions-list");
+  list.innerHTML = "";
+  for (const suggestion of suggestions) {
+    list.appendChild(renderAISuggestionCard(suggestion));
+  }
+}
+
+function renderAISuggestionCard(suggestion) {
+  const card = document.createElement("article");
+  card.className = "rc-candidate-card";
+  card.dataset.track = suggestion.track;
+
+  const head = document.createElement("div");
+  head.className = "rc-candidate-card-head";
+  const heading = document.createElement("strong");
+  heading.textContent = suggestion.headline;
+  head.appendChild(heading);
+  if (!suggestion.is_suggestion) {
+    const badge = document.createElement("span");
+    badge.className = "rc-badge";
+    badge.dataset.kind = "heuristic";
+    badge.textContent = "Browse only";
+    head.appendChild(badge);
+  }
+  card.appendChild(head);
+
+  for (const line of suggestion.detail_lines) {
+    const p = document.createElement("p");
+    p.className = "rc-candidate-rationale";
+    p.textContent = line;
+    card.appendChild(p);
+  }
+
+  if (suggestion.browse_only_note) {
+    const note = document.createElement("p");
+    note.className = "rc-candidate-rationale rc-ai-browse-only-note";
+    note.textContent = suggestion.browse_only_note;
+    card.appendChild(note);
+  }
+
+  card.appendChild(renderAIMemberList(suggestion));
+
+  const details = document.createElement("details");
+  details.className = "rc-ai-technical-detail";
+  const summary = document.createElement("summary");
+  summary.textContent = "Technical detail";
+  details.appendChild(summary);
+  const detailText = document.createElement("p");
+  detailText.textContent = suggestion.technical_detail;
+  details.appendChild(detailText);
+  card.appendChild(details);
+
+  return card;
+}
+
+// SEMANTIC_IMAGE clusters get NO checkbox, NO apply affordance at all -- structural, not just a
+// visual convention: this function never even constructs a checkbox element for that track, so
+// there is nothing for a future change to accidentally leave clickable (ADR-0025 decision 6/7).
+function renderAIMemberList(suggestion) {
+  const allowSelection = suggestion.track !== "semantic_image";
+  const list = document.createElement("ul");
+  list.className = "rc-ai-member-list";
+
+  for (const member of suggestion.members) {
+    const li = document.createElement("li");
+    li.className = "rc-ai-member-row";
+
+    if (allowSelection) {
+      const label = document.createElement("label");
+      label.className = "rc-checkbox-row";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = aiSelectedPaths.has(member.path);
+      checkbox.setAttribute("aria-label", `Select ${member.path} for apply`);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) aiSelectedPaths.add(member.path);
+        else aiSelectedPaths.delete(member.path);
+        updateAIApplyBar();
+      });
+      const pathSpan = document.createElement("span");
+      pathSpan.className = "rc-candidate-path";
+      pathSpan.textContent = member.path;
+      label.appendChild(checkbox);
+      label.appendChild(pathSpan);
+      li.appendChild(label);
+    } else {
+      const pathSpan = document.createElement("span");
+      pathSpan.className = "rc-candidate-path";
+      pathSpan.textContent = member.path;
+      li.appendChild(pathSpan);
+    }
+
+    const meta = document.createElement("span");
+    meta.className = "rc-ai-member-meta";
+    meta.textContent =
+      member.position !== null && member.position !== undefined
+        ? `${member.size_human} — position ${member.position + 1}`
+        : member.size_human;
+    li.appendChild(meta);
+
+    if (member.is_recommended_keep) {
+      const badge = document.createElement("span");
+      badge.className = "rc-badge";
+      badge.dataset.kind = "heuristic";
+      badge.textContent = "Recommended keep";
+      li.appendChild(badge);
+    }
+
+    list.appendChild(li);
+  }
+  return list;
+}
+
+function updateAIApplyBar() {
+  document.getElementById("ai-apply-selected-count").textContent = String(aiSelectedPaths.size);
+  document.getElementById("ai-apply-preview-btn").disabled = aiSelectedPaths.size === 0;
+  document.getElementById("ai-apply-real-btn").disabled = true; // re-enabled only after a
+  // fresh preview of the current selection, same discipline as the Review Queue's apply bar.
+}
+
+async function runAIApply(dryRun) {
+  const resultEl = document.getElementById("ai-apply-result");
+  const paths = [...aiSelectedPaths];
+  if (paths.length === 0) return;
+
+  if (!dryRun) {
+    const confirmed = window.confirm(
+      `This will really apply ${paths.length} selected item(s). Continue?`
+    );
+    if (!confirmed) return;
+  }
+
+  renderState(resultEl, "loading", { title: dryRun ? "Running dry-run preview…" : "Applying…" });
+  try {
+    // Sent to the exact same /api/apply every other apply path uses -- an AI-suggested,
+    // explicitly-selected path is safety-validated independently there (ADR-0025 decision 6),
+    // never a separate AI-only apply mechanism.
+    const report = await api("/api/apply", {
+      method: "POST",
+      body: JSON.stringify({ tier: "both", paths, method: "vault", dry_run: dryRun }),
+    });
+    renderApplyReport(resultEl, report);
+    if (dryRun) document.getElementById("ai-apply-real-btn").disabled = false;
+    if (!dryRun) {
+      aiSelectedPaths.clear();
+      loadAISuggestions();
+    }
+  } catch (err) {
+    renderState(resultEl, "error", { title: "Apply failed", message: err.message });
+  }
+}
+
+function initAISuggestions() {
+  document.getElementById("ai-analyze-btn").addEventListener("click", startAIAnalysis);
+  document.getElementById("ai-apply-preview-btn").addEventListener("click", () => runAIApply(true));
+  document.getElementById("ai-apply-real-btn").addEventListener("click", () => runAIApply(false));
 }
 
 // --- Quarantine / restore ------------------------------------------------------------------------
@@ -1117,6 +1420,7 @@ function init() {
   initTabs();
   initScanBar();
   initReviewQueue();
+  initAISuggestions();
   initQuickClean();
   initHowItWorks();
   initModeControls();

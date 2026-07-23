@@ -432,22 +432,66 @@ def test_review_queue_partitions_all_five_tracks_correctly() -> None:
 # --- 6. Full pipeline sanity: apply_batch's real call sites never touch reclaim.ai -------------
 
 
-def test_cli_and_api_service_never_import_reclaim_ai_today() -> None:
-    """Today, the AI layer has no dashboard/CLI wiring at all — the strongest possible
-    safety property at this stage of the build (spec §8 build order: harness + safety eval
-    land before any feature, let alone any UI surface). If/when a future feature adds
-    READ-ONLY AI-review wiring to the dashboard, this test must be narrowed (not deleted) to
-    assert the wiring never flows into `apply_batch`'s `selected`/`candidates` argument —
-    see this test's docstring at that point for the updated guarantee it should assert.
-    """
-    for source_file in (
-        _AI_PACKAGE_ROOT.parent / "cli.py",
-        _AI_PACKAGE_ROOT.parent / "api" / "service.py",
-        _AI_PACKAGE_ROOT.parent / "api" / "routes.py",
-    ):
-        imported = _imported_module_names(source_file.read_text(encoding="utf-8"))
-        hit = {name for name in imported if name == "reclaim.ai" or name.startswith("reclaim.ai.")}
-        assert hit == set(), f"{source_file.name} must not import reclaim.ai yet: {hit}"
+def test_cli_never_imports_reclaim_ai() -> None:
+    """CLI wiring remains explicitly out of scope (ADR-0025: the dashboard's AI Suggestions
+    tab is the only wired surface) — `cli.py` must still never import `reclaim.ai` at all."""
+    source_file = _AI_PACKAGE_ROOT.parent / "cli.py"
+    imported = _imported_module_names(source_file.read_text(encoding="utf-8"))
+    hit = {name for name in imported if name == "reclaim.ai" or name.startswith("reclaim.ai.")}
+    assert hit == set(), f"{source_file.name} must not import reclaim.ai: {hit}"
+
+
+def test_ai_orchestration_module_never_imports_the_executor_or_send2trash() -> None:
+    """ADR-0025's new `api/ai_orchestration.py` is the ONE api-layer module that calls into
+    `reclaim.ai`'s compute functions (image/document similarity, screenshot review, semantic
+    grouping, the clutter ranker) — it has no business ever touching apply/executor, only
+    computing clusters, so it gets the exact same AST-scanned guarantee every file under
+    `src/reclaim/ai/` already has (test 1 above), even though it lives outside that package.
+    `api/service.py`/`api/routes.py` legitimately import BOTH `reclaim.ai` (read-only, for
+    suggestions) AND `reclaim.executor` (to actually apply a user's explicit selection) — see
+    `test_apply_selection_only_ever_builds_candidates_from_deterministic_or_freshly_safety_
+    validated_sources` below for the runtime proof that those two never mix into one call."""
+    source_file = _AI_PACKAGE_ROOT.parent / "api" / "ai_orchestration.py"
+    forbidden = {"reclaim.executor", "send2trash"}
+    imported = _imported_module_names(source_file.read_text(encoding="utf-8"))
+    hit = {name for name in imported if name in forbidden or name.startswith("send2trash.")}
+    assert hit == set(), (
+        f"api/ai_orchestration.py must never import the auto-delete executor or send2trash: {hit}"
+    )
+
+
+def test_api_service_now_imports_reclaim_ai_for_read_only_suggestions() -> None:
+    """The other half of ADR-0025's narrowing: `api/service.py` DOES import `reclaim.ai` now
+    (expected — `presentation.present_cluster`) — this is a positive assertion (not just "no
+    longer forbidden") so a future refactor that accidentally removes the wiring is caught here,
+    not just silently passing the old test's absence-check by coincidence. `api/routes.py`
+    itself never needs to import `reclaim.ai` directly (it calls `service`/`ai_orchestration`),
+    so it isn't asserted here — see `test_ai_orchestration_module_never_imports_the_executor_
+    or_send2trash` above for that module's own coverage."""
+    source_file = _AI_PACKAGE_ROOT.parent / "api" / "service.py"
+    imported = _imported_module_names(source_file.read_text(encoding="utf-8"))
+    hit = {name for name in imported if name == "reclaim.ai" or name.startswith("reclaim.ai.")}
+    assert hit, "api/service.py is expected to import reclaim.ai after ADR-0025: none found"
+
+
+def test_apply_selection_candidates_are_deterministic_or_freshly_safety_validated() -> None:
+    """Runtime half of ADR-0025's narrowed guarantee: `reclaim.api.service.apply_selection`'s
+    only two candidate sources are (1) `_all_candidates` (the deterministic detector/dedup
+    pipeline, unchanged) and (2) `_build_user_selected_candidate`, which independently
+    re-evaluates a fresh `FileRecord` through the real `SafetyValidator` before ever
+    constructing a `Candidate` — never an `AICluster`/`AIClusterMember`. This is proven
+    structurally (source inspection: neither function's CODE references those two types at all
+    — a docstring merely mentioning "reclaim.ai" in prose is fine and not checked here) rather
+    than by running a live server, since the whole point is that this is impossible by
+    construction, not merely unexercised in today's tests."""
+    import inspect
+
+    from reclaim.api import service
+
+    for fn in (service.apply_selection, service._build_user_selected_candidate):
+        source = inspect.getsource(fn)
+        assert "AICluster" not in source
+        assert "AIClusterMember" not in source
 
 
 def test_apply_batch_signature_has_no_ai_layer_parameter() -> None:
