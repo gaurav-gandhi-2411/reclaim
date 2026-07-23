@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from reclaim.ai.models import AICluster
 from reclaim.config import Config, apply_safe_mode_category_overrides
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
@@ -12,6 +13,7 @@ from reclaim.models import Mode
 from reclaim.safety import SafetyValidator
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed"]
+AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
 
 
 @dataclass(slots=True)
@@ -29,6 +31,25 @@ class ScanStatus:
     files_unchanged: int | None = None
     files_pruned: int | None = None
     elapsed_seconds: float | None = None
+
+
+@dataclass(slots=True)
+class AIAnalysisStatus:
+    """Snapshot of the most recent (or in-progress) AI analysis pass for this process --
+    mirrors `ScanStatus`'s exact shape/locking pattern (ADR-0025). `scan_generation` records
+    which `AppState.scan_generation` this analysis covered, so a caller can tell a completed
+    analysis is stale (a newer scan has since completed) without forcing a recompute on every
+    page load -- see `AppState.scan_generation`'s docstring."""
+
+    status: AIAnalysisStatusLiteral = "idle"
+    scan_generation: int | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    tracks_run: list[str] = field(default_factory=list)
+    tracks_skipped: list[tuple[str, str]] = field(default_factory=list)  # (track, reason) pairs
+    files_considered: dict[str, int] = field(default_factory=dict)
+    files_capped: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -70,6 +91,16 @@ class AppState:
     scan_status: ScanStatus = field(default_factory=ScanStatus)
     mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
     first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
+    # ADR-0025: incremented once per successfully COMPLETED scan (`service.run_scan`'s success
+    # branch) -- the AI analysis cache below is keyed to this value so a caller can tell a
+    # cached analysis is stale (a newer scan completed since) without forcing a recompute on
+    # every page load.
+    scan_generation: int = 0
+    ai_status: AIAnalysisStatus = field(default_factory=AIAnalysisStatus)
+    # The last COMPLETED analysis's clusters -- valid only when `ai_status.scan_generation ==
+    # scan_generation` (see above). In-memory only, like every other piece of this process's
+    # session state (ADR-0025 decision 2): lost on restart, re-computed with one click.
+    ai_clusters: list[AICluster] = field(default_factory=list)
 
     @property
     def live_mode(self) -> Mode:

@@ -44,6 +44,7 @@
     <button class="rc-tab" role="tab" data-view="overview" id="tab-overview" aria-selected="true" aria-controls="view-overview">Overview</button>
     <button class="rc-tab" role="tab" data-view="treemap" id="tab-treemap" aria-selected="false" aria-controls="view-treemap">Storage Treemap</button>
     <button class="rc-tab" role="tab" data-view="review" id="tab-review" aria-selected="false" aria-controls="view-review">Review Queue</button>
+    <button class="rc-tab" role="tab" data-view="ai-suggestions" id="tab-ai-suggestions" aria-selected="false" aria-controls="view-ai-suggestions">AI Suggestions</button>
     <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
   </nav>
 
@@ -166,6 +167,36 @@
           </button>
         </div>
         <div id="apply-result"></div>
+      </div>
+    </section>
+
+    <!-- AI Suggestions: recommend-only, clearly separate from the deterministic Quick Clean /
+         Review Queue flows above -- nothing here can reach apply without the user explicitly
+         selecting specific files first (see app.js's aiSuggestions* functions). -->
+    <section id="view-ai-suggestions" class="rc-view" role="tabpanel" aria-labelledby="tab-ai-suggestions" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>AI Suggestions</h1>
+          <p>Recommend-only. AI never deletes anything on its own — you review and select specific files, which then go through the exact same apply/safety check as everything else in Reclaim.</p>
+        </div>
+        <button id="ai-analyze-btn" type="button" class="rc-btn rc-btn-primary" disabled>Analyze with AI</button>
+      </div>
+      <div id="ai-suggestions-state"></div>
+      <div id="ai-suggestions-content" hidden>
+        <p id="ai-suggestions-stale-note" class="rc-candidate-rationale" hidden>A newer scan has completed since this analysis — click "Analyze with AI" to refresh.</p>
+        <div id="ai-suggestions-list" class="rc-candidate-list"></div>
+        <div class="rc-apply-bar">
+          <p>
+            Selected: <span id="ai-apply-selected-count">0</span> item(s)
+          </p>
+          <button id="ai-apply-preview-btn" type="button" class="rc-btn rc-btn-secondary" disabled>
+            1. Preview (dry-run)
+          </button>
+          <button id="ai-apply-real-btn" type="button" class="rc-btn rc-btn-danger" disabled>
+            2. Confirm real apply
+          </button>
+        </div>
+        <div id="ai-apply-result"></div>
       </div>
     </section>
 

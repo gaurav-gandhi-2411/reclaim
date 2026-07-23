@@ -3,10 +3,12 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 
-from reclaim.api import service
+from reclaim.api import ai_orchestration, service
 from reclaim.api.schemas import (
+    AIAnalysisStatusOut,
+    AISuggestionsResponse,
     ApplyRequest,
     ApplyResponse,
     CandidatesResponse,
@@ -23,7 +25,7 @@ from reclaim.api.schemas import (
     SummaryResponse,
     TreemapResponse,
 )
-from reclaim.api.state import AppState, ScanStatus
+from reclaim.api.state import AIAnalysisStatus, AppState, ScanStatus
 from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
@@ -136,6 +138,48 @@ def apply(payload: ApplyRequest, request: Request) -> ApplyResponse:
         # contract — e.g. requesting a blanket tier-apply with no explicit paths, or a non-
         # recycle_bin method — a real 400, not a sign anything is broken.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- AI suggestions (recommend-only; ADR-0025) -------------------------------------------------
+
+
+@router.post("/ai/analyze", response_model=AIAnalysisStatusOut)
+def start_ai_analysis(
+    background_tasks: BackgroundTasks, request: Request, response: Response
+) -> AIAnalysisStatusOut:
+    """Mirrors `POST /api/scan`'s exact shape: starts a background analysis and returns
+    immediately. Degraded mode (no `ai` extra installed) returns a typed "unavailable" body with
+    the default `200` — nothing was accepted for background work, so `202` would be misleading."""
+    state = get_state(request)
+    if not ai_orchestration.ai_extra_available():
+        return service.ai_status_out(state)
+
+    if not service.has_scan_data(state):
+        raise HTTPException(status_code=400, detail="run a scan before analyzing with AI")
+
+    started_at = time.time()
+    with state.lock:
+        if state.ai_status.status == "running":
+            raise HTTPException(status_code=409, detail="an AI analysis is already running")
+        scan_generation = state.scan_generation
+        state.ai_status = AIAnalysisStatus(
+            status="running", scan_generation=scan_generation, started_at=started_at
+        )
+        status_snapshot = state.ai_status
+
+    background_tasks.add_task(service.run_ai_analysis, state, scan_generation, started_at)
+    response.status_code = 202
+    return service.to_ai_status_out(status_snapshot, current_scan_generation=scan_generation)
+
+
+@router.get("/ai/status", response_model=AIAnalysisStatusOut)
+def ai_status(request: Request) -> AIAnalysisStatusOut:
+    return service.ai_status_out(get_state(request))
+
+
+@router.get("/ai/suggestions", response_model=AISuggestionsResponse)
+def ai_suggestions(request: Request) -> AISuggestionsResponse:
+    return service.build_ai_suggestions(get_state(request))
 
 
 @router.get("/quarantine", response_model=QuarantineListResponse)

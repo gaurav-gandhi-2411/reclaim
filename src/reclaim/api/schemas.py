@@ -36,6 +36,10 @@ _CATEGORY_LABELS: dict[str, str] = {
     "large_logs": "Large Stale Logs",
     "duplicates": "Exact Duplicates",
     "other": "Uncategorized",
+    # ADR-0025: the category_group `apply_selection` assigns to an explicitly-named path that
+    # wasn't already a deterministic candidate (the common case for an AI-suggestion apply) --
+    # never emitted by `reclaim.detectors`, only by `api/service.py`'s apply-time safety check.
+    "user_selected": "Individually Selected Items",
 }
 
 
@@ -403,6 +407,66 @@ class RestoreResponse(BaseModel):
     files_unsupported: int
     bytes_restored: int
     bytes_restored_human: str
+
+
+# --- AI suggestions (recommend-only; reclaim.ai.presentation output only, never a raw
+# AICluster/AIClusterMember -- see ADR-0025) ---------------------------------------------------
+
+
+class AITrackSkipOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    track: str
+    reason: str
+
+
+class AIAnalysisStatusOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # "unavailable" | "idle" | "running" | "completed" | "failed"
+    unavailable_reason: str | None
+    scan_generation: int | None
+    stale: bool
+    started_at: float | None
+    finished_at: float | None
+    error: str | None
+    tracks_run: list[str]
+    tracks_skipped: list[AITrackSkipOut]
+    files_considered: dict[str, int]
+    files_capped: dict[str, int]
+
+
+class AIClusterMemberOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_bytes: int
+    size_human: str
+    is_recommended_keep: bool
+    position: int | None
+
+
+class AISuggestionOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cluster_id: str
+    track: str
+    headline: str
+    detail_lines: list[str]
+    is_suggestion: bool
+    browse_only_note: str | None
+    keep_path: str | None
+    technical_detail: str
+    members: list[AIClusterMemberOut]
+
+
+class AISuggestionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    unavailable_reason: str | None
+    stale: bool
+    suggestions: list[AISuggestionOut]
 
 
 # --- Stage 2: mode + first-run ----------------------------------------------------------------
