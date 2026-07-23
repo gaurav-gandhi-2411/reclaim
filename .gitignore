@@ -50,6 +50,13 @@ node_modules/
 # a local, unsigned build artifact, never committed.
 dist/
 
+# Stage 2 public installer pipeline (packaging/, ADR-0024): Nuitka's --standalone build tree
+# and the compiled Inno Setup installer are large, machine-specific, unsigned build outputs —
+# never committed. packaging/entry_point.py, packaging/reclaim.iss, and
+# packaging/test_packaged_safe_mode.ps1 (source/scripts) are the only tracked files here.
+packaging/build/
+packaging/dist/
+
 # IDE / OS
 .vscode/
 .idea/

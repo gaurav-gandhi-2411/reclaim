@@ -1261,6 +1261,97 @@ retention + restore, now with an explicit `purge` command for expired entries.
   document/ADR-0018 incident, the version-chain safety property, Feature 2 (+ follow-up), and
   Feature 3, plus a summary of the four structural harness invariants the incidents produced.
 
+### 2026-07-19 — Stage 2 Part A complete: safe mode as a structural safety boundary (checkpoint recorded retroactively)
+- Commit `755ce5d`, ADR-0023 (`docs/architecture/adr/0023-stage2-safe-mode-safety-boundary.md`)
+  — this checkpoint was not recorded at the time; adding it now for continuity before Part B's
+  own checkpoint below. See the ADR for full design; summary: safe mode is the default for
+  every fresh install (no `mode_log.jsonl` means `Mode.SAFE`, not just an in-code fallback),
+  enforced as three independent, structurally-proven guarantees — (1) `apply_batch` and
+  `purge_expired` short-circuit to recycle-bin-only / refuse-unconditionally the instant
+  `mode=SAFE`, before any other logic, proven by monkeypatching `os.unlink`/`shutil.rmtree` to
+  raise during a real `apply=True` batch; (2) `duplicates`/`model_caches`/`dev_artifacts` forced
+  off via a new `load_effective_config` (kept separate from `load_config` — baking the override
+  into `load_config` directly broke ~240 pre-existing tests that were never about mode); (3)
+  every candidate forced to Tier B, and the API refuses a blanket tier/category apply with no
+  explicit paths. Power mode is a typed-confirmation opt-in
+  (`switch_to_power_mode("I understand this can permanently delete files")`, case-sensitive,
+  exact match), logged append-only to `data/mode_log.jsonl`, reversible to safe with no gate.
+  First-run screen added (dashboard overlay, shown once). 581 tests passed (562 pre-existing +
+  19 new), zero regressions, two clean verifier passes.
+- Next: Stage 2 Part B — packaging (Windows installer, AI-bundle size decision, LICENSE,
+  safe-mode-survives-packaging proof).
+
+### 2026-07-23 — Stage 2 Part B complete: Windows installer, core-only AI-bundle decision, LICENSE
+- **Installer tooling**: Nuitka `--standalone` + Inno Setup, over Briefcase MSI. ADR-0024
+  documents why: `cli.py`'s `uvicorn.run(app, ...)` already passes a real app object (not a
+  dynamic `"module:app"` string), sidestepping the most common Nuitka+FastAPI failure mode;
+  Briefcase's FastAPI-serving path is a brand-new 2026Q2 feature built for embedding a site in
+  native window chrome (Toga/Positron), not a background-service-plus-browser-dashboard tool,
+  and needs the WiX Toolset besides. Inno Setup 7.0.2 (x64) installed system-wide from the
+  official `jrsoftware/issrc` GitHub release, silently (`/VERYSILENT`) — flagged to GG as a
+  system-level tool install, not just a repo change. `nuitka` added as a `uv add --dev` entry.
+- **AI-bundle size decision, measured not guessed** (two clean `uv venv` + `uv pip install`
+  scratch environments, no dev-tool contamination): core-only `site-packages` = **13.6 MB**;
+  with `[ai]` extras = **1,041.8 MB** (`torch` alone is 464 MB — 45% of the delta, and shared by
+  *both* Feature 1b's document dedup and Track B's CLIP grouping, so the "lightweight image/doc
+  dedup vs. heavy semantic AI" split the brief assumed doesn't cleanly exist; recorded as a
+  disclosed, deferred option in ADR-0024, not silently implemented). **Decision: core-only
+  public installer** — every AI feature is recommend-only/browse-only by construction, so a
+  fresh install loses nothing essential; AI stays a documented `pip install reclaim[ai]` /
+  `uv sync --extra ai` post-install path. No `pyproject.toml` extras restructuring done.
+- **LICENSE**: MIT + a prominent, explicitly-titled "DATA-DELETION SOFTWARE" disclaimer section
+  (no-warranty/limitation-of-liability, backup responsibility, safe-mode-is-the-default note)
+  that states it governs over the MIT boilerplate where the two conflict on warranty/liability.
+- **Packaging pipeline** (`packaging/`, gitignored build/dist outputs — only
+  `entry_point.py`/`reclaim.iss`/`test_packaged_safe_mode.ps1` are tracked):
+  `entry_point.py` (thin `reclaim.cli:main` wrapper — Nuitka compiles a script, not a
+  console_scripts reference); `reclaim.iss` (per-user install, `PrivilegesRequired=lowest`, no
+  admin prompt at any step — matches `reclaim.elevation.assert_not_elevated`'s "never runs
+  elevated" invariant end to end; Start Menu + optional desktop shortcut launch
+  `reclaim.exe dashboard` with `WorkingDir={app}` so the CLI's relative `data/`/`config.toml`
+  defaults land in the per-user install folder, not wherever Explorer happened to launch from).
+  Built from the core-only scratch venv specifically (not the mixed dev venv) so the "core-only"
+  guarantee is airtight rather than incidental to `reclaim.ai`'s lazy `importlib.import_module`
+  imports not being statically followed. Installer: **18.2 MB** (`packaging/dist/reclaim-setup.exe`).
+- **Safe-mode-survives-packaging proof, against the ACTUAL compiled artifact, twice**
+  (`packaging/test_packaged_safe_mode.ps1`, 13 checks) — once against the raw Nuitka
+  `--standalone` dist folder, once against a real silent-install → run → silent-uninstall cycle
+  through the built `reclaim-setup.exe` (no admin prompt at install or uninstall): fresh install
+  (no prior `mode_log.jsonl`) reports `mode=safe`; a real `--apply` batch (not dry-run) against a
+  `dev_artifacts`-eligible fixture with a `config.toml` explicitly trying to re-enable
+  `dev_artifacts`/`duplicates`/`model_caches` still resolves to `method=recycle_bin` (never
+  `vault`/`direct_delete` — confirmed both from the printed report line and the manifest's own
+  recorded `method`/`vault_path` fields, plus absence of any per-batch vault subdirectory);
+  wrong confirmation phrase rejected, mode stays safe; exact phrase switches to power; reverting
+  to safe needs no confirmation. Also confirmed: the installed `reclaim.exe serve` launches and
+  answers `GET /` with HTTP 200 on `127.0.0.1:8420`; uninstall removes all installed files but
+  correctly leaves runtime-created `data/` behind (expected — an uninstaller shouldn't silently
+  delete a user's quarantine/mode-log history).
+- **Test-authoring bug caught and fixed during this work, not after**: the smoke test's first
+  version asserted "no `quarantine/manifest.jsonl` file" as its vault-didn't-happen check — but
+  `manifest.jsonl` is written as an audit-trail entry for every method (vault, recycle_bin,
+  direct_delete alike), so its mere existence proves nothing about which method ran. Fixed to
+  check the manifest's own recorded `method`/`vault_path` fields plus the absence of a per-batch
+  vault subdirectory — the actual vault signal.
+- **Tooling gotcha**: the project's PowerShell tool session became unresponsive mid-session
+  (every command, including `Write-Output "hello"`, returned exit 1 with zero output) for
+  reasons that couldn't be diagnosed from inside the session — worked around by invoking
+  `powershell.exe`/`pwsh` as a subprocess via the Bash tool instead for the rest of this pass's
+  verification. Separately, `test_packaged_safe_mode.ps1`'s original em-dash punctuation broke
+  under Windows PowerShell 5.1 (`powershell.exe`, which doesn't default to UTF-8 for BOM-less
+  script files) even though it parsed fine under the PowerShell-7-backed tool session — rewrote
+  the script ASCII-only so it's portable across both, since a packaging test script is exactly
+  the kind of thing that shouldn't depend on which PowerShell a machine defaults to.
+- Verification: `uv run ruff check .` — pass · `uv run ruff format --check .` — pass (127 files)
+  · `uv run mypy` — pass (50 source files) · `uv run pytest --cov` — 563 passed, 2 skipped,
+  95.19% coverage · both Nuitka-dist-folder and real-installer safe-mode smoke test runs — 13/13
+  checks pass each.
+- Next: Stage 2 Part C — signing (report cost/UX options only, do not spend), then the
+  merge-review doc for `feat/stage2-public`. Follow-up disclosed, not yet actioned: no working
+  path today for "enable AI on a Nuitka-installed `reclaim.exe`" (the compiled binary isn't a
+  `pip`-installable environment) — documented in ADR-0024's consequences, deferred to the
+  installer README's eventual "power users" section.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

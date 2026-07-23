@@ -101,52 +101,61 @@ losing is covered.
 
 ## Distribution status
 
-This pass targets **you and technical reviewers** — anyone comfortable running a CLI tool they
-built or cloned themselves. Explicitly out of scope for this pass, pending a separate go-public
-decision:
+**Stage 2** (ADR-0023, ADR-0024) turned this from "a CLI tool you clone and run yourself" into a
+double-click Windows installer aimed at people who won't read the source first:
 
-- A safe-mode-by-default posture for non-technical users (review-only, Recycle-Bin-only, no
-  batch-auto-apply) — current behavior assumes you've read what you're enabling.
-- A signed, double-click public installer (MSI/Tauri). A documented, reproducible Nuitka
-  one-folder build (below) produces a double-clickable local `reclaim.exe`, but it is unsigned;
-  expect an antivirus/SmartScreen false-positive prompt on first run (common for freshly-built,
-  unsigned PyInstaller/Nuitka binaries) and treat that as expected, not as a compromise signal,
-  for a binary you built yourself from this source. Public code signing is deliberately deferred
-  to the Stage 2 public-distribution pass.
+- **Safe mode is the default for every fresh install.** Recommend/review-only, Recycle-Bin-only
+  deletes, and the highest-risk categories (`duplicates`/`model_caches`/`dev_artifacts`) forced
+  off — structurally enforced (`evals/test_safe_mode_gate.py`), not a convention. Full behavior
+  ("power mode") requires an explicit, typed, logged confirmation
+  (`reclaim mode power --confirm "I understand this can permanently delete files"`) — see
+  ADR-0023.
+- **A double-click installer** (`packaging/reclaim.iss`, built with Nuitka `--standalone` +
+  Inno Setup — see ADR-0024 for why this pair over Briefcase/MSI) installs per-user, no admin
+  prompt (matches `reclaim.elevation.assert_not_elevated`'s "never runs elevated" invariant end
+  to end), and adds a Start Menu / optional desktop shortcut that launches
+  `reclaim.exe dashboard`.
+- **Core-only, by design.** The installer ships the deterministic engine only — no AI-layer
+  dependencies. Measured (clean `uv venv` install, this session): core `site-packages` is
+  **13.6 MB**; the `[ai]` extra adds **~1,028 MB** (`torch` alone is 464 MB, shared by both
+  Feature 1b's document dedup and Track B's CLIP grouping — there's no way to get "semantic
+  grouping" without it). Every AI feature is recommend-only or browse-only, so a fresh install
+  loses nothing essential by not carrying it; if you want the AI layer, install from source with
+  `uv sync --extra ai` / `pip install reclaim[ai]` (a separate Python environment — the
+  Nuitka-compiled `reclaim.exe` cannot `pip install` into itself; see ADR-0024's consequences
+  section for this disclosed gap).
+- **Unsigned.** Expect a SmartScreen/antivirus prompt on first run — this is normal for a
+  freshly-built, unsigned binary and is not a compromise signal for a binary built from this
+  source. Code-signing options are assessed (cost/UX, not implemented) in Stage 2 Part C.
 
-### Optional: standalone `reclaim.exe` (Nuitka)
-
-For a double-clickable local build that doesn't require a Python environment on the target
-machine — **one-folder mode** (`--standalone`, not `--onefile`): produces a `dist/cli.dist/`
-folder containing `reclaim.exe` plus its dependencies as separate files, not a single packed
-binary, per this pass's explicit scope (a public single-file/signed installer is Stage 2):
+Build it yourself:
 
 ```powershell
-uv pip install nuitka
-uv run python -m nuitka --standalone --output-dir=dist `
-  --output-filename=reclaim.exe `
+uv add --dev nuitka   # already recorded in pyproject.toml's dev group
+uv run python -m nuitka --standalone --assume-yes-for-downloads `
   --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=0.1.0 `
-  --include-package=fastapi --include-package=starlette --include-package=pydantic `
-  --include-package=uvicorn --include-package=jinja2 --include-package=structlog `
-  --include-data-dir=src/reclaim/api/templates=reclaim/api/templates `
+  --include-package=reclaim --include-package=uvicorn --include-package=fastapi `
+  --include-package=starlette `
   --include-data-dir=src/reclaim/api/static=reclaim/api/static `
-  --windows-console-mode=force `
-  src/reclaim/cli.py
+  --include-data-dir=src/reclaim/api/templates=reclaim/api/templates `
+  --output-dir=packaging/build --output-filename=reclaim.exe `
+  packaging/entry_point.py
+
+# Build from a CORE-ONLY environment (no [ai] extra) so nothing AI-related can leak into the
+# installer — Nuitka's static import analysis won't follow reclaim.ai's lazy
+# importlib.import_module() calls anyway, but a clean venv makes the guarantee airtight rather
+# than incidental. Then package it:
+"C:\Program Files\Inno Setup 7\ISCC.exe" packaging\reclaim.iss
+# -> packaging\dist\reclaim-setup.exe
 ```
 
-`dist/cli.dist/reclaim.exe` launches the same CLI (`reclaim.exe dashboard` opens the browser
-dashboard) — **this exact command was run and verified** (`reclaim.exe --help` and
-`reclaim.exe scan <dir>` both work correctly against a real directory) as part of this pass. No C
-compiler is required up front: Nuitka downloads a private MinGW64 toolchain on first run if
-neither MSVC nor an existing MinGW is found (this build did — the whole compile, ~858 C files,
-took several minutes). Building against this project's own dev venv (which has `--all-groups`
-installed, including `mypy`/`ruff`/`pytest`) pulls in more than the runtime dependency closure —
-the verified build came to 121MB in `dist/cli.dist/`; build against a runtime-only venv
-(`uv sync --no-dev` in a fresh `.venv`) for a leaner result if you're not also iterating on the
-compile itself. This is **not code-signed** — Windows SmartScreen and some antivirus engines flag
-unsigned, freshly-compiled executables by default, independent of whether the binary is actually
-malicious; this build is meant for you and reviewers who trust the source it was built from, not
-for public distribution.
+`packaging/test_packaged_safe_mode.ps1` is the safety proof that runs against the **actual
+compiled artifact** (not the dev tree): fresh-install defaults to safe mode, a real `--apply`
+batch against a config.toml that tries to re-enable the force-off categories still resolves to
+`method=recycle_bin` (never vault/direct_delete), and typed confirmation is the only door to
+power mode — all verified against both the raw Nuitka `--standalone` build and a real
+Inno-Setup-installed copy (silent install → run → silent uninstall, no admin prompt at any
+step).
 
 ## Development
 
