@@ -14,8 +14,7 @@ from reclaim.ai.models import AICluster, AIClusterMember
 # future LambdaMART ranker has real, time-stamped, commit-keyed training data once enough
 # accumulates. GG's explicit instruction: build ONLY this; the ranker itself is a documented,
 # label-gated future step (activates at >= 500 real decisions, time-split eval), not built or
-# shipped now — there is no data to train it on yet. See `cold_start_priority.py` for the
-# transparent, non-ML heuristic that orders the review queue in the meantime.
+# shipped now — there is no data to train it on yet.
 #
 # Same persistence discipline as `labeling.py`'s `LabelStore` (append-only JSONL, never
 # rewritten in place — same event-log pattern as `executor.QuarantineManifestEntry`), same
@@ -27,6 +26,18 @@ from reclaim.ai.models import AICluster, AIClusterMember
 # NO atime anywhere in the feature vector (spec §4 explicit: "No atime dependence (unreliable
 # on NTFS)" — `FILE_ATTRIBUTE_...` access-time tracking is commonly disabled system-wide via
 # `NtfsDisableLastAccessUpdate`, making atime an unreliable signal even where present).
+#
+# UNWIRED: `record_feedback_decision` has no production caller yet — the dashboard wiring
+# (ADR-0025) explicitly deferred Feature 3's feedback logging ("Feature 3's feedback logging
+# isn't wired to the dashboard by this ADR; a documented future step, not silently faked
+# here"), and ADR-0020 built this module ahead of that wiring on purpose, so the schema exists
+# before real decisions need logging. Not dead code — reachable, tested (10 cases in
+# `tests/test_ai_feedback_store.py`), and named-and-justified in both ADRs as intentional
+# built-ahead infrastructure. `ClusterStats`/`FeatureVector`/`SiblingDecisionContext`/
+# `classify_path_class` ARE already live, imported by `reclaim.api.ai_orchestration` for the
+# clutter-ranker's feature-vector construction — only the top-level `record_feedback_decision`
+# entry point (and its sibling `FeedbackStore.append`/`.count()` path) awaits the dashboard
+# actually recording a user's accept/reject/keep decision.
 
 FeedbackDecisionKind = Literal["accepted", "rejected", "kept"]
 # "accepted": the user approved an AI suggestion (this member is/will be removed).
