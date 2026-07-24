@@ -186,6 +186,67 @@ def test_explicit_path_in_safe_mode_is_forced_to_recycle_bin_and_tier_b(tmp_path
     assert not photo.exists()  # really moved (to the Recycle Bin)
 
 
+def test_safe_mode_short_circuit_holds_under_background_task_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix/apply-progress-feedback moved `apply_batch`'s real call from `POST /api/apply`'s
+    request-handling thread into a background task (`service.run_apply`) — this proves the
+    safe-mode structural boundary (ADR-0023: vault/direct_delete are unreachable whenever
+    `mode=Mode.SAFE`, regardless of what's requested) still holds from THAT call site, not just
+    the synchronous one the pre-existing `test_explicit_path_in_safe_mode_is_forced_to_
+    recycle_bin_and_tier_b` above already covers. Monkeypatches `os.unlink`/`shutil.rmtree` (the
+    only two calls `executor.apply_batch` ever uses for `direct_delete`, and `shutil.rmtree` is
+    also used by the `vault` method's directory branch) to raise `AssertionError` if invoked at
+    all — a real crash, not silently swallowed by the background task's own broad
+    `except Exception`, since a genuine per-item apply failure and "the safe-mode boundary
+    itself broke" must never be conflated. `send2trash.send2trash` is monkeypatched too, but
+    only to RECORD that it fired (the expected, safe-mode-only code path), not to block it.
+    """
+    import send2trash as send2trash_module
+
+    import reclaim.executor as executor_module
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "safe mode must never reach os.unlink/shutil.rmtree, even from a background task"
+        )
+
+    send2trash_calls: list[str] = []
+    real_send2trash = send2trash_module.send2trash
+
+    def _recording_send2trash(path: str) -> None:
+        send2trash_calls.append(path)
+        real_send2trash(path)
+
+    monkeypatch.setattr(executor_module.os, "unlink", _boom)
+    monkeypatch.setattr(executor_module.shutil, "rmtree", _boom)
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", _recording_send2trash)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    photo = root / "Pictures" / "vacation.jpg"
+    photo.parent.mkdir()
+    photo.write_bytes(b"not a real jpeg, just fixture bytes")
+
+    client = _make_app_safe_mode(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    # method="vault" requested, exactly as the pre-existing synchronous-path test does --
+    # exercising the SAME override this test targets, now through the async execution path.
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False}
+    )
+
+    assert body["method"] == "recycle_bin"
+    assert body["files_succeeded"] == 1
+    assert not photo.exists()
+    assert send2trash_calls == [str(photo)]  # the real, safe-mode-only path genuinely ran
+
+    status = client.get("/api/apply/status").json()
+    assert status["status"] == "completed"
+    assert status["error"] is None  # no exception was swallowed into "failed"
+
+
 # --- A BLOCKED path is silently excluded, never force-applied ---------------------------------
 
 

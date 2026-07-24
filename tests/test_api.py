@@ -748,6 +748,65 @@ def test_restore_status_items_total_reflects_only_restorable_entries_in_mixed_ba
     assert status["result"]["files_unsupported"] == 3
 
 
+def test_run_apply_completes_and_leaves_a_durable_manifest_with_zero_status_polls(
+    tmp_path: Path,
+) -> None:
+    """A browser disconnect mid-poll (closed tab, lost network, whatever) must never orphan a
+    running apply or leave the manifest unrecoverable -- proven here by never polling
+    `GET /api/apply/status` AT ALL while the background task runs, which is the literal worst
+    case ("nobody is watching this task, ever, for its whole lifetime"). `service.run_apply` is
+    Starlette's actual background-task body (scheduled via `BackgroundTasks.add_task`, which
+    Starlette itself decouples from the request/response and any client connection -- this test
+    doesn't re-prove Starlette's own framework guarantee, it proves THIS app's specific use of it
+    doesn't accidentally depend on a poller ever running, e.g. by only flushing/finalizing state
+    from inside a code path a status-check happens to trigger). Runs `run_apply` in a real
+    `threading.Thread` (matching how Starlette's own worker-thread-pool dispatch behaves) with
+    no polling until after the thread has fully finished, then confirms both the in-memory
+    status AND the on-disk manifest are correct -- the manifest write happens inside
+    `apply_batch` itself regardless of whether anyone ever reads `apply_status`."""
+    import threading
+
+    from reclaim.api import service
+    from reclaim.executor import read_manifest_entries
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    photo = root / "vacation.jpg"
+    photo.write_bytes(b"not a real jpeg, just fixture bytes")
+
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    from reclaim.api.schemas import ApplyRequest
+
+    selected, method, apply = service.resolve_apply_selection(
+        state,
+        ApplyRequest(tier="both", paths=[photo.as_posix()], method="vault", dry_run=False),
+    )
+    assert selected, "fixture setup bug: expected the explicit path to resolve to one candidate"
+
+    thread = threading.Thread(
+        target=service.run_apply, args=(state, selected, method, apply, time.time())
+    )
+    thread.start()
+    # Deliberately NO client.get("/api/apply/status") call anywhere in this window -- the point
+    # is that nothing about task completion or manifest durability depends on one ever happening.
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "run_apply did not finish within 30s"
+
+    assert not photo.exists()  # the real move genuinely happened, unattended
+    assert state.apply_status.status == "completed"
+    assert state.apply_status.error is None
+
+    entries = read_manifest_entries(state.manifest_path)
+    done_entries = [e for e in entries if e.phase == "done" and e.original_path == photo]
+    assert len(done_entries) == 1, (
+        f"expected exactly one durable phase='done' manifest entry for {photo}, found "
+        f"{[e.phase for e in entries if e.original_path == photo]}"
+    )
+
+
 def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
