@@ -46,6 +46,7 @@ def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
         manifest_path=tmp_path / "manifest.jsonl",
         mode_log_path=mode_log,
         first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -65,6 +66,7 @@ def _make_app_safe_mode(tmp_path: Path, *, config: Config) -> TestClient:
         manifest_path=tmp_path / "manifest.jsonl",
         mode_log_path=tmp_path / "mode_log.jsonl",
         first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )

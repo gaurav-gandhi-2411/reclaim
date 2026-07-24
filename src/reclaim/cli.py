@@ -22,6 +22,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.index import ScanIndex
+from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import (
     DEFAULT_MODE_LOG_PATH,
     ModeSwitchDeniedError,
@@ -348,6 +349,13 @@ def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
         help=f"Override the first-run-acknowledged marker path (default: "
         f"{DEFAULT_FIRST_RUN_STATE_PATH}).",
     )
+    parser.add_argument(
+        "--log-path",
+        type=Path,
+        default=None,
+        help=f"Override the persistent rotating log file path (default: "
+        f"{DEFAULT_LOG_PATH}) — see SUPPORT.md for what this file is for.",
+    )
 
 
 def _run_scan(args: argparse.Namespace) -> int:
@@ -594,6 +602,7 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     first_run_state = (
         args.first_run_state if args.first_run_state is not None else DEFAULT_FIRST_RUN_STATE_PATH
     )
+    log_path = args.log_path if args.log_path is not None else DEFAULT_LOG_PATH
     app = create_app(
         db_path=args.db,
         config=config,
@@ -601,6 +610,7 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
         manifest_path=args.manifest,
         mode_log_path=mode_log,
         first_run_state_path=first_run_state,
+        log_path=log_path,
         host=args.host,
         port=args.port,
     )
@@ -747,6 +757,17 @@ def _run_purge(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Every subcommand goes through this one entry point, so this is the single place a
+    # persistent, rotating log file needs wiring up once per process (G25: before this, every
+    # `structlog.get_logger(__name__)` call in the codebase rendered to structlog's
+    # console-only default, which vanishes the moment a console-less launch -- a Start Menu
+    # shortcut, or a closed console window -- has nowhere to show it). Reads `DEFAULT_LOG_PATH`
+    # via this module's own imported name (not `logging_config.configure_logging`'s internal
+    # default) so a test can redirect it with `monkeypatch.setattr("reclaim.cli.DEFAULT_LOG_PATH",
+    # ...)`, the same pattern already used for `DEFAULT_MODE_LOG_PATH` elsewhere in this file --
+    # without that, every CLI invocation in the test suite would write into the real repo's
+    # working directory instead of a test's own tmp_path.
+    configure_logging(DEFAULT_LOG_PATH)
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "scan":

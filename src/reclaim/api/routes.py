@@ -12,6 +12,7 @@ from reclaim.api.schemas import (
     ApplyRequest,
     ApplyResponse,
     CandidatesResponse,
+    DiagnosticsResponse,
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
     ModeStatusResponse,
@@ -239,3 +240,13 @@ def first_run_status(request: Request) -> FirstRunStatusResponse:
 @router.post("/first-run/acknowledge", response_model=FirstRunStatusResponse)
 def first_run_acknowledge(request: Request) -> FirstRunStatusResponse:
     return service.acknowledge_first_run_screen(get_state(request))
+
+
+# --- G25: bug-report diagnostics ----------------------------------------------------------------
+
+
+@router.get("/diagnostics", response_model=DiagnosticsResponse)
+def diagnostics(request: Request) -> DiagnosticsResponse:
+    """Backs the dashboard's "Copy diagnostics" button — paths, counts, and version/mode
+    metadata only, never file content (see `DiagnosticsResponse`'s docstring and PRIVACY.md)."""
+    return service.build_diagnostics(get_state(request))

@@ -85,6 +85,7 @@ def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
         manifest_path=tmp_path / "manifest.jsonl",
         mode_log_path=mode_log,
         first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -107,6 +108,7 @@ def _make_app_safe_mode(tmp_path: Path, *, config: Config) -> TestClient:
         manifest_path=tmp_path / "manifest.jsonl",
         mode_log_path=tmp_path / "mode_log.jsonl",
         first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -663,6 +665,7 @@ def test_mutating_request_without_csrf_token_is_rejected(tmp_path: Path) -> None
         config=_config(tmp_path / "tree"),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -682,6 +685,7 @@ def test_mutating_request_with_wrong_csrf_token_is_rejected(tmp_path: Path) -> N
         config=_config(tmp_path / "tree"),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -705,6 +709,7 @@ def test_read_only_request_needs_no_csrf_token(tmp_path: Path) -> None:
         config=_config(tmp_path / "tree"),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -751,6 +756,7 @@ def test_non_api_paths_are_not_guarded(tmp_path: Path) -> None:
         config=_config(tmp_path / "tree"),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
+        log_path=tmp_path / "reclaim.log",
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
@@ -758,3 +764,52 @@ def test_non_api_paths_are_not_guarded(tmp_path: Path) -> None:
 
     response = bare_client.get("/", headers={"host": "evil.example.com"})
     assert response.status_code == 200
+
+
+# --- G25: bug-report diagnostics ---------------------------------------------------------------
+
+
+def test_diagnostics_endpoint_reports_paths_and_metadata_only(tmp_path: Path) -> None:
+    """The dashboard's "Copy diagnostics" button reads this endpoint -- every field must be a
+    path, a version, a mode name, or the log tail itself (paths/counts/errors only, never file
+    contents -- see `DiagnosticsResponse`'s docstring and PRIVACY.md)."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/diagnostics")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "power"  # _make_app pre-seeds a POWER-mode log
+    assert isinstance(body["reclaim_version"], str) and body["reclaim_version"]
+    assert isinstance(body["ai_extra_installed"], bool)
+    assert isinstance(body["os_version"], str) and body["os_version"]
+    assert body["log_path"] == str(tmp_path / "reclaim.log")
+
+
+def test_diagnostics_log_tail_reflects_the_real_log_file(tmp_path: Path) -> None:
+    """A request made through this same app must actually be logged (via
+    `reclaim.api.security`'s local-origin guard, which logs nothing content-derived) and then
+    show up in the next call's `log_tail` -- proof this reads the real file `configure_logging`
+    is writing to, not a hardcoded placeholder."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    # Any request at all is enough to guarantee the log file exists and is non-empty by the
+    # time diagnostics reads it (mode.switched_to_power from _make_app's setup already wrote at
+    # least one line before this).
+    client.get("/api/summary")
+
+    response = client.get("/api/diagnostics")
+    assert response.status_code == 200
+    log_tail = response.json()["log_tail"]
+    assert log_tail
+    assert log_tail != "(no log file yet — nothing has been logged this install)"
+
+
+def test_diagnostics_log_tail_placeholder_when_log_file_missing(tmp_path: Path) -> None:
+    """A fresh log path that has genuinely never been written to (a log path override pointed
+    somewhere new mid-session) must return an explanatory placeholder, never a crash or an empty
+    string a user could mistake for "nothing happened."""
+    from reclaim.api.service import _read_log_tail
+
+    missing_path = tmp_path / "never-written.log"
+    expected = "(no log file yet — nothing has been logged this install)"
+    assert _read_log_tail(missing_path) == expected
