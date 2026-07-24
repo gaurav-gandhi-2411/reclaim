@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ pytest.importorskip("PIL")
 
 from PIL import Image, ImageDraw
 
+from reclaim.ai import image_embeddings as image_embeddings_module
 from reclaim.ai.image_embeddings import (
     ImageEmbeddingCache,
     compute_embeddings_batch,
@@ -131,3 +133,115 @@ def test_compute_embeddings_batch_skips_unreadable_files(tmp_path: Path) -> None
     embeddings = compute_embeddings_batch([good, bad])
     assert len(embeddings) == 1
     assert embeddings[0].path == good
+
+
+# E17/E18 (audit findings, ADR-0026): pinned-revision checkpoint download + sha256 integrity
+# verification for the CLIP checkpoint. Real download/inference is exercised by the other
+# tests in this file when the `ai` extra + network are available; these tests instead mock
+# `require()`'s return value so the pinning/verification wiring is provable without a real
+# download, per the task's own guidance.
+
+
+@pytest.fixture
+def _reset_model_cache() -> object:
+    """Module-level `_model_cache`/`_preprocess_cache` are a process-wide lazy singleton --
+    save/restore around tests that need `_model_and_preprocess()` to actually re-run its
+    loading logic, so this doesn't leak a mocked model into (or lose a real model already
+    cached by) other tests in this file."""
+    original_model = image_embeddings_module._model_cache
+    original_preprocess = image_embeddings_module._preprocess_cache
+    image_embeddings_module._model_cache = None
+    image_embeddings_module._preprocess_cache = None
+    yield object()
+    image_embeddings_module._model_cache = original_model
+    image_embeddings_module._preprocess_cache = original_preprocess
+
+
+def test_model_and_preprocess_downloads_pinned_revision_and_verifies_checksum(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _reset_model_cache: object
+) -> None:
+    fake_checkpoint = tmp_path / "checkpoint.safetensors"
+    fake_checkpoint.write_bytes(b"fake-clip-weights")
+    monkeypatch.setattr(
+        image_embeddings_module,
+        "_OPEN_CLIP_HF_WEIGHTS_SHA256",
+        hashlib.sha256(b"fake-clip-weights").hexdigest(),
+    )
+
+    hf_hub_download_calls: list[dict[str, object]] = []
+
+    class _FakeHfHub:
+        @staticmethod
+        def hf_hub_download(**kwargs: object) -> str:
+            hf_hub_download_calls.append(kwargs)
+            return str(fake_checkpoint)
+
+    create_model_calls: list[dict[str, object]] = []
+
+    class _FakeModel:
+        def eval(self) -> None:
+            pass
+
+    class _FakeOpenClip:
+        @staticmethod
+        def get_pretrained_cfg(model_name: str, tag: str) -> dict[str, object]:
+            assert model_name == image_embeddings_module._OPEN_CLIP_MODEL_NAME
+            assert tag == "openai"
+            return {
+                "quick_gelu": True,
+                "mean": (0.48145466, 0.4578275, 0.40821073),
+                "std": (0.26862954, 0.26130258, 0.27577711),
+                "interpolation": "bicubic",
+                "resize_mode": "shortest",
+            }
+
+        @staticmethod
+        def create_model_and_transforms(*args: object, **kwargs: object) -> tuple[object, ...]:
+            create_model_calls.append(kwargs)
+            return _FakeModel(), object(), object()
+
+    def _fake_require(module_name: str, *, feature: str) -> object:
+        if module_name == "huggingface_hub":
+            return _FakeHfHub()
+        if module_name == "open_clip":
+            return _FakeOpenClip()
+        raise AssertionError(f"unexpected require() call: {module_name}")
+
+    monkeypatch.setattr(image_embeddings_module, "require", _fake_require)
+
+    model, _ = image_embeddings_module._model_and_preprocess()
+
+    assert isinstance(model, _FakeModel)
+    assert hf_hub_download_calls == [
+        {
+            "repo_id": image_embeddings_module._OPEN_CLIP_HF_REPO,
+            "filename": image_embeddings_module._OPEN_CLIP_HF_WEIGHTS_FILENAME,
+            "revision": image_embeddings_module._OPEN_CLIP_HF_REVISION,
+        }
+    ]
+    assert len(create_model_calls) == 1
+    assert create_model_calls[0]["pretrained"] == str(fake_checkpoint)
+    assert create_model_calls[0]["force_quick_gelu"] is True
+    assert create_model_calls[0]["image_mean"] == (0.48145466, 0.4578275, 0.40821073)
+
+
+def test_pinned_checkpoint_sha256_mismatch_quarantines_the_bad_file_and_raises(
+    tmp_path: Path,
+) -> None:
+    bad_checkpoint = tmp_path / "bad.safetensors"
+    bad_checkpoint.write_bytes(b"tampered content")
+
+    with pytest.raises(RuntimeError, match="integrity check failed"):
+        image_embeddings_module._verify_checkpoint_sha256_or_quarantine(bad_checkpoint, "0" * 64)
+
+    assert not bad_checkpoint.exists()  # quarantined, never left for a caller to load
+
+
+def test_pinned_checkpoint_sha256_match_leaves_the_file_in_place(tmp_path: Path) -> None:
+    good_checkpoint = tmp_path / "good.safetensors"
+    good_checkpoint.write_bytes(b"real content")
+    expected = hashlib.sha256(b"real content").hexdigest()
+
+    image_embeddings_module._verify_checkpoint_sha256_or_quarantine(good_checkpoint, expected)
+
+    assert good_checkpoint.exists()
