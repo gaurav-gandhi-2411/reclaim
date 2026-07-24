@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,6 +29,22 @@ _OPEN_CLIP_MODEL_NAME = "ViT-B-32-quickgelu"  # NOT the bare "ViT-B-32" -- the "
 # tag (caught during this ADR's build, not shipped with a silently-degraded embedding space —
 # see ADR-0022).
 _EMBEDDING_MODEL_ID = f"open_clip:{_OPEN_CLIP_MODEL_NAME}:openai"  # see ADR-0022
+
+# Supply-chain integrity (audit findings E17/E18, ADR-0028): open_clip==3.3.0 (pinned in
+# pyproject.toml/uv.lock) has NO `revision=` passthrough anywhere on the tag-based
+# `pretrained="openai"` loading path -- `create_model` always calls
+# `download_pretrained_from_hf(model_id, cache_dir=cache_dir)` with `revision=None`, i.e. HF
+# Hub's MUTABLE "main" ref (verified directly against the installed package source, not
+# assumed). The "openai" tag resolves (via `open_clip.get_pretrained_cfg`) to HF Hub repo
+# "timm/vit_base_patch32_clip_224.openai", not the more obviously-named
+# "openai/clip-vit-base-patch32". `_pinned_open_clip_checkpoint_path` below bypasses this
+# entirely: it downloads the checkpoint itself, pinned to an explicit commit hash, verifies
+# its SHA-256, and hands `create_model_and_transforms` a concrete local file path instead of
+# the "openai" tag -- the ONLY call site that ever touches HF Hub for this checkpoint.
+_OPEN_CLIP_HF_REPO = "timm/vit_base_patch32_clip_224.openai"
+_OPEN_CLIP_HF_REVISION = "a6f597a30f7b82c51704746581f9a4e41421e878"  # pinned; see ADR-0028
+_OPEN_CLIP_HF_WEIGHTS_FILENAME = "open_clip_model.safetensors"
+_OPEN_CLIP_HF_WEIGHTS_SHA256 = "e6d1bd7789aa45192b3bf90570a789b478bae1b74ebcce7eddd908e83a2b7c31"
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS image_embeddings (
@@ -102,12 +119,64 @@ _model_cache: object | None = None
 _preprocess_cache: object | None = None
 
 
+def _verify_checkpoint_sha256_or_quarantine(checkpoint_path: Path, expected_sha256: str) -> None:
+    """Hashes `checkpoint_path` and compares it to `expected_sha256`, raising `RuntimeError`
+    (and deleting the file -- quarantine, never a silent reuse) on mismatch. HF Hub's own
+    download path is already atomic (tmp-file + rename, size-checked before the rename ever
+    happens -- a genuinely partial/interrupted download is never left where a caller could
+    read it), so this is a deliberate, independent layer on top: it catches a case the
+    size-only check inside `huggingface_hub` cannot, a server (or a compromised mirror/proxy)
+    that serves the wrong but correctly-sized bytes for the pinned revision."""
+    digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        checkpoint_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"CLIP checkpoint integrity check failed for {checkpoint_path}: expected sha256 "
+            f"{expected_sha256}, got {actual_sha256}. The corrupted/tampered file has been "
+            "deleted; retry to re-download."
+        )
+
+
+def _pinned_open_clip_checkpoint_path() -> str:
+    """Downloads (or reuses the local HF Hub cache for) the exact pinned CLIP checkpoint
+    revision and verifies its content hash (E18) before returning its path -- see the module
+    docstring comment above `_OPEN_CLIP_HF_REPO` for why this bypasses open_clip's own
+    `pretrained="openai"` tag resolution entirely."""
+    huggingface_hub = require("huggingface_hub", feature="pinned CLIP checkpoint download")
+    checkpoint_path = str(
+        huggingface_hub.hf_hub_download(
+            repo_id=_OPEN_CLIP_HF_REPO,
+            filename=_OPEN_CLIP_HF_WEIGHTS_FILENAME,
+            revision=_OPEN_CLIP_HF_REVISION,
+        )
+    )
+    _verify_checkpoint_sha256_or_quarantine(Path(checkpoint_path), _OPEN_CLIP_HF_WEIGHTS_SHA256)
+    return checkpoint_path
+
+
 def _model_and_preprocess() -> tuple[object, object]:
     global _model_cache, _preprocess_cache
     if _model_cache is None:
         open_clip = require("open_clip", feature="CLIP semantic image embeddings")
+        checkpoint_path = _pinned_open_clip_checkpoint_path()
+        # The "openai" tag's mean/std/interpolation/resize_mode/quick_gelu -- read from
+        # open_clip's own built-in config rather than duplicated as magic numbers here, so this
+        # reproduces EXACTLY what `pretrained="openai"` would have configured, just sourcing the
+        # weights file from the pinned/verified download above instead of the tag's own (mutable
+        # "main"-resolving) lookup.
+        tag_cfg = open_clip.get_pretrained_cfg(_OPEN_CLIP_MODEL_NAME, "openai")
         model, _, preprocess = open_clip.create_model_and_transforms(
-            _OPEN_CLIP_MODEL_NAME, pretrained="openai"
+            _OPEN_CLIP_MODEL_NAME,
+            pretrained=checkpoint_path,
+            force_quick_gelu=tag_cfg["quick_gelu"],
+            image_mean=tag_cfg["mean"],
+            image_std=tag_cfg["std"],
+            image_interpolation=tag_cfg["interpolation"],
+            image_resize_mode=tag_cfg["resize_mode"],
         )
         model.eval()
         _model_cache = model
