@@ -93,9 +93,7 @@ def _is_contained(path: Path, container: Path) -> bool:
     return resolved_path == resolved_container or resolved_container in resolved_path.parents
 
 
-def _classify(
-    entry: QuarantineManifestEntry, vault_dir: Path
-) -> tuple[ReconciliationOutcome, str]:
+def _classify(entry: QuarantineManifestEntry, vault_dir: Path) -> tuple[ReconciliationOutcome, str]:
     """The four-way stat-based classification ADR-0026 specifies: source-only -> aborted (the
     action never ran); target-only -> completed (it ran, only the DONE record was lost to the
     crash); both or neither -> needs_review, never guessed. For an operation/method pair with no

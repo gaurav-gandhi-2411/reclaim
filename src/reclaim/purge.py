@@ -329,9 +329,7 @@ def purge_expired(
                     unlink_clear_readonly(long_path(vault_path))
             except OSError as exc:
                 logger.warning("purge.item_failed", path=str(vault_path), error=str(exc))
-                _append_and_sync(
-                    manifest_fh, intent_entry.model_copy(update={"phase": "aborted"})
-                )
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
                 items.append(
                     PurgeItemResult(
                         original_path=entry.original_path,

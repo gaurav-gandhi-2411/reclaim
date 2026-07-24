@@ -293,9 +293,7 @@ def test_restore_crash_after_intent_fsync_before_action_reconciles_as_aborted(
     # restore intent only (1) = 10.
     assert len(raw_entries) == 10
     restore_intents = [
-        e
-        for e in raw_entries
-        if e.original_path == crashed_original and e.operation == "restore"
+        e for e in raw_entries if e.original_path == crashed_original and e.operation == "restore"
     ]
     assert len(restore_intents) == 1
     assert restore_intents[0].phase == "intent"
@@ -304,9 +302,7 @@ def test_restore_crash_after_intent_fsync_before_action_reconciles_as_aborted(
     assert crashed_vault_path.exists()  # vault copy never moved
 
     preview = compute_reconciliation(manifest_path, vault_dir)
-    reconciled_for_item = [
-        r for r in preview.reconciled if r.original_path == crashed_original
-    ]
+    reconciled_for_item = [r for r in preview.reconciled if r.original_path == crashed_original]
     assert len(reconciled_for_item) == 1
     assert reconciled_for_item[0].outcome == "aborted"
 
@@ -353,9 +349,7 @@ def test_restore_crash_after_action_before_done_fsync_reconciles_as_completed(
 
     raw_entries = read_manifest_entries(manifest_path)
     restore_intents = [
-        e
-        for e in raw_entries
-        if e.original_path == crashed_original and e.operation == "restore"
+        e for e in raw_entries if e.original_path == crashed_original and e.operation == "restore"
     ]
     assert len(restore_intents) == 1
     assert restore_intents[0].phase == "intent"
@@ -364,9 +358,7 @@ def test_restore_crash_after_action_before_done_fsync_reconciles_as_completed(
     assert not crashed_vault_path.exists()  # moved away for real
 
     preview = compute_reconciliation(manifest_path, vault_dir)
-    reconciled_for_item = [
-        r for r in preview.reconciled if r.original_path == crashed_original
-    ]
+    reconciled_for_item = [r for r in preview.reconciled if r.original_path == crashed_original]
     assert len(reconciled_for_item) == 1
     assert reconciled_for_item[0].outcome == "completed"
 

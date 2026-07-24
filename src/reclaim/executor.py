@@ -1154,9 +1154,7 @@ def restore_batch(
                     path=str(entry.original_path),
                     error=str(exc),
                 )
-                _append_and_sync(
-                    manifest_fh, intent_entry.model_copy(update={"phase": "aborted"})
-                )
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
                 items.append(
                     RestoreItemResult(
                         original_path=entry.original_path,
