@@ -59,8 +59,11 @@ def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO
     actual privacy guarantee is upstream, at every call site (paths/counts/error strings only,
     never file content or OCR'd text -- see PRIVACY.md and `reclaim.ai.screenshot_ocr`'s
     module-level comment) and is verified by `tests/test_ai_screenshot_ocr.py`'s canary-string
-    test, which now also asserts the canary never reaches the persistent log file this function
-    creates, not just the `caplog` records it asserted against before.
+    test, which asserts a real OCR'd secret never reaches any `caplog`-captured log record at
+    any level. That test asserts at the stdlib `logging` layer (independent of whichever
+    handlers, if any, are attached), not by inspecting this function's rotating file directly --
+    if the canary never reaches a log record at all, it cannot reach this (or any) handler's
+    output either.
     """
     global _configured_for_path
     resolved_path = log_path if log_path is not None else DEFAULT_LOG_PATH
