@@ -9,7 +9,7 @@ import pytest
 
 from reclaim.index import ScanIndex, logical_size_bytes, physical_size_bytes
 from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
-from reclaim.scanner import is_cloud_sync_root, long_path, scan_tree
+from reclaim.scanner import GitRepoCache, is_cloud_sync_root, long_path, scan_tree
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -279,3 +279,30 @@ def test_scan_tree_reports_genuinely_unreadable_path_as_skipped(
     assert blocked not in paths
     assert stats.skipped_unreadable_count == 1
     assert str(blocked) in stats.skipped_unreadable_paths
+
+
+def test_git_repo_cache_finds_repo_root_past_max_path(tmp_path: Path) -> None:
+    r"""D12 follow-up: `GitRepoCache.repo_root_for`'s upward `.git`-directory walk used
+    `Path.is_dir()`, which silently returns `False` past Windows' 260-char MAX_PATH (it never
+    raises, it just never touches the filesystem) — the exact same failure *shape* `build_record`
+    had before this fix, just reached via a different call. Left unfixed, a file inside a git
+    repo whose ROOT itself sits past MAX_PATH would get `git_repo_root=None`, silently bypassing
+    `safety.py`'s in-repo deletion protection (`_builtin_deny` only blocks a candidate when
+    `record.git_repo_root is not None`). The repo root itself must be deep enough that the `.git`
+    check at the root is past the limit, not just a file nested somewhere below a shallow root.
+
+    Unit-level against `GitRepoCache` directly (a plain `.git` DIRECTORY marker, not a real git
+    repo/commit) rather than via `scan_tree` + a real `git init` subprocess: attempting the
+    latter surfaced a separate, real Windows constraint worth noting — `subprocess.run(cwd=...)`
+    cannot use a `\\?\`-prefixed `cwd` at all (`CreateProcess` rejects it outright with
+    `NotADirectoryError: [WinError 267]`, confirmed empirically), so a real git subprocess cannot
+    be invoked with a working directory past MAX_PATH without system-wide `LongPathsEnabled` —
+    orthogonal to this fix, which only needed `GitRepoCache`'s OWN directory check to be
+    long-path-safe, not `git.exe` itself.
+    """
+    root = _make_deep_tree(tmp_path / "root", depth=12, segment_len=20)
+    os.makedirs(long_path(root / ".git"), exist_ok=True)  # noqa: PTH103 -- \\?\ str, not Path
+
+    found = GitRepoCache().repo_root_for(root)
+
+    assert found == root

@@ -144,7 +144,18 @@ class GitRepoCache:
 
     def repo_root_for(self, search_start: Path) -> Path | None:
         """Walks upward from `search_start` looking for a `.git` directory, memoizing every
-        directory visited along the way so sibling files/dirs resolve in O(1)."""
+        directory visited along the way so sibling files/dirs resolve in O(1).
+
+        Uses `long_path()`-prefixed `os.path.isdir` rather than `Path.is_dir()` (D12 follow-up):
+        `Path.is_dir()` silently returns `False` for a path past Windows' 260-char MAX_PATH —
+        it doesn't raise, it just never touches the filesystem — so a repo whose root itself
+        sits past that limit would never be found walking up from a deeply-nested file, giving
+        that file `git_repo_root=None` and silently bypassing `safety.py`'s in-repo deletion
+        protection (`_builtin_deny` only blocks a candidate when `record.git_repo_root is not
+        None`). Same failure shape `build_record`'s own MAX_PATH bug had before this branch's
+        main fix — a silent `False`/`None`, never a loud error — just reached via `Path.is_dir()`
+        instead of a raw stat call.
+        """
         visited: list[Path] = []
         current = search_start
         while True:
@@ -153,7 +164,7 @@ class GitRepoCache:
                 result: Path | None = cached  # type: ignore[assignment]
                 break
             visited.append(current)
-            if (current / ".git").is_dir():
+            if os.path.isdir(long_path(current / ".git")):  # noqa: PTH112 -- \\?\ str, not Path
                 result = current
                 break
             parent = current.parent
