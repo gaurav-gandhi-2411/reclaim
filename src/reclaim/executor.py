@@ -12,7 +12,7 @@ from typing import Literal, TextIO
 
 import send2trash
 import structlog
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.models import Candidate, Mode, Tier, Verdict
 from reclaim.safety import SafetyValidator
@@ -117,6 +117,13 @@ class RestoreIntegrityError(RuntimeError):
 ManifestPhase = Literal["intent", "done", "aborted", "needs_review"]
 ManifestOperation = Literal["apply", "restore", "purge"]
 
+# ADR-0027 (schema versioning): the manifest shape as of introducing `schema_version` itself —
+# every field this class has today, including ADR-0026's `phase`/`intent_id`/`operation` (added
+# before versioning existed, so there was never a "version 0" of the format to distinguish from).
+# Bump this whenever a field is added/removed/changed and update `read_manifest_entries` if a
+# migration step is ever needed.
+QUARANTINE_MANIFEST_SCHEMA_VERSION = 1
+
 
 class QuarantineManifestEntry(BaseModel):
     """One line in the append-only `data/quarantine/manifest.jsonl` log.
@@ -140,9 +147,18 @@ class QuarantineManifestEntry(BaseModel):
     approximation, it's the literal truth for that line. A kill between the intent write and the
     done/aborted write leaves an intent with no matching resolution — `reclaim.recovery` finds
     these by replaying the raw manifest and reconciles each one against real on-disk state.
+
+    ADR-0027 (schema versioning): `extra="allow"` (not `"forbid"`/`"ignore"`) is deliberate —
+    entries are re-serialized after being read (`restore_batch`/`purge_expired`/`reclaim.recovery`
+    all call `entry.model_copy(update=...)` then re-`model_dump_json()` the result), so a field
+    this version of the code doesn't recognize (written by a newer release) must round-trip
+    through that read-modify-write cycle unchanged rather than being silently dropped —
+    `extra="ignore"` would discard it right there, a real data-loss bug distinct from the crash
+    this ADR primarily fixes. `read_manifest_entries` logs (never raises) when it sees a
+    `schema_version` newer than `QUARANTINE_MANIFEST_SCHEMA_VERSION`.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     batch_id: str
     original_path: Path
@@ -180,6 +196,11 @@ class QuarantineManifestEntry(BaseModel):
     phase: ManifestPhase = "done"
     intent_id: str | None = None
     operation: ManifestOperation = "apply"
+    # ADR-0027: absent (pre-versioning) entries validate with this field defaulting to `1` —
+    # the literal truth, not an approximation, since `1` is the version every existing field on
+    # this class belongs to. A future field addition bumps this default and `read_manifest_entries`
+    # warns (never raises) on any entry whose recorded version is newer than the code knows.
+    schema_version: int = Field(default=QUARANTINE_MANIFEST_SCHEMA_VERSION)
 
 
 @dataclass(frozen=True, slots=True)
@@ -538,16 +559,34 @@ def _append_and_sync(fh: TextIO, entry: QuarantineManifestEntry) -> None:
 
 
 def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
-    """Public: reused by `purge.py` (via `fold_latest_manifest_entries`) and the API layer."""
+    """Public: reused by `purge.py` (via `fold_latest_manifest_entries`) and the API layer.
+
+    ADR-0027: never raises on an entry written by a newer release — `QuarantineManifestEntry`'s
+    `extra="allow"` already guarantees a field this version doesn't recognize parses fine (and
+    round-trips if the entry is later re-serialized); this additionally logs a warning (once per
+    call, listing every newer version actually seen) so a genuinely newer schema is visible in
+    logs rather than silently absorbed.
+    """
     if not manifest_path.exists():
         return []
     entries: list[QuarantineManifestEntry] = []
+    newer_versions: set[int] = set()
     with manifest_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:
                 continue
-            entries.append(QuarantineManifestEntry.model_validate_json(stripped))
+            entry = QuarantineManifestEntry.model_validate_json(stripped)
+            if entry.schema_version > QUARANTINE_MANIFEST_SCHEMA_VERSION:
+                newer_versions.add(entry.schema_version)
+            entries.append(entry)
+    if newer_versions:
+        logger.warning(
+            "executor.manifest_newer_schema_version_detected",
+            manifest_path=str(manifest_path),
+            known_schema_version=QUARANTINE_MANIFEST_SCHEMA_VERSION,
+            encountered_schema_versions=sorted(newer_versions),
+        )
     return entries
 
 

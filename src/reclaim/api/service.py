@@ -65,6 +65,7 @@ from reclaim.executor import (
     RestoreReport,
     SafeModeViolationError,
     apply_batch,
+    read_manifest_entries,
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
@@ -875,19 +876,6 @@ def build_ai_suggestions(state: AppState) -> AISuggestionsResponse:
 # --- Quarantine / restore --------------------------------------------------------------------
 
 
-def _read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
-    if not manifest_path.exists():
-        return []
-    entries: list[QuarantineManifestEntry] = []
-    with manifest_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            entries.append(QuarantineManifestEntry.model_validate_json(stripped))
-    return entries
-
-
 def _recycle_bin_restore_message(count: int) -> str:
     """Verbatim wording from `executor.RecycleBinRestoreUnsupportedError`'s message (reproduced
     here, not reworded) so the quarantine *listing* view can show it before a restore is ever
@@ -964,7 +952,7 @@ def list_quarantine_batches(state: AppState) -> QuarantineListResponse:
     wins) is the same documented contract as the manifest's own append-only format, not a
     reinterpretation of it.
     """
-    entries = _read_manifest_entries(state.manifest_path)
+    entries = read_manifest_entries(state.manifest_path)
     latest: dict[tuple[str, str], QuarantineManifestEntry] = {}
     for entry in entries:
         latest[(entry.batch_id, entry.original_path.as_posix())] = entry
