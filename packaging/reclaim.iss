@@ -47,6 +47,10 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "{#MyDistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Third-party notices (NOTICES.md) — the dashboard's /NOTICES route reads this relative to the
+; process's own working directory ({app}, per the [Icons] "Start in" note below), same pattern
+; as the LICENSE-acceptance page's LicenseFile= above needing the repo-root LICENSE at build time.
+Source: "..\NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; "Start in" is deliberately {app} (not {userdocs} or anything else) — reclaim's CLI defaults

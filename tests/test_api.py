@@ -166,6 +166,17 @@ def test_index_page_serves_html(tmp_path: Path) -> None:
     assert "Reclaim" in response.text
 
 
+def test_notices_route_serves_third_party_notices(tmp_path: Path) -> None:
+    """Repo-root NOTICES.md (also copied to {app}\\NOTICES.md by the installer, see
+    packaging/reclaim.iss) is reachable at /NOTICES, same pattern as the existing /LICENSE route
+    -- linked from the dashboard footer's "Third-party notices" link."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/NOTICES")
+    assert response.status_code == 200
+    assert "Third-party notices" in response.text
+    assert "open-clip-torch" in response.text
+
+
 # --- Error paths -------------------------------------------------------------------------------
 
 
