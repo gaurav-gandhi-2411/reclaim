@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -9,7 +10,13 @@ import pytest
 
 from reclaim.index import ScanIndex, logical_size_bytes, physical_size_bytes
 from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
-from reclaim.scanner import GitRepoCache, is_cloud_sync_root, long_path, scan_tree
+from reclaim.scanner import (
+    GitRepoCache,
+    build_record_for_path,
+    is_cloud_sync_root,
+    long_path,
+    scan_tree,
+)
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -306,3 +313,42 @@ def test_git_repo_cache_finds_repo_root_past_max_path(tmp_path: Path) -> None:
     found = GitRepoCache().repo_root_for(root)
 
     assert found == root
+
+
+def test_build_record_for_path_fails_closed_on_8dot3_short_name_input(tmp_path: Path) -> None:
+    r"""D13 second pass (audit brief item 4): does `build_record_for_path` ever construct a
+    `FileRecord.path` from a caller-supplied 8.3 SHORT-name form (`C:\PROGRA~1\...`), which would
+    then reach `SafetyValidator` looking like the short alias rather than the real long name?
+
+    No -- `build_record_for_path` re-`scandir`s the parent directory and matches by
+    `entry.name == path.name` (NFC-normalized, D11); `os.scandir`'s `entry.name` on Windows is
+    always populated from `WIN32_FIND_DATA.cFileName` (the LONG name), never
+    `cAlternateFileName` (the short 8.3 name) — so a short-name `path.name` genuinely never
+    equals any real `entry.name`, and the lookup returns `None` (fails closed: the caller
+    treats `None` as "path missing", not "here is a FileRecord" — never a false ELIGIBLE). This
+    means the short-name-alias gap `tests/test_safety.py::
+    test_8dot3_short_name_alias_of_protected_root_denied` closes is only reachable via a path
+    `SafetyValidator.evaluate()` is handed WITHOUT going through this reconstruction step (e.g. a
+    hand-built `FileRecord`, or `api.service._build_user_selected_candidate`'s `Path(path_str)`
+    fed DIRECTLY into `record.path` for pattern-matching -- it also calls
+    `build_record_for_path`, so it inherits this exact same fail-closed behavior).
+
+    Skips (not silently passes) if this volume has 8.3 short-name generation disabled, matching
+    `tests/test_safety.py`'s own honesty discipline for this OS-configurable feature.
+    """
+    real_dir = tmp_path / "Long Named Directory For 8dot3 Reachability"
+    real_dir.mkdir()
+    (real_dir / "file.txt").write_text("hi")
+
+    buf = ctypes.create_unicode_buffer(260)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(real_dir), buf, 260)  # type: ignore[attr-defined]
+    if not n or buf.value == str(real_dir):
+        pytest.skip("8.3 short-name generation is disabled on this volume (fsutil 8dot3name)")
+
+    short_form_path = Path(buf.value)
+    assert short_form_path.name != real_dir.name  # sanity: genuinely a different name string
+    assert short_form_path.resolve() == real_dir.resolve()  # but the same real directory
+
+    record = build_record_for_path(short_form_path, GitRepoCache())
+
+    assert record is None
