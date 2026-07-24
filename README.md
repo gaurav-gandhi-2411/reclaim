@@ -139,6 +139,22 @@ the Recycle Bin, with an explicit reminder that emptying it is a separate, manua
   <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/10-light-theme.png" alt="Overview tab in light theme" width="800" />
 </p>
 
+<p>
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/11-recovery-banner.png" alt="Crash-recovery banner shown when a quarantine operation was interrupted, explaining it will resolve automatically" width="800" />
+</p>
+
+**Crash recovery, visible not hidden (v1.2.0)** — if a real crash interrupts an apply/restore/
+purge, the dashboard says so and tells you exactly what to run, rather than staying silent
+about it.
+
+<p>
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/12-apply-progress.png" alt="Live progress bar during a large apply, showing items processed of total and the current category" width="800" />
+</p>
+
+**Live progress for long operations (v1.2.0)** — a large apply now shows real progress instead
+of going quiet, plus an explicit note that closing the tab or stopping the server mid-operation
+is safe.
+
 </details>
 
 ## Questions, bugs, and privacy
