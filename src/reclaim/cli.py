@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -10,15 +11,20 @@ from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_s
 from reclaim.detectors import generate_candidates
 from reclaim.elevation import ElevatedProcessError, assert_not_elevated
 from reclaim.executor import (
+    DEFAULT_MANIFEST_PATH,
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
+    ProgressCallback,
     QuarantineMethod,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
     SafeModeViolationError,
     SafetyInvariantError,
     apply_batch,
+    estimate_batch_seconds,
+    fold_latest_manifest_entries,
     restore_batch,
+    should_warn_about_batch_duration,
 )
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.index import ScanIndex
@@ -30,7 +36,7 @@ from reclaim.mode import (
     switch_to_safe_mode,
 )
 from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode, Tier
-from reclaim.purge import purge_expired
+from reclaim.purge import purge_eligible_entries, purge_expired
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
@@ -493,6 +499,60 @@ def _print_materiality_exclusion(
     )
 
 
+# --- Progress feedback + pre-apply time estimate (fix/apply-progress-feedback) -----------------
+#
+# ADR-0026's measured ~9x per-item fsync cost turns a large apply/restore/purge into a
+# multi-minute operation with no visible feedback — a real hazard: it looks hung, which makes a
+# frustrated user more likely to kill the process mid-batch (exactly the scenario the crash-safe
+# manifest exists to survive, but still worth heading off with real information instead of
+# silence). This section wires `executor.ProgressCallback`/`estimate_batch_seconds` into a CLI
+# user actually watching the terminal.
+
+
+def _cli_progress_printer(label: str) -> ProgressCallback:
+    """Interval-gated (never per-item — see `executor._HEARTBEAT_INTERVAL_SECONDS`) stdout
+    heartbeat for a CLI user watching the terminal during a long `apply`/`purge`/`undo` run —
+    structlog's own `executor.*_progress`/`purge.progress` line at the same cadence is captured
+    for operators/log tooling, but isn't necessarily visible on a plain terminal, so this prints
+    directly too, mirroring `_run_scan`'s existing `print(f"reclaim scan: ...")` convention."""
+
+    def _print_progress(items_processed: int, items_total: int, current_category: str) -> None:
+        print(  # noqa: T201 -- CLI output, not application logging
+            f"reclaim {label}: {items_processed:,}/{items_total:,} item(s) processed "
+            f"(current category: {current_category})"
+        )
+
+    return _print_progress
+
+
+def _print_batch_duration_warning(label: str, item_count: int) -> None:
+    """Pre-apply/-purge/-undo time estimate, derived from ADR-0026's real measured per-item
+    fsync cost (`executor.estimate_batch_seconds` — never a guessed number), shown only above
+    `executor.should_warn_about_batch_duration`'s threshold (a handful of items doesn't need
+    one). Purely informational, not a second typed-confirmation gate: `--apply`/`undo`'s own
+    batch_id argument are already this CLI's "are you sure" gate (mirroring the dry-run-by-
+    default design), and an interactive prompt here would break non-interactive/scripted use —
+    unlike power-mode's typed confirmation (`reclaim mode power --confirm ...`), which guards a
+    structural safety-mode transition, not a single already-explicit apply/restore/purge
+    invocation. Also states the interrupt-safety guarantee explicitly (verified for a graceful
+    Ctrl-C specifically, not just a hard crash — see tests/test_recovery.py's
+    `test_apply_keyboard_interrupt_*` tests): stopping is safe, nothing is lost, `reclaim
+    recover` reconciles it afterward.
+    """
+    if not should_warn_about_batch_duration(item_count):
+        return
+    seconds = estimate_batch_seconds(item_count)
+    minutes = seconds / 60.0
+    time_phrase = "under a minute" if minutes < 1 else f"approximately {minutes:.1f} minute(s)"
+    print(  # noqa: T201
+        f"reclaim {label}: about to process {item_count:,} item(s) — at a measured ~8ms/item "
+        f"durability cost (ADR-0026), this may take {time_phrase}. It is SAFE to interrupt "
+        "(Ctrl-C) or close this terminal at any point during this: nothing is lost, whether "
+        "quarantined-but-not-yet-recorded or genuinely mid-move. Run 'reclaim recover' "
+        "afterward to reconcile anything interrupted mid-item."
+    )
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     try:
         assert_not_elevated()
@@ -547,6 +607,8 @@ def _run_apply(args: argparse.Namespace) -> int:
     # know to pass --method recycle_bin, so a plain `reclaim apply --apply` just works under
     # the default safe mode instead of failing on the --method flag's own "vault" default.
     method: QuarantineMethod = "recycle_bin" if config.mode == Mode.SAFE else args.method
+    if args.apply:
+        _print_batch_duration_warning("apply", len(selected))
     try:
         report = apply_batch(
             selected,
@@ -560,6 +622,7 @@ def _run_apply(args: argparse.Namespace) -> int:
             direct_delete_size_guard_retention_days=(
                 config.safety.direct_delete_size_guard_retention_days
             ),
+            on_progress=_cli_progress_printer("apply"),
         )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
@@ -695,12 +758,24 @@ def _run_undo(args: argparse.Namespace) -> int:
     config = load_config(config_path if config_path.exists() else None)
     safety = SafetyValidator(config)
 
+    # 'undo' has no dry-run concept (a restore is always real) — the pre-restore time estimate
+    # is scoped to the batch's actual vault-entry count (the only entries a restore ever moves;
+    # see `executor.resolve_restorable_entries`'s docstring), not the whole batch's item count.
+    resolved_manifest_path = args.manifest if args.manifest is not None else DEFAULT_MANIFEST_PATH
+    vault_entry_count = sum(
+        1
+        for entry in fold_latest_manifest_entries(resolved_manifest_path)
+        if entry.batch_id == args.batch_id and entry.method == "vault"
+    )
+    _print_batch_duration_warning("undo", vault_entry_count)
+
     try:
         report = restore_batch(
             args.batch_id,
             manifest_path=args.manifest,
             vault_dir=args.vault_dir,
             safety=safety,
+            on_progress=_cli_progress_printer("undo"),
         )
     except (
         BatchNotFoundError,
@@ -737,6 +812,13 @@ def _run_purge(args: argparse.Namespace) -> int:
     config = load_effective_config(config_path if config_path.exists() else None, mode=live_mode)
     safety = SafetyValidator(config)
 
+    if args.apply:
+        resolved_manifest_path = (
+            args.manifest if args.manifest is not None else DEFAULT_MANIFEST_PATH
+        )
+        eligible_count = len(purge_eligible_entries(resolved_manifest_path, time.time()))
+        _print_batch_duration_warning("purge", eligible_count)
+
     try:
         report = purge_expired(
             apply=args.apply,
@@ -745,6 +827,7 @@ def _run_purge(args: argparse.Namespace) -> int:
             safety=safety,
             only_rebuildable=args.rebuildable_only,
             mode=live_mode,
+            on_progress=_cli_progress_printer("purge"),
         )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim purge: {exc}", file=sys.stderr)  # noqa: T201

@@ -11,13 +11,16 @@ from pathlib import Path
 import structlog
 
 from reclaim.executor import (
+    _HEARTBEAT_INTERVAL_SECONDS,
     DEFAULT_MANIFEST_PATH,
     DEFAULT_VAULT_DIR,
     CategoryBreakdown,
+    ProgressCallback,
     QuarantineManifestEntry,
     SafeModeViolationError,
     SafetyInvariantError,
     _append_and_sync,
+    _due,
     _open_manifest_for_sync,
     fold_latest_manifest_entries,
     long_path,
@@ -88,7 +91,7 @@ def _is_stale_original_reoccupied(entry: QuarantineManifestEntry) -> bool:
     return os.path.exists(long_path(entry.original_path))  # noqa: PTH110 -- \\?\ str, not Path
 
 
-def _purge_eligible_entries(
+def purge_eligible_entries(
     manifest_path: Path, now_ts: float
 ) -> list[tuple[QuarantineManifestEntry, bool]]:
     """Selects purge-eligible vault entries, paired with whether each is eligible via genuine
@@ -100,6 +103,14 @@ def _purge_eligible_entries(
        is no parameter anywhere in this module that can force it early.
     2. `original_path` re-occupied (ADR-0005) — independent of category and of
        `retention_until`, since a stale vault copy can never be usefully restored either way.
+
+    Public (fix/apply-progress-feedback): a cheap, read-only manifest scan (no filesystem
+    mutation, no ADR-0026 fsync cost) — `cli.py`'s pre-purge time estimate (`should_warn_about_
+    batch_duration`) calls this directly to get a real item count before running `purge_expired`,
+    rather than re-deriving the same eligibility logic a second time. Doesn't apply
+    `only_rebuildable`'s further restriction (that's `purge_expired`'s own concern) — a
+    `--rebuildable-only` run's real eligible count can only ever be <= what this returns, so the
+    estimate this feeds is conservative (an upper bound), never an underestimate.
     """
     eligible: list[tuple[QuarantineManifestEntry, bool]] = []
     for entry in fold_latest_manifest_entries(manifest_path):
@@ -193,12 +204,17 @@ def purge_expired(
     now: float | None = None,
     only_rebuildable: bool = False,
     mode: Mode = Mode.POWER,
+    on_progress: ProgressCallback | None = None,
 ) -> PurgeReport:
     """Permanently deletes vaulted items (`method="vault"` manifest entries) whose retention
     window has passed, OR whose `original_path` is now stale (ADR-0005: re-occupied by
     something else, almost always a regenerated cache — see `_is_stale_original_reoccupied`).
     Never touches anything at an entry's `original_path` itself — by the time an entry is
     purge-eligible via either path, that vaulted copy is the only thing left to purge (ADR-0001).
+
+    `on_progress` (fix/apply-progress-feedback): optional interval-gated progress hook over the
+    eligible-entries loop — see `executor.ProgressCallback`'s docstring. Defaults to `None` so
+    every existing caller is unaffected.
 
     `mode` defaults to `Mode.POWER` (preserves every existing caller's behavior unchanged);
     real end-user entry points must pass the live mode explicitly. Stage 2 safety boundary:
@@ -222,7 +238,7 @@ def purge_expired(
     Hard boundary for the retention-expiry path, unconditional regardless of `apply`: an entry
     whose `retention_until` is still in the future is never selected via that path alone — there
     is no parameter that can force it. The stale-original-reoccupied path (ADR-0005) is
-    independent of `retention_until` by design (see `_purge_eligible_entries`).
+    independent of `retention_until` by design (see `purge_eligible_entries`).
 
     `only_rebuildable=True` further restricts eligibility to entries whose `category_group` is
     in `REBUILDABLE_CATEGORY_GROUPS` (ADR-0005) — a scoped purge that never touches a
@@ -246,7 +262,7 @@ def purge_expired(
     resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
     now_ts = now if now is not None else time.time()
 
-    eligible = _purge_eligible_entries(resolved_manifest_path, now_ts)
+    eligible = purge_eligible_entries(resolved_manifest_path, now_ts)
     if only_rebuildable:
         eligible = [
             (entry, stale)
@@ -274,10 +290,26 @@ def purge_expired(
     # ADR-0026: one manifest handle held open for the whole run, only if apply=True and there's
     # at least one entry that might attempt a delete — mirrors executor.py's approach.
     manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if apply and eligible else None
+    total_eligible = len(eligible)
+    last_heartbeat = time.monotonic()
     try:
-        for entry, stale in eligible:
+        for index, (entry, stale) in enumerate(eligible, start=1):
+            # fix/apply-progress-feedback: interval-gated, not per-item (see
+            # `executor.ProgressCallback`).
+            heartbeat_now = time.monotonic()
+            if _due(last=last_heartbeat, now=heartbeat_now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                logger.info(
+                    "purge.progress",
+                    items_processed=index - 1,
+                    items_total=total_eligible,
+                    current_category=entry.category,
+                )
+                if on_progress is not None:
+                    on_progress(index - 1, total_eligible, entry.category)
+                last_heartbeat = heartbeat_now
+
             if entry.vault_path is None:
-                # Unreachable in practice: `_purge_eligible_entries` only ever selects
+                # Unreachable in practice: `purge_eligible_entries` only ever selects
                 # `method="vault"` entries, which always carry a `vault_path`. Guards mypy's
                 # None narrowing and, if manifest data were ever corrupted, fails loudly
                 # per-item rather than crashing the whole purge run.

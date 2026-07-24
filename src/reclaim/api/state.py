@@ -7,6 +7,7 @@ from typing import Literal
 
 from reclaim.ai.models import AICluster
 from reclaim.config import Config, apply_safe_mode_category_overrides
+from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
 from reclaim.models import Mode
@@ -14,6 +15,8 @@ from reclaim.safety import SafetyValidator
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed"]
 AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
+ApplyStatusLiteral = Literal["idle", "running", "completed", "failed"]
+RestoreStatusLiteral = Literal["idle", "running", "completed", "failed"]
 
 
 @dataclass(slots=True)
@@ -50,6 +53,47 @@ class AIAnalysisStatus:
     tracks_skipped: list[tuple[str, str]] = field(default_factory=list)  # (track, reason) pairs
     files_considered: dict[str, int] = field(default_factory=dict)
     files_capped: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ApplyStatus:
+    """Snapshot of the most recent (or in-progress) `POST /api/apply` background task for this
+    process (fix/apply-progress-feedback) — mirrors `ScanStatus`'s exact shape/locking
+    convention. `items_processed`/`items_total`/`current_category` are updated at the same
+    interval-gated cadence `executor.apply_batch`'s own progress heartbeat uses (see
+    `executor.ProgressCallback`), so `GET /api/apply/status` polling sees real incremental
+    progress during a long-running vault apply (ADR-0026's measured per-item fsync cost), not
+    just idle/running/completed. `result` holds the real `BatchApplyReport` once `status`
+    reaches `"completed"` — converted to the API's `ApplyResponse` shape only at the read
+    boundary (`api.service.to_apply_status_out`), same convention every other `Out` schema in
+    this module already follows."""
+
+    status: ApplyStatusLiteral = "idle"
+    items_processed: int | None = None
+    items_total: int | None = None
+    current_category: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    result: BatchApplyReport | None = None
+
+
+@dataclass(slots=True)
+class RestoreStatus:
+    """Snapshot of the most recent (or in-progress) `POST /api/restore/{batch_id}` background
+    task for this process (fix/apply-progress-feedback) — mirrors `ApplyStatus` exactly, one
+    level down: restoring only ever moves a batch's `vault`-method entries (see `executor.
+    resolve_restorable_entries`), so `items_total` here is that count, not the whole batch's
+    item count."""
+
+    status: RestoreStatusLiteral = "idle"
+    items_processed: int | None = None
+    items_total: int | None = None
+    current_category: str | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    result: RestoreReport | None = None
 
 
 @dataclass(slots=True)
@@ -101,6 +145,12 @@ class AppState:
     # scan_generation` (see above). In-memory only, like every other piece of this process's
     # session state (ADR-0025 decision 2): lost on restart, re-computed with one click.
     ai_clusters: list[AICluster] = field(default_factory=list)
+    # fix/apply-progress-feedback: `POST /api/apply`/`POST /api/restore/{batch_id}` background
+    # tasks -- one in-flight apply and one in-flight restore per process at a time (single-user,
+    # single-browser-tab tool; see this class's own docstring), same single-flight posture
+    # `scan_status`/`ai_status` already have.
+    apply_status: ApplyStatus = field(default_factory=ApplyStatus)
+    restore_status: RestoreStatus = field(default_factory=RestoreStatus)
 
     @property
     def live_mode(self) -> Mode:

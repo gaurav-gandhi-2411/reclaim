@@ -346,6 +346,24 @@ class ApplyResponse(BaseModel):
     disk_free_delta_bytes: int | None
 
 
+class ApplyStatusOut(BaseModel):
+    """`GET /api/apply/status`'s body (fix/apply-progress-feedback) -- mirrors `ScanStatusOut`'s
+    shape, plus a nested `result` (the same `ApplyResponse` shape `POST /api/apply` used to
+    return synchronously, before that endpoint became a background-task + polling pattern)
+    populated only once `status == "completed"`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # "idle" | "running" | "completed" | "failed"
+    items_processed: int | None
+    items_total: int | None
+    current_category: str | None
+    started_at: float | None
+    finished_at: float | None
+    error: str | None
+    result: ApplyResponse | None = None
+
+
 # --- Quarantine / restore --------------------------------------------------------------------
 
 
@@ -433,6 +451,24 @@ class RestoreResponse(BaseModel):
     files_unsupported: int
     bytes_restored: int
     bytes_restored_human: str
+
+
+class RestoreStatusOut(BaseModel):
+    """`GET /api/restore/status`'s body (fix/apply-progress-feedback) -- mirrors `ApplyStatusOut`
+    exactly, one level down: `POST /api/restore/{batch_id}` became the same background-task +
+    polling pattern, `result` is the same `RestoreResponse` shape that endpoint used to return
+    synchronously."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # "idle" | "running" | "completed" | "failed"
+    items_processed: int | None
+    items_total: int | None
+    current_category: str | None
+    started_at: float | None
+    finished_at: float | None
+    error: str | None
+    result: RestoreResponse | None = None
 
 
 # --- AI suggestions (recommend-only; reclaim.ai.presentation output only, never a raw
