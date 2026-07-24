@@ -7,7 +7,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from reclaim.config import load_config, load_effective_config
+from reclaim.config import Config, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
 from reclaim.elevation import ElevatedProcessError, assert_not_elevated
@@ -395,6 +395,34 @@ def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _load_config_or_none(
+    command: str, config_path: Path, *, mode: Mode | None = None, effective: bool = False
+) -> Config | None:
+    """Loads `config.toml` for a CLI command, turning a malformed file into one friendly line
+    on stderr instead of a raw traceback (D16), and returns `None` in that case so the caller
+    can `return 1` -- same "print a clean message, exit 1" shape `ElevatedProcessError` already
+    uses above.
+
+    Every failure mode `load_config`/`load_effective_config` can raise for a bad *file* --
+    `tomllib.TOMLDecodeError` (invalid TOML syntax), `UnknownConfigKeyError` (an unrecognized
+    key with no forward-compat justification), `pydantic.ValidationError` (a recognized key with
+    an invalid value) -- is a `ValueError` subclass; catching that one base class here covers all
+    three without enumerating them, and anything that isn't one of those (a real bug) still
+    propagates rather than being silently absorbed.
+    """
+    resolved_path = config_path if config_path.exists() else None
+    try:
+        if effective:
+            return load_effective_config(resolved_path, mode=mode)
+        return load_config(resolved_path)
+    except ValueError as exc:
+        print(  # noqa: T201
+            f"reclaim {command}: config.toml is invalid ({config_path}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _run_scan(args: argparse.Namespace) -> int:
     root: Path = args.path
     if not root.is_dir():
@@ -595,9 +623,9 @@ def _run_apply(args: argparse.Namespace) -> int:
 
     config_path: Path = args.config
     mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
-    config = load_effective_config(
-        config_path if config_path.exists() else None, mode=current_mode(mode_log)
-    )
+    config = _load_config_or_none("apply", config_path, mode=current_mode(mode_log), effective=True)
+    if config is None:
+        return 1
 
     hash_skips: list[HashSkip] = []
     materiality: MaterialityExclusionStats | None = None
@@ -707,7 +735,9 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     # safe, the category override) fresh on every request, not once at server startup, so a
     # mode switch via the API takes effect immediately without a restart. See AppState's
     # docstring for why create_app must never receive an already-mode-resolved config here.
-    config = load_config(config_path if config_path.exists() else None)
+    config = _load_config_or_none("serve", config_path)
+    if config is None:
+        return 1
     mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
     first_run_state = (
         args.first_run_state if args.first_run_state is not None else DEFAULT_FIRST_RUN_STATE_PATH
@@ -805,7 +835,9 @@ def _run_undo(args: argparse.Namespace) -> int:
         return 1
 
     config_path: Path = args.config
-    config = load_config(config_path if config_path.exists() else None)
+    config = _load_config_or_none("undo", config_path)
+    if config is None:
+        return 1
     safety = SafetyValidator(config)
 
     # 'undo' has no dry-run concept (a restore is always real) — the pre-restore time estimate
@@ -859,7 +891,9 @@ def _run_purge(args: argparse.Namespace) -> int:
     config_path: Path = args.config
     mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
     live_mode = current_mode(mode_log)
-    config = load_effective_config(config_path if config_path.exists() else None, mode=live_mode)
+    config = _load_config_or_none("purge", config_path, mode=live_mode, effective=True)
+    if config is None:
+        return 1
     safety = SafetyValidator(config)
 
     if args.apply:

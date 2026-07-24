@@ -286,6 +286,114 @@ def test_serve_refuses_to_run_elevated(
     assert "simulated: process is elevated" in capsys.readouterr().err
 
 
+# --- malformed config.toml is a friendly message, not a raw traceback — audit D16 ---------------
+
+
+def test_apply_reports_clean_message_for_malformed_toml_syntax(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invalid TOML syntax (`tomllib.TOMLDecodeError`) must never surface as a raw traceback --
+    it should print one actionable line naming the file and exit 1."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+def test_apply_reports_clean_message_for_unknown_config_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recognized-syntax TOML file with an unrecognized key raises `UnknownConfigKeyError`
+    (a `ValueError` subclass) -- same friendly-message treatment as bad TOML syntax, not a raw
+    traceback."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("a_typo_or_attack_key = true\n", encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+def test_apply_reports_clean_message_for_pydantic_validation_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recognized key with an invalid value raises `pydantic.ValidationError` -- same
+    friendly-message treatment, not a raw traceback."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    # schema_version is declared as an int everywhere in this codebase; a string fails
+    # Config.model_validate with a real pydantic.ValidationError.
+    bad_config.write_text('schema_version = "not-an-int"\n', encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+@pytest.mark.parametrize("command", ["serve", "undo", "purge"])
+def test_other_config_consuming_commands_report_clean_message_too(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D16 wires the friendly-message helper into every CLI entry point that loads config.toml,
+    not just `apply` -- `serve`/`undo`/`purge` each get the same treatment."""
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+
+    args = [command, "--config", str(bad_config)]
+    if command == "undo":
+        args.append("some-batch-id")
+    else:
+        # "serve"/"purge" both resolve the live mode before loading config; point at an
+        # isolated, guaranteed-nonexistent mode log rather than depending on whatever
+        # data/mode_log.jsonl happens (or doesn't) to exist relative to the test runner's cwd.
+        args.extend(["--mode-log", str(tmp_path / "mode_log.jsonl")])
+
+    exit_code = main(args)
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert f"reclaim {command}:" in err
+    assert str(bad_config) in err
+
+
 # --- serve: clean messages for port-bind failures — audit F22 ----------------------------------
 
 
