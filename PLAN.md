@@ -1548,6 +1548,68 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   v1.1.0 marked pre-release/superseded (documented reason: the orphan-file gap this release
   fixes). https://github.com/gaurav-gandhi-2411/reclaim/releases/tag/v1.2.0
 
+### 2026-07-25 — Workstream A (P2 hardening) complete: 5 PRs opened, all draft
+- GG's autonomous work order: P2 hardening (Workstream A), visual identity refresh (B), and
+  simplified SIMPLE/ADVANCED UX modes (C), then a full rebuild/release. This checkpoint covers
+  Workstream A only; B and C follow.
+- **9 audit findings resolved across 5 branches/PRs**, each independently `scripts/verify.py`-
+  green:
+  - PR #14 `fix/p2-hardening-batch1` (F22 port-collision message, A5 ENOSPC handling, D16
+    friendly config-error message, D11 Unicode NFC/NFD path-comparison fix, D15 PIL
+    decompression-bomb cap) — both independent adversarial verifier passes CONFIRMED before
+    opening. 562-line diff (161 source / ~400 tests), over the 400-line auto-merge ceiling —
+    opened draft.
+  - PR #15 `chore/third-party-notices` (WS-A1: `NOTICES.md`, every core/`[ai]`-extra dependency
+    and downloaded model weight license verified via `importlib.metadata` + cited model-card
+    sources; corrected a stale ADR-0022 claim along the way — CLIP's specific pinned checkpoint
+    is Apache-2.0, not the MIT the ADR generalized from `open_clip`'s hub — permissive either
+    way, redistribution verdict unchanged; wired into the installer + a new `/NOTICES` route +
+    dashboard footer link, screenshot captured against a disposable demo tree).
+  - PR #16 `fix/manifest-append-lock` (C10: `msvcrt.locking()`-based OS lock around
+    `manifest.jsonl` appends, covering both same-process cross-thread and cross-process races;
+    concurrency regression test with two real threads, confirmed to fail without the fix).
+  - PR #17 `fix/unc-path-safety-bypass` (D13: blanket-deny UNC-form paths in `SafetyValidator`,
+    checked at `PROTECTED_SYSTEM_ROOT` precedence; **also fixed a related gap found during
+    review** — `\\?\C:\...`-prefixed local paths also failed to match drive-letter patterns
+    because `.as_posix()` carried the prefix into the fnmatch candidate; not independently
+    exploitable via the real scan path today, since `FileRecord.path` never carries that prefix
+    in practice, but `path_is_protected_root` is also called directly by the restore guard, so
+    closed defensively).
+  - PR #18 `chore/remove-dead-ai-code` (H28: `get_config()` and `ColdStartPriority` deleted as
+    genuinely dead — `get_config()` was also a latent footgun, since it bypasses
+    `load_effective_config`'s safe-mode override; `record_feedback_decision` kept, ADR-0020/
+    ADR-0025 both document it as intentional built-ahead infra; **`AIReviewQueue` kept — the
+    audit finding was wrong**, `grep`-ing `src/` alone misses that `evals/test_ai_safety_gate.py`
+    exercises it directly as part of the §7.5 safety-boundary proof).
+- **Incident: 4 of 5 branches' subagents hit a hard session usage limit mid-task** ("resets
+  11:40pm Asia/Calcutta"), failing with a terminated-early API error partway through their final
+  verification step. Each had already done the real implementation + test-writing work in its
+  own isolated git worktree (visible via `git status`/`git diff` in
+  `.claude/worktrees/agent-<id>/` even after the agent process died). Rather than idle-wait for
+  the quota reset, took over each worktree directly: reviewed the diff myself, ran
+  `scripts/verify.py` myself (pointing `UV_PROJECT_ENVIRONMENT` at each worktree's own
+  pre-provisioned `.venv`), fixed what verification caught (a line-length lint error on D13; the
+  extended-length-path gap above, caught by my own review, not mechanical verification), then
+  committed/pushed/opened the PR myself.
+- **Consequence, disclosed honestly, not glossed over**: PRs #15/#16/#17/#18 got only ONE
+  adversarial review pass (mine) instead of the two independent passes this work order requires,
+  because the second subagent slot was unavailable for the same quota reason. Each PR body says
+  this explicitly and recommends a second pass before merge — flagged especially hard on #16
+  (crash-safety-critical manifest path) and #17 (the core safety-boundary module), where I
+  self-imposed "flag for GG's review, don't self-merge even under the size gate" regardless of
+  the eventual second-pass outcome, given those touch the two things this project has
+  historically been most careful about.
+- All 5 PRs opened as **draft** — #14 by the explicit 400-line-diff gate (562 lines); #15/#16/
+  #17/#18 by the disclosed single-verification-pass gap above, not by size (all four are under
+  400 lines). None auto-merged. CI: #14 fully green at PR-open time; #15-#18 still running when
+  this checkpoint was written (`gh pr checks` shows each job either `pass` or `pending`, nothing
+  red so far) — confirm all green before merging any of them, per the standing CI-gate rule
+  above.
+- Next: Workstream B (visual identity refresh — new palette + dimensional depth on the existing
+  "block lifted from a filled square" logo geometry, regenerate all assets via
+  `packaging/build_brand_assets.py`, modernize the dashboard), then Workstream C (SIMPLE/
+  ADVANCED dashboard modes), then the release rebuild.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
