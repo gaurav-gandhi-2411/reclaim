@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -471,10 +472,19 @@ def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | N
     `SkippedPath` accounting is specific to `scan_tree`'s own aggregate report.
     """
     skipped: list[SkippedPath] = []
+    # D11: NTFS stores filenames as UTF-16 without normalizing composed (NFC) vs decomposed
+    # (NFD) Unicode forms -- a filename produced by one path (e.g. a macOS-authored file) can
+    # round-trip back from `os.scandir` in a different normalization form than `path.name`'s
+    # own in-memory string even though both denote the exact same filesystem entry, which would
+    # make a real match miss here and this function wrongly return None. Comparing under NFC is
+    # scoped to this equality check alone -- `entry_path`/`FileRecord.path` inside
+    # `build_record` are still built from `entry.name` verbatim, never the normalized form, so
+    # identity/round-trip behavior elsewhere (the index, `Candidate.path`, etc.) is unaffected.
+    target_name = unicodedata.normalize("NFC", path.name)
     try:
         with os.scandir(long_path(path.parent)) as entries:
             for entry in entries:
-                if entry.name == path.name:
+                if unicodedata.normalize("NFC", entry.name) == target_name:
                     built = build_record(entry, path.parent, git_cache, skipped)
                     return built[0] if built is not None else None
     except OSError:
