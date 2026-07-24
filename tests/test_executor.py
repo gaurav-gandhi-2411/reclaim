@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,10 @@ from reclaim.executor import (
     SafeModeViolationError,
     SafetyInvariantError,
     VaultIntegrityError,
+    _append_and_sync,
+    _close_manifest_for_sync,
     _latest_entries_for_batch,
+    _open_manifest_for_sync,
     apply_batch,
     long_path,
     restore_batch,
@@ -1838,3 +1842,107 @@ def test_restore_refuses_whole_batch_when_original_path_is_a_protected_root(
     assert legit_vault_path.exists()
     assert not legit_target.exists()
     assert not tampered_original.exists()
+
+
+# --- Audit finding C10: OS-level lock around manifest.jsonl appends ----------------------------
+
+
+def _manifest_entry_for_lock_test(*, batch_id: str, index: int) -> QuarantineManifestEntry:
+    """A minimal, valid `phase="done"` entry — content is irrelevant to this test, only that
+    every appended line round-trips as valid JSON and none get lost or merged."""
+    return QuarantineManifestEntry(
+        batch_id=batch_id,
+        original_path=Path(f"C:/fake/{batch_id}/item_{index:04d}.txt"),
+        size_bytes=index,
+        is_dir=False,
+        category="test_category",
+        category_group="test_group",
+        rationale="C10 concurrency regression test",
+        rebuild_instruction=None,
+        tier=Tier.A,
+        method="vault",
+        vault_path=Path(f"C:/fake/vault/{batch_id}/item_{index:04d}.txt"),
+        retention_days=30,
+        quarantined_at=_NOW,
+        retention_until=_NOW + 30 * 86400.0,
+    )
+
+
+def test_concurrent_manifest_appends_from_two_threads_never_interleave_partial_lines(
+    tmp_path: Path,
+) -> None:
+    """Audit finding C10: `apply_batch`/`restore_batch`/`purge_expired` each independently call
+    `_open_manifest_for_sync(manifest_path)` once per batch, hold that file handle open for the
+    whole batch, and write via `_append_and_sync` per item. Nothing prevented two of these batch
+    calls from running concurrently against the SAME `manifest_path` — e.g. two dashboard
+    requests dispatched via FastAPI `BackgroundTasks` (`run_in_threadpool` — real OS threads, not
+    cooperative-only) — and two independent file handles opened in append mode, each doing
+    multiple buffered `write()` calls per JSON line, could interleave partial lines from
+    different threads, corrupting the manifest: this tool's entire audit trail and crash-recovery
+    source of truth (`reclaim recover` parses this file to reconcile orphaned intents).
+
+    This spawns two real OS threads (not two processes): Windows byte-range locks — what
+    `msvcrt.locking` wraps inside `_acquire_manifest_lock`/`_release_manifest_lock` — are
+    associated with the file HANDLE, not the process, so two handles opened by two threads in
+    the SAME process contend exactly like two handles opened by two different processes would.
+    A thread-based test exercises the identical OS-level contention path a real cross-process
+    race would hit, without the added flakiness/cost of spawning and synchronizing real
+    subprocesses to prove the same underlying mechanism.
+    `tests/test_recovery.py`/`tests/_recovery_crash_harness.py` already cover genuine
+    cross-process hard-crash recovery separately (`os._exit()` mid-batch, via subprocess) — this
+    test's job is purely to prove the lock actually serializes concurrent writers, not to reprove
+    that a subprocess is a subprocess.
+
+    Confirmed this test fails without the fix: temporarily reverting `_acquire_manifest_lock`/
+    `_release_manifest_lock` to no-ops (so `_open_manifest_for_sync` opens two fully independent,
+    unsynchronized append-mode handles, matching the pre-fix code) makes this test fail
+    reliably — corrupted/unparseable lines and/or a wrong total line count.
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    entries_per_thread = 300
+    errors: list[BaseException] = []
+
+    def _write_batch(batch_id: str) -> None:
+        try:
+            fh = _open_manifest_for_sync(manifest_path)
+            try:
+                for index in range(entries_per_thread):
+                    entry = _manifest_entry_for_lock_test(batch_id=batch_id, index=index)
+                    _append_and_sync(fh, entry)
+            finally:
+                _close_manifest_for_sync(fh)
+        except BaseException as exc:  # pragma: no cover -- surfaced via `errors`, never swallowed
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_write_batch, args=(batch_id,))
+        for batch_id in ("batch_thread_a", "batch_thread_b")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not any(t.is_alive() for t in threads), "a writer thread hung — lock deadlock?"
+    assert not errors, f"writer thread(s) raised: {errors!r}"
+
+    lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    expected_total = 2 * entries_per_thread
+    assert len(lines) == expected_total, (
+        f"expected {expected_total} manifest lines (one per _append_and_sync call across both "
+        f"threads), got {len(lines)} — lines were lost or merged, a symptom of interleaved "
+        "concurrent writes corrupting the manifest"
+    )
+
+    parsed_by_batch: dict[str, int] = {"batch_thread_a": 0, "batch_thread_b": 0}
+    for line in lines:
+        # Every line must independently parse as one complete, valid JSON entry — a corrupted
+        # interleave (two threads' partial writes merged into one garbled line, or one write
+        # split across two lines) fails this.
+        entry = QuarantineManifestEntry.model_validate_json(line)
+        parsed_by_batch[entry.batch_id] += 1
+
+    assert parsed_by_batch == {
+        "batch_thread_a": entries_per_thread,
+        "batch_thread_b": entries_per_thread,
+    }

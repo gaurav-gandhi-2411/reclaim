@@ -20,6 +20,7 @@ from reclaim.executor import (
     SafeModeViolationError,
     SafetyInvariantError,
     _append_and_sync,
+    _close_manifest_for_sync,
     _due,
     _open_manifest_for_sync,
     fold_latest_manifest_entries,
@@ -400,7 +401,7 @@ def purge_expired(
             )
     finally:
         if manifest_fh is not None:
-            manifest_fh.close()
+            _close_manifest_for_sync(manifest_fh)
 
     disk_free_after = (
         _measure_disk_free(_vault_disk_usage_anchor(resolved_vault_dir)) if apply else None
