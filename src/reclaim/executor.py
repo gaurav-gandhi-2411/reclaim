@@ -588,11 +588,21 @@ _MANIFEST_LOCK_NBYTES = 1  # a single sentinel byte at a fixed offset (0) is loc
 # Locking a FIXED offset (not "wherever the fd happens to be") means every opener -- regardless
 # of how large the file already is when it opens -- contends for exactly the same byte.
 _MANIFEST_LOCK_POLL_SECONDS = 0.25
-_MANIFEST_LOCK_TIMEOUT_SECONDS = 600.0  # generous headroom over the largest real batch measured
-# in ADR-0026 (186.02s for a 23,000-item apply with per-item fsync) -- bounds the wait instead of
-# hanging forever if a lock is somehow never released (Windows releases byte-range locks
-# automatically when the owning handle closes or the process exits, so this should only ever
-# fire as a deep defensive bound, not an expected path).
+_MANIFEST_LOCK_TIMEOUT_SECONDS = 1800.0  # audit C10 (second pass), point 5: bounds the wait
+# instead of hanging forever if a lock is somehow never released (Windows releases byte-range
+# locks automatically when the owning handle closes or the process exits, so this should only
+# ever fire as a deep defensive bound, not an expected path) -- but the original 600s value was
+# under-justified: ADR-0026's 186.02s/23,000-item measurement is the WORST case *recorded*, not
+# a ceiling on how large or slow a legitimate real batch can get. A real production run already
+# hit 23,565 items in one batch (see `restore_batch`'s docstring); a machine with several times
+# that much accumulated clutter is a plausible, not hypothetical, next data point, and real-world
+# antivirus interception of every per-item file-open/fsync/delete syscall (well documented on
+# Windows) can multiply the measured 8.088ms/item several-fold without anything actually being
+# stuck. At the measured per-item rate, 1800s covers roughly 220,000 items (~9.5x the largest
+# recorded real batch) -- no fixed bound can cover an unbounded batch size times an unbounded
+# per-item slowdown, so this is a deliberately generous, evidence-anchored policy choice, not a
+# guarantee that no legitimate batch will ever exceed it; see the softened error message below,
+# which no longer asserts the holder must be stuck.
 
 
 class ManifestLockTimeoutError(RuntimeError):
@@ -638,8 +648,11 @@ def _acquire_manifest_lock(fh: TextIO) -> None:
                 raise ManifestLockTimeoutError(
                     "could not acquire the manifest.jsonl write lock within "
                     f"{_MANIFEST_LOCK_TIMEOUT_SECONDS:.0f}s -- another apply/restore/purge batch "
-                    "appears to be holding it far longer than any real batch should take (see "
-                    "ADR-0026's measured fsync cost); audit finding C10"
+                    "is either still legitimately running (an exceptionally large batch, a slow "
+                    "disk, or antivirus scanning every file operation can all push a real run "
+                    "past this bound) or a process holding the lock is stuck. Check Task Manager "
+                    "for a running reclaim/python process before assuming anything is wrong, and "
+                    "retry once it has finished or been closed; audit finding C10"
                 ) from None
             time.sleep(_MANIFEST_LOCK_POLL_SECONDS)
         else:
