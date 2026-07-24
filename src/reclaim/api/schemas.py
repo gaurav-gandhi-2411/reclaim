@@ -496,3 +496,27 @@ class FirstRunStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     acknowledged: bool
+
+
+# --- G25: bug-report diagnostics ----------------------------------------------------------------
+
+
+class DiagnosticsResponse(BaseModel):
+    """Everything the dashboard's "Copy diagnostics" button hands the user for a bug report.
+
+    PRIVACY (non-negotiable, see PRIVACY.md): every field here is a path, a version string, a
+    mode name, or a tail of the structured log file itself — never file content or OCR'd text.
+    `log_tail` is safe by construction, not by filtering: every `logger.*(...)` call site in
+    this codebase only ever passes paths/counts/error strings as structured fields (see
+    `reclaim.logging_config`'s module docstring and PRIVACY.md), so nothing the log file could
+    contain violates this guarantee in the first place.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reclaim_version: str
+    mode: Mode
+    ai_extra_installed: bool
+    os_version: str
+    log_path: str
+    log_tail: str

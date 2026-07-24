@@ -537,6 +537,48 @@ function initHowItWorks() {
   });
 }
 
+// --- Copy diagnostics (G25) ----------------------------------------------------------------------
+
+// Paths/counts/metadata only, never file contents -- see DiagnosticsResponse's docstring and
+// PRIVACY.md. This just formats what /api/diagnostics already returned; it adds nothing of its
+// own that could leak anything the server didn't already decide was safe to send.
+function formatDiagnosticsText(diagnostics) {
+  return [
+    `Reclaim version: ${diagnostics.reclaim_version}`,
+    `Mode: ${diagnostics.mode}`,
+    `AI extra installed: ${diagnostics.ai_extra_installed}`,
+    `OS: ${diagnostics.os_version}`,
+    `Log file: ${diagnostics.log_path}`,
+    "",
+    "--- recent log lines ---",
+    diagnostics.log_tail,
+  ].join("\n");
+}
+
+function initDiagnostics() {
+  const btn = document.getElementById("copy-diagnostics-btn");
+  const statusEl = document.getElementById("copy-diagnostics-status");
+  const defaultLabel = btn.textContent;
+  let resetHandle = null;
+
+  btn.addEventListener("click", async () => {
+    clearTimeout(resetHandle);
+    try {
+      const diagnostics = await api("/api/diagnostics");
+      await navigator.clipboard.writeText(formatDiagnosticsText(diagnostics));
+      btn.textContent = "Copied!";
+      statusEl.textContent = "Diagnostics copied to clipboard.";
+    } catch (err) {
+      btn.textContent = "Copy failed";
+      statusEl.textContent = `Could not copy diagnostics: ${err.message}`;
+    } finally {
+      resetHandle = setTimeout(() => {
+        btn.textContent = defaultLabel;
+      }, 2000);
+    }
+  });
+}
+
 // --- Treemap -----------------------------------------------------------------------------------
 
 async function loadTreemapView() {
@@ -1423,6 +1465,7 @@ function init() {
   initAISuggestions();
   initQuickClean();
   initHowItWorks();
+  initDiagnostics();
   initModeControls();
   initFirstRun();
   activateTab("overview");

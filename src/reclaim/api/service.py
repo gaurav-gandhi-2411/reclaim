@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import platform
 import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
+from importlib import metadata
 from pathlib import Path
 
 import structlog
@@ -24,6 +26,7 @@ from reclaim.api.schemas import (
     CandidatesResponse,
     CategoryBreakdownOut,
     CategoryCardOut,
+    DiagnosticsResponse,
     DuplicateClusterOut,
     DuplicateClusterReviewOut,
     DuplicateClusterReviewResponse,
@@ -1042,3 +1045,50 @@ def first_run_status(state: AppState) -> FirstRunStatusResponse:
 def acknowledge_first_run_screen(state: AppState) -> FirstRunStatusResponse:
     acknowledge_first_run(state.first_run_state_path)
     return FirstRunStatusResponse(acknowledged=True)
+
+
+# --- G25: bug-report diagnostics ----------------------------------------------------------------
+
+
+def installed_version() -> str:
+    """Resolves the installed `reclaim` distribution version (same source `pip show`/`uv pip
+    show` use) — one definition shared by the FastAPI app's own `version=` (see `api.app`) and
+    the diagnostics endpoint below, rather than two places that could drift. Falls back to
+    `"dev"` for a source checkout with no installed distribution record (e.g. running straight
+    out of the repo without `uv tool install .`/`pip install -e .`) — this must never raise.
+    """
+    try:
+        return metadata.version("reclaim")
+    except metadata.PackageNotFoundError:
+        return "dev"
+
+
+_DIAGNOSTICS_TAIL_LINES = 200
+
+
+def _read_log_tail(log_path: Path, *, max_lines: int = _DIAGNOSTICS_TAIL_LINES) -> str:
+    """Last `max_lines` lines of the persistent log file, or an explanatory placeholder if it
+    doesn't exist yet (a fresh install that hasn't logged anything, or a log path override that
+    was never written to). Reads the whole file rather than seeking from the end — the file is
+    capped at a few MB by `logging_config`'s rotation, so this is cheap, and correctness (never
+    splitting a multi-byte UTF-8 sequence by seeking to an arbitrary byte offset) matters more
+    here than shaving a read of an already-small file."""
+    if not log_path.exists():
+        return "(no log file yet — nothing has been logged this install)"
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = lines[-max_lines:]
+    return "\n".join(tail) if tail else "(log file is empty)"
+
+
+def build_diagnostics(state: AppState) -> DiagnosticsResponse:
+    """Assembles everything the dashboard's "Copy diagnostics" button hands the user for a bug
+    report: paths, counts, and version/mode metadata only — never file content or OCR'd text
+    (see `DiagnosticsResponse`'s docstring and PRIVACY.md)."""
+    return DiagnosticsResponse(
+        reclaim_version=installed_version(),
+        mode=state.live_mode,
+        ai_extra_installed=ai_orchestration.ai_extra_available(),
+        os_version=platform.platform(),
+        log_path=str(state.log_path),
+        log_tail=_read_log_tail(state.log_path),
+    )

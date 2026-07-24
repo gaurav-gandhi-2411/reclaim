@@ -8,6 +8,7 @@ from typing import Literal
 from reclaim.ai.models import AICluster
 from reclaim.config import Config, apply_safe_mode_category_overrides
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
+from reclaim.logging_config import DEFAULT_LOG_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
 from reclaim.models import Mode
 from reclaim.safety import SafetyValidator
@@ -91,6 +92,10 @@ class AppState:
     scan_status: ScanStatus = field(default_factory=ScanStatus)
     mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
     first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
+    # G25: the persistent rotating log file this process's `configure_logging` call actually
+    # writes to — `create_app` always sets this to match, so `GET /api/diagnostics` reads the
+    # tail of the real file, never a stale default that drifted from a `--log-path` override.
+    log_path: Path = field(default_factory=lambda: DEFAULT_LOG_PATH)
     # ADR-0025: incremented once per successfully COMPLETED scan (`service.run_scan`'s success
     # branch) -- the AI analysis cache below is keyed to this value so a caller can tell a
     # cached analysis is stale (a newer scan completed since) without forcing a recompute on
