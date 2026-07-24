@@ -4,12 +4,30 @@ import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
+import structlog
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reclaim.mode import current_mode
 from reclaim.models import SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS, Mode
+
+logger = structlog.get_logger(__name__)
+
+# ADR-0027 (schema versioning): the config shape as of introducing `schema_version` — bump
+# whenever a top-level or category field is added/removed/changed in a way that would otherwise
+# be invisible to a reader of an older release.
+CONFIG_SCHEMA_VERSION = 1
+
+# ADR-0027: every config/category class below sets `extra="ignore"` (never `"allow"`) —
+# config.toml is parsed into `Config` and consulted in-memory (`load_effective_config`'s
+# `model_copy` calls layer `mode`/`categories` overrides on top), but the app never writes a
+# `Config`/category config back to config.toml, so there is no read-modify-write cycle for an
+# unrecognized key to be lost from the way there is for `executor.QuarantineManifestEntry`.
+# `load_config` additionally warns (never raises) about any top-level/category key it doesn't
+# recognize — see `_warn_on_unknown_config_keys` — so a genuine typo or newer-release key is
+# still visible in logs rather than silently absorbed.
 
 # Absolute defaults for production; SafetyValidator tests substitute a fixture-relative
 # list so real C:\Windows etc. are never touched during development (spec: never scan or
@@ -139,7 +157,7 @@ def _default_crash_dump_paths() -> list[str]:
 
 
 class SafetyConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     deny: list[str] = Field(default_factory=list)
     allow: list[str] = Field(default_factory=list)
@@ -167,7 +185,7 @@ class SafetyConfig(BaseModel):
 
 
 class PackageCachesConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_package_cache_paths)
@@ -186,7 +204,7 @@ class PackageCachesConfig(BaseModel):
 
 
 class ModelCachesConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_model_cache_paths)
@@ -203,7 +221,7 @@ class ModelCachesConfig(BaseModel):
 
 
 class TempAndBrowserCachesConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     cache_paths: list[str] = Field(default_factory=_default_browser_and_thumbnail_cache_paths)
@@ -214,7 +232,7 @@ class TempAndBrowserCachesConfig(BaseModel):
 
 
 class CrashDumpsConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_crash_dump_paths)
@@ -224,7 +242,7 @@ class CrashDumpsConfig(BaseModel):
 
 
 class OldInstallersConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     # Spec: review-queue by default, auto-quarantine only if the user explicitly opts in.
     enabled: bool = False
@@ -236,7 +254,7 @@ class OldInstallersConfig(BaseModel):
 
 
 class LargeLogsConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     min_size_bytes: int = 50 * 1024 * 1024
@@ -248,7 +266,7 @@ class LargeLogsConfig(BaseModel):
 
 
 class DevArtifactsConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     # Conservative default: the node_modules-in-clean-repo exemption requires this to be
     # explicitly turned on (spec: "category explicitly enabled"). Stage 3 also uses this flag
@@ -261,7 +279,7 @@ class DevArtifactsConfig(BaseModel):
 
 
 class ArchivePairsConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
@@ -271,7 +289,7 @@ class ArchivePairsConfig(BaseModel):
 
 
 class DuplicatesConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     enabled: bool = False
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
@@ -291,7 +309,7 @@ class DuplicatesConfig(BaseModel):
 
 
 class CategoriesConfig(BaseModel):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     dev_artifacts: DevArtifactsConfig = Field(default_factory=DevArtifactsConfig)
     package_caches: PackageCachesConfig = Field(default_factory=PackageCachesConfig)
@@ -311,7 +329,7 @@ class CategoriesConfig(BaseModel):
 
 
 class Config(BaseSettings):
-    model_config = SettingsConfigDict(extra="forbid")
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
@@ -322,6 +340,44 @@ class Config(BaseSettings):
     # caller that doesn't go through `load_config` — is the conservative default, never an
     # accidental power-mode config.
     mode: Mode = Mode.SAFE
+    # ADR-0027: absent (pre-versioning) config.toml files validate with this defaulting to `1` —
+    # the literal truth, since `1` is the version every existing field on this class belongs to.
+    # A hand-edited config.toml is never expected to set this itself; it exists for a future
+    # release's migration logic, not as a user-facing knob.
+    schema_version: int = Field(default=CONFIG_SCHEMA_VERSION)
+
+
+def _warn_on_unknown_config_keys(data: dict[str, Any]) -> None:
+    """Logs (never raises) about config.toml keys this version of the code does not recognize —
+    a newer release's config field, or a plain user typo. `extra="ignore"` on `Config`/
+    `CategoriesConfig`/every category config already guarantees these never crash `load_config`;
+    this adds the actionable signal a silent `extra="forbid"` crash used to provide, without
+    reintroducing the crash itself."""
+    unknown_top = sorted(set(data) - set(Config.model_fields))
+    if unknown_top:
+        logger.warning("config.unknown_keys_ignored", scope="top_level", keys=unknown_top)
+
+    categories_raw = data.get("categories")
+    if not isinstance(categories_raw, dict):
+        return
+    unknown_categories = sorted(set(categories_raw) - set(CategoriesConfig.model_fields))
+    if unknown_categories:
+        logger.warning("config.unknown_keys_ignored", scope="categories", keys=unknown_categories)
+
+    for category_name, category_data in categories_raw.items():
+        field = CategoriesConfig.model_fields.get(category_name)
+        if field is None or not isinstance(category_data, dict):
+            continue
+        category_model = field.annotation
+        if not (isinstance(category_model, type) and issubclass(category_model, BaseModel)):
+            continue
+        unknown_fields = sorted(set(category_data) - set(category_model.model_fields))
+        if unknown_fields:
+            logger.warning(
+                "config.unknown_keys_ignored",
+                scope=f"categories.{category_name}",
+                keys=unknown_fields,
+            )
 
 
 def apply_safe_mode_category_overrides(categories: CategoriesConfig) -> CategoriesConfig:
@@ -350,12 +406,25 @@ def load_config(path: Path | None) -> Config:
     that needs "exactly what config.toml says," no policy layered on top) keeps working
     unchanged. Real end-user entry points (the CLI, the dashboard) must call
     `load_effective_config` instead — see its docstring for why the two are kept separate.
+
+    ADR-0027: never raises over an unrecognized top-level/category key (see `Config`'s
+    `extra="ignore"`) or a `schema_version` newer than `CONFIG_SCHEMA_VERSION` — both are logged
+    instead of crashing `load_config`/`load_effective_config`.
     """
     if path is None or not path.exists():
         return Config()
     with path.open("rb") as fh:
         data = tomllib.load(fh)
-    return Config.model_validate(data)
+    _warn_on_unknown_config_keys(data)
+    config = Config.model_validate(data)
+    if config.schema_version > CONFIG_SCHEMA_VERSION:
+        logger.warning(
+            "config.newer_schema_version_detected",
+            config_path=str(path),
+            known_schema_version=CONFIG_SCHEMA_VERSION,
+            encountered_schema_version=config.schema_version,
+        )
+    return config
 
 
 def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Config:

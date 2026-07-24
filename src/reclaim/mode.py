@@ -4,11 +4,15 @@ import time
 from pathlib import Path
 
 import structlog
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.models import Mode
 
 logger = structlog.get_logger(__name__)
+
+# ADR-0027 (schema versioning): the mode-log shape as of introducing `schema_version` — every
+# field `ModeChangeEntry` has today. Bump whenever a field is added/removed/changed.
+MODE_LOG_SCHEMA_VERSION = 1
 
 # Append-only event log, same "fold to latest entry" pattern as executor.py's manifest.jsonl —
 # the live mode is whatever `to_mode` the LAST entry recorded, never a value read from
@@ -31,9 +35,20 @@ class ModeSwitchDeniedError(RuntimeError):
 
 class ModeChangeEntry(BaseModel):
     """One line in the append-only `data/mode_log.jsonl`. Mirrors
-    `executor.QuarantineManifestEntry`'s event-log shape/rigor."""
+    `executor.QuarantineManifestEntry`'s event-log shape/rigor.
 
-    model_config = ConfigDict(extra="forbid")
+    ADR-0027 (schema versioning): `extra="ignore"` (not `"allow"`) is deliberate here — unlike
+    `QuarantineManifestEntry`, a `ModeChangeEntry` is never re-serialized after being read (no
+    `model_copy` call on this class anywhere in the codebase; every entry is freshly constructed
+    by `switch_to_power_mode`/`switch_to_safe_mode` and appended once, immutably), so there is no
+    read-modify-write cycle for an unrecognized field to be silently dropped from — `"ignore"` is
+    exactly as safe as `"allow"` for this class and simpler. `current_mode` never raises on an
+    entry written by a newer release; it logs a warning if that entry's `schema_version` is newer
+    than `MODE_LOG_SCHEMA_VERSION`, and otherwise resolves `to_mode` from every field it does
+    know — critical because `current_mode` is on the load path of nearly every CLI command.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     from_mode: Mode
     to_mode: Mode
@@ -45,22 +60,42 @@ class ModeChangeEntry(BaseModel):
     # the audit trail states the fact rather than requiring a reader to infer it from which
     # function must have been called.
     confirmed: bool
+    # ADR-0027: absent (pre-versioning) entries validate with this defaulting to `1` — the literal
+    # truth, since `1` is the version every existing field on this class belongs to.
+    schema_version: int = Field(default=MODE_LOG_SCHEMA_VERSION)
 
 
 def current_mode(log_path: Path | None = None) -> Mode:
     """The live application mode: the most recent entry's `to_mode`, or `Mode.SAFE` if the log
     doesn't exist or is empty — SAFE is the honest default for an install that has never
-    switched, not merely a fallback value."""
+    switched, not merely a fallback value.
+
+    ADR-0027: never raises on a log line written by a newer release — `ModeChangeEntry`'s
+    `extra="ignore"` already guarantees an unrecognized field parses fine; this additionally logs
+    a warning (once per call, listing every newer version actually seen) rather than silently
+    absorbing it. This function sits on the load path of nearly every CLI command, so it must
+    never hard-crash the whole CLI over one incompatible mode-log line.
+    """
     resolved = log_path if log_path is not None else DEFAULT_MODE_LOG_PATH
     if not resolved.exists():
         return Mode.SAFE
     latest: ModeChangeEntry | None = None
+    newer_versions: set[int] = set()
     with resolved.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:
                 continue
             latest = ModeChangeEntry.model_validate_json(stripped)
+            if latest.schema_version > MODE_LOG_SCHEMA_VERSION:
+                newer_versions.add(latest.schema_version)
+    if newer_versions:
+        logger.warning(
+            "mode.log_newer_schema_version_detected",
+            log_path=str(resolved),
+            known_schema_version=MODE_LOG_SCHEMA_VERSION,
+            encountered_schema_versions=sorted(newer_versions),
+        )
     return latest.to_mode if latest is not None else Mode.SAFE
 
 
