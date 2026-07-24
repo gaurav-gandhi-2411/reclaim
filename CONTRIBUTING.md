@@ -6,9 +6,25 @@ This is a solo portfolio project, but issues and PRs are welcome.
 
 ```powershell
 uv sync --all-groups
-uv run pytest              # unit tests
-uv run pytest evals/ -v    # safety-gate + perf smoke tests (slower — real git ops)
-uv run ruff check . && uv run ruff format --check . && uv run mypy
+uv run python scripts/verify.py    # THE required check before any push -- see below
+```
+
+`scripts/verify.py` is the single canonical pre-push/pre-PR command: ruff check, ruff format
+--check, mypy, `pytest tests/` plus the three safety-gate eval files (`evals/test_safety_gate.py`,
+`evals/test_ai_safety_gate.py`, `evals/test_safe_mode_gate.py`), then the per-module coverage
+floor. **Never substitute a hand-picked subset of this** — `pyproject.toml`'s
+`testpaths = ["tests"]` means a bare `uv run pytest`/`uv run pytest tests/ -q` silently skips
+every safety-gate eval, which is exactly how a real config-security regression once reached PR
+review undetected (see docs/architecture/adr/0027-schema-versioning-for-durable-state.md's "A
+real regression this ADR caused" section). Never report "the full test suite passes" from a
+command that omits `evals/test_safety_gate.py`/`test_ai_safety_gate.py`/`test_safe_mode_gate.py`.
+
+For the slower gold-set/operating-point evals (need the `[ai]` extra and real fixture datasets —
+not part of the required pre-push check, run only when touching AI-layer detection quality):
+
+```powershell
+uv sync --all-groups --extra ai
+uv run pytest evals/ -v
 ```
 
 Frontend regression tests (jsdom, no browser download required):
@@ -21,10 +37,12 @@ npm test
 
 ## Non-negotiables for a PR
 
-- **`evals/test_safe_mode_gate.py` and `evals/test_ai_safety_gate.py` must pass.** These are the
-  structural proof that safe mode's guarantees hold (ADR-0023) and that the AI layer stays
-  recommend-only, never delete-capable (§7.5). A change that breaks either of these is a safety
-  regression, not a style nit — it blocks the PR regardless of what else it does.
+- **`scripts/verify.py` must pass in full** — `evals/test_safety_gate.py`, `test_ai_safety_gate.py`,
+  and `test_safe_mode_gate.py` are the structural proof that the deterministic deny-first gate
+  (spec principle 3), the AI layer's recommend-only guarantee (§7.5), and safe mode's guarantees
+  (ADR-0023) all still hold. A change that breaks any of the three is a safety regression, not a
+  style nit — it blocks the PR regardless of what else it does, and regardless of whether
+  `pytest tests/` alone stayed green (it would — that command doesn't run any of them).
 - **No fabricated metrics.** Every number in a commit message, README, or ADR must trace back to
   something actually measured or a test that actually ran — never an estimate presented as a
   measurement.
