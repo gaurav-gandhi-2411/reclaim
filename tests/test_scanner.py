@@ -9,12 +9,27 @@ import pytest
 
 from reclaim.index import ScanIndex, logical_size_bytes, physical_size_bytes
 from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
-from reclaim.scanner import is_cloud_sync_root, scan_tree
+from reclaim.scanner import is_cloud_sync_root, long_path, scan_tree
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
 _GIT_EMAIL = "scanner-test@reclaim.test"
 _GIT_NAME = "Reclaim Scanner Test"
+
+
+def _make_deep_tree(root: Path, *, depth: int = 15, segment_len: int = 20) -> Path:
+    r"""Builds a directory tree whose full path comfortably exceeds Windows' 260-char MAX_PATH,
+    to exercise `\\?\`-prefixed long-path handling (D12/ADR-0004). Uses `os.makedirs` on a raw
+    `\\?\`-prefixed string rather than `Path.mkdir` — `pathlib.Path` doesn't reliably round-trip
+    that prefix, same reasoning as `reclaim.scanner`'s own long-path helpers. Mirrors
+    `tests/test_executor.py::_make_deep_tree` (ADR-0004's own fixture) — duplicated rather than
+    imported so this test module doesn't take on a cross-test-module dependency."""
+    current = root
+    for i in range(depth):
+        current = current / (f"seg_{i:03d}_" + "x" * segment_len)
+        os.makedirs(long_path(current), exist_ok=True)  # noqa: PTH103
+    assert len(str(current)) > 260, f"fixture path too short: {len(str(current))} chars"
+    return current
 
 
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -198,3 +213,69 @@ def test_scan_tree_prunes_deleted_files(tmp_path: Path) -> None:
 
     assert second.files_pruned == 1
     assert {r.path for r in inventory} == {keep}
+
+
+# --- D12: long-path-safe scan walk + visible skipped/unreadable accounting ----------------------
+
+
+def test_scan_tree_walks_past_max_path_without_dropping_the_subtree(tmp_path: Path) -> None:
+    """The real-disk regression this fix responds to: before D12, `build_record`'s bare
+    `Path.stat()` call raised `WinError 3` on the first entry past Windows' 260-char MAX_PATH,
+    returned `None`, and — because a directory's `None` return means it's never pushed onto the
+    walk stack — its ENTIRE subtree (every directory AND file below that point) silently never
+    got visited, while the scan still reported success with a plausible-looking count. Every
+    directory segment down to, and including, a real >260-char leaf must now appear in the scan
+    inventory, and zero entries should be recorded as skipped."""
+    root = tmp_path / "root"
+    root.mkdir()
+    leaf = _make_deep_tree(root)
+    payload = leaf / "payload.bin"
+    with open(long_path(payload), "wb") as fh:  # noqa: PTH123 -- \\?\ str, not Path
+        fh.write(b"deep-payload-past-max-path")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+        inventory = index.full_inventory(under=root)
+
+    paths = {r.path for r in inventory}
+    current = root
+    for part in leaf.relative_to(root).parts:
+        current = current / part
+        assert current in paths, f"{current} missing from scan inventory -- subtree was dropped"
+    assert payload in paths
+    assert stats.skipped_unreadable_count == 0
+    assert stats.skipped_unreadable_paths == ()
+
+
+def test_scan_tree_reports_genuinely_unreadable_path_as_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine per-entry failure (simulated via monkeypatch — a real ACL-denied fixture isn't
+    reliable enough across environments to assert against directly) must be visible in
+    `ScanStats.skipped_unreadable_count`/`skipped_unreadable_paths`, not silently vanish the way
+    every unreadable entry did before D12. The sibling `readable.txt` must still be scanned
+    normally — one bad entry never aborts the rest of the directory."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    blocked = root / "blocked.txt"
+    blocked.write_text("blocked", encoding="utf-8")
+
+    real_stat = os.stat
+
+    def fake_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if os.path.basename(str(path)) == "blocked.txt":  # noqa: PTH119 -- raw str, not Path
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+        inventory = index.full_inventory(under=root)
+
+    paths = {r.path for r in inventory}
+    assert root / "readable.txt" in paths
+    assert blocked not in paths
+    assert stats.skipped_unreadable_count == 1
+    assert str(blocked) in stats.skipped_unreadable_paths

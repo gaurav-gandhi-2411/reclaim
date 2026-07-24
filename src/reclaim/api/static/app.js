@@ -227,7 +227,10 @@ function renderScanStatus(status) {
     statusEl.textContent =
       `Scan of ${status.root} complete: ${status.entries_total} entries ` +
       `(${status.files_written} written, ${status.files_unchanged} unchanged, ` +
-      `${status.files_pruned} pruned) in ${status.elapsed_seconds?.toFixed(2)}s.`;
+      `${status.files_pruned} pruned) in ${status.elapsed_seconds?.toFixed(2)}s.` +
+      (status.skipped_unreadable_count
+        ? ` ${status.skipped_unreadable_count} path(s) skipped (unreadable).`
+        : "");
   } else if (status.status === "failed") {
     statusEl.dataset.tone = "error";
     statusEl.textContent = `Scan of ${status.root} failed: ${status.error}`;
@@ -268,6 +271,7 @@ async function loadOverview() {
     stateEl.innerHTML = "";
     contentEl.hidden = false;
     renderSummaryStats(summary);
+    renderSkippedUnreadableNote(summary);
     renderCategoryCards(summary.categories);
     loadQuickClean();
   } catch (err) {
@@ -307,6 +311,26 @@ function renderSummaryStats(summary) {
     stat.appendChild(dd);
     row.appendChild(stat);
   }
+}
+
+// D12: visible (not just logged) accounting of paths the last scan couldn't stat/list --
+// permission errors and real I/O faults, never a long-path-only failure (every scandir/stat
+// call in the scan walk is now long-path-safe -- see reclaim.scanner's D12 module note).
+function renderSkippedUnreadableNote(summary) {
+  const note = document.getElementById("skipped-unreadable-note");
+  if (!summary.skipped_unreadable_count) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  note.dataset.tone = "warning";
+  const sample = summary.skipped_unreadable_paths.slice(0, 5).join(", ");
+  const more = summary.skipped_unreadable_count > 5 ? ", …" : "";
+  note.textContent =
+    `${summary.skipped_unreadable_count} path(s) could not be read during the last scan ` +
+    "(permission denied or a real I/O error) and were skipped" +
+    (sample ? `: ${sample}${more}` : ".");
 }
 
 function formatFromBytes(bytes) {

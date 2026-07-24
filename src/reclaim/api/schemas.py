@@ -133,6 +133,10 @@ class ScanStatusOut(BaseModel):
     files_unchanged: int | None
     files_pruned: int | None
     elapsed_seconds: float | None
+    # D12: real count (+ a sample of actual paths) of entries the scan could not stat/list
+    # (permission error, genuine I/O fault) -- see `reclaim.scanner.SkippedPath`.
+    skipped_unreadable_count: int | None
+    skipped_unreadable_paths: list[str] | None
 
 
 # --- Summary / category cards -------------------------------------------------------------
@@ -160,6 +164,13 @@ class SummaryResponse(BaseModel):
     tier_b_bytes: int
     tier_b_count: int
     categories: list[CategoryCardOut]
+    # D12: real count (+ a sample of actual paths) of entries the most recent completed scan
+    # (this process's session) could not stat/list -- see `reclaim.scanner.SkippedPath`. Always
+    # `0`/`[]` when no scan has completed yet in this process, never `None` -- unlike
+    # `ScanStatusOut`, this endpoint has no "no scan status recorded" state of its own to
+    # distinguish from "zero skipped".
+    skipped_unreadable_count: int
+    skipped_unreadable_paths: list[str]
 
 
 # --- Treemap -------------------------------------------------------------------------------

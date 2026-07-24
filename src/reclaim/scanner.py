@@ -28,6 +28,69 @@ logger = structlog.get_logger(__name__)
 _ONEDRIVE_ENV_VARS = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
 _CLOUD_ROOT_FOLDER_PREFIXES = ("onedrive", "dropbox", "google drive")
 
+# --- D12: long-path-safe scan walk ------------------------------------------------------------
+#
+# ADR-0004 gave the vault/move path in `executor.py` `\\?\`-prefixed, MAX_PATH-safe filesystem
+# calls, but the SCAN path itself never got the same treatment: `build_record`/`_walk_subtree`
+# stat'd real filesystem entries via bare `Path`/`os.scandir` calls. On a real >260-char directory
+# (confirmed via a live audit fixture: a 9-directory-deep, 604-char tree), the stat call fails with
+# `WinError 3`, `build_record` returns `None` for that entry — and because a directory's `None`
+# return means it's never pushed onto the walk stack, its ENTIRE subtree silently never gets
+# visited. The scan still reports success (exit 0, plausible-looking counts): disk usage is
+# silently under-reported for any real deeply-nested user tree, with nothing anywhere surfacing
+# that it happened. `long_path` (moved here from `executor.py`, which re-exports it for backward
+# compatibility — see that module) is the same primitive ADR-0004 already trusts, applied
+# unconditionally to every scandir/stat call in this module's walk, matching executor.py's own
+# "always prefix, it's idempotent and cheap" convention rather than only prefixing paths already
+# suspected to be long. Genuinely unreadable paths (permission denied, a real I/O error) are no
+# longer silently dropped either: `build_record`/`_walk_subtree`/`scan_tree` now accumulate every
+# skip as a `SkippedPath` that flows into `ScanStats.skipped_unreadable_count`/
+# `skipped_unreadable_paths` — visible in both the CLI's printed output and the dashboard's
+# `/api/summary` view, not just logged and forgotten.
+_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def long_path(path: Path) -> str:
+    r"""Returns an absolute, `\\?\`-prefixed path string so the Win32 APIs behind `os`/`shutil`
+    bypass the legacy 260-character MAX_PATH limit (this tool targets Windows/NTFS exclusively —
+    see `pytestmark` in the test suite).
+
+    `\\?\` disables the normal path parser's `.`/`..` and forward-slash handling entirely, so the
+    string must already be a fully-normalized, all-backslash absolute path before the prefix is
+    added — `str(Path(...))` (not raw string concatenation) guarantees that on Windows. Idempotent:
+    a path already carrying the prefix is returned unchanged. UNC paths get the `\\?\UNC\` form;
+    drive-letter paths get a plain `\\?\` prefix.
+    """
+    raw = str(Path(path).absolute())
+    if raw.startswith(_LONG_PATH_PREFIX):
+        return raw
+    if raw.startswith("\\\\"):  # UNC: \\server\share\... -> \\?\UNC\server\share\...
+        return _LONG_PATH_PREFIX + "UNC\\" + raw[2:]
+    return _LONG_PATH_PREFIX + raw
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedPath:
+    r"""One filesystem entry `scan_tree` could not stat or list, and why.
+
+    Surfaced (not just logged) via `ScanStats.skipped_unreadable_count`/
+    `skipped_unreadable_paths` — before D12, a permission error or a genuine I/O fault on one
+    directory silently dropped that directory's entire subtree from the scan with no visible
+    trace anywhere in the scan's output. Every scandir/stat call in this module is now
+    `\\?\`-prefixed (see `long_path`), so a `SkippedPath` means a real permission/IO problem, not
+    merely "the path was long".
+    """
+
+    path: str
+    error: str
+
+
+# Cap on how many actual `SkippedPath.path` strings `ScanStats.skipped_unreadable_paths` carries —
+# the full count is always exact, but a scan hitting a genuinely inaccessible root (e.g. an entire
+# protected directory tree) could otherwise accumulate an unbounded sample list for no added value
+# past the first handful.
+_SKIPPED_PATHS_SAMPLE_LIMIT = 20
+
 
 def is_cloud_sync_root(path: Path) -> bool:
     """Best-effort heuristic: is `path` a cloud-sync provider's root folder (OneDrive/Dropbox/
@@ -57,6 +120,11 @@ class ScanStats:
     files_unchanged: int
     files_pruned: int
     elapsed_seconds: float
+    # D12: real count of every entry `scan_tree` could not stat/list (permission error, genuine
+    # I/O fault) — see the `SkippedPath` docstring. `skipped_unreadable_paths` is a sample (first
+    # `_SKIPPED_PATHS_SAMPLE_LIMIT`) of the actual paths, never the full list.
+    skipped_unreadable_count: int
+    skipped_unreadable_paths: tuple[str, ...]
 
 
 class GitRepoCache:
@@ -131,32 +199,43 @@ def _query_git_clean(repo_root: Path) -> bool:
 
 
 def build_record(
-    entry: os.DirEntry[str], current_dir: Path, git_cache: GitRepoCache
+    entry: os.DirEntry[str],
+    current_dir: Path,
+    git_cache: GitRepoCache,
+    skipped: list[SkippedPath],
 ) -> tuple[FileRecord, bool] | None:
     """Builds a FileRecord for one os.scandir entry.
 
     Returns `(record, should_recurse)`, or `None` if the entry couldn't be stat'd (permission
-    error, deleted mid-scan, etc.) — the caller logs and skips those rather than crashing the
-    scan. `should_recurse` is gated solely on the reparse-point attribute bit, never on
-    `entry.is_dir()` — Windows junctions carry `FILE_ATTRIBUTE_DIRECTORY` alongside the
-    reparse bit and some Python/Windows combinations still report them as traversable via
-    `is_dir()`.
+    error, deleted mid-scan, etc.) — the caller skips those rather than crashing the scan, and
+    this function itself appends a `SkippedPath` to `skipped` so the miss is visible in
+    `ScanStats`, not just logged (D12). `should_recurse` is gated solely on the reparse-point
+    attribute bit, never on `entry.is_dir()` — Windows junctions carry `FILE_ATTRIBUTE_DIRECTORY`
+    alongside the reparse bit and some Python/Windows combinations still report them as
+    traversable via `is_dir()`.
     """
-    entry_path = Path(entry.path)
+    entry_path = current_dir / entry.name
     try:
-        # Path.stat(), not entry.stat(): DirEntry.stat() on Windows is populated straight from
-        # the FindNextFile data scandir already collected, which does NOT include the file ID
+        # os.stat() on `entry.path` (a raw string, not wrapped in `Path`), not entry.stat() and
+        # not `entry_path.stat()`: DirEntry.stat() on Windows is populated straight from the
+        # FindNextFile data scandir already collected, which does NOT include the file ID
         # (st_ino) or volume serial number (st_dev) — those only come from a real
-        # GetFileInformationByHandle call, which Path.stat()/os.stat() make and entry.stat()
-        # does not. Measured cost of the extra per-entry syscall this implies: ~30K files/sec
-        # on a synthetic local tree, still ~18x the spec's ~1667 files/sec (100K/min) floor, so
+        # GetFileInformationByHandle call, which os.stat() makes and entry.stat() does not.
+        # Measured cost of the extra per-entry syscall this implies: ~30K files/sec on a
+        # synthetic local tree, still ~18x the spec's ~1667 files/sec (100K/min) floor, so
         # trading scandir's free-stat optimization for correct hardlink dedup is worth it.
-        # follow_symlinks=False so a reparse point is stat'd as itself, not as whatever it
-        # points to — required to read the reparse-point attribute bit correctly.
-        st = entry_path.stat(follow_symlinks=False)
+        # `entry.path` already carries whatever `\\?\` prefix the os.scandir() call that produced
+        # this DirEntry was given (see `long_path`/D12) — os.stat() on that raw string is what
+        # lets a real >MAX_PATH path still be statted; `Path.stat()` doesn't reliably round-trip
+        # a `\\?\`-prefixed string (it mishandles the literal `?` segment), same reasoning
+        # `executor.py`'s `_atomic_move`/`_tree_stats` already document. follow_symlinks=False so
+        # a reparse point is stat'd as itself, not as whatever it points to — required to read
+        # the reparse-point attribute bit correctly.
+        st = os.stat(entry.path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path
         is_dir_entry = entry.is_dir(follow_symlinks=False)
     except OSError as exc:
-        logger.warning("scan.entry_unreadable", path=entry.path, error=str(exc))
+        logger.warning("scan.entry_unreadable", path=str(entry_path), error=str(exc))
+        skipped.append(SkippedPath(path=str(entry_path), error=str(exc)))
         return None
 
     attributes = st.st_file_attributes
@@ -183,19 +262,27 @@ def build_record(
 
 
 def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | None:
-    """Reconstructs a fresh `FileRecord` for one already-known path outside of an in-progress
+    r"""Reconstructs a fresh `FileRecord` for one already-known path outside of an in-progress
     `scan_tree` walk (`build_record` needs a live `os.DirEntry`, which callers here don't have)
     by re-`scandir`-ing the parent directory and delegating to `build_record` — reuses the
     exact same stat/reparse-point/git-repo logic the scanner itself uses rather than
     duplicating it. Used by `executor.py`'s pre-delete safety re-check (ADR-0001), which only
     ever has a `Path` from a `Candidate`, never a live scan in progress. Returns `None` if
     `path` no longer exists or its parent can't be listed.
+
+    `path.parent` is `\\?\`-prefixed (D12) before the `scandir` call the same way `scan_tree`'s
+    own walk is — a direct-delete candidate can itself be a deeply-nested path (dev-artifact
+    caches routinely are), so this single-path lookup needs the identical MAX_PATH safety.
+    `skipped` here is a throwaway, single-call list: this function reports only `FileRecord |
+    None` to its caller, which already treats `None` as "path missing, not a fatal error" — the
+    `SkippedPath` accounting is specific to `scan_tree`'s own aggregate report.
     """
+    skipped: list[SkippedPath] = []
     try:
-        with os.scandir(path.parent) as entries:
+        with os.scandir(long_path(path.parent)) as entries:
             for entry in entries:
                 if entry.name == path.name:
-                    built = build_record(entry, path.parent, git_cache)
+                    built = build_record(entry, path.parent, git_cache, skipped)
                     return built[0] if built is not None else None
     except OSError:
         return None
@@ -206,27 +293,36 @@ def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | N
 class _SubtreeResult:
     records: list[FileRecord]
     dirs_visited: int
+    skipped: list[SkippedPath]
 
 
 def _walk_subtree(start: Path) -> _SubtreeResult:
-    """Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
+    r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
+
+    Every `os.scandir` call here is `\\?\`-prefixed (D12) — `current_dir` itself always stays an
+    ordinary, unprefixed `Path` (used for the walk stack, `FileRecord.path`, and the git-repo
+    cache keys), and only the string handed to `scandir` carries the prefix, matching
+    `executor.py`'s own "prefix only the raw filesystem call, never the value the rest of the
+    code reasons about" convention.
     """
     git_cache = GitRepoCache()
     records: list[FileRecord] = []
+    skipped: list[SkippedPath] = []
     dirs_visited = 0
     stack = [start]
     while stack:
         current_dir = stack.pop()
         dirs_visited += 1
         try:
-            entries = list(os.scandir(current_dir))
+            entries = list(os.scandir(long_path(current_dir)))
         except OSError as exc:
             logger.warning("scan.dir_unreadable", path=str(current_dir), error=str(exc))
+            skipped.append(SkippedPath(path=str(current_dir), error=str(exc)))
             continue
 
         for entry in entries:
-            built = build_record(entry, current_dir, git_cache)
+            built = build_record(entry, current_dir, git_cache, skipped)
             if built is None:
                 continue
             record, should_recurse = built
@@ -234,7 +330,7 @@ def _walk_subtree(start: Path) -> _SubtreeResult:
             if should_recurse:
                 stack.append(record.path)
 
-    return _SubtreeResult(records=records, dirs_visited=dirs_visited)
+    return _SubtreeResult(records=records, dirs_visited=dirs_visited, skipped=skipped)
 
 
 def scan_tree(
@@ -257,17 +353,19 @@ def scan_tree(
     # used below to skip writing unchanged records.
     stat_cache: dict[str, StoredStat] = index.load_stat_cache(root)
 
+    all_skipped: list[SkippedPath] = []
     try:
-        top_level_entries = list(os.scandir(root))
+        top_level_entries = list(os.scandir(long_path(root)))
     except OSError as exc:
         logger.warning("scan.root_unreadable", path=str(root), error=str(exc))
         top_level_entries = []
+        all_skipped.append(SkippedPath(path=str(root), error=str(exc)))
 
     root_git_cache = GitRepoCache()
     top_level_records: list[FileRecord] = []
     recurse_into: list[Path] = []
     for entry in top_level_entries:
-        built = build_record(entry, root, root_git_cache)
+        built = build_record(entry, root, root_git_cache, all_skipped)
         if built is None:
             continue
         record, should_recurse = built
@@ -283,6 +381,7 @@ def scan_tree(
             for result in executor.map(_walk_subtree, recurse_into):
                 all_records.extend(result.records)
                 dirs_visited += result.dirs_visited
+                all_skipped.extend(result.skipped)
 
     to_write: list[FileRecord] = []
     unchanged_paths: list[str] = []
@@ -307,4 +406,8 @@ def scan_tree(
         files_unchanged=len(unchanged_paths),
         files_pruned=files_pruned,
         elapsed_seconds=time.monotonic() - start_time,
+        skipped_unreadable_count=len(all_skipped),
+        skipped_unreadable_paths=tuple(
+            skipped_path.path for skipped_path in all_skipped[:_SKIPPED_PATHS_SAMPLE_LIMIT]
+        ),
     )

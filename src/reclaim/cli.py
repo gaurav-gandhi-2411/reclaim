@@ -363,9 +363,21 @@ def _run_scan(args: argparse.Namespace) -> int:
     print(  # noqa: T201 -- CLI output, not application logging
         f"reclaim scan: {stats.entries_total} entries under {stats.root} "
         f"({stats.dirs_visited} dirs visited, {stats.files_written} written, "
-        f"{stats.files_unchanged} unchanged, {stats.files_pruned} pruned) "
+        f"{stats.files_unchanged} unchanged, {stats.files_pruned} pruned, "
+        f"{stats.skipped_unreadable_count} skipped/unreadable) "
         f"in {stats.elapsed_seconds:.2f}s"
     )
+    # D12: a skip is a real permission/IO failure (long-path-only failures no longer land here
+    # at all -- see reclaim.scanner's D12 module note), so it's surfaced loudly here rather than
+    # only ever existing in a structlog line nobody reads.
+    if stats.skipped_unreadable_paths:
+        sample = "; ".join(stats.skipped_unreadable_paths)
+        sample_count = len(stats.skipped_unreadable_paths)
+        suffix = ", ..." if stats.skipped_unreadable_count > sample_count else ""
+        print(  # noqa: T201 -- CLI output, not application logging
+            f"reclaim scan: skipped/unreadable (first {sample_count} of "
+            f"{stats.skipped_unreadable_count}): {sample}{suffix}"
+        )
     return 0
 
 

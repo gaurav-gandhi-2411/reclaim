@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 from reclaim.models import Candidate, Mode, Tier, Verdict
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path
+from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
 logger = structlog.get_logger(__name__)
 
@@ -290,26 +291,13 @@ def _measure_disk_free(anchor: Path | None) -> int | None:
 # be close to the limit. Empirically confirmed on this system (see PLAN.md's 2026-07-17
 # checkpoint): a >260-char path fails even a bare `os.makedirs`/`open()` without the `\\?\`
 # extended-length prefix, and succeeds with it — this system has no `LongPathsEnabled` opt-in.
-_LONG_PATH_PREFIX = "\\\\?\\"
-
-
-def long_path(path: Path) -> str:
-    r"""Returns an absolute, `\\?\`-prefixed path string so the Win32 APIs behind `os`/`shutil`
-    bypass the legacy 260-character MAX_PATH limit (this tool targets Windows/NTFS exclusively —
-    see `pytestmark` in the test suite).
-
-    `\\?\` disables the normal path parser's `.`/`..` and forward-slash handling entirely, so the
-    string must already be a fully-normalized, all-backslash absolute path before the prefix is
-    added — `str(Path(...))` (not raw string concatenation) guarantees that on Windows. Idempotent:
-    a path already carrying the prefix is returned unchanged. UNC paths get the `\\?\UNC\` form;
-    drive-letter paths get a plain `\\?\` prefix.
-    """
-    raw = str(Path(path).absolute())
-    if raw.startswith(_LONG_PATH_PREFIX):
-        return raw
-    if raw.startswith("\\\\"):  # UNC: \\server\share\... -> \\?\UNC\server\share\...
-        return _LONG_PATH_PREFIX + "UNC\\" + raw[2:]
-    return _LONG_PATH_PREFIX + raw
+#
+# D12: `long_path` itself now lives in `reclaim.scanner` (re-exported here for backward
+# compatibility, since `purge.py`/this module's own tests import it as `reclaim.executor.
+# long_path`) — the scan walk hit the exact same MAX_PATH gap this ADR describes for the vault
+# path, and needed the identical primitive. `scanner.py` doesn't import from this module (this
+# module already imports FROM `scanner.py`, for `GitRepoCache`/`build_record_for_path`), so
+# moving the shared helper to the lower-level module avoids a circular import.
 
 
 def _tree_stats(long_path_root: str) -> tuple[int, int]:
