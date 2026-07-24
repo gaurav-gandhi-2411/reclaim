@@ -23,6 +23,7 @@ REASON_FINANCE_LEGAL_DOCUMENT = "FINANCE_LEGAL_DOCUMENT"
 REASON_USER_ALLOW_LIST_OVERRIDE = "USER_ALLOW_LIST_OVERRIDE"
 REASON_USER_ALLOW_LIST = "USER_ALLOW_LIST"
 REASON_DEFAULT_ELIGIBLE = "DEFAULT_ELIGIBLE"
+REASON_UNC_NETWORK_PATH = "UNC_NETWORK_PATH"
 
 # (reason_code, rationale) pair carried through when a built-in deny check is skipped by
 # an exemption, so the eventual ELIGIBLE result still explains *why* rather than falling
@@ -30,8 +31,23 @@ REASON_DEFAULT_ELIGIBLE = "DEFAULT_ELIGIBLE"
 _Exemption = tuple[str, str]
 
 
+def _strip_local_extended_length_prefix(path: Path) -> Path:
+    r"""Strips a leading `\\?\` extended-length-path prefix off a normal LOCAL drive-letter path
+    (`\\?\C:\Windows\...` -> `C:\Windows\...`) so pattern matching sees the same string whether or
+    not a caller's path happens to carry D12's MAX_PATH-bypass prefix. Never called for a UNC
+    path (`_is_unc_network_path` is checked ahead of every pattern-based list, so a `\\?\UNC\...`
+    path is denied before it would reach here) -- `path.drive` is used, not `str.removeprefix`,
+    for the same "reparse the drive segment structurally, not by string luck" reasoning as
+    `_is_unc_network_path`.
+    """
+    drive = path.drive
+    if drive.lower().startswith("\\\\?\\") and not drive.lower().startswith("\\\\?\\unc\\"):
+        return Path(str(path)[4:])
+    return path
+
+
 def _pattern_matches(path: Path, pattern: str) -> bool:
-    candidate = path.as_posix()
+    candidate = _strip_local_extended_length_prefix(path).as_posix()
     if pattern.startswith("re:"):
         return re.search(pattern[3:], candidate, flags=re.IGNORECASE) is not None
     return fnmatch.fnmatch(candidate.lower(), pattern.lower())
@@ -39,6 +55,32 @@ def _pattern_matches(path: Path, pattern: str) -> bool:
 
 def _any_pattern_matches(path: Path, patterns: Sequence[str]) -> bool:
     return any(_pattern_matches(path, pattern) for pattern in patterns)
+
+
+def _is_unc_network_path(path: Path) -> bool:
+    r"""True for any path expressed in UNC network-share form (`\\host\share\...`), including
+    the `\\?\UNC\host\share\...` extended-length form -- False for every drive-letter path,
+    including one carrying the `\\?\` extended-length-path prefix (`\\?\C:\...`, D12's local
+    MAX_PATH bypass, a completely different mechanism -- see `scanner.long_path`).
+
+    D13: `DEFAULT_PROTECTED_ROOTS`/`DEFAULT_DOCKER_WSL_ROOTS` are entirely drive-letter-form glob
+    patterns matched against `path.as_posix()` (`_pattern_matches`). A UNC administrative-share
+    alias of the exact same file (`\\localhost\C$\Windows\...`, `\\127.0.0.1\C$\...`, or any other
+    hostname alias for "this machine") produces a `.as_posix()` string (`//localhost/C$/...`)
+    that never matches a `C:/Windows/*`-style pattern, even though it denotes the identical
+    on-disk file -- so every pattern-based deny check silently passed it. `path.drive` is used
+    (not `.as_posix()`/`str()`) because it isolates exactly the prefix that distinguishes "UNC
+    share" from "drive letter" without needing to reparse separators by hand.
+    """
+    drive = path.drive.lower()
+    if not drive.startswith("\\\\"):
+        return False
+    if drive.startswith("\\\\?\\"):
+        # Extended-length prefix: only the `\\?\UNC\...` form is a real network share in its
+        # long-path-safe spelling. `\\?\<drive-letter>:` (e.g. `\\?\C:`) is a normal local path
+        # that merely opted into the length-limit bypass -- must NOT be treated as UNC.
+        return drive.startswith("\\\\?\\unc\\")
+    return True
 
 
 def _has_path_segment(path: Path, segment: str) -> bool:
@@ -147,19 +189,44 @@ class SafetyValidator:
         file is about to be recreated there, so there's nothing to stat).
 
         Checks only the two `_builtin_deny` sub-checks that need no live stat or git-repo state
-        (`protected_roots`, `docker_wsl_roots`) — not the full `evaluate()` precedence chain
-        (extensions, cloud-placeholder, finance tokens, user allow/deny lists all either need a
-        stat or accept an ambiguity that's fine for a proactive scan decision but not for a
-        last-resort "never write here" restore guard, where a false negative is the only
-        acceptable failure mode and a false positive just means one restore item is refused).
+        (`protected_roots`, `docker_wsl_roots`), plus the UNC-network-path check (D13, also stat-
+        free) — not the full `evaluate()` precedence chain (extensions, cloud-placeholder, finance
+        tokens, user allow/deny lists all either need a stat or accept an ambiguity that's fine for
+        a proactive scan decision but not for a last-resort "never write here" restore guard, where
+        a false negative is the only acceptable failure mode and a false positive just means one
+        restore item is refused).
         """
         cfg = self._safety
-        return _any_pattern_matches(path, cfg.protected_roots) or _any_pattern_matches(
-            path, cfg.docker_wsl_roots
+        return (
+            _is_unc_network_path(path)
+            or _any_pattern_matches(path, cfg.protected_roots)
+            or _any_pattern_matches(path, cfg.docker_wsl_roots)
         )
 
     def _builtin_deny(self, record: FileRecord) -> tuple[SafetyResult | None, _Exemption | None]:
         cfg = self._safety
+
+        # D13: checked before every pattern-based deny list (protected_roots, docker_wsl_roots,
+        # and any future one) — a UNC network-share path can alias any drive-letter path those
+        # lists are trying to protect without ever matching a drive-letter-form glob pattern (see
+        # `_is_unc_network_path`'s docstring). This tool is a local-disk cleanup tool: every real
+        # local file is always reachable via its drive letter too, so a UNC form is never required
+        # to reach anything this tool legitimately needs to touch — blanket-denying the entire
+        # class is strictly safer than trying to enumerate every "this machine" alias
+        # (localhost/127.0.0.1/::1/the real hostname/`.`), which would itself be an incomplete and
+        # fragile allowlist.
+        if _is_unc_network_path(record.path):
+            return self._blocked(
+                record,
+                REASON_UNC_NETWORK_PATH,
+                "Path is expressed in UNC network-share form (\\\\host\\share\\... or its "
+                "\\\\?\\UNC\\host\\share\\... extended-length form) — blocked outright rather "
+                "than pattern-matched, because a UNC alias (including a localhost/loopback "
+                "administrative share like \\\\localhost\\C$\\...) can reference the exact same "
+                "on-disk file as a protected drive-letter path without ever matching that path's "
+                "drive-letter-form deny pattern. A drive letter always reaches any real local "
+                "file, so no legitimate scan/apply/restore target ever requires UNC form.",
+            ), None
 
         if _any_pattern_matches(record.path, cfg.protected_roots):
             return self._blocked(
