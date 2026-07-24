@@ -17,7 +17,9 @@ from reclaim.config import (
     LargeLogsConfig,
     SafetyConfig,
 )
+from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
+from reclaim.models import Tier
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -670,6 +672,78 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     # Idempotent: restoring the same batch again reports already_restored, not an error.
     second_restore = _restore_and_wait(client, report["batch_id"])
     assert all(item["already_restored"] for item in second_restore["items"])
+
+
+def test_restore_status_items_total_reflects_only_restorable_entries_in_mixed_batch(
+    tmp_path: Path,
+) -> None:
+    """A verifier pass on fix/apply-progress-feedback found `RestoreStatus.items_total` was set
+    to the vault-entry count at the START of a restore (correct -- `restore_batch`'s per-item
+    progress loop only ever iterates vault entries, never the pre-classified `direct_delete`/
+    `recycle_bin` ones), but silently overwritten with `report.files_processed` (the WHOLE
+    batch, every method) at completion -- a real contract break for any mixed-method batch,
+    exactly the shape a real batch takes in production (see executor.py's own ADR-0004 comment:
+    "23,565 direct_delete entries alongside 7 vault ones", one `batch_id`). This constructs that
+    exact shape directly against the manifest (bypassing a real apply, which is simpler here)
+    and confirms `items_total` stays at the vault-only count end to end, never jumping to the
+    full batch size on completion."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    batch_id = "batch_mixed_methods"
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    vault_entries = []
+    for i in range(2):
+        vault_path = vault_dir / batch_id / f"vault_item_{i}.bin"
+        vault_path.parent.mkdir(parents=True, exist_ok=True)
+        vault_path.write_bytes(f"vault-payload-{i}".encode())
+        vault_entries.append(
+            QuarantineManifestEntry(
+                batch_id=batch_id,
+                original_path=tmp_path / f"restored_target_{i}.bin",
+                size_bytes=len(f"vault-payload-{i}".encode()),
+                is_dir=False,
+                category="test_category",
+                category_group="test_group",
+                rationale="test",
+                rebuild_instruction=None,
+                tier=Tier.A,
+                method="vault",
+                vault_path=vault_path,
+                retention_days=30,
+                quarantined_at=_NOW,
+                retention_until=_NOW + 29 * 86400,
+            )
+        )
+    direct_delete_entries = [
+        QuarantineManifestEntry(
+            batch_id=batch_id,
+            original_path=tmp_path / f"gone_{i}.bin",
+            size_bytes=10,
+            is_dir=False,
+            category="test_category",
+            category_group="test_group",
+            rationale="test",
+            rebuild_instruction=None,
+            tier=Tier.A,
+            method="direct_delete",
+            vault_path=None,
+            retention_days=None,
+            quarantined_at=_NOW,
+            retention_until=None,
+        )
+        for i in range(3)
+    ]
+    append_manifest_entries(manifest_path, [*vault_entries, *direct_delete_entries])
+
+    response = client.post(f"/api/restore/{batch_id}")
+    assert response.status_code == 202, response.text
+    status = client.get("/api/restore/status").json()
+    assert status["status"] == "completed", status
+    assert status["items_total"] == 2  # vault-restorable entries only, not the 5-item batch
+    assert status["items_processed"] == 2
+    assert status["result"]["files_succeeded"] == 2
+    assert status["result"]["files_unsupported"] == 3
 
 
 def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(

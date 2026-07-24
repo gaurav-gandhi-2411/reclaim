@@ -1178,10 +1178,20 @@ def run_restore(state: AppState, batch_id: str, started_at: float) -> None:
         return
 
     with state.lock:
+        # `report.files_processed` counts EVERY entry in the batch (direct_delete/recycle_bin
+        # included), but `items_total` has meant "restorable (vault) entry count" since this
+        # status was first created in `routes.restore` -- `restore_batch`'s per-item progress
+        # loop only ever iterates vault entries, never the pre-classified-unsupported ones (see
+        # `RestoreItemResult.restore_unsupported`). Reusing the already-tracked total (last set
+        # by `_on_progress` above, or the initial vault-entry count if the batch was empty)
+        # keeps `items_total` consistent end-to-end instead of silently redefining it to a
+        # bigger number on completion -- a real, verifier-caught bug for any mixed-method batch
+        # (e.g. the 2026-07-17 real batch: 7 vault entries alongside 23,565 direct_delete ones).
+        final_total = state.restore_status.items_total
         state.restore_status = RestoreStatus(
             status="completed",
-            items_processed=report.files_processed,
-            items_total=report.files_processed,
+            items_processed=final_total,
+            items_total=final_total,
             started_at=started_at,
             finished_at=time.time(),
             result=report,
