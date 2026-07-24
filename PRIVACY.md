@@ -12,8 +12,10 @@ that level of access owes you a precise answer about where that data goes. Here 
   served only to your own machine (`127.0.0.1` — hard-enforced; binding to a network-reachable
   address is a startup error, not a setting).
 - **Scan results stay local.** The scan index (a SQLite file), the quarantine vault, the
-  manifest, mode logs, and all AI analysis results live under Reclaim's own `data/` folder on
-  your disk. Nothing is uploaded, anywhere, at any time.
+  manifest, mode logs, the application log (`data/logs/reclaim.log` — see SUPPORT.md), and all
+  AI analysis results live under Reclaim's own `data/` folder on your disk. Nothing is uploaded,
+  anywhere, at any time. The application log contains file **paths**, counts, and error
+  messages only — never file contents (same guarantee as below).
 - **AI features run locally.** Image similarity, document comparison, OCR, and ranking all
   execute on your CPU against your files. Extracted text and OCR output are never written to
   logs — this is enforced by automated tests, not just policy (a canary-string test asserts

@@ -22,6 +22,12 @@ data/scan-index/
 # pattern above doesn't reach nested subdirectories, so this run's own folder needs its own entry.
 data/real-disk-run/
 
+# G25: the persistent rotating application log (reclaim.logging_config) — same "never commit
+# real runtime data" posture as the rest of data/ above; every test that constructs a CLI/API
+# process points log_path at its own tmp_path instead of this default, so this is a backstop,
+# not something a normal test run should ever populate.
+data/logs/
+
 # evals/test_dedup.py scratch trees — created outside a system Temp dir on purpose (pytest's
 # own tmp_path lives under %TEMP%, which would confound the keep-heuristic's Downloads/Temp
 # fixture cases), cleaned up by the test fixture but ignored as a backstop.

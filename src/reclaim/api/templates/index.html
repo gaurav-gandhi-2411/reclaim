@@ -24,6 +24,10 @@
     <div class="rc-header-spacer"></div>
     <button id="mode-badge" type="button" class="rc-mode-badge" aria-haspopup="dialog">Loading mode…</button>
     <button id="how-it-works-btn" type="button" class="rc-btn rc-btn-secondary">How this works</button>
+    <!-- G25: copies version/mode/log-tail (paths and metadata only, never file contents — see
+         PRIVACY.md) to the clipboard for a bug report. -->
+    <button id="copy-diagnostics-btn" type="button" class="rc-btn rc-btn-secondary">Copy diagnostics</button>
+    <span id="copy-diagnostics-status" class="rc-visually-hidden" role="status" aria-live="polite"></span>
     <button id="theme-toggle" type="button" class="rc-theme-toggle">Switch to dark</button>
   </header>
 

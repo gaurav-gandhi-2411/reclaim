@@ -9,6 +9,18 @@ from reclaim.cli import _build_parser, _run_serve, main
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 
 
+@pytest.fixture(autouse=True)
+def _isolate_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every `main(...)` call in this file goes through `cli.main`'s `configure_logging(...)`
+    call, which defaults to the real app-wide `data/logs/reclaim.log` relative to cwd --
+    redirect it into this test's own `tmp_path` so running this file never writes a log file
+    into the actual repo working directory (same isolation goal as every other DEFAULT_* path
+    override elsewhere in this file, just applied automatically since G25's log wiring runs
+    unconditionally on every `main()` call, unlike the opt-in-per-test `--db`/`--manifest`
+    overrides)."""
+    monkeypatch.setattr("reclaim.cli.DEFAULT_LOG_PATH", tmp_path / "reclaim.log")
+
+
 def test_apply_dry_run_skips_duplicates_by_default(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

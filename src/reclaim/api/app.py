@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from importlib import metadata
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -10,11 +9,13 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
+from reclaim.api import service
 from reclaim.api.routes import router
 from reclaim.api.security import LocalOriginPolicy, generate_csrf_token, local_origin_violation
 from reclaim.api.state import AppState
 from reclaim.config import Config
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
+from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
 from reclaim.safety import SafetyValidator
 
@@ -30,22 +31,6 @@ _DEFAULT_PORT = 8420
 _templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
-def _installed_version() -> str:
-    """Resolves the installed `reclaim` distribution version for display (dashboard footer).
-
-    Reads from `importlib.metadata` (the installed package's own record — same source `pip
-    show`/`uv pip show` use) rather than duplicating the version string from `pyproject.toml`,
-    so there is exactly one place it can drift out of date: the package metadata itself. Falls
-    back to `"dev"` for a source checkout with no installed distribution record (e.g. running
-    straight out of the repo without `uv tool install .`/`pip install -e .`) — this must never
-    raise and block the dashboard from rendering.
-    """
-    try:
-        return metadata.version("reclaim")
-    except metadata.PackageNotFoundError:
-        return "dev"
-
-
 def create_app(
     *,
     db_path: Path,
@@ -54,6 +39,7 @@ def create_app(
     manifest_path: Path | None = None,
     mode_log_path: Path | None = None,
     first_run_state_path: Path | None = None,
+    log_path: Path | None = None,
     host: str = _DEFAULT_HOST,
     port: int = _DEFAULT_PORT,
 ) -> FastAPI:
@@ -75,8 +61,15 @@ def create_app(
 
     State lives on `app.state.reclaim` (an `AppState`), never a module-level global — see
     `AppState`'s docstring for why that's the right call for this single-user, localhost tool.
+
+    G25: `configure_logging` is called here too (not only in `cli.main()`) so any caller that
+    constructs a FastAPI app without going through the CLI first (a test, a future embedder)
+    still gets a persistent log file — cheap and idempotent when `log_path` matches whatever a
+    prior call already configured (see `logging_config.configure_logging`'s docstring).
     """
-    app = FastAPI(title="Reclaim", version=_installed_version())
+    resolved_log_path = log_path if log_path is not None else DEFAULT_LOG_PATH
+    configure_logging(resolved_log_path)
+    app = FastAPI(title="Reclaim", version=service.installed_version())
     # Created eagerly (not lazily inside a route) so every read-only endpoint (summary,
     # treemap, candidates) can open `ScanIndex(db_path)` even before the first scan has run —
     # `sqlite3.connect` fails outright if the parent directory doesn't exist yet.
@@ -96,6 +89,7 @@ def create_app(
             if first_run_state_path is not None
             else DEFAULT_FIRST_RUN_STATE_PATH
         ),
+        log_path=resolved_log_path,
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     app.include_router(router)
@@ -119,7 +113,10 @@ def create_app(
         return _templates.TemplateResponse(
             request,
             "index.html",
-            {"csrf_token": app.state.reclaim.csrf_token, "reclaim_version": _installed_version()},
+            {
+                "csrf_token": app.state.reclaim.csrf_token,
+                "reclaim_version": service.installed_version(),
+            },
         )
 
     @app.get("/LICENSE", include_in_schema=False)
