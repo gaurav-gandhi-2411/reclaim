@@ -20,6 +20,7 @@ from reclaim.api.schemas import (
     AITrackSkipOut,
     ApplyRequest,
     ApplyResponse,
+    ApplyStatusOut,
     CandidateOut,
     CandidatesResponse,
     CategoryBreakdownOut,
@@ -41,6 +42,7 @@ from reclaim.api.schemas import (
     RecoveryStatusResponse,
     RestoreItemOut,
     RestoreResponse,
+    RestoreStatusOut,
     ScanStatusOut,
     SuggestedScanRootOut,
     SuggestedScanRootsResponse,
@@ -51,7 +53,7 @@ from reclaim.api.schemas import (
     format_bytes,
     plain_language_category,
 )
-from reclaim.api.state import AIAnalysisStatus, AppState, ScanStatus
+from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -65,6 +67,8 @@ from reclaim.executor import (
     RestoreReport,
     SafeModeViolationError,
     apply_batch,
+    resolve_restorable_entries,
+    restore_batch,
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
@@ -627,7 +631,20 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
     )
 
 
-def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
+def resolve_apply_selection(
+    state: AppState, request: ApplyRequest
+) -> tuple[list[Candidate], QuarantineMethod, bool]:
+    """Synchronous, request-shape validation + candidate selection for `POST /api/apply`
+    (fix/apply-progress-feedback) -- split out of what used to be `apply_selection`'s single
+    synchronous call so a malformed/refused REQUEST (safe mode's blanket-selection gate) still
+    fails fast with an immediate HTTP error exactly as before that endpoint became a
+    background-task + polling pattern (see `run_apply`) -- only the real, potentially slow
+    `apply_batch` filesystem work moved to the background.
+
+    Returns `(selected, method, apply)` -- `apply` is `not request.dry_run`, resolved here so
+    `run_apply` never needs to see the request/dry_run inversion again (see `ApplyRequest.
+    dry_run`'s docstring for why `dry_run=True` -> `apply=False` is not an inversion bug).
+    """
     live_mode = state.live_mode
 
     # Stage 2 "no batch-auto for ANY category" gate: a blanket tier/category-group selection
@@ -675,24 +692,84 @@ def apply_selection(state: AppState, request: ApplyRequest) -> ApplyResponse:
     # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its
     # own method selector disabled/hidden depending on mode to avoid a confusing 400.
     method: QuarantineMethod = "recycle_bin" if live_mode == Mode.SAFE else request.method
+    return selected, method, not request.dry_run
 
-    report = apply_batch(
-        selected,
-        safety=state.safety,
-        apply=not request.dry_run,  # `dry_run=True` (the default) => `apply=False` (executor's
-        # own default) — the two defaults agree on "touch nothing", which is the invariant that
-        # actually matters; see `ApplyRequest.dry_run`'s docstring for why this is not an
-        # inversion bug.
-        method=method,
-        mode=live_mode,
-        vault_dir=state.vault_dir,
-        manifest_path=state.manifest_path,
-        direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
-        direct_delete_size_guard_retention_days=(
-            state.config.safety.direct_delete_size_guard_retention_days
-        ),
+
+def to_apply_status_out(status: ApplyStatus) -> ApplyStatusOut:
+    """Pure formatter -- mirrors `to_scan_status_out`'s role for `ScanStatus`."""
+    return ApplyStatusOut(
+        status=status.status,
+        items_processed=status.items_processed,
+        items_total=status.items_total,
+        current_category=status.current_category,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        error=status.error,
+        result=_apply_response(status.result) if status.result is not None else None,
     )
-    return _apply_response(report)
+
+
+def run_apply(
+    state: AppState,
+    selected: list[Candidate],
+    method: QuarantineMethod,
+    apply: bool,
+    started_at: float,
+) -> None:
+    """Background-task body for `POST /api/apply` (fix/apply-progress-feedback) -- same
+    threading/locking posture as `run_scan`: runs on Starlette's worker-thread pool, never blocks
+    the event loop; `state.lock` guards every read/write of `apply_status` against a concurrent
+    `GET /api/apply/status` poll.
+
+    `on_progress` updates `state.apply_status` at the same interval-gated cadence `executor.
+    apply_batch`'s own heartbeat log uses (ADR-0026), so polling sees real incremental progress
+    during a long-running vault apply, not just idle/running/completed. A failure here --
+    including `SafetyInvariantError` (defense-in-depth; should never trigger since `apply_batch`'s
+    BLOCKED-candidate check should never find anything, every candidate already having passed
+    `SafetyValidator` upstream) -- is recorded on `apply_status` (surfaced via the status
+    endpoint), never raised into the background-task machinery where it would just be logged and
+    lost -- identical posture to `run_scan`/`run_ai_analysis`.
+    """
+
+    def _on_progress(items_processed: int, items_total: int, current_category: str) -> None:
+        with state.lock:
+            state.apply_status.items_processed = items_processed
+            state.apply_status.items_total = items_total
+            state.apply_status.current_category = current_category
+
+    try:
+        report = apply_batch(
+            selected,
+            safety=state.safety,
+            apply=apply,
+            method=method,
+            mode=state.live_mode,
+            vault_dir=state.vault_dir,
+            manifest_path=state.manifest_path,
+            direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+            direct_delete_size_guard_retention_days=(
+                state.config.safety.direct_delete_size_guard_retention_days
+            ),
+            on_progress=_on_progress,
+        )
+    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+        # the status endpoint, never crash silently into Starlette's background-task machinery.
+        logger.warning("api.apply_failed", error=str(exc))
+        with state.lock:
+            state.apply_status = ApplyStatus(
+                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+            )
+        return
+
+    with state.lock:
+        state.apply_status = ApplyStatus(
+            status="completed",
+            items_processed=report.files_processed,
+            items_total=report.files_processed,
+            started_at=started_at,
+            finished_at=time.time(),
+            result=report,
+        )
 
 
 # --- AI suggestions (recommend-only; ADR-0025) ------------------------------------------------
@@ -1035,6 +1112,80 @@ def restore_response(report: RestoreReport) -> RestoreResponse:
         bytes_restored=report.bytes_restored,
         bytes_restored_human=format_bytes(report.bytes_restored),
     )
+
+
+def validate_restorable_batch(state: AppState, batch_id: str) -> int:
+    """Synchronous pre-check for `POST /api/restore/{batch_id}` (fix/apply-progress-feedback) --
+    runs the EXACT validation `restore_batch` itself performs before touching anything
+    (`executor.resolve_restorable_entries`: batch lookup, the manifest-integrity/zip-slip-
+    equivalent guard, the whole-call refusal when nothing is restorable) so a bad batch id,
+    an unsupported method, or a corrupted manifest still gets an immediate 404/409/500 from the
+    route, exactly as before this endpoint became a background-task + polling pattern. Raises the
+    same typed exceptions `restore_batch` would; `routes.restore` translates them to HTTP.
+
+    Returns the vault-entry count -- the real `items_total` the background task's progress will
+    report against (see `RestoreStatus`'s docstring for why that's the right total, not the
+    whole batch's item count)."""
+    vault_entries, _direct_delete_entries, _recycle_bin_entries = resolve_restorable_entries(
+        batch_id, manifest_path=state.manifest_path, vault_dir=state.vault_dir, safety=state.safety
+    )
+    return len(vault_entries)
+
+
+def to_restore_status_out(status: RestoreStatus) -> RestoreStatusOut:
+    """Pure formatter -- mirrors `to_apply_status_out`'s role for `ApplyStatus`."""
+    return RestoreStatusOut(
+        status=status.status,
+        items_processed=status.items_processed,
+        items_total=status.items_total,
+        current_category=status.current_category,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        error=status.error,
+        result=restore_response(status.result) if status.result is not None else None,
+    )
+
+
+def run_restore(state: AppState, batch_id: str, started_at: float) -> None:
+    """Background-task body for `POST /api/restore/{batch_id}` (fix/apply-progress-feedback) --
+    mirrors `run_apply`'s threading/locking posture exactly. `routes.restore` already ran
+    `validate_restorable_batch` synchronously before scheduling this, so the typed restore
+    exceptions below should not normally trigger here -- but the manifest could in principle
+    change between that check and this call (e.g. a second restore of the same batch racing
+    ahead), so they're still handled the same broad "record on `restore_status`, never crash the
+    background task" way as any other failure, identical posture to `run_scan`/`run_apply`."""
+
+    def _on_progress(items_processed: int, items_total: int, current_category: str) -> None:
+        with state.lock:
+            state.restore_status.items_processed = items_processed
+            state.restore_status.items_total = items_total
+            state.restore_status.current_category = current_category
+
+    try:
+        report = restore_batch(
+            batch_id,
+            manifest_path=state.manifest_path,
+            vault_dir=state.vault_dir,
+            safety=state.safety,
+            on_progress=_on_progress,
+        )
+    except Exception as exc:  # broad on purpose: see run_apply's identical reasoning above.
+        logger.warning("api.restore_failed", batch_id=batch_id, error=str(exc))
+        with state.lock:
+            state.restore_status = RestoreStatus(
+                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+            )
+        return
+
+    with state.lock:
+        state.restore_status = RestoreStatus(
+            status="completed",
+            items_processed=report.files_processed,
+            items_total=report.files_processed,
+            started_at=started_at,
+            finished_at=time.time(),
+            result=report,
+        )
 
 
 # --- Stage 2: mode + first-run --------------------------------------------------------------

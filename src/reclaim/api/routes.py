@@ -10,7 +10,7 @@ from reclaim.api.schemas import (
     AIAnalysisStatusOut,
     AISuggestionsResponse,
     ApplyRequest,
-    ApplyResponse,
+    ApplyStatusOut,
     CandidatesResponse,
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
@@ -19,22 +19,20 @@ from reclaim.api.schemas import (
     PowerModeRequest,
     QuarantineListResponse,
     RecoveryStatusResponse,
-    RestoreResponse,
+    RestoreStatusOut,
     ScanRequest,
     ScanStatusOut,
     SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapResponse,
 )
-from reclaim.api.state import AIAnalysisStatus, AppState, ScanStatus
+from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
 from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
     SafeModeViolationError,
-    SafetyInvariantError,
-    restore_batch,
 )
 from reclaim.mode import ModeSwitchDeniedError
 
@@ -120,25 +118,50 @@ def duplicate_cluster_review(request: Request, limit: int = 15) -> DuplicateClus
     return service.list_duplicate_cluster_review(get_state(request), limit=limit)
 
 
-@router.post("/apply", response_model=ApplyResponse)
-def apply(payload: ApplyRequest, request: Request) -> ApplyResponse:
+@router.post("/apply", response_model=ApplyStatusOut, status_code=202)
+def apply(
+    payload: ApplyRequest, background_tasks: BackgroundTasks, request: Request
+) -> ApplyStatusOut:
+    """fix/apply-progress-feedback: mirrors `POST /api/scan`'s background-task + polling shape —
+    a large apply's ADR-0026 fsync cost previously blocked this HTTP request for the whole
+    multi-minute duration with zero progress and real risk of a client/proxy timeout. Request-
+    shape validation (bad tier, safe mode's blanket-selection gate) stays synchronous — see
+    `service.resolve_apply_selection` — only the real, potentially slow `apply_batch` filesystem
+    work moved to the background (`service.run_apply`)."""
     if payload.tier not in ("A", "B", "both"):
         raise HTTPException(
             status_code=400, detail=f"tier must be one of A, B, both (got {payload.tier!r})"
         )
+    state = get_state(request)
     try:
-        return service.apply_selection(get_state(request), payload)
-    except SafetyInvariantError as exc:
-        # Defense-in-depth surfaced honestly: this should never trigger (every candidate has
-        # already passed SafetyValidator upstream), so a 500 is correct here — it means an
-        # invariant broke, not that the caller supplied bad input.
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        selected, method, apply_flag = service.resolve_apply_selection(state, payload)
     except SafeModeViolationError as exc:
-        # Unlike SafetyInvariantError above, this is a routine, expected outcome of the caller
-        # (the dashboard frontend, or a future different client) not respecting the safe-mode
-        # contract — e.g. requesting a blanket tier-apply with no explicit paths, or a non-
-        # recycle_bin method — a real 400, not a sign anything is broken.
+        # A routine, expected outcome of the caller (the dashboard frontend, or a future
+        # different client) not respecting the safe-mode contract — e.g. requesting a blanket
+        # tier-apply with no explicit paths — a real 400, not a sign anything is broken.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    started_at = time.time()
+    with state.lock:
+        if state.apply_status.status == "running":
+            raise HTTPException(status_code=409, detail="an apply is already running")
+        state.apply_status = ApplyStatus(
+            status="running",
+            items_processed=0,
+            items_total=len(selected),
+            started_at=started_at,
+        )
+        status_snapshot = state.apply_status
+
+    background_tasks.add_task(service.run_apply, state, selected, method, apply_flag, started_at)
+    return service.to_apply_status_out(status_snapshot)
+
+
+@router.get("/apply/status", response_model=ApplyStatusOut)
+def apply_status(request: Request) -> ApplyStatusOut:
+    state = get_state(request)
+    with state.lock:
+        return service.to_apply_status_out(state.apply_status)
 
 
 # --- AI suggestions (recommend-only; ADR-0025) -------------------------------------------------
@@ -195,27 +218,49 @@ def recovery_status(request: Request) -> RecoveryStatusResponse:
     return service.recovery_status(get_state(request))
 
 
-@router.post("/restore/{batch_id}", response_model=RestoreResponse)
-def restore(batch_id: str, request: Request) -> RestoreResponse:
+@router.post("/restore/{batch_id}", response_model=RestoreStatusOut, status_code=202)
+def restore(batch_id: str, background_tasks: BackgroundTasks, request: Request) -> RestoreStatusOut:
+    """fix/apply-progress-feedback: same background-task + polling conversion as `POST
+    /api/apply` (see that route's docstring) — restoring a batch runs through the identical
+    ADR-0026 fsync-bearing loop. `service.validate_restorable_batch` runs the exact same
+    up-front validation `restore_batch` itself performs (cheap: a manifest read, no filesystem
+    mutation) synchronously here, so a bad batch id/unsupported method/corrupted manifest still
+    gets an immediate 404/409/500 exactly as before this conversion."""
     state = get_state(request)
     try:
-        report = restore_batch(
-            batch_id,
-            manifest_path=state.manifest_path,
-            vault_dir=state.vault_dir,
-            safety=state.safety,
-        )
+        vault_entry_count = service.validate_restorable_batch(state, batch_id)
     except BatchNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (RecycleBinRestoreUnsupportedError, DirectDeleteRestoreImpossibleError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RestoreIntegrityError as exc:
-        # Same "should never trigger" honesty as apply's SafetyInvariantError -> 500 below:
-        # every vault entry restore_batch reads back should already be well-formed, so hitting
-        # this means an invariant broke (a corrupted/tampered manifest), not that the caller
-        # supplied bad input.
+        # Same "should never trigger" honesty as apply's SafetyInvariantError -> 500: every
+        # vault entry restore_batch reads back should already be well-formed, so hitting this
+        # means an invariant broke (a corrupted/tampered manifest), not that the caller supplied
+        # bad input.
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return service.restore_response(report)
+
+    started_at = time.time()
+    with state.lock:
+        if state.restore_status.status == "running":
+            raise HTTPException(status_code=409, detail="a restore is already running")
+        state.restore_status = RestoreStatus(
+            status="running",
+            items_processed=0,
+            items_total=vault_entry_count,
+            started_at=started_at,
+        )
+        status_snapshot = state.restore_status
+
+    background_tasks.add_task(service.run_restore, state, batch_id, started_at)
+    return service.to_restore_status_out(status_snapshot)
+
+
+@router.get("/restore/status", response_model=RestoreStatusOut)
+def restore_status(request: Request) -> RestoreStatusOut:
+    state = get_state(request)
+    with state.lock:
+        return service.to_restore_status_out(state.restore_status)
 
 
 # --- Stage 2: mode + first-run -----------------------------------------------------------------

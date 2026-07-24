@@ -39,6 +39,62 @@ DEFAULT_VAULT_DIR = Path("data/quarantine")
 DEFAULT_MANIFEST_PATH = DEFAULT_VAULT_DIR / "manifest.jsonl"
 _SECONDS_PER_DAY = 86400.0
 
+# --- Progress feedback (fix/apply-progress-feedback) ------------------------------------------
+#
+# ADR-0026's per-item fsync cost (measured ~9x slower than a flush-only baseline — see that
+# ADR's "Measured fsync cost" section) turns a large apply/restore/purge into a multi-minute
+# operation with previously zero visible feedback in either the CLI or the dashboard — a real UX
+# hazard (looks hung, invites a frustrated mid-batch kill) that this section exists to close.
+
+_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+def _due(*, last: float, now: float, interval: float) -> bool:
+    """Pure predicate behind the progress-heartbeat gate — mirrors `dedup._due`'s exact
+    convention (this codebase's established interval-gated-logging pattern). Duplicated here
+    (rather than imported) since `dedup.py` doesn't export it and a 2-line pure predicate isn't
+    worth a shared-utils module for its second use (house rule: duplicate twice, abstract on the
+    third occurrence) — `purge.py` imports THIS copy rather than adding a third."""
+    return (now - last) >= interval
+
+
+ProgressCallback = Callable[[int, int, str], None]
+"""`(items_processed, items_total, current_category) -> None`. Optional hook threaded through
+`apply_batch`/`restore_batch`/`purge_expired`'s per-item loop, invoked at the SAME interval-gated
+cadence as the `executor.*_progress`/`purge.progress` structlog line each function already emits
+(never per-item — ADR-0026's fsync cost makes a real per-item callback call needlessly expensive
+on top of the fsync itself, and per-item logging would spam a fast batch). Lets a caller (the
+CLI's stdout heartbeat printer, the dashboard's background task updating `AppState`) observe the
+same real, monotonic-time-gated progress this module already logs, without polling structlog
+output itself."""
+
+# ADR-0026's own "Measured fsync cost" table (docs/architecture/adr/0026-crash-safe-two-phase-
+# manifest.md), WITH-fsync row, measured 2026-07-24 via scripts/bench_fsync.py against a real
+# 23,000-item synthetic vault-apply on this development machine (Windows 11, local NVMe SSD) —
+# not a guessed constant (house rule 65b: metric provenance). Re-derive this from a fresh
+# `scripts/bench_fsync.py` run (and update the ADR) rather than hand-tuning it if it goes stale.
+_MEASURED_MS_PER_ITEM_WITH_FSYNC = 8.088
+
+# Below this, an apply/restore/purge feels close to instant regardless of item count; above it, a
+# user watching a blank terminal or an unresponsive-looking dashboard could plausibly conclude the
+# process hung — exactly the UX hazard the pre-apply time estimate (CLI/dashboard) exists to head
+# off before that user kills the process mid-batch.
+_LARGE_BATCH_WARNING_SECONDS = 10.0
+
+
+def estimate_batch_seconds(item_count: int) -> float:
+    """Real, measured estimate (never a guess) of how long an `apply_batch`/`restore_batch`/
+    `purge_expired` run of `item_count` items will take, derived from ADR-0026's measured
+    per-item fsync cost."""
+    return item_count * _MEASURED_MS_PER_ITEM_WITH_FSYNC / 1000.0
+
+
+def should_warn_about_batch_duration(item_count: int) -> bool:
+    """True once `estimate_batch_seconds` crosses `_LARGE_BATCH_WARNING_SECONDS` — the threshold
+    the CLI/dashboard use to decide whether a pre-apply time estimate is worth showing at all (a
+    5-item apply doesn't need one)."""
+    return estimate_batch_seconds(item_count) >= _LARGE_BATCH_WARNING_SECONDS
+
 
 class SafetyInvariantError(RuntimeError):
     """Raised by `apply_batch` when it is handed a BLOCKED candidate.
@@ -706,9 +762,14 @@ def apply_batch(
     now: float | None = None,
     direct_delete_size_guard_bytes: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES,
     direct_delete_size_guard_retention_days: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS,
+    on_progress: ProgressCallback | None = None,
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
+
+    `on_progress` (fix/apply-progress-feedback): optional interval-gated progress hook — see
+    `ProgressCallback`'s docstring. Defaults to `None` so every existing caller (this test
+    suite's ~600 tests included) is unaffected.
 
     `mode` defaults to `Mode.POWER` — this function's own default preserves every existing
     caller's exact current behavior (this test suite's ~600 tests included); real end-user
@@ -791,13 +852,29 @@ def apply_batch(
     )
 
     items: list[ItemApplyResult] = []
+    total_candidates = len(candidates)
+    last_heartbeat = time.monotonic()
     # ADR-0026: one manifest file handle held open for the whole batch (not re-opened per item)
     # so the only added per-item filesystem cost is the fsync itself, not repeated `open()`
     # syscalls. `None` in dry-run — dry-run makes zero filesystem calls of any kind, manifest
     # writes included, same guarantee as before this change.
     manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if apply else None
     try:
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates, start=1):
+            # fix/apply-progress-feedback: interval-gated, not per-item (see `ProgressCallback`).
+            # `index - 1` is "items completed before this one", the honest count at this point.
+            heartbeat_now = time.monotonic()
+            if _due(last=last_heartbeat, now=heartbeat_now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                logger.info(
+                    "executor.apply_progress",
+                    items_processed=index - 1,
+                    items_total=total_candidates,
+                    current_category=candidate.category,
+                )
+                if on_progress is not None:
+                    on_progress(index - 1, total_candidates, candidate.category)
+                last_heartbeat = heartbeat_now
+
             item_method, item_retention_days = _effective_method_and_retention_days(
                 candidate,
                 method,
@@ -982,6 +1059,68 @@ def _restore_integrity_violations(
     return violations
 
 
+def resolve_restorable_entries(
+    batch_id: str,
+    *,
+    manifest_path: Path,
+    vault_dir: Path,
+    safety: SafetyValidator,
+) -> tuple[
+    list[QuarantineManifestEntry], list[QuarantineManifestEntry], list[QuarantineManifestEntry]
+]:
+    """Every check `restore_batch` performs BEFORE touching anything: batch lookup
+    (`BatchNotFoundError`), the manifest-integrity/zip-slip-equivalent guard
+    (`RestoreIntegrityError`), and the whole-call refusal when nothing in the batch is restorable
+    at all (`DirectDeleteRestoreImpossibleError`/`RecycleBinRestoreUnsupportedError`).
+
+    Factored out of `restore_batch` (fix/apply-progress-feedback) — not merely called
+    internally, but exported — so `api.service`'s background-task conversion of `POST
+    /api/restore/{batch_id}` can run this EXACT validation synchronously (a cheap manifest read
+    + fold, no filesystem mutation, no ADR-0026 fsync cost) before committing to a background
+    task for the real, potentially slow restore loop. That keeps the immediate HTTP response for
+    a bad batch id (404), an unsupported method (409), or a corrupted manifest (500) exactly as
+    fast as before that conversion — only the genuinely slow per-item work moved to the
+    background. `restore_batch` itself calls this first, behavior unchanged.
+
+    Returns `(vault_entries, direct_delete_entries, recycle_bin_entries)` — the exact three
+    partitions `restore_batch`'s own body needs next.
+    """
+    entries = _latest_entries_for_batch(manifest_path, batch_id)
+    if not entries:
+        raise BatchNotFoundError(f"no manifest entries found for batch_id={batch_id!r}")
+
+    vault_entries = [entry for entry in entries if entry.method == "vault"]
+    direct_delete_entries = [entry for entry in entries if entry.method == "direct_delete"]
+    recycle_bin_entries = [entry for entry in entries if entry.method == "recycle_bin"]
+
+    integrity_violations = _restore_integrity_violations(vault_entries, vault_dir, safety)
+    if integrity_violations:
+        raise RestoreIntegrityError(
+            f"restore_batch's manifest-integrity pre-check found {len(integrity_violations)} "
+            "violation(s) in batch_id="
+            f"{batch_id!r} — refusing the entire restore, moving nothing: "
+            f"{integrity_violations[:5]}"
+        )
+
+    if not vault_entries:
+        # Nothing restorable at all in this batch — preserve the loud, whole-call refusal
+        # rather than silently returning an all-skipped report that looks like it did nothing.
+        if direct_delete_entries:
+            raise DirectDeleteRestoreImpossibleError(
+                f"this batch contains {len(direct_delete_entries)} permanently-deleted file(s) "
+                "(retention=none for their category) — there is nothing to restore, they were "
+                "not quarantined"
+            )
+        if recycle_bin_entries:
+            raise RecycleBinRestoreUnsupportedError(
+                f"this batch contains {len(recycle_bin_entries)} Recycle-Bin-quarantined "
+                "file(s); restore them manually via Windows Explorer's Recycle Bin — automated "
+                "restore isn't supported for this method"
+            )
+
+    return vault_entries, direct_delete_entries, recycle_bin_entries
+
+
 def restore_batch(
     batch_id: str,
     *,
@@ -989,6 +1128,7 @@ def restore_batch(
     vault_dir: Path | None = None,
     safety: SafetyValidator,
     now: float | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> RestoreReport:
     """Restores every *restorable* item in `batch_id` back to its exact original path.
 
@@ -1018,43 +1158,21 @@ def restore_batch(
     occupied by something else now fails loudly (recorded in the report) rather than silently
     clobbering it. Idempotent: an item already marked `restored=True` is reported as
     `already_restored` and left untouched, so restoring the same batch twice is safe.
+
+    `on_progress` (fix/apply-progress-feedback): optional interval-gated progress hook over the
+    `vault_entries` loop specifically — see `ProgressCallback`'s docstring. `items_total` in the
+    callback is `len(vault_entries)`, not the whole batch's item count: `direct_delete`/
+    `recycle_bin` entries are classified instantly above (no filesystem I/O, no fsync cost), so
+    only the vault-entries loop is ever slow enough to need a progress signal. Defaults to
+    `None` so every existing caller is unaffected.
     """
     resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
     resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
     now_ts = now if now is not None else time.time()
 
-    entries = _latest_entries_for_batch(resolved_manifest_path, batch_id)
-    if not entries:
-        raise BatchNotFoundError(f"no manifest entries found for batch_id={batch_id!r}")
-
-    vault_entries = [entry for entry in entries if entry.method == "vault"]
-    direct_delete_entries = [entry for entry in entries if entry.method == "direct_delete"]
-    recycle_bin_entries = [entry for entry in entries if entry.method == "recycle_bin"]
-
-    integrity_violations = _restore_integrity_violations(vault_entries, resolved_vault_dir, safety)
-    if integrity_violations:
-        raise RestoreIntegrityError(
-            f"restore_batch's manifest-integrity pre-check found {len(integrity_violations)} "
-            "violation(s) in batch_id="
-            f"{batch_id!r} — refusing the entire restore, moving nothing: "
-            f"{integrity_violations[:5]}"
-        )
-
-    if not vault_entries:
-        # Nothing restorable at all in this batch — preserve the loud, whole-call refusal
-        # rather than silently returning an all-skipped report that looks like it did nothing.
-        if direct_delete_entries:
-            raise DirectDeleteRestoreImpossibleError(
-                f"this batch contains {len(direct_delete_entries)} permanently-deleted file(s) "
-                "(retention=none for their category) — there is nothing to restore, they were "
-                "not quarantined"
-            )
-        if recycle_bin_entries:
-            raise RecycleBinRestoreUnsupportedError(
-                f"this batch contains {len(recycle_bin_entries)} Recycle-Bin-quarantined "
-                "file(s); restore them manually via Windows Explorer's Recycle Bin — automated "
-                "restore isn't supported for this method"
-            )
+    vault_entries, direct_delete_entries, recycle_bin_entries = resolve_restorable_entries(
+        batch_id, manifest_path=resolved_manifest_path, vault_dir=resolved_vault_dir, safety=safety
+    )
 
     items: list[RestoreItemResult] = []
 
@@ -1090,8 +1208,23 @@ def restore_batch(
     # ADR-0026: opened once for the whole restore call, only if there's a vault entry that might
     # actually attempt a move — mirrors `apply_batch`'s single-handle-per-call approach.
     manifest_fh = _open_manifest_for_sync(resolved_manifest_path) if vault_entries else None
+    total_vault_entries = len(vault_entries)
+    last_heartbeat = time.monotonic()
     try:
-        for entry in vault_entries:
+        for index, entry in enumerate(vault_entries, start=1):
+            # fix/apply-progress-feedback: interval-gated, not per-item (see `ProgressCallback`).
+            heartbeat_now = time.monotonic()
+            if _due(last=last_heartbeat, now=heartbeat_now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                logger.info(
+                    "executor.restore_progress",
+                    items_processed=index - 1,
+                    items_total=total_vault_entries,
+                    current_category=entry.category,
+                )
+                if on_progress is not None:
+                    on_progress(index - 1, total_vault_entries, entry.category)
+                last_heartbeat = heartbeat_now
+
             if entry.restored:
                 items.append(
                     RestoreItemResult(

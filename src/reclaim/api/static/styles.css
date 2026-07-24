@@ -882,3 +882,56 @@ button {
   gap: var(--rc-space-3);
   margin-top: var(--rc-space-4);
 }
+
+/* --- Batch progress (apply/restore, fix/apply-progress-feedback) --------------------------------- */
+/*
+ * Shown while `POST /api/apply`/`POST /api/restore/{batch_id}`'s background task is running
+ * (polled via GET /api/apply|restore/status) -- this IS the apply/restore flow's loading state
+ * (house rule 15a); the error state on failure reuses the existing .rc-state-panel[data-kind=
+ * "error"] rule above via renderState(), and there is no empty state for this component since it
+ * only ever renders while an apply/restore is in flight (the surrounding apply bar's buttons are
+ * disabled whenever there is nothing selected to run one against).
+ */
+
+.rc-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rc-space-2);
+  background: var(--rc-surface);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+}
+
+.rc-progress-track {
+  width: 100%;
+  height: 10px;
+  background: var(--rc-surface-alt);
+  border-radius: var(--rc-radius-sm);
+  overflow: hidden;
+}
+
+.rc-progress-fill {
+  height: 100%;
+  background: var(--rc-brand);
+  border-radius: var(--rc-radius-sm);
+  transition: width 0.3s ease;
+}
+
+.rc-progress-label {
+  font-size: var(--rc-text-sm);
+  color: var(--rc-text-muted);
+  margin: 0;
+}
+
+.rc-progress-safety-note {
+  font-size: var(--rc-text-sm);
+  color: var(--rc-text);
+  margin: 0;
+}
+
+.rc-batch-warning {
+  font-size: var(--rc-text-sm);
+  color: var(--rc-warning);
+  font-weight: 600;
+}

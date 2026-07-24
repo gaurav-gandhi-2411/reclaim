@@ -65,6 +65,88 @@ async function api(path, options = {}) {
   return body;
 }
 
+// --- Batch progress / time estimate (fix/apply-progress-feedback) -------------------------------
+//
+// ADR-0026's measured ~9x per-item fsync cost turns a large apply/restore into a multi-minute
+// operation. `MEASURED_MS_PER_ITEM_WITH_FSYNC` mirrors `executor.py`'s own real, measured
+// constant for THIS locally-derived estimate (same "mirror the server's real numbers" convention
+// `formatFromBytes` above already follows for `format_bytes`) -- never a guessed number.
+
+const MEASURED_MS_PER_ITEM_WITH_FSYNC = 8.088; // see docs/architecture/adr/0026-crash-safe-two-phase-manifest.md
+const LARGE_BATCH_WARNING_SECONDS = 10.0;
+const BATCH_POLL_INTERVAL_MS = 1000;
+
+function estimateBatchSeconds(itemCount) {
+  return (itemCount * MEASURED_MS_PER_ITEM_WITH_FSYNC) / 1000;
+}
+
+function batchWarningLine(itemCount) {
+  const seconds = estimateBatchSeconds(itemCount);
+  if (seconds < LARGE_BATCH_WARNING_SECONDS) return null;
+  const minutes = seconds / 60;
+  const timePhrase =
+    minutes < 1 ? `${Math.ceil(seconds)} second(s)` : `${minutes.toFixed(1)} minute(s)`;
+  return (
+    `This will process ${itemCount.toLocaleString()} item(s) and may take approximately ` +
+    `${timePhrase} (measured ~8ms/item durability cost). It's safe to close this tab or stop ` +
+    'the server at any point during this — nothing is lost; run "reclaim recover" from a ' +
+    "terminal afterward if needed."
+  );
+}
+
+// Renders the apply/restore loading state WHILE a background task is running (house rule 15a:
+// this component's own "loading" state) -- the surrounding view's existing renderState() covers
+// the error state on failure, and there is no empty state here (it only ever shows mid-run).
+function renderBatchProgress(container, status) {
+  container.innerHTML = "";
+  const panel = document.createElement("div");
+  panel.className = "rc-progress";
+  panel.setAttribute("role", "status");
+  panel.setAttribute("aria-live", "polite");
+
+  const total = status.items_total ?? 0;
+  const processed = status.items_processed ?? 0;
+  const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+
+  const track = document.createElement("div");
+  track.className = "rc-progress-track";
+  const fill = document.createElement("div");
+  fill.className = "rc-progress-fill";
+  fill.style.width = `${pct}%`;
+  track.appendChild(fill);
+  panel.appendChild(track);
+
+  const label = document.createElement("p");
+  label.className = "rc-progress-label";
+  label.textContent =
+    total > 0
+      ? `${processed.toLocaleString()} / ${total.toLocaleString()} item(s) processed` +
+        (status.current_category ? ` — current category: ${status.current_category}` : "")
+      : "Starting…";
+  panel.appendChild(label);
+
+  const safety = document.createElement("p");
+  safety.className = "rc-progress-safety-note";
+  safety.textContent =
+    "It's safe to close this tab or stop the server at any point — nothing is lost; run " +
+    '"reclaim recover" from a terminal afterward if needed.';
+  panel.appendChild(safety);
+
+  container.appendChild(panel);
+}
+
+// Polls an ApplyStatusOut/RestoreStatusOut-shaped endpoint until it leaves "running", rendering
+// live progress via renderBatchProgress on every tick -- generalizes the scan bar's own
+// refreshScanStatus/pollScanStatus poll-and-render loop for apply/restore's two status objects.
+async function pollUntilDone(statusPath, resultEl) {
+  for (;;) {
+    const status = await api(statusPath);
+    if (status.status !== "running") return status;
+    renderBatchProgress(resultEl, status);
+    await new Promise((resolve) => setTimeout(resolve, BATCH_POLL_INTERVAL_MS));
+  }
+}
+
 // --- Generic loading / empty / error state panel ------------------------------------------------
 
 function renderState(container, kind, { title, message, actionLabel, onAction } = {}) {
@@ -427,6 +509,7 @@ function openQuickCleanDialog() {
   const list = document.getElementById("quick-clean-dialog-groups");
   list.innerHTML = "";
   let totalBytes = 0;
+  let totalCount = 0;
   for (const group of lastQuickCleanGroups) {
     const li = document.createElement("li");
     li.textContent =
@@ -434,8 +517,13 @@ function openQuickCleanDialog() {
       `${group.total_bytes_human}`;
     list.appendChild(li);
     totalBytes += group.total_bytes;
+    totalCount += group.file_count;
   }
   document.getElementById("quick-clean-dialog-total").textContent = formatFromBytes(totalBytes);
+  const warningEl = document.getElementById("quick-clean-dialog-warning");
+  const warning = batchWarningLine(totalCount);
+  warningEl.textContent = warning || "";
+  warningEl.hidden = !warning;
   document.getElementById("quick-clean-dialog").hidden = false;
 }
 
@@ -456,11 +544,19 @@ async function confirmQuickClean() {
     // selection refuses a blanket tier/category-group selection with no paths regardless of
     // this call's tier value). method: "vault" only matters in power mode — safe mode's
     // apply_batch forces recycle_bin unconditionally no matter what's requested here.
-    const report = await api("/api/apply", {
+    //
+    // fix/apply-progress-feedback: POST /api/apply returns 202 immediately and runs in the
+    // background — pollUntilDone renders live progress (this view's loading state) until it
+    // completes or fails.
+    await api("/api/apply", {
       method: "POST",
       body: JSON.stringify({ tier: "both", paths, method: "vault", dry_run: false }),
     });
-    renderQuickCleanResult(resultEl, report);
+    const status = await pollUntilDone("/api/apply/status", resultEl);
+    if (status.status === "failed") {
+      throw new ApiError(status.error || "apply failed", 500);
+    }
+    renderQuickCleanResult(resultEl, status.result);
     loadQuickClean();
   } catch (err) {
     renderState(resultEl, "error", { title: "Clean failed", message: err.message });
@@ -850,19 +946,25 @@ async function runApply(dryRun) {
   if (paths.length === 0) return;
 
   if (!dryRun) {
-    const confirmed = window.confirm(
-      `This will really quarantine ${paths.length} item(s) via ${method}. Continue?`
-    );
-    if (!confirmed) return;
+    let message = `This will really quarantine ${paths.length} item(s) via ${method}. Continue?`;
+    const warning = batchWarningLine(paths.length);
+    if (warning) message = `${warning}\n\n${message}`;
+    if (!window.confirm(message)) return;
   }
 
   renderState(resultEl, "loading", { title: dryRun ? "Running dry-run preview…" : "Applying…" });
   try {
-    const report = await api("/api/apply", {
+    // fix/apply-progress-feedback: POST /api/apply returns 202 immediately and runs in the
+    // background — pollUntilDone renders live progress until it completes or fails.
+    await api("/api/apply", {
       method: "POST",
       body: JSON.stringify({ tier: "both", paths, method, dry_run: dryRun }),
     });
-    renderApplyReport(resultEl, report);
+    const status = await pollUntilDone("/api/apply/status", resultEl);
+    if (status.status === "failed") {
+      throw new ApiError(status.error || "apply failed", 500);
+    }
+    renderApplyReport(resultEl, status.result);
     if (dryRun) document.getElementById("apply-real-btn").disabled = false;
     if (!dryRun) {
       selectedPaths.clear();
@@ -1201,22 +1303,27 @@ async function runAIApply(dryRun) {
   if (paths.length === 0) return;
 
   if (!dryRun) {
-    const confirmed = window.confirm(
-      `This will really apply ${paths.length} selected item(s). Continue?`
-    );
-    if (!confirmed) return;
+    let message = `This will really apply ${paths.length} selected item(s). Continue?`;
+    const warning = batchWarningLine(paths.length);
+    if (warning) message = `${warning}\n\n${message}`;
+    if (!window.confirm(message)) return;
   }
 
   renderState(resultEl, "loading", { title: dryRun ? "Running dry-run preview…" : "Applying…" });
   try {
     // Sent to the exact same /api/apply every other apply path uses -- an AI-suggested,
     // explicitly-selected path is safety-validated independently there (ADR-0025 decision 6),
-    // never a separate AI-only apply mechanism.
-    const report = await api("/api/apply", {
+    // never a separate AI-only apply mechanism. fix/apply-progress-feedback: same background-
+    // task + polling pattern as runApply above.
+    await api("/api/apply", {
       method: "POST",
       body: JSON.stringify({ tier: "both", paths, method: "vault", dry_run: dryRun }),
     });
-    renderApplyReport(resultEl, report);
+    const status = await pollUntilDone("/api/apply/status", resultEl);
+    if (status.status === "failed") {
+      throw new ApiError(status.error || "apply failed", 500);
+    }
+    renderApplyReport(resultEl, status.result);
     if (dryRun) document.getElementById("ai-apply-real-btn").disabled = false;
     if (!dryRun) {
       aiSelectedPaths.clear();
@@ -1302,8 +1409,17 @@ function renderBatchList(batches) {
 
 async function restoreBatch(batchId) {
   const stateEl = document.getElementById("quarantine-state");
+  const contentEl = document.getElementById("quarantine-content");
   try {
+    // fix/apply-progress-feedback: POST /api/restore/{batch_id} returns 202 immediately and
+    // runs in the background — pollUntilDone renders live progress (this view's loading state)
+    // in place of the batch list until the restore completes or fails.
     await api(`/api/restore/${encodeURIComponent(batchId)}`, { method: "POST" });
+    contentEl.hidden = true;
+    const status = await pollUntilDone("/api/restore/status", stateEl);
+    if (status.status === "failed") {
+      throw new ApiError(status.error || "restore failed", 500);
+    }
     loadQuarantineView();
   } catch (err) {
     renderState(stateEl, "error", {
@@ -1312,7 +1428,7 @@ async function restoreBatch(batchId) {
       actionLabel: "Back to quarantine",
       onAction: loadQuarantineView,
     });
-    document.getElementById("quarantine-content").hidden = true;
+    contentEl.hidden = true;
   }
 }
 
