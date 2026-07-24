@@ -35,6 +35,21 @@ green; if a job is red, fix it or get GG's explicit approval to waive it for tha
 assume the waiver. Hard extension of rule 70a gate 2 to cover checks that haven't run yet on
 the exact branch being merged, not just checks already known to be red.
 
+**Standing rule (added 2026-07-24, self-flagged incident):** the ONE canonical pre-push/pre-PR
+check is `uv run python scripts/verify.py` — never a hand-picked subset of it, and never report
+"the full test suite passes" from a command that omits it. `pyproject.toml`'s
+`testpaths = ["tests"]` means a bare `pytest`/`pytest tests/ -q` silently never discovers
+`evals/` at all — five P1 branches (schema versioning, model pinning, long-path scan, persistent
+logging, progress feedback) were each verified with exactly that bare command before pushing,
+and a real config-security regression (fix/schema-versioning tolerating an adversarial
+`ai_`-named config key it should have rejected) reached PR review undetected as a result, caught
+only by CI's separate `eval.yml` job on the pushed branch. `scripts/verify.py` now bundles ruff,
+mypy, `pytest tests/` + all three safety-gate eval files
+(`evals/test_safety_gate.py`/`test_ai_safety_gate.py`/`test_safe_mode_gate.py`), and the
+per-module coverage floor into one command — see CONTRIBUTING.md. A second, independent gap
+found in the same pass: `test_safe_mode_gate.py` (18 tests, the actual safe-mode structural
+gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `safety-gate` job.
+
 ## Stage order (riskiest assumption first)
 
 | # | Stage | Status | CI gate |

@@ -42,18 +42,24 @@ jobs:
           uv run python scripts/git_guard.py config --global user.email "fixture@reclaim.test"
           uv run python scripts/git_guard.py config --global user.name "Reclaim Fixture Builder"
 
-      # Scoped explicitly to the two safety-gate files, not the whole evals/ directory: every
+      # Scoped explicitly to these three safety-gate files, not the whole evals/ directory: every
       # other evals/*.py file is a gold-set/operating-point measurement that needs the [ai]
       # extra (torch/PIL/numpy/datasketch/...) to even collect, and this job deliberately does
       # NOT install it — those measurements run in ci.yml's ai-layer-with-extras job instead
-      # (`pytest tests/ evals/test_ai_safety_gate.py -v`, extras installed there). Neither
-      # safety-gate file needs the ai extra: test_safety_gate.py tests the deterministic
-      # engine's SafetyValidator hard gate directly; test_ai_safety_gate.py constructs
+      # (`pytest tests/ evals/test_ai_safety_gate.py -v`, extras installed there). None of the
+      # three needs the ai extra: test_safety_gate.py tests the deterministic engine's
+      # SafetyValidator hard gate directly; test_ai_safety_gate.py constructs
       # AICluster/AIClusterMember objects with hardcoded scores to prove the structural
-      # recommend-only guarantee — it never runs a real model, so it doesn't need lightgbm/
-      # torch/etc. either. Verified: both collect and pass 24/24 with zero ai deps installed.
-      - name: Safety gates -- deterministic (test_safety_gate.py) + AI recommend-only (test_ai_safety_gate.py)
-        run: uv run pytest evals/test_safety_gate.py evals/test_ai_safety_gate.py -v --junitxml=pytest-results.xml
+      # recommend-only guarantee (never runs a real model); test_safe_mode_gate.py tests the
+      # Stage 2 safe/power mode structural boundary via config.py alone. Verified: all three
+      # collect and pass with zero ai deps installed.
+      #
+      # test_safe_mode_gate.py was added here after a real gap was found: `pyproject.toml`'s
+      # `testpaths = ["tests"]` means a bare `pytest` NEVER discovers anything under evals/, so
+      # this 18-test file — the actual safe-mode structural gate — had never run in ANY CI job
+      # before this, only ever locally if someone happened to invoke it by exact path.
+      - name: Safety gates -- deterministic, AI recommend-only, and safe-mode structural boundary
+        run: uv run pytest evals/test_safety_gate.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
