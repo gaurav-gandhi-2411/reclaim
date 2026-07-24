@@ -370,6 +370,35 @@ def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.Monke
     assert main(["scan", str(root), "--db", str(db)]) == 0
 
 
+# --- scan: clean message on disk-full during the index write — audit A5 ------------------------
+
+
+def test_scan_reports_clean_message_when_disk_is_full(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk-full failure writing the index must never surface as an uncaught traceback --
+    it should print one actionable line to stderr and exit 1, same pattern as F22's serve
+    port-collision handling."""
+    import errno
+
+    from reclaim.index import ScanIndex as ScanIndexClass
+
+    def fake_upsert(self: object, records: object, *, scanned_at: float) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ScanIndexClass, "upsert_records", fake_upsert)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+
+    exit_code = main(["scan", str(root), "--db", str(db)])
+
+    assert exit_code == 1
+    assert "disk is full" in capsys.readouterr().err
+
+
 # --- dashboard: serve + auto-open browser -------------------------------------------------------
 
 

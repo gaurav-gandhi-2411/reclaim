@@ -40,7 +40,7 @@ from reclaim.mode import (
 from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode, Tier
 from reclaim.purge import purge_eligible_entries, purge_expired
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import scan_tree
+from reclaim.scanner import ScanDiskFullError, scan_tree
 
 _DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
 _DEFAULT_CONFIG_PATH = Path("config.toml")
@@ -402,8 +402,12 @@ def _run_scan(args: argparse.Namespace) -> int:
         return 1
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
-    with ScanIndex(args.db) as index:
-        stats = scan_tree(root, index, incremental=not args.full, max_workers=args.workers)
+    try:
+        with ScanIndex(args.db) as index:
+            stats = scan_tree(root, index, incremental=not args.full, max_workers=args.workers)
+    except ScanDiskFullError as exc:
+        print(f"reclaim scan: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
 
     print(  # noqa: T201 -- CLI output, not application logging
         f"reclaim scan: {stats.entries_total} entries under {stats.root} "

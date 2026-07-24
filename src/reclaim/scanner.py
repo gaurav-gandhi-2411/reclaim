@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import functools
 import os
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -243,6 +245,33 @@ class _ProgressTracker:
             self._last_heartbeat = now
             processed = self._processed
         self._on_progress(processed, self._entries_estimated_total, now - self._start_time)
+
+
+class ScanDiskFullError(RuntimeError):
+    """Raised by `scan_tree` when the index write at the end of a scan (`upsert_records`/
+    `prune_missing`) fails because the disk holding the SQLite index is full (A5).
+
+    The scan walk itself (`os.scandir`/`os.stat`) is read-only and never triggers ENOSPC — the
+    only place this scan touches disk for a write is the two index-write calls at the end of
+    `scan_tree`, so that's where this is caught, not scattered through the read-only walk.
+    Distinct from a generic `OSError` so the CLI can print "disk is full, free up space and try
+    again" instead of an uncaught traceback, matching `ElevatedProcessError`'s pattern.
+    """
+
+
+def _is_disk_full(exc: Exception) -> bool:
+    """True if `exc` is the OS or SQLite manifestation of "no space left on the volume holding
+    the index db". SQLite intercepts the underlying OS write failure itself and reports it as
+    `sqlite3.OperationalError` (message text, no errno) rather than letting a raw `OSError`
+    propagate through the C extension in the common case — checked by message here since that's
+    the only signal `sqlite3` gives; a raw `OSError(errno.ENOSPC, ...)` is checked too in case a
+    future/alternate DB-API path ever does let one through directly.
+    """
+    if isinstance(exc, OSError):
+        return exc.errno == errno.ENOSPC
+    if isinstance(exc, sqlite3.OperationalError):
+        return "disk" in str(exc).lower() and "full" in str(exc).lower()
+    return False
 
 
 def is_cloud_sync_root(path: Path) -> bool:
@@ -579,8 +608,13 @@ def scan_tree(
         else:
             to_write.append(record)
 
-    files_written = index.upsert_records(to_write, scanned_at=scanned_at)
-    files_pruned = index.prune_missing(stat_cache.keys(), seen_paths)
+    try:
+        files_written = index.upsert_records(to_write, scanned_at=scanned_at)
+        files_pruned = index.prune_missing(stat_cache.keys(), seen_paths)
+    except (OSError, sqlite3.OperationalError) as exc:
+        if _is_disk_full(exc):
+            raise ScanDiskFullError("disk is full — free up space and try again") from exc
+        raise
 
     return ScanStats(
         root=root,
