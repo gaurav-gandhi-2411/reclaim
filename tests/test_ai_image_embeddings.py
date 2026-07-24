@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import struct
+import zlib
 from pathlib import Path
 
 import pytest
@@ -28,10 +31,43 @@ def _make_image(
     img.save(path, format="PNG")
 
 
+def _make_decompression_bomb_png(path: Path, *, declared_size: tuple[int, int]) -> None:
+    """D15 fixture (see `tests/test_ai_phash.py`'s twin of this helper for the full mechanism
+    explanation): a real, tiny (4x4-pixel) PNG whose IHDR chunk is patched post-save to CLAIM
+    `declared_size`, tripping Pillow's decompression-bomb check inside `Image.open()` without a
+    genuinely huge real image on disk. Duplicated here rather than imported — this test module
+    and `test_ai_phash.py` deliberately don't share a cross-test-module dependency."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = io.BytesIO()
+    Image.new("RGB", (4, 4), color=(1, 2, 3)).save(stream, format="PNG")
+    buf = bytearray(stream.getvalue())
+
+    width, height = declared_size
+    buf[16:20] = struct.pack(">I", width)
+    buf[20:24] = struct.pack(">I", height)
+    buf[29:33] = struct.pack(">I", zlib.crc32(bytes(buf[12:29])) & 0xFFFFFFFF)
+
+    path.write_bytes(bytes(buf))
+
+
 def test_compute_image_embedding_returns_none_for_unreadable_file(tmp_path: Path) -> None:
     not_an_image = tmp_path / "fake.png"
     not_an_image.write_bytes(b"not image data")
     assert compute_image_embedding(not_an_image) is None
+
+
+def test_compute_image_embedding_returns_none_for_declared_dimensions_past_bomb_cap(
+    tmp_path: Path,
+) -> None:
+    """D15 regression: same decompression-bomb cap as `phash.compute_image_hashes` (both call
+    sites share the single `require("PIL.Image", ...)` cap set in `reclaim.ai._optional`) --
+    `compute_image_embedding`'s own broad `except Exception: return None` around `Image.open()`
+    must catch the resulting `DecompressionBombError` the same way it already catches any other
+    unreadable/corrupt image."""
+    bomb = tmp_path / "bomb.png"
+    _make_decompression_bomb_png(bomb, declared_size=(20000, 20000))
+
+    assert compute_image_embedding(bomb) is None
 
 
 def test_compute_image_embedding_returns_none_for_missing_file(tmp_path: Path) -> None:
