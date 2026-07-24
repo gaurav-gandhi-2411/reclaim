@@ -37,6 +37,8 @@ from reclaim.api.schemas import (
     QuarantineBatchOut,
     QuarantineItemOut,
     QuarantineListResponse,
+    RecoveryItemOut,
+    RecoveryStatusResponse,
     RestoreItemOut,
     RestoreResponse,
     ScanStatusOut,
@@ -73,6 +75,7 @@ from reclaim.mode import (
     switch_to_safe_mode,
 )
 from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier, Verdict
+from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path, scan_tree
 
@@ -921,6 +924,32 @@ def _quarantine_item_out(entry: QuarantineManifestEntry) -> QuarantineItemOut:
         method=entry.method,
         restored=entry.restored,
         restored_at=entry.restored_at,
+    )
+
+
+def recovery_status(state: AppState) -> RecoveryStatusResponse:
+    """Read-only dashboard surface for ADR-0026's crash recovery: previews what `reclaim
+    recover --apply` would do without writing anything (`compute_reconciliation` makes zero
+    manifest mutations — safe to call on every dashboard load). A real fix (writing the
+    reconciling manifest records) still requires the explicit `reclaim recover --apply` CLI
+    command — this endpoint only ever reports, matching every other read endpoint in this
+    module."""
+    report = compute_reconciliation(manifest_path=state.manifest_path, vault_dir=state.vault_dir)
+    pending = [
+        RecoveryItemOut(
+            operation=item.operation,
+            batch_id=item.batch_id,
+            original_path=str(item.original_path),
+            outcome=item.outcome,
+            detail=item.detail,
+        )
+        for item in report.reconciled
+    ]
+    return RecoveryStatusResponse(
+        scanned_intents=report.scanned_intents,
+        already_resolved=report.already_resolved,
+        pending=pending,
+        has_needs_review=any(item.outcome == "needs_review" for item in report.reconciled),
     )
 
 

@@ -18,6 +18,7 @@ from reclaim.api.schemas import (
     OneClickCleanSummaryResponse,
     PowerModeRequest,
     QuarantineListResponse,
+    RecoveryStatusResponse,
     RestoreResponse,
     ScanRequest,
     ScanStatusOut,
@@ -185,6 +186,13 @@ def ai_suggestions(request: Request) -> AISuggestionsResponse:
 @router.get("/quarantine", response_model=QuarantineListResponse)
 def quarantine(request: Request) -> QuarantineListResponse:
     return service.list_quarantine_batches(get_state(request))
+
+
+@router.get("/recovery/status", response_model=RecoveryStatusResponse)
+def recovery_status(request: Request) -> RecoveryStatusResponse:
+    """Read-only preview of ADR-0026 crash recovery — see `service.recovery_status`. Never
+    writes anything; a real fix still requires `reclaim recover --apply` from the CLI."""
+    return service.recovery_status(get_state(request))
 
 
 @router.post("/restore/{batch_id}", response_model=RestoreResponse)

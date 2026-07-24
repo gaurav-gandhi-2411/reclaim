@@ -41,6 +41,13 @@ jobs:
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
 
+      # Per-module coverage floor for the five safety-critical modules (mode/purge/safety/
+      # executor/config) -- the aggregate `fail_under = 80` above can pass while one of these
+      # five silently regresses, diluted by the other ~40 modules' coverage (ADR-0018 precedent:
+      # never let a healthy aggregate hide a gap in one specific place).
+      - name: Per-module coverage floor (safety-critical modules)
+        run: uv run python scripts/check_per_module_coverage.py
+
   ai-layer-with-extras:
     # Hard Gate 3 (reclaim-ai-features-spec.md §8/§0.3): proves the "ai extras installed"
     # profile in a clean environment this session doesn't control by hand — complements

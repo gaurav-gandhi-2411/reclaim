@@ -207,3 +207,65 @@ def test_path_is_protected_root_matches_protected_roots_pattern(
 
 def test_path_is_protected_root_matches_docker_wsl_roots(validator: SafetyValidator) -> None:
     assert validator.path_is_protected_root(Path("C:/Users/gg/AppData/Local/Docker/data")) is True
+
+
+# --- `re:`-prefixed regex patterns (deny/allow) -------------------------------------------------
+
+
+def test_re_prefixed_deny_pattern_blocks_matching_path_and_allows_non_matching() -> None:
+    """A `re:`-prefixed deny pattern is regex, not glob -- must actually block a path matching
+    the regex and must NOT block a path that doesn't, proving the regex is real (not silently
+    matching everything or nothing)."""
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=[r"re:/scratch/.*\.tmp$"])))
+    matching = _record("C:/scratch/build_output.tmp")
+    result = validator.evaluate(matching)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "USER_DENY_LIST"
+
+    non_matching = _record("C:/scratch/build_output.log")
+    result = validator.evaluate(non_matching)
+    assert result.verdict == Verdict.ELIGIBLE
+
+
+def test_re_prefixed_allow_pattern_promotes_finance_doc_and_leaves_non_matching_review_only() -> (
+    None
+):
+    """Same regex mechanism on the allow-list side: a finance-tokened file matching a `re:`
+    allow pattern is promoted to eligible (USER_ALLOW_LIST_OVERRIDE); a finance-tokened file
+    that doesn't match is left at REVIEW_ONLY."""
+    custom_validator = SafetyValidator(
+        Config(safety=SafetyConfig(allow=[r"re:/allow-me/.*\.pdf$"]))
+    )
+    matching = _record("C:/Data/allow-me/2025_tax_return.pdf")
+    result = custom_validator.evaluate(matching)
+    assert result.verdict == Verdict.ELIGIBLE
+    assert result.reason_code == "USER_ALLOW_LIST_OVERRIDE"
+
+    non_matching = _record("C:/Data/2025_tax_return.pdf")
+    result = custom_validator.evaluate(non_matching)
+    assert result.verdict == Verdict.REVIEW_ONLY
+    assert result.reason_code == "FINANCE_LEGAL_DOCUMENT"
+
+
+def test_re_prefixed_pattern_is_case_insensitive() -> None:
+    """`_pattern_matches`'s `re:` branch passes `re.IGNORECASE` explicitly -- an upper/mixed-case
+    path must still match a lowercase regex pattern."""
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=[r"re:/deny-me/.*\.dat$"])))
+    result = validator.evaluate(_record("C:/DENY-ME/FILE.DAT"))
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "USER_DENY_LIST"
+
+
+# --- Plain USER_ALLOW_LIST (no finance token present) --------------------------------------------
+
+
+def test_user_allow_list_without_finance_token_gets_plain_reason_code(
+    validator: SafetyValidator,
+) -> None:
+    """An allow-listed path with no finance/tax/legal token in its name gets REASON_USER_ALLOW_LIST
+    specifically -- distinct from REASON_USER_ALLOW_LIST_OVERRIDE, which only fires when a
+    finance token IS present."""
+    record = _record("C:/Data/allow-me/random_notes.txt")
+    result = validator.evaluate(record)
+    assert result.verdict == Verdict.ELIGIBLE
+    assert result.reason_code == "USER_ALLOW_LIST"

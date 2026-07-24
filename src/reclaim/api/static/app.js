@@ -1412,6 +1412,41 @@ async function initFirstRun() {
   });
 }
 
+// --- Crash recovery banner (ADR-0026) ---------------------------------------------------------
+//
+// Read-only: fetches GET /api/recovery/status (which itself never writes anything — it's a
+// preview of what `reclaim recover --apply` would do). Fails silent-hidden on error, same
+// "never trap the user" posture as initFirstRun — a broken status check must never surface as
+// a false alarm banner.
+
+async function initRecoveryBanner() {
+  const banner = document.getElementById("recovery-banner");
+  const message = document.getElementById("recovery-banner-message");
+  document.getElementById("recovery-banner-dismiss").addEventListener("click", () => {
+    banner.hidden = true;
+  });
+
+  try {
+    const status = await api("/api/recovery/status");
+    if (status.pending.length === 0) {
+      return;
+    }
+    const reviewCount = status.pending.filter((item) => item.outcome === "needs_review").length;
+    const suffix = reviewCount > 0
+      ? ` — ${reviewCount} need manual review`
+      : " — will resolve automatically";
+    message.textContent = (
+      `${status.pending.length} quarantine operation(s) were interrupted by a crash or forced ` +
+      `shutdown and need reconciling${suffix}. Run "reclaim recover --apply" from a terminal ` +
+      "to reconcile them; nothing on disk is at risk in the meantime."
+    );
+    banner.hidden = false;
+  } catch {
+    // Fail hidden: an unreachable/erroring status check must never itself read as "something
+    // is wrong" — see initFirstRun's identical reasoning.
+  }
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
@@ -1425,6 +1460,7 @@ function init() {
   initHowItWorks();
   initModeControls();
   initFirstRun();
+  initRecoveryBanner();
   activateTab("overview");
 }
 
