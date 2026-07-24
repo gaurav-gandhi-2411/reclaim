@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,8 @@ import pytest
 from reclaim.config import Config
 from reclaim.executor import (
     QuarantineManifestEntry,
+    _close_manifest_for_sync,
+    _open_manifest_for_sync,
     append_manifest_entries,
     apply_batch,
     fold_latest_manifest_entries,
@@ -958,3 +962,162 @@ def test_apply_keyboard_interrupt_after_action_before_done_write_reconciles_as_c
     # blocks run for BaseException too, not just Exception) -- confirmed indirectly here: the
     # manifest file is fully readable/parseable immediately after the KeyboardInterrupt (no
     # dangling open handle/lock on Windows would have made read_manifest_entries above fail).
+
+
+# --- Audit finding C10 (second pass), point 4: the manifest write LOCK survives a hard crash --
+#
+# Distinct from every crash-recovery test above: those all prove ADR-0026's intent/done manifest
+# *content* survives a hard kill correctly. None of them touch the C10 lock at all --
+# `reclaim.recovery` reads/writes the manifest via `read_manifest_entries`/`append_manifest_
+# entries`, neither of which acquires the OS-level lock (an infrequent, explicit maintenance
+# operation, not the concurrent hot path C10 protects). The two tests below close that gap: they
+# prove a hard crash while `apply_batch` holds the manifest's write lock does NOT leave that lock
+# stuck forever (which would otherwise mean every subsequent apply/restore/purge -- and even
+# `reclaim recover` itself, if it were ever changed to go through the locked path -- silently
+# hangs for up to `_MANIFEST_LOCK_TIMEOUT_SECONDS` after any real crash).
+
+
+def test_manifest_lock_released_after_hard_crash_while_lock_held(tmp_path: Path) -> None:
+    """`_acquire_manifest_lock`'s own docstring asserts "Windows releases byte-range locks
+    automatically when the owning handle closes or the process exits" -- the load-bearing
+    assumption behind treating `_MANIFEST_LOCK_TIMEOUT_SECONDS` as "a deep defensive bound, not
+    an expected path". Never empirically exercised anywhere in this suite before now. This test
+    re-acquires the SAME manifest's write lock, for real, immediately after a genuine
+    `os._exit()` hard-crash of the process that was holding it -- proving a hard crash never
+    leaves the manifest permanently (or even long-windedly) locked out for the next real
+    apply/restore/purge.
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    items = _apply_items(tmp_path, 3)
+
+    result = _run_harness(
+        {
+            "operation": "apply",
+            "checkpoint": "after_intent_fsync",
+            "crash_index": 0,  # crash right after the FIRST intent write -- definitely still
+            # holding the manifest lock (acquired before any item is processed at all).
+            "manifest_path": str(manifest_path),
+            "vault_dir": str(vault_dir),
+            "now": _NOW,
+            "items": items,
+        },
+        tmp_path,
+    )
+    _assert_hard_crash(result)
+
+    start = time.monotonic()
+    fh = _open_manifest_for_sync(manifest_path)  # would hang up to _MANIFEST_LOCK_TIMEOUT_SECONDS
+    elapsed = time.monotonic() - start  # (1800s) if the OS hadn't released the dead process's
+    _close_manifest_for_sync(fh)  # lock -- bounded assertion below keeps this test's own
+    # worst-case runtime sane rather than actually waiting 1800s to prove a negative.
+    assert elapsed < 5.0, (
+        f"re-acquiring the manifest lock after a hard crash took {elapsed:.2f}s -- the crashed "
+        "process's OS-level lock was not released promptly on process death"
+    )
+
+
+def test_second_batch_blocked_on_lock_during_hard_crash_writes_nothing_and_unblocks_after(
+    tmp_path: Path,
+) -> None:
+    """GG's explicit extension request: kills the process WHILE a second, real batch is actively
+    blocked in `_acquire_manifest_lock`'s retry loop waiting for it -- not merely "kill, then
+    separately try to acquire afterward" (the previous test) -- proving the in-flight-waiter case
+    specifically: the blocked batch (1) never gets a manifest handle back, so it provably writes
+    NOTHING while the first batch is alive, (2) unblocks promptly once the OS releases the dead
+    process's lock, and (3) the manifest ends up with exactly the crashed batch's own
+    (intent-only) entry, nothing corrupted or duplicated by the waiter.
+
+    Uses `tests/_recovery_crash_harness.py`'s `lock_acquired_marker`/`proceed_marker` hooks
+    (added for this test) to make the timing deterministic: the child process pauses -- still
+    HOLDING the lock -- right after acquiring it and before touching any item, until this test
+    has confirmed a real second lock-acquisition attempt is genuinely blocked, then releases it
+    to crash for real.
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    items = _apply_items(tmp_path, 3)
+    lock_acquired_marker = tmp_path / "lock_acquired.marker"
+    proceed_marker = tmp_path / "proceed.marker"
+
+    config_path = tmp_path / "_harness_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "operation": "apply",
+                "checkpoint": "after_intent_fsync",
+                "crash_index": 0,
+                "manifest_path": str(manifest_path),
+                "vault_dir": str(vault_dir),
+                "now": _NOW,
+                "items": items,
+                "lock_acquired_marker": str(lock_acquired_marker),
+                "proceed_marker": str(proceed_marker),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell, trusted local test fixture
+        [sys.executable, str(_HARNESS_PATH), str(config_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second_batch_thread: threading.Thread | None = None
+    try:
+        deadline = time.monotonic() + 15
+        while not lock_acquired_marker.exists():
+            assert time.monotonic() < deadline, (
+                "harness process never reached the lock-acquired marker"
+            )
+            assert proc.poll() is None, "harness process exited before acquiring the lock"
+            time.sleep(0.02)
+
+        second_batch_result: dict[str, object] = {}
+
+        def _second_batch() -> None:
+            start = time.monotonic()
+            fh = _open_manifest_for_sync(manifest_path)  # must block until the crash releases it
+            second_batch_result["acquired_after_seconds"] = time.monotonic() - start
+            _close_manifest_for_sync(fh)
+
+        second_batch_thread = threading.Thread(target=_second_batch)
+        second_batch_thread.start()
+
+        time.sleep(0.5)  # real chance to attempt-and-block while process A still holds the lock
+        assert second_batch_thread.is_alive(), (
+            "the second batch's _open_manifest_for_sync returned before process A crashed -- "
+            "it was never actually blocked on the lock"
+        )
+        # Confirmed blocked: process A is still alive (crash not yet triggered -- it's paused on
+        # proceed_marker), so the second batch has provably written zero bytes while waiting (it
+        # has no manifest handle at all yet).
+        assert proc.poll() is None, "process A exited before the test released it to crash"
+
+        proceed_marker.write_text("1", encoding="utf-8")  # let process A proceed into its crash
+        stdout, stderr = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:  # pragma: no cover -- defensive cleanup if an assertion above fired
+            proc.kill()
+            proc.communicate(timeout=10)
+
+    assert proc.returncode == _CRASH_EXIT_CODE, (
+        f"expected the crash hook to fire (exit {_CRASH_EXIT_CODE}), got "
+        f"{proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+
+    assert second_batch_thread is not None
+    second_batch_thread.join(timeout=15)
+    assert not second_batch_thread.is_alive(), (
+        "the second batch's blocked _open_manifest_for_sync call never returned after process A "
+        "hard-crashed -- the lock leaked past process death"
+    )
+    assert "acquired_after_seconds" in second_batch_result
+    assert second_batch_result["acquired_after_seconds"] < 5.0
+
+    # Exactly process A's own crash-time state ended up on disk: one intent-only entry (item 0),
+    # nothing from the (never-actually-writing) second batch.
+    raw_entries = read_manifest_entries(manifest_path)
+    assert len(raw_entries) == 1
+    assert raw_entries[0].phase == "intent"
