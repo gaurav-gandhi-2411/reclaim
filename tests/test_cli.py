@@ -286,6 +286,74 @@ def test_serve_refuses_to_run_elevated(
     assert "simulated: process is elevated" in capsys.readouterr().err
 
 
+# --- serve: clean messages for port-bind failures — audit F22 ----------------------------------
+
+
+def test_serve_reports_clean_message_when_port_already_in_use(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bind-in-use failure from `uvicorn.run` must never surface as a raw OSError
+    traceback -- it should print one actionable line to stderr and exit 1."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["serve", "--db", str(db)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "port 8420 is already in use" in err
+    assert "--port" in err
+
+
+def test_serve_reports_clean_message_when_port_bind_denied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission-denied bind failure (e.g. a privileged port) is a distinct condition
+    from port-in-use and must get its own clear message, not be conflated with EADDRINUSE."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["serve", "--db", str(db)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "permission denied" in err
+    assert "port 8420" in err
+
+
+def test_serve_does_not_swallow_unrelated_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the two known bind-failure conditions get a friendly message -- any other
+    OSError must still propagate so it isn't silently hidden from the user."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EIO, "some other I/O error")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    with pytest.raises(OSError, match="some other I/O error"):
+        main(["serve", "--db", str(db)])
+
+
 def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Read-only `scan` touches nothing and must never be blocked by the elevation guard —
     only the mutating commands (apply/undo/purge/serve) check it."""

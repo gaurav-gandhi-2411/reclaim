@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import sys
 import time
 from collections.abc import Sequence
@@ -728,7 +729,30 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
         # if it isn't, the browser's own connection retry/error page covers the gap, same as
         # opening a bookmark half a second before your server finishes starting normally would.
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
-    uvicorn.run(app, host=args.host, port=args.port)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    except OSError as exc:
+        # uvicorn/the socket layer raises a raw OSError (WinError 10048 on Windows,
+        # errno.EADDRINUSE on POSIX) for a port already in use, and a raw WinError
+        # 10013/errno.EACCES for a privileged port without permission — both would
+        # otherwise surface as an unhandled traceback to the user. Distinguish the two so
+        # the message tells the user what to actually do next (rule 104: errors are part
+        # of the API).
+        if exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048:
+            print(  # noqa: T201
+                f"reclaim serve: port {args.port} is already in use — stop whatever is "
+                "using it, or pass --port to pick another.",
+                file=sys.stderr,
+            )
+            return 1
+        if exc.errno == errno.EACCES or getattr(exc, "winerror", None) == 10013:
+            print(  # noqa: T201
+                f"reclaim serve: permission denied binding to port {args.port} — "
+                "pick a port above 1024, or run with the privileges that port requires.",
+                file=sys.stderr,
+            )
+            return 1
+        raise
     return 0
 
 
