@@ -75,9 +75,19 @@ Check "apply did NOT choose vault or direct_delete" `
 # direct_delete alike) -- its existence alone proves nothing about which method ran. The real
 # vault signal is the per-batch subdirectory apply_batch creates only when it actually moves
 # files into the vault (data/quarantine/<batch_id>/), and the manifest's own recorded fields.
-$manifestLine = Get-Content "$work\quarantine\manifest.jsonl" -Raw -ErrorAction SilentlyContinue
+#
+# ADR-0026 (crash-safe two-phase manifest): each item now writes TWO lines -- phase="intent"
+# (fsynced before the action) then phase="done" (fsynced after) -- so manifest.jsonl is JSONL
+# (one JSON object per line), never a single JSON document; -Raw + ConvertFrom-Json on the whole
+# file breaks now that there's more than one line. Parse line-by-line and take the phase="done"
+# entry, which is the one that reflects the actually-completed action.
+$manifestLines = Get-Content "$work\quarantine\manifest.jsonl" -ErrorAction SilentlyContinue
 $manifestEntry = $null
-if ($manifestLine) { $manifestEntry = $manifestLine | ConvertFrom-Json }
+foreach ($line in $manifestLines) {
+    if (-not $line.Trim()) { continue }
+    $parsed = $line | ConvertFrom-Json
+    if ($parsed.phase -eq "done") { $manifestEntry = $parsed }
+}
 Check "manifest records method=recycle_bin, vault_path=null (nothing was ever vaulted)" `
     ($manifestEntry -and $manifestEntry.method -eq "recycle_bin" -and $null -eq $manifestEntry.vault_path)
 $vaultBatchDirs = Get-ChildItem "$work\quarantine" -Directory -ErrorAction SilentlyContinue
