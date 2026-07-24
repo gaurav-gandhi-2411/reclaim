@@ -1499,6 +1499,55 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   branches, merge-preview-ai-ui); stale remote branches from merged PRs left alone (never
   delete unasked).
 
+### 2026-07-24 — full production-readiness audit, P0+P1 fixes, v1.2.0 released
+- 32-item adversarial production-readiness audit run across 5 parallel background agents.
+  Critical finding: `apply_batch`/`restore_batch`/`purge_expired` batched every manifest write
+  to a single call after the whole batch, so a kill mid-batch could orphan an already-moved
+  file with zero trace. High findings: no schema versioning (a future field addition would
+  crash every older install), unpinned AI model revisions, no persistent log file, a long-path
+  gap in the scan walk (not just the vault path), and per-module test-coverage gaps on the
+  exact confirmation-rejection/safe-mode-guard lines that matter most.
+- **P0** (`fix/crash-safe-manifest`, PR #5): two-phase intent/done manifest (ADR-0026) — every
+  mutating action now fsyncs an intent record before touching a file and a done record after,
+  so a real crash leaves either a fully-invisible-but-recoverable orphaned intent or a fully
+  recorded done entry, never silent data loss. New `reclaim recover` + dashboard banner
+  reconciles orphaned intents against real on-disk state, never guessing an ambiguous case.
+  Per-item fsync cost measured (not estimated) at ~9x overhead on a 23k-item batch — shipped
+  anyway, judged acceptable for this tool's workload, documented honestly in the ADR rather
+  than silently batched away. Plus H27 safety-boundary test coverage (mode's confirmation-
+  rejection gate, purge's/apply's safe-mode guards, the `re:` regex pattern, restore/copy2
+  failure isolation) and a new per-module CI coverage gate.
+- **P1**, 5 parallel branches, each independently verified: schema versioning (ADR-0027, PR
+  #6), model weight revision pinning + integrity verification (ADR-0028, PR #7), long-path-safe
+  scan walk + a `GitRepoCache` detection-boundary fix found during verification (PR #8),
+  persistent rotating logging + copy-diagnostics (PR #9), visible apply/restore/purge progress
+  + a pre-apply time estimate + interrupt-safety proof (PR #10).
+- **A real regression caught by this exact audit's own blind spot**: every P1 branch was
+  verified with `pytest tests/ -q`, which `pyproject.toml`'s `testpaths = ["tests"]` silently
+  never extends to `evals/` — so the AI/safe-mode safety-gate suite never ran per-branch, and
+  fix/schema-versioning's config forward-compat change accidentally let an adversarial
+  `ai_`-named config key bypass rejection, reaching PR review undetected until CI's separate
+  `eval.yml` job caught it. Fixed structurally: `scripts/verify.py` is now the one canonical
+  pre-push command (ruff, mypy, `tests/` + all three safety-gate eval files including
+  `evals/test_safe_mode_gate.py`, which — second gap found in the same pass — had never been
+  referenced by ANY CI workflow at all before this). Documented in CONTRIBUTING.md; a matching
+  standing rule added above.
+- PR #5 was squash-merged (not a merge commit), which broke the two branches stacked on top of
+  it (#6, #10) — retargeting their base wasn't enough; both needed a real `git rebase --onto`
+  onto the post-squash main, which surfaced one conflict (an import-list collision in
+  `api/service.py` between #6's and #10's own additions, cleanly integrated) and required
+  re-verifying #10's async-execution-specific safety properties from scratch.
+- **v1.2.0 released**: rebuilt from a genuinely isolated production venv after catching a real
+  mistake — the first build used the regular dev venv and pulled `mypy` into the standalone
+  dist (869 C files / 119MB instead of the correct 486 files / 75MB). The packaged safe-mode
+  test script (`test_packaged_safe_mode.ps1`) also broke against the new binary — it assumed
+  one manifest line per apply, but ADR-0026 now writes two (intent + done); fixed to parse
+  JSONL correctly and take the `phase="done"` entry. 14/14 safe-mode checks (the real current
+  count, not the historical "13") passed twice — raw build and a real silent install/serve/
+  uninstall cycle. SHA-256 verified byte-identical after downloading the published asset back.
+  v1.1.0 marked pre-release/superseded (documented reason: the orphan-file gap this release
+  fixes). https://github.com/gaurav-gandhi-2411/reclaim/releases/tag/v1.2.0
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
