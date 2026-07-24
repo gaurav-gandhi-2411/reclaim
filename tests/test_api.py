@@ -187,6 +187,46 @@ def test_scan_already_running_returns_409(tmp_path: Path) -> None:
     assert "already running" in response.json()["detail"]
 
 
+def test_apply_already_running_returns_409(tmp_path: Path) -> None:
+    """fix/apply-progress-feedback: `POST /api/apply` became a background-task + single-flight
+    pattern, same guard `ScanStatus`/`AIAnalysisStatus` already have -- mirrors
+    `test_scan_already_running_returns_409` above."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    app_state = client.app.state.reclaim
+    from reclaim.api.state import ApplyStatus
+
+    with app_state.lock:
+        app_state.apply_status = ApplyStatus(status="running", started_at=time.time())
+
+    response = client.post("/api/apply", json={"tier": "A"})
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+def test_restore_already_running_returns_409(tmp_path: Path) -> None:
+    """Same single-flight guard as `test_apply_already_running_returns_409` above, for `POST
+    /api/restore/{batch_id}`. A batch id that fails `validate_restorable_batch`'s synchronous
+    pre-check would return 404 before this guard is ever reached, so this test needs a real,
+    valid batch first."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+    tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
+    report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
+    assert paths["kept_file"].exists()  # sanity: fixture still intact for this test's own use
+
+    app_state = client.app.state.reclaim
+    from reclaim.api.state import RestoreStatus
+
+    with app_state.lock:
+        app_state.restore_status = RestoreStatus(status="running", started_at=time.time())
+
+    response = client.post(f"/api/restore/{report['batch_id']}")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
 def test_restore_nonexistent_batch_returns_404(tmp_path: Path) -> None:
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
     response = client.post("/api/restore/does-not-exist")
@@ -253,6 +293,34 @@ def _scan_and_wait(client: TestClient, root: Path) -> dict[str, object]:
     status = client.get("/api/scan/status").json()
     assert status["status"] == "completed", status
     return status
+
+
+def _apply_and_wait(client: TestClient, payload: dict[str, object]) -> dict[str, object]:
+    """`POST /api/apply` + `GET /api/apply/status` (fix/apply-progress-feedback: `POST /api/apply`
+    became a background-task + polling pattern, same shape as `_scan_and_wait` above) -- returns
+    the `result` (the same `ApplyResponse` shape the POST itself used to return synchronously).
+    Only used for requests expected to be ACCEPTED (202) and actually run; a request refused
+    synchronously (bad tier, safe mode's blanket-selection gate) still asserts its own status
+    code directly against `client.post(...)`, never through this helper."""
+    response = client.post("/api/apply", json=payload)
+    assert response.status_code == 202, response.text
+    status = client.get("/api/apply/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
+
+
+def _restore_and_wait(client: TestClient, batch_id: str) -> dict[str, object]:
+    """Same helper as `_apply_and_wait`, for `POST /api/restore/{batch_id}` + `GET
+    /api/restore/status`. Only used when the restore is expected to be ACCEPTED (202) -- a
+    synchronously-refused restore (unknown batch id, recycle_bin-only batch) still asserts its
+    status code directly against `client.post(...)`."""
+    response = client.post(f"/api/restore/{batch_id}")
+    assert response.status_code == 202, response.text
+    status = client.get("/api/restore/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
 
 
 # --- Full pipeline: scan -> summary/treemap/candidates -> dry-run apply -> real apply -> restore
@@ -434,8 +502,8 @@ def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recyc
 ) -> None:
     """Proves the one-click apply flow end to end: the group's enumerated `paths` (never a
     blanket tier/category-group selection) sent through the SAME `/api/apply` endpoint and
-    `apply_selection` safe-mode guard every other apply path uses — with `tier="both"` since
-    safe mode forces every candidate's tier to B (ADR-0023 guarantee 3)."""
+    `resolve_apply_selection` safe-mode guard every other apply path uses — with `tier="both"`
+    since safe mode forces every candidate's tier to B (ADR-0023 guarantee 3)."""
     root = tmp_path / "tree"
     paths = _build_tree(root)
     client = _make_app_safe_mode(tmp_path, config=_config(root))
@@ -445,12 +513,9 @@ def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recyc
     all_paths = [p for group in summary["groups"] for p in group["paths"]]
     assert paths["node_modules_dir"].as_posix() in all_paths
 
-    response = client.post(
-        "/api/apply",
-        json={"tier": "both", "paths": all_paths, "method": "vault", "dry_run": False},
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": all_paths, "method": "vault", "dry_run": False}
     )
-    assert response.status_code == 200
-    body = response.json()
     assert body["apply"] is True
     assert body["method"] == "recycle_bin"  # safe mode forces this regardless of the request
     assert body["bytes_freed"] == 5_000
@@ -510,9 +575,7 @@ def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:
     client = _make_app(tmp_path, config=_config(root))
     _scan_and_wait(client, root)
 
-    response = client.post("/api/apply", json={"tier": "A", "category_group": "large_logs"})
-    assert response.status_code == 200
-    body = response.json()
+    body = _apply_and_wait(client, {"tier": "A", "category_group": "large_logs"})
     assert body["apply"] is False
     assert body["files_processed"] == 1
     assert body["items"][0]["path"] == paths["old_log"].as_posix()
@@ -538,9 +601,8 @@ def test_safe_mode_apply_requires_explicit_paths_no_blanket_tier_selection(tmp_p
     # the blanket-selection shape, not a blanket "safe mode can never apply anything" refusal.
     tier_b_paths = [c["path"] for c in client.get("/api/candidates?tier=B").json()["candidates"]]
     assert tier_b_paths, "expected at least one Tier B candidate in this fixture"
-    scoped_response = client.post("/api/apply", json={"tier": "B", "paths": tier_b_paths})
-    assert scoped_response.status_code == 200
-    assert scoped_response.json()["method"] == "recycle_bin"
+    scoped_body = _apply_and_wait(client, {"tier": "B", "paths": tier_b_paths})
+    assert scoped_body["method"] == "recycle_bin"
 
 
 def test_apply_defaults_to_dry_run_when_field_omitted(tmp_path: Path) -> None:
@@ -551,9 +613,7 @@ def test_apply_defaults_to_dry_run_when_field_omitted(tmp_path: Path) -> None:
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    response = client.post("/api/apply", json={"tier": "A", "paths": tier_a_paths})
-    assert response.status_code == 200
-    body = response.json()
+    body = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths})
     assert body["apply"] is False
     assert body["files_succeeded"] == len(tier_a_paths)
     assert paths["node_modules_dir"].exists()  # nothing on disk touched
@@ -568,9 +628,8 @@ def test_apply_defaults_to_dry_run_when_field_explicitly_true(tmp_path: Path) ->
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    response = client.post("/api/apply", json={"tier": "A", "paths": tier_a_paths, "dry_run": True})
-    assert response.status_code == 200
-    assert response.json()["apply"] is False
+    body = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": True})
+    assert body["apply"] is False
     assert paths["node_modules_dir"].exists()
     assert paths["old_log"].exists()
 
@@ -586,11 +645,7 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     original_log_bytes = paths["old_log"].read_bytes()
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    apply_response = client.post(
-        "/api/apply", json={"tier": "A", "paths": tier_a_paths, "dry_run": False}
-    )
-    assert apply_response.status_code == 200
-    report = apply_response.json()
+    report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
     assert report["apply"] is True
     assert report["files_succeeded"] == len(tier_a_paths)
     assert report["files_failed"] == 0
@@ -606,18 +661,15 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     assert batch["can_restore"] is True
     assert batch["restore_blocked_reason"] is None
 
-    restore_response = client.post(f"/api/restore/{report['batch_id']}")
-    assert restore_response.status_code == 200
-    restore_body = restore_response.json()
+    restore_body = _restore_and_wait(client, report["batch_id"])
     assert restore_body["files_succeeded"] == len(tier_a_paths)
     assert paths["node_modules_dir"].exists()
     assert paths["old_log"].exists()
     assert paths["old_log"].read_bytes() == original_log_bytes  # byte-identical, ground truth
 
     # Idempotent: restoring the same batch again reports already_restored, not an error.
-    second_restore = client.post(f"/api/restore/{report['batch_id']}")
-    assert second_restore.status_code == 200
-    assert all(item["already_restored"] for item in second_restore.json()["items"])
+    second_restore = _restore_and_wait(client, report["batch_id"])
+    assert all(item["already_restored"] for item in second_restore["items"])
 
 
 def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
@@ -633,12 +685,10 @@ def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
     _scan_and_wait(client, root)
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
-    apply_response = client.post(
-        "/api/apply",
-        json={"tier": "A", "paths": tier_a_paths, "method": "recycle_bin", "dry_run": False},
+    apply_body = _apply_and_wait(
+        client, {"tier": "A", "paths": tier_a_paths, "method": "recycle_bin", "dry_run": False}
     )
-    assert apply_response.status_code == 200
-    batch_id = apply_response.json()["batch_id"]
+    batch_id = apply_body["batch_id"]
 
     quarantine = client.get("/api/quarantine").json()
     batch = next(b for b in quarantine["batches"] if b["batch_id"] == batch_id)
