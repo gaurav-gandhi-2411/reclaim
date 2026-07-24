@@ -56,7 +56,7 @@ _ALL_GATED_MODULE_NAMES = {
     "open_clip",
     "torch",
     "faiss",
-    "huggingface_hub",  # ADR-0026 -- pinned-revision checkpoint download + sha256 integrity
+    "huggingface_hub",  # ADR-0028 -- pinned-revision checkpoint download + sha256 integrity
     # verification for image_embeddings.py/text_embeddings.py (E17/E18 audit findings)
 }
 

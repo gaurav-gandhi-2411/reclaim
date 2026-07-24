@@ -1,4 +1,4 @@
-# 0026. Model weight revision pinning and content-hash integrity verification
+# 0028. Model weight revision pinning and content-hash integrity verification
 
 ## Context
 

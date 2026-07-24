@@ -135,7 +135,7 @@ def test_compute_embeddings_batch_skips_unreadable_files(tmp_path: Path) -> None
     assert embeddings[0].path == good
 
 
-# E17/E18 (audit findings, ADR-0026): pinned-revision checkpoint download + sha256 integrity
+# E17/E18 (audit findings, ADR-0028): pinned-revision checkpoint download + sha256 integrity
 # verification for the CLIP checkpoint. Real download/inference is exercised by the other
 # tests in this file when the `ai` extra + network are available; these tests instead mock
 # `require()`'s return value so the pinning/verification wiring is provable without a real

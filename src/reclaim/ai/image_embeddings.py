@@ -30,7 +30,7 @@ _OPEN_CLIP_MODEL_NAME = "ViT-B-32-quickgelu"  # NOT the bare "ViT-B-32" -- the "
 # see ADR-0022).
 _EMBEDDING_MODEL_ID = f"open_clip:{_OPEN_CLIP_MODEL_NAME}:openai"  # see ADR-0022
 
-# Supply-chain integrity (audit findings E17/E18, ADR-0026): open_clip==3.3.0 (pinned in
+# Supply-chain integrity (audit findings E17/E18, ADR-0028): open_clip==3.3.0 (pinned in
 # pyproject.toml/uv.lock) has NO `revision=` passthrough anywhere on the tag-based
 # `pretrained="openai"` loading path -- `create_model` always calls
 # `download_pretrained_from_hf(model_id, cache_dir=cache_dir)` with `revision=None`, i.e. HF
@@ -42,7 +42,7 @@ _EMBEDDING_MODEL_ID = f"open_clip:{_OPEN_CLIP_MODEL_NAME}:openai"  # see ADR-002
 # its SHA-256, and hands `create_model_and_transforms` a concrete local file path instead of
 # the "openai" tag -- the ONLY call site that ever touches HF Hub for this checkpoint.
 _OPEN_CLIP_HF_REPO = "timm/vit_base_patch32_clip_224.openai"
-_OPEN_CLIP_HF_REVISION = "a6f597a30f7b82c51704746581f9a4e41421e878"  # pinned; see ADR-0026
+_OPEN_CLIP_HF_REVISION = "a6f597a30f7b82c51704746581f9a4e41421e878"  # pinned; see ADR-0028
 _OPEN_CLIP_HF_WEIGHTS_FILENAME = "open_clip_model.safetensors"
 _OPEN_CLIP_HF_WEIGHTS_SHA256 = "e6d1bd7789aa45192b3bf90570a789b478bae1b74ebcce7eddd908e83a2b7c31"
 

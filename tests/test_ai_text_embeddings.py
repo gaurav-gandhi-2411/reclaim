@@ -7,7 +7,7 @@ import pytest
 
 from reclaim.ai import text_embeddings as text_embeddings_module
 
-# E17/E18 (audit findings, ADR-0026): pinned-revision model download + sha256 integrity
+# E17/E18 (audit findings, ADR-0028): pinned-revision model download + sha256 integrity
 # verification for the sentence-transformers MiniLM checkpoint. `reclaim.ai.text_embeddings`
 # imports lazily (`_optional.require`) so this module-level import succeeds even without the
 # `ai` extra installed -- these tests mock `require()`'s return value so the pinning/
