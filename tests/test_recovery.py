@@ -11,10 +11,11 @@ from reclaim.config import Config
 from reclaim.executor import (
     QuarantineManifestEntry,
     append_manifest_entries,
+    apply_batch,
     fold_latest_manifest_entries,
     read_manifest_entries,
 )
-from reclaim.models import Tier
+from reclaim.models import Candidate, Tier, Verdict
 from reclaim.recovery import compute_reconciliation, reconcile_manifest
 from reclaim.safety import SafetyValidator
 
@@ -798,3 +799,162 @@ def test_vault_path_outside_vault_dir_always_forces_needs_review(
     assert len(preview.reconciled) == 1
     assert preview.reconciled[0].outcome == "needs_review"
     assert "does not resolve inside the configured vault directory" in preview.reconciled[0].detail
+
+
+# --- KeyboardInterrupt: a graceful Ctrl-C is exactly as safe as a hard crash, but does NOT
+# self-resolve -------------------------------------------------------------------------------
+#
+# Concrete correctness question this section answers (see the fix/apply-progress-feedback task):
+# `apply_batch`'s per-item loop only ever catches `except Exception` around the real filesystem
+# action. `KeyboardInterrupt` inherits from `BaseException`, not `Exception` -- Python's own
+# exception hierarchy deliberately excludes it from a bare `except Exception` precisely so a
+# Ctrl-C can't be silently swallowed by overly-broad handlers. That means a `KeyboardInterrupt`
+# raised mid-item is NOT caught by the existing per-item `except Exception` block at all -- it
+# propagates straight out of `apply_batch` (proven below via `pytest.raises(KeyboardInterrupt)`),
+# skipping the `phase="aborted"`/`phase="done"` write for that one item entirely.
+#
+# That is NOT a gap: it puts the interrupted item in exactly the same "orphaned intent" state a
+# hard SIGKILL at the equivalent checkpoint already leaves (see the subprocess-crash-harness
+# tests above for the byte-for-byte-identical scenario) -- which `reclaim.recovery` is already
+# built to detect and reconcile from real on-disk state, regardless of *why* the process didn't
+# reach the resolving write. The one real difference from a caught, handled per-item error: it
+# does NOT self-resolve. The user must still run `reclaim recover` afterward, same as after a
+# real crash -- this is disclosed explicitly in the CLI's pre-apply time-estimate message and the
+# dashboard's progress panel (see `cli.py`/`app.js`).
+def _keyboard_interrupt_candidate(path: Path, *, retention_days: int | None = 30) -> Candidate:
+    return Candidate(
+        path=path,
+        is_dir=False,
+        category="test_category",
+        category_group="test_group",
+        size_bytes=path.stat().st_size,
+        tier=Tier.A,
+        rationale="test rationale",
+        rebuild_instruction=None,
+        safety_verdict=Verdict.ELIGIBLE,
+        safety_reason_code="TEST_REASON",
+        retention_days=retention_days,
+    )
+
+
+def test_apply_keyboard_interrupt_before_action_propagates_and_orphans_a_recoverable_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    sources = []
+    for i in range(5):
+        p = tmp_path / f"source_{i}.bin"
+        p.write_bytes(f"item-{i}-payload".encode() * 4)
+        sources.append(p)
+    candidates = [_keyboard_interrupt_candidate(p) for p in sources]
+    crash_index = 2
+
+    import reclaim.executor as executor_module
+
+    real_atomic_move = executor_module._atomic_move
+
+    def _flaky_atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+        if src == sources[crash_index]:
+            raise KeyboardInterrupt()
+        real_atomic_move(src, dst, is_dir=is_dir)
+
+    monkeypatch.setattr(executor_module, "_atomic_move", _flaky_atomic_move)
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_batch(
+            candidates,
+            safety=_safety(),
+            apply=True,
+            method="vault",
+            vault_dir=vault_dir,
+            manifest_path=manifest_path,
+            now=_NOW,
+        )
+
+    # Source untouched -- the real move never started before the interrupt fired.
+    assert sources[crash_index].exists()
+
+    raw_entries = read_manifest_entries(manifest_path)
+    # items 0-1: intent+done pairs (4 lines); item 2: intent only (1 line) = 5. Items 3-4 never
+    # even started (the propagating KeyboardInterrupt stopped the whole for-loop immediately).
+    assert len(raw_entries) == 5
+    crashed_entries = [e for e in raw_entries if e.original_path == sources[crash_index]]
+    assert len(crashed_entries) == 1
+    assert crashed_entries[0].phase == "intent"
+    assert crashed_entries[0].operation == "apply"
+
+    preview = compute_reconciliation(manifest_path, vault_dir)
+    assert len(preview.reconciled) == 1
+    assert preview.reconciled[0].outcome == "aborted"
+    assert preview.reconciled[0].original_path == sources[crash_index]
+
+    reconcile_manifest(manifest_path, vault_dir, now=_NOW + 1)
+    folded = fold_latest_manifest_entries(manifest_path)
+    assert len(folded) == 2  # only items 0 and 1 ever completed
+    assert sources[crash_index] not in {e.original_path for e in folded}
+
+
+def test_apply_keyboard_interrupt_after_action_before_done_write_reconciles_as_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same proof as above, at the OTHER checkpoint: the real move genuinely completes, then
+    `KeyboardInterrupt` fires before `apply_batch` gets to write the `phase="done"` record.
+    Recovery must classify this `completed` (from real on-disk state), not `aborted` -- proving
+    the reconciliation logic doesn't care how the process failed to reach the done-write, only
+    what's really on disk."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    sources = []
+    for i in range(5):
+        p = tmp_path / f"source_{i}.bin"
+        p.write_bytes(f"item-{i}-payload".encode() * 4)
+        sources.append(p)
+    candidates = [_keyboard_interrupt_candidate(p) for p in sources]
+    crash_index = 2
+
+    import reclaim.executor as executor_module
+
+    real_atomic_move = executor_module._atomic_move
+
+    def _flaky_atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+        real_atomic_move(src, dst, is_dir=is_dir)
+        if src == sources[crash_index]:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(executor_module, "_atomic_move", _flaky_atomic_move)
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_batch(
+            candidates,
+            safety=_safety(),
+            apply=True,
+            method="vault",
+            vault_dir=vault_dir,
+            manifest_path=manifest_path,
+            now=_NOW,
+        )
+
+    assert not sources[crash_index].exists()  # the move genuinely happened
+
+    raw_entries = read_manifest_entries(manifest_path)
+    crashed_entries = [e for e in raw_entries if e.original_path == sources[crash_index]]
+    assert len(crashed_entries) == 1
+    assert crashed_entries[0].phase == "intent"
+    assert crashed_entries[0].vault_path is not None
+    assert crashed_entries[0].vault_path.exists()  # the vault copy is real
+
+    preview = compute_reconciliation(manifest_path, vault_dir)
+    assert len(preview.reconciled) == 1
+    assert preview.reconciled[0].outcome == "completed"
+
+    reconcile_manifest(manifest_path, vault_dir, now=_NOW + 1)
+    folded = fold_latest_manifest_entries(manifest_path)
+    assert len(folded) == 3  # items 0, 1, and now the recovered item 2
+    folded_by_path = {e.original_path: e for e in folded}
+    assert folded_by_path[sources[crash_index]].phase == "done"
+
+    # finally: manifest_fh.close() still runs during BaseException propagation (Python finally
+    # blocks run for BaseException too, not just Exception) -- confirmed indirectly here: the
+    # manifest file is fully readable/parseable immediately after the KeyboardInterrupt (no
+    # dangling open handle/lock on Windows would have made read_manifest_entries above fail).

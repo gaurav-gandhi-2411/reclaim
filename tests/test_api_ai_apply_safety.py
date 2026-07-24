@@ -84,6 +84,28 @@ def _scan_and_wait(client: TestClient, root: Path) -> None:
     assert client.get("/api/scan/status").json()["status"] == "completed"
 
 
+def _apply_and_wait(client: TestClient, payload: dict[str, object]) -> dict[str, object]:
+    """`POST /api/apply` + `GET /api/apply/status` (fix/apply-progress-feedback: `POST
+    /api/apply` became a background-task + polling pattern, same shape as `_scan_and_wait`
+    above) -- returns `result` (the same `ApplyResponse` shape the POST itself used to return
+    synchronously)."""
+    response = client.post("/api/apply", json=payload)
+    assert response.status_code == 202, response.text
+    status = client.get("/api/apply/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
+
+
+def _restore_and_wait(client: TestClient, batch_id: str) -> dict[str, object]:
+    response = client.post(f"/api/restore/{batch_id}")
+    assert response.status_code == 202, response.text
+    status = client.get("/api/restore/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
+
+
 # --- The core AI-suggestion-shaped path: not a deterministic candidate at all -------------------
 
 
@@ -101,10 +123,8 @@ def test_explicit_path_not_a_deterministic_candidate_still_applies_dry_run(tmp_p
     tier_both = client.get("/api/candidates?tier=both").json()["candidates"]
     assert photo.as_posix() not in {c["path"] for c in tier_both}
 
-    response = client.post("/api/apply", json={"tier": "both", "paths": [photo.as_posix()]})
+    body = _apply_and_wait(client, {"tier": "both", "paths": [photo.as_posix()]})
 
-    assert response.status_code == 200
-    body = response.json()
     assert body["apply"] is False
     assert body["files_processed"] == 1
     item = body["items"][0]
@@ -126,21 +146,17 @@ def test_explicit_path_not_a_deterministic_candidate_really_applies_and_restores
     client = _make_app(tmp_path, config=_config(root))
     _scan_and_wait(client, root)
 
-    response = client.post(
-        "/api/apply",
-        json={"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False},
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False}
     )
 
-    assert response.status_code == 200
-    body = response.json()
     assert body["apply"] is True
     assert body["files_succeeded"] == 1
     assert not photo.exists()  # really moved
 
     batch_id = body["batch_id"]
-    restore_response = client.post(f"/api/restore/{batch_id}")
-    assert restore_response.status_code == 200
-    assert restore_response.json()["files_succeeded"] == 1
+    restore_body = _restore_and_wait(client, batch_id)
+    assert restore_body["files_succeeded"] == 1
     assert photo.exists()  # real, working restore round-trip
 
 
@@ -159,18 +175,76 @@ def test_explicit_path_in_safe_mode_is_forced_to_recycle_bin_and_tier_b(tmp_path
 
     # method="vault" is explicitly REQUESTED but must be silently overridden to recycle_bin --
     # the exact same safe-mode guarantee every other apply path already has (ADR-0023).
-    response = client.post(
-        "/api/apply",
-        json={"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False},
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False}
     )
 
-    assert response.status_code == 200
-    body = response.json()
     assert body["method"] == "recycle_bin"
     assert body["items"][0]["tier"] == "B"
     assert body["items"][0]["method"] == "recycle_bin"
     assert body["files_succeeded"] == 1
     assert not photo.exists()  # really moved (to the Recycle Bin)
+
+
+def test_safe_mode_short_circuit_holds_under_background_task_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix/apply-progress-feedback moved `apply_batch`'s real call from `POST /api/apply`'s
+    request-handling thread into a background task (`service.run_apply`) — this proves the
+    safe-mode structural boundary (ADR-0023: vault/direct_delete are unreachable whenever
+    `mode=Mode.SAFE`, regardless of what's requested) still holds from THAT call site, not just
+    the synchronous one the pre-existing `test_explicit_path_in_safe_mode_is_forced_to_
+    recycle_bin_and_tier_b` above already covers. Monkeypatches `os.unlink`/`shutil.rmtree` (the
+    only two calls `executor.apply_batch` ever uses for `direct_delete`, and `shutil.rmtree` is
+    also used by the `vault` method's directory branch) to raise `AssertionError` if invoked at
+    all — a real crash, not silently swallowed by the background task's own broad
+    `except Exception`, since a genuine per-item apply failure and "the safe-mode boundary
+    itself broke" must never be conflated. `send2trash.send2trash` is monkeypatched too, but
+    only to RECORD that it fired (the expected, safe-mode-only code path), not to block it.
+    """
+    import send2trash as send2trash_module
+
+    import reclaim.executor as executor_module
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "safe mode must never reach os.unlink/shutil.rmtree, even from a background task"
+        )
+
+    send2trash_calls: list[str] = []
+    real_send2trash = send2trash_module.send2trash
+
+    def _recording_send2trash(path: str) -> None:
+        send2trash_calls.append(path)
+        real_send2trash(path)
+
+    monkeypatch.setattr(executor_module.os, "unlink", _boom)
+    monkeypatch.setattr(executor_module.shutil, "rmtree", _boom)
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", _recording_send2trash)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    photo = root / "Pictures" / "vacation.jpg"
+    photo.parent.mkdir()
+    photo.write_bytes(b"not a real jpeg, just fixture bytes")
+
+    client = _make_app_safe_mode(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    # method="vault" requested, exactly as the pre-existing synchronous-path test does --
+    # exercising the SAME override this test targets, now through the async execution path.
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": [photo.as_posix()], "method": "vault", "dry_run": False}
+    )
+
+    assert body["method"] == "recycle_bin"
+    assert body["files_succeeded"] == 1
+    assert not photo.exists()
+    assert send2trash_calls == [str(photo)]  # the real, safe-mode-only path genuinely ran
+
+    status = client.get("/api/apply/status").json()
+    assert status["status"] == "completed"
+    assert status["error"] is None  # no exception was swallowed into "failed"
 
 
 # --- A BLOCKED path is silently excluded, never force-applied ---------------------------------
@@ -190,18 +264,15 @@ def test_explicit_path_under_a_protected_root_is_silently_excluded_never_applied
     client = _make_app(tmp_path, config=_config(root))
     _scan_and_wait(client, root)
 
-    response = client.post(
-        "/api/apply",
-        json={
+    body = _apply_and_wait(
+        client,
+        {
             "tier": "both",
             "paths": [protected_file.as_posix()],
             "method": "vault",
             "dry_run": False,
         },
     )
-
-    assert response.status_code == 200
-    body = response.json()
     # The BLOCKED path matched no deterministic candidate AND failed the fresh safety check --
     # it is silently dropped from the batch entirely, not force-applied and not erroring the
     # whole request.
@@ -228,12 +299,8 @@ def test_explicit_path_that_is_already_a_deterministic_candidate_keeps_its_own_c
     _scan_and_wait(client, root)
 
     dev_artifact_path = node_modules_file.parent.parent.as_posix()  # the node_modules dir itself
-    response = client.post(
-        "/api/apply", json={"tier": "both", "paths": [dev_artifact_path], "dry_run": True}
-    )
+    body = _apply_and_wait(client, {"tier": "both", "paths": [dev_artifact_path], "dry_run": True})
 
-    assert response.status_code == 200
-    body = response.json()
     assert body["files_processed"] == 1
     assert body["items"][0]["category_group"] == "dev_artifacts"  # NOT overwritten to
     # "user_selected" -- the deterministic-candidate path is completely unaffected by the new

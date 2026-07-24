@@ -17,7 +17,9 @@ from reclaim.config import (
     LargeLogsConfig,
     SafetyConfig,
 )
+from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
+from reclaim.models import Tier
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner targets Windows/NTFS only")
 
@@ -189,6 +191,46 @@ def test_scan_already_running_returns_409(tmp_path: Path) -> None:
     assert "already running" in response.json()["detail"]
 
 
+def test_apply_already_running_returns_409(tmp_path: Path) -> None:
+    """fix/apply-progress-feedback: `POST /api/apply` became a background-task + single-flight
+    pattern, same guard `ScanStatus`/`AIAnalysisStatus` already have -- mirrors
+    `test_scan_already_running_returns_409` above."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    app_state = client.app.state.reclaim
+    from reclaim.api.state import ApplyStatus
+
+    with app_state.lock:
+        app_state.apply_status = ApplyStatus(status="running", started_at=time.time())
+
+    response = client.post("/api/apply", json={"tier": "A"})
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+def test_restore_already_running_returns_409(tmp_path: Path) -> None:
+    """Same single-flight guard as `test_apply_already_running_returns_409` above, for `POST
+    /api/restore/{batch_id}`. A batch id that fails `validate_restorable_batch`'s synchronous
+    pre-check would return 404 before this guard is ever reached, so this test needs a real,
+    valid batch first."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+    tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
+    report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
+    assert paths["kept_file"].exists()  # sanity: fixture still intact for this test's own use
+
+    app_state = client.app.state.reclaim
+    from reclaim.api.state import RestoreStatus
+
+    with app_state.lock:
+        app_state.restore_status = RestoreStatus(status="running", started_at=time.time())
+
+    response = client.post(f"/api/restore/{report['batch_id']}")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
 def test_restore_nonexistent_batch_returns_404(tmp_path: Path) -> None:
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
     response = client.post("/api/restore/does-not-exist")
@@ -255,6 +297,34 @@ def _scan_and_wait(client: TestClient, root: Path) -> dict[str, object]:
     status = client.get("/api/scan/status").json()
     assert status["status"] == "completed", status
     return status
+
+
+def _apply_and_wait(client: TestClient, payload: dict[str, object]) -> dict[str, object]:
+    """`POST /api/apply` + `GET /api/apply/status` (fix/apply-progress-feedback: `POST /api/apply`
+    became a background-task + polling pattern, same shape as `_scan_and_wait` above) -- returns
+    the `result` (the same `ApplyResponse` shape the POST itself used to return synchronously).
+    Only used for requests expected to be ACCEPTED (202) and actually run; a request refused
+    synchronously (bad tier, safe mode's blanket-selection gate) still asserts its own status
+    code directly against `client.post(...)`, never through this helper."""
+    response = client.post("/api/apply", json=payload)
+    assert response.status_code == 202, response.text
+    status = client.get("/api/apply/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
+
+
+def _restore_and_wait(client: TestClient, batch_id: str) -> dict[str, object]:
+    """Same helper as `_apply_and_wait`, for `POST /api/restore/{batch_id}` + `GET
+    /api/restore/status`. Only used when the restore is expected to be ACCEPTED (202) -- a
+    synchronously-refused restore (unknown batch id, recycle_bin-only batch) still asserts its
+    status code directly against `client.post(...)`."""
+    response = client.post(f"/api/restore/{batch_id}")
+    assert response.status_code == 202, response.text
+    status = client.get("/api/restore/status").json()
+    assert status["status"] == "completed", status
+    assert status["result"] is not None
+    return status["result"]  # type: ignore[no-any-return]
 
 
 # --- Full pipeline: scan -> summary/treemap/candidates -> dry-run apply -> real apply -> restore
@@ -436,8 +506,8 @@ def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recyc
 ) -> None:
     """Proves the one-click apply flow end to end: the group's enumerated `paths` (never a
     blanket tier/category-group selection) sent through the SAME `/api/apply` endpoint and
-    `apply_selection` safe-mode guard every other apply path uses — with `tier="both"` since
-    safe mode forces every candidate's tier to B (ADR-0023 guarantee 3)."""
+    `resolve_apply_selection` safe-mode guard every other apply path uses — with `tier="both"`
+    since safe mode forces every candidate's tier to B (ADR-0023 guarantee 3)."""
     root = tmp_path / "tree"
     paths = _build_tree(root)
     client = _make_app_safe_mode(tmp_path, config=_config(root))
@@ -447,12 +517,9 @@ def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recyc
     all_paths = [p for group in summary["groups"] for p in group["paths"]]
     assert paths["node_modules_dir"].as_posix() in all_paths
 
-    response = client.post(
-        "/api/apply",
-        json={"tier": "both", "paths": all_paths, "method": "vault", "dry_run": False},
+    body = _apply_and_wait(
+        client, {"tier": "both", "paths": all_paths, "method": "vault", "dry_run": False}
     )
-    assert response.status_code == 200
-    body = response.json()
     assert body["apply"] is True
     assert body["method"] == "recycle_bin"  # safe mode forces this regardless of the request
     assert body["bytes_freed"] == 5_000
@@ -512,9 +579,7 @@ def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:
     client = _make_app(tmp_path, config=_config(root))
     _scan_and_wait(client, root)
 
-    response = client.post("/api/apply", json={"tier": "A", "category_group": "large_logs"})
-    assert response.status_code == 200
-    body = response.json()
+    body = _apply_and_wait(client, {"tier": "A", "category_group": "large_logs"})
     assert body["apply"] is False
     assert body["files_processed"] == 1
     assert body["items"][0]["path"] == paths["old_log"].as_posix()
@@ -540,9 +605,8 @@ def test_safe_mode_apply_requires_explicit_paths_no_blanket_tier_selection(tmp_p
     # the blanket-selection shape, not a blanket "safe mode can never apply anything" refusal.
     tier_b_paths = [c["path"] for c in client.get("/api/candidates?tier=B").json()["candidates"]]
     assert tier_b_paths, "expected at least one Tier B candidate in this fixture"
-    scoped_response = client.post("/api/apply", json={"tier": "B", "paths": tier_b_paths})
-    assert scoped_response.status_code == 200
-    assert scoped_response.json()["method"] == "recycle_bin"
+    scoped_body = _apply_and_wait(client, {"tier": "B", "paths": tier_b_paths})
+    assert scoped_body["method"] == "recycle_bin"
 
 
 def test_apply_defaults_to_dry_run_when_field_omitted(tmp_path: Path) -> None:
@@ -553,9 +617,7 @@ def test_apply_defaults_to_dry_run_when_field_omitted(tmp_path: Path) -> None:
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    response = client.post("/api/apply", json={"tier": "A", "paths": tier_a_paths})
-    assert response.status_code == 200
-    body = response.json()
+    body = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths})
     assert body["apply"] is False
     assert body["files_succeeded"] == len(tier_a_paths)
     assert paths["node_modules_dir"].exists()  # nothing on disk touched
@@ -570,9 +632,8 @@ def test_apply_defaults_to_dry_run_when_field_explicitly_true(tmp_path: Path) ->
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    response = client.post("/api/apply", json={"tier": "A", "paths": tier_a_paths, "dry_run": True})
-    assert response.status_code == 200
-    assert response.json()["apply"] is False
+    body = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": True})
+    assert body["apply"] is False
     assert paths["node_modules_dir"].exists()
     assert paths["old_log"].exists()
 
@@ -588,11 +649,7 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     original_log_bytes = paths["old_log"].read_bytes()
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
 
-    apply_response = client.post(
-        "/api/apply", json={"tier": "A", "paths": tier_a_paths, "dry_run": False}
-    )
-    assert apply_response.status_code == 200
-    report = apply_response.json()
+    report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
     assert report["apply"] is True
     assert report["files_succeeded"] == len(tier_a_paths)
     assert report["files_failed"] == 0
@@ -608,18 +665,146 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     assert batch["can_restore"] is True
     assert batch["restore_blocked_reason"] is None
 
-    restore_response = client.post(f"/api/restore/{report['batch_id']}")
-    assert restore_response.status_code == 200
-    restore_body = restore_response.json()
+    restore_body = _restore_and_wait(client, report["batch_id"])
     assert restore_body["files_succeeded"] == len(tier_a_paths)
     assert paths["node_modules_dir"].exists()
     assert paths["old_log"].exists()
     assert paths["old_log"].read_bytes() == original_log_bytes  # byte-identical, ground truth
 
     # Idempotent: restoring the same batch again reports already_restored, not an error.
-    second_restore = client.post(f"/api/restore/{report['batch_id']}")
-    assert second_restore.status_code == 200
-    assert all(item["already_restored"] for item in second_restore.json()["items"])
+    second_restore = _restore_and_wait(client, report["batch_id"])
+    assert all(item["already_restored"] for item in second_restore["items"])
+
+
+def test_restore_status_items_total_reflects_only_restorable_entries_in_mixed_batch(
+    tmp_path: Path,
+) -> None:
+    """A verifier pass on fix/apply-progress-feedback found `RestoreStatus.items_total` was set
+    to the vault-entry count at the START of a restore (correct -- `restore_batch`'s per-item
+    progress loop only ever iterates vault entries, never the pre-classified `direct_delete`/
+    `recycle_bin` ones), but silently overwritten with `report.files_processed` (the WHOLE
+    batch, every method) at completion -- a real contract break for any mixed-method batch,
+    exactly the shape a real batch takes in production (see executor.py's own ADR-0004 comment:
+    "23,565 direct_delete entries alongside 7 vault ones", one `batch_id`). This constructs that
+    exact shape directly against the manifest (bypassing a real apply, which is simpler here)
+    and confirms `items_total` stays at the vault-only count end to end, never jumping to the
+    full batch size on completion."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    batch_id = "batch_mixed_methods"
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+
+    vault_entries = []
+    for i in range(2):
+        vault_path = vault_dir / batch_id / f"vault_item_{i}.bin"
+        vault_path.parent.mkdir(parents=True, exist_ok=True)
+        vault_path.write_bytes(f"vault-payload-{i}".encode())
+        vault_entries.append(
+            QuarantineManifestEntry(
+                batch_id=batch_id,
+                original_path=tmp_path / f"restored_target_{i}.bin",
+                size_bytes=len(f"vault-payload-{i}".encode()),
+                is_dir=False,
+                category="test_category",
+                category_group="test_group",
+                rationale="test",
+                rebuild_instruction=None,
+                tier=Tier.A,
+                method="vault",
+                vault_path=vault_path,
+                retention_days=30,
+                quarantined_at=_NOW,
+                retention_until=_NOW + 29 * 86400,
+            )
+        )
+    direct_delete_entries = [
+        QuarantineManifestEntry(
+            batch_id=batch_id,
+            original_path=tmp_path / f"gone_{i}.bin",
+            size_bytes=10,
+            is_dir=False,
+            category="test_category",
+            category_group="test_group",
+            rationale="test",
+            rebuild_instruction=None,
+            tier=Tier.A,
+            method="direct_delete",
+            vault_path=None,
+            retention_days=None,
+            quarantined_at=_NOW,
+            retention_until=None,
+        )
+        for i in range(3)
+    ]
+    append_manifest_entries(manifest_path, [*vault_entries, *direct_delete_entries])
+
+    response = client.post(f"/api/restore/{batch_id}")
+    assert response.status_code == 202, response.text
+    status = client.get("/api/restore/status").json()
+    assert status["status"] == "completed", status
+    assert status["items_total"] == 2  # vault-restorable entries only, not the 5-item batch
+    assert status["items_processed"] == 2
+    assert status["result"]["files_succeeded"] == 2
+    assert status["result"]["files_unsupported"] == 3
+
+
+def test_run_apply_completes_and_leaves_a_durable_manifest_with_zero_status_polls(
+    tmp_path: Path,
+) -> None:
+    """A browser disconnect mid-poll (closed tab, lost network, whatever) must never orphan a
+    running apply or leave the manifest unrecoverable -- proven here by never polling
+    `GET /api/apply/status` AT ALL while the background task runs, which is the literal worst
+    case ("nobody is watching this task, ever, for its whole lifetime"). `service.run_apply` is
+    Starlette's actual background-task body (scheduled via `BackgroundTasks.add_task`, which
+    Starlette itself decouples from the request/response and any client connection -- this test
+    doesn't re-prove Starlette's own framework guarantee, it proves THIS app's specific use of it
+    doesn't accidentally depend on a poller ever running, e.g. by only flushing/finalizing state
+    from inside a code path a status-check happens to trigger). Runs `run_apply` in a real
+    `threading.Thread` (matching how Starlette's own worker-thread-pool dispatch behaves) with
+    no polling until after the thread has fully finished, then confirms both the in-memory
+    status AND the on-disk manifest are correct -- the manifest write happens inside
+    `apply_batch` itself regardless of whether anyone ever reads `apply_status`."""
+    import threading
+
+    from reclaim.api import service
+    from reclaim.executor import read_manifest_entries
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    photo = root / "vacation.jpg"
+    photo.write_bytes(b"not a real jpeg, just fixture bytes")
+
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    from reclaim.api.schemas import ApplyRequest
+
+    selected, method, apply = service.resolve_apply_selection(
+        state,
+        ApplyRequest(tier="both", paths=[photo.as_posix()], method="vault", dry_run=False),
+    )
+    assert selected, "fixture setup bug: expected the explicit path to resolve to one candidate"
+
+    thread = threading.Thread(
+        target=service.run_apply, args=(state, selected, method, apply, time.time())
+    )
+    thread.start()
+    # Deliberately NO client.get("/api/apply/status") call anywhere in this window -- the point
+    # is that nothing about task completion or manifest durability depends on one ever happening.
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "run_apply did not finish within 30s"
+
+    assert not photo.exists()  # the real move genuinely happened, unattended
+    assert state.apply_status.status == "completed"
+    assert state.apply_status.error is None
+
+    entries = read_manifest_entries(state.manifest_path)
+    done_entries = [e for e in entries if e.phase == "done" and e.original_path == photo]
+    assert len(done_entries) == 1, (
+        f"expected exactly one durable phase='done' manifest entry for {photo}, found "
+        f"{[e.phase for e in entries if e.original_path == photo]}"
+    )
 
 
 def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
@@ -635,12 +820,10 @@ def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
     _scan_and_wait(client, root)
 
     tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
-    apply_response = client.post(
-        "/api/apply",
-        json={"tier": "A", "paths": tier_a_paths, "method": "recycle_bin", "dry_run": False},
+    apply_body = _apply_and_wait(
+        client, {"tier": "A", "paths": tier_a_paths, "method": "recycle_bin", "dry_run": False}
     )
-    assert apply_response.status_code == 200
-    batch_id = apply_response.json()["batch_id"]
+    batch_id = apply_body["batch_id"]
 
     quarantine = client.get("/api/quarantine").json()
     batch = next(b for b in quarantine["batches"] if b["batch_id"] == batch_id)
