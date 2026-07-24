@@ -88,6 +88,32 @@ Verified explicitly with hand-written pre-this-change JSON/TOML fixtures in
   before this ADR (`phase`, `intent_id`, `operation` from ADR-0026) unchanged; this ADR is purely
   additive on top.
 
+### A real regression this ADR caused, and its fix
+
+A first version of `Config`'s `_check_unknown_config_keys` (originally `_warn_on_unknown_config_keys`)
+tolerated **every** unrecognized top-level/category/category-field key unconditionally, warning
+but never raising — this broke `evals/test_ai_safety_gate.py`'s adversarial requirement that a
+hand-edited `config.toml` must never be able to smuggle an `ai_`-named category or field into the
+deterministic candidate pipeline; two of that suite's tests (`test_malicious_config_cannot_inject_an_ai_category_section`,
+`test_malicious_config_cannot_add_an_ai_tier_field_to_an_existing_category`) started silently
+passing malicious input instead of rejecting it, caught by CI's `safety-gate` job on the
+retargeted PR, not by `pytest tests/ -q` (the `evals/` suite runs as a separate CI job and was not
+re-run against this branch specifically before that point — a real gap in this branch's own
+pre-push verification, not just an unlucky miss).
+
+**Fix**: forward-compat tolerance is now gated on the file's own `schema_version` genuinely being
+**greater than** `CONFIG_SCHEMA_VERSION` — a real, checkable claim that the file came from a
+newer release. Absent that claim (no `schema_version` key, or one equal to/less than current), an
+unrecognized key raises `UnknownConfigKeyError` — the exact same hard-reject `extra="forbid"`
+gave before this ADR. Forward compat was never meant to mean "any unrecognized key, ever, no
+matter what" — only "a key this exact kind of file can honestly claim wasn't invented by this
+version's own maliciously/accidentally malformed input." Two of this ADR's own test cases
+(`test_forward_compat_unknown_top_level_key_does_not_raise`,
+`test_forward_compat_unknown_category_level_key_does_not_raise`) had used `schema_version = 1`
+(current, not newer) to demonstrate tolerance — updated to use a genuinely newer version (`2`),
+since `schema_version = 1` alongside an unrecognized key is exactly the ambiguous case that must
+now raise, not the forward-compat case it was meant to demonstrate.
+
 ## Alternatives considered
 
 1. **`extra="ignore"` uniformly across all three models, accepting the round-trip data loss for

@@ -25,9 +25,13 @@ CONFIG_SCHEMA_VERSION = 1
 # `model_copy` calls layer `mode`/`categories` overrides on top), but the app never writes a
 # `Config`/category config back to config.toml, so there is no read-modify-write cycle for an
 # unrecognized key to be lost from the way there is for `executor.QuarantineManifestEntry`.
-# `load_config` additionally warns (never raises) about any top-level/category key it doesn't
-# recognize — see `_warn_on_unknown_config_keys` — so a genuine typo or newer-release key is
-# still visible in logs rather than silently absorbed.
+# An unrecognized top-level/category/category-field key is tolerated (logged, not raised) ONLY
+# when config.toml's own `schema_version` genuinely claims to be newer than
+# `CONFIG_SCHEMA_VERSION` — see `_check_unknown_config_keys`. Without that claim, an unrecognized
+# key still raises `UnknownConfigKeyError`, same as `extra="forbid"` did before this ADR — a
+# security requirement `evals/test_ai_safety_gate.py` depends on (a hand-edited config.toml must
+# never be able to smuggle an AI-related category/field into the deterministic pipeline just
+# because it's unrecognized), not merely a stylistic preference.
 
 # Absolute defaults for production; SafetyValidator tests substitute a fixture-relative
 # list so real C:\Windows etc. are never touched during development (spec: never scan or
@@ -347,37 +351,79 @@ class Config(BaseSettings):
     schema_version: int = Field(default=CONFIG_SCHEMA_VERSION)
 
 
-def _warn_on_unknown_config_keys(data: dict[str, Any]) -> None:
-    """Logs (never raises) about config.toml keys this version of the code does not recognize —
-    a newer release's config field, or a plain user typo. `extra="ignore"` on `Config`/
-    `CategoriesConfig`/every category config already guarantees these never crash `load_config`;
-    this adds the actionable signal a silent `extra="forbid"` crash used to provide, without
-    reintroducing the crash itself."""
+class UnknownConfigKeyError(ValueError):
+    """Raised by `_check_unknown_config_keys` when `config.toml` has a key this version of the
+    code doesn't recognize AND the file doesn't declare itself as coming from a newer schema
+    version -- see that function's docstring for why this is a hard reject, not a warning, in
+    that specific case."""
+
+
+def _check_unknown_config_keys(data: dict[str, Any], *, allow_unknown: bool) -> None:
+    """Scans `config.toml`'s raw top-level/category/category-field keys against what this
+    version of the code recognizes.
+
+    `allow_unknown=True` (the file's own declared `schema_version` is genuinely higher than
+    `CONFIG_SCHEMA_VERSION` -- see `load_config`): logs and continues. ADR-0027's forward-compat
+    goal only ever covers *this exact scenario* -- a real newer release of this same project
+    adding a field, where the reader can tell from the version number that's what happened.
+
+    `allow_unknown=False` (no such claim): RAISES `UnknownConfigKeyError` instead of merely
+    logging. This is deliberately the same hard-reject `extra="forbid"` gave before ADR-0027 --
+    `evals/test_ai_safety_gate.py`'s adversarial tests require exactly this (a hand-edited
+    config.toml trying to smuggle in an `ai_`-named category or field must be rejected outright,
+    never silently absorbed with only a log line no one is guaranteed to read) and a first
+    version of this ADR broke that security boundary by tolerating ALL unknown keys
+    unconditionally, version claim or not -- fixed here by scoping the tolerance to only the
+    case it was actually meant for."""
     unknown_top = sorted(set(data) - set(Config.model_fields))
-    if unknown_top:
-        logger.warning("config.unknown_keys_ignored", scope="top_level", keys=unknown_top)
-
     categories_raw = data.get("categories")
-    if not isinstance(categories_raw, dict):
-        return
-    unknown_categories = sorted(set(categories_raw) - set(CategoriesConfig.model_fields))
-    if unknown_categories:
-        logger.warning("config.unknown_keys_ignored", scope="categories", keys=unknown_categories)
+    unknown_categories = (
+        sorted(set(categories_raw) - set(CategoriesConfig.model_fields))
+        if isinstance(categories_raw, dict)
+        else []
+    )
+    unknown_fields_by_category: dict[str, list[str]] = {}
+    if isinstance(categories_raw, dict):
+        for category_name, category_data in categories_raw.items():
+            field = CategoriesConfig.model_fields.get(category_name)
+            if field is None or not isinstance(category_data, dict):
+                continue
+            category_model = field.annotation
+            if not (isinstance(category_model, type) and issubclass(category_model, BaseModel)):
+                continue
+            unknown_fields = sorted(set(category_data) - set(category_model.model_fields))
+            if unknown_fields:
+                unknown_fields_by_category[category_name] = unknown_fields
 
-    for category_name, category_data in categories_raw.items():
-        field = CategoriesConfig.model_fields.get(category_name)
-        if field is None or not isinstance(category_data, dict):
-            continue
-        category_model = field.annotation
-        if not (isinstance(category_model, type) and issubclass(category_model, BaseModel)):
-            continue
-        unknown_fields = sorted(set(category_data) - set(category_model.model_fields))
-        if unknown_fields:
+    if not (unknown_top or unknown_categories or unknown_fields_by_category):
+        return
+
+    if allow_unknown:
+        if unknown_top:
+            logger.warning("config.unknown_keys_ignored", scope="top_level", keys=unknown_top)
+        if unknown_categories:
+            logger.warning(
+                "config.unknown_keys_ignored", scope="categories", keys=unknown_categories
+            )
+        for category_name, unknown_fields in unknown_fields_by_category.items():
             logger.warning(
                 "config.unknown_keys_ignored",
                 scope=f"categories.{category_name}",
                 keys=unknown_fields,
             )
+        return
+
+    all_unknown = [
+        *unknown_top,
+        *unknown_categories,
+        *(field for fields in unknown_fields_by_category.values() for field in fields),
+    ]
+    raise UnknownConfigKeyError(
+        f"config.toml has unrecognized key(s) {all_unknown} and does not declare a "
+        f"schema_version newer than {CONFIG_SCHEMA_VERSION} -- refusing to load rather than "
+        "silently ignore an unrecognized key with no forward-compat justification for it "
+        "(extra='ignore' only ever applies once a genuinely newer schema_version is declared)."
+    )
 
 
 def apply_safe_mode_category_overrides(categories: CategoriesConfig) -> CategoriesConfig:
@@ -407,15 +453,22 @@ def load_config(path: Path | None) -> Config:
     unchanged. Real end-user entry points (the CLI, the dashboard) must call
     `load_effective_config` instead — see its docstring for why the two are kept separate.
 
-    ADR-0027: never raises over an unrecognized top-level/category key (see `Config`'s
-    `extra="ignore"`) or a `schema_version` newer than `CONFIG_SCHEMA_VERSION` — both are logged
-    instead of crashing `load_config`/`load_effective_config`.
+    ADR-0027: an unrecognized top-level/category/category-field key only ever gets tolerated
+    (logged, not raised) when config.toml's own `schema_version` genuinely claims to be newer
+    than `CONFIG_SCHEMA_VERSION` — a real signal this came from a newer release of this project,
+    not a typo or an adversarial hand-edit. Absent that claim, an unrecognized key raises
+    `UnknownConfigKeyError` — the same hard-reject `extra="forbid"` gave before ADR-0027, and a
+    requirement `evals/test_ai_safety_gate.py` depends on (see `_check_unknown_config_keys`).
     """
     if path is None or not path.exists():
         return Config()
     with path.open("rb") as fh:
         data = tomllib.load(fh)
-    _warn_on_unknown_config_keys(data)
+    declared_schema_version = data.get("schema_version", CONFIG_SCHEMA_VERSION)
+    claims_newer_schema = (
+        isinstance(declared_schema_version, int) and declared_schema_version > CONFIG_SCHEMA_VERSION
+    )
+    _check_unknown_config_keys(data, allow_unknown=claims_newer_schema)
     config = Config.model_validate(data)
     if config.schema_version > CONFIG_SCHEMA_VERSION:
         logger.warning(

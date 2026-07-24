@@ -110,10 +110,16 @@ enabled = true
 
 
 def test_forward_compat_unknown_top_level_key_does_not_raise(tmp_path: Path) -> None:
+    """Tolerance for an unrecognized key is gated on the file HONESTLY claiming to be from a
+    newer release (`schema_version` genuinely > `CONFIG_SCHEMA_VERSION`) -- `schema_version = 1`
+    (the CURRENT version) alongside an unrecognized key is exactly the ambiguous case
+    `test_unknown_top_level_key_with_no_newer_schema_version_claim_raises` below proves gets
+    rejected instead, so this test uses a real future version (2) to demonstrate genuine
+    forward compat, not the security-boundary case."""
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
-schema_version = 1
+schema_version = 2
 a_future_top_level_key = "something new"
 """,
         encoding="utf-8",
@@ -121,13 +127,15 @@ a_future_top_level_key = "something new"
 
     config = load_config(config_path)
 
-    assert config.schema_version == 1
+    assert config.schema_version == 2
 
 
 def test_forward_compat_unknown_category_level_key_does_not_raise(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
+schema_version = 2
+
 [categories]
 a_future_category = { enabled = true }
 
@@ -141,6 +149,49 @@ a_future_field = "unseen by this code"
     config = load_config(config_path)
 
     assert config.categories.dev_artifacts.enabled is True
+
+
+# --- Security boundary: an unrecognized key with NO newer-schema-version claim is rejected -----
+#
+# This is the case a first version of ADR-0027 got wrong: tolerating EVERY unrecognized key
+# unconditionally (regardless of whether the file claimed to be from a newer release) broke
+# evals/test_ai_safety_gate.py's adversarial requirement that a hand-edited config.toml must
+# never be able to smuggle an `ai_`-named category or field into the deterministic pipeline just
+# by being unrecognized. Forward compat is scoped to ONLY the case it's actually meant for.
+
+
+def test_unknown_top_level_key_with_no_newer_schema_version_claim_raises(tmp_path: Path) -> None:
+    from reclaim.config import UnknownConfigKeyError
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('a_typo_or_attack_key = "x"\n', encoding="utf-8")
+
+    with pytest.raises(UnknownConfigKeyError, match="a_typo_or_attack_key"):
+        load_config(config_path)
+
+
+def test_unknown_category_field_with_schema_version_equal_to_current_raises(
+    tmp_path: Path,
+) -> None:
+    """The exact ambiguous case: `schema_version` present but equal to (not greater than)
+    `CONFIG_SCHEMA_VERSION` -- not a real forward-compat claim, so an unrecognized field still
+    raises, same as if `schema_version` were absent entirely."""
+    from reclaim.config import UnknownConfigKeyError
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+schema_version = 1
+
+[categories.dev_artifacts]
+enabled = true
+ai_source = "near_identical_image"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnknownConfigKeyError, match="ai_source"):
+        load_config(config_path)
 
 
 def test_forward_compat_newer_schema_version_does_not_raise(tmp_path: Path) -> None:
@@ -204,6 +255,9 @@ def test_load_config_logs_warning_on_newer_schema_version(
 def test_load_config_logs_warning_on_unknown_top_level_and_category_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Only reached in the tolerate-branch (a genuine newer-schema-version claim) -- see
+    `test_unknown_top_level_key_with_no_newer_schema_version_claim_raises` for the other branch,
+    where an unrecognized key raises instead of logging."""
     import reclaim.config as config_module
 
     fake_logger = _RecordingLogger()
@@ -212,6 +266,7 @@ def test_load_config_logs_warning_on_unknown_top_level_and_category_keys(
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
+schema_version = 2
 a_future_top_level_key = "x"
 
 [categories.dev_artifacts]
@@ -223,7 +278,15 @@ a_future_field = "y"
 
     load_config(config_path)
 
-    scopes = {kwargs["scope"]: kwargs["keys"] for _, kwargs in fake_logger.warnings}
+    # schema_version=2 (> CONFIG_SCHEMA_VERSION) also logs its own
+    # "config.newer_schema_version_detected" warning (no "scope" key) -- filter to just the
+    # unknown-keys ones this test cares about.
+    key_warnings = [
+        (event, kwargs)
+        for event, kwargs in fake_logger.warnings
+        if event == "config.unknown_keys_ignored"
+    ]
+    scopes = {kwargs["scope"]: kwargs["keys"] for _, kwargs in key_warnings}
     assert scopes["top_level"] == ["a_future_top_level_key"]
     assert scopes["categories.dev_artifacts"] == ["a_future_field"]
 
