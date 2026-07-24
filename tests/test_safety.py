@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import ctypes
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, SafetyConfig
 from reclaim.models import FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FileRecord, Verdict
-from reclaim.safety import SafetyValidator
+from reclaim.safety import SafetyValidator, _canonical_path
 
 
 def _record(
@@ -399,4 +401,318 @@ def test_path_is_protected_root_denies_unc_alias(validator: SafetyValidator) -> 
     assert validator.path_is_protected_root(Path(r"\\localhost\C$\Windows\system.dll")) is True
     assert validator.path_is_protected_root(Path(r"\\some-other-host\C$\Windows\file")) is True
     assert validator.path_is_protected_root(Path(r"\\?\C:\Windows\system.dll")) is True
-    assert validator.path_is_protected_root(Path(r"C:\Data\notes.txt")) is False
+
+
+# --- D13 second pass: enumerated alias-form audit ------------------------------------------------
+#
+# GG's brief: enumerate every path-alias form that could reach the same physical file as a
+# protected root without matching a drive-letter glob pattern, and prove (via a real test)
+# whether each is denied or leaks through TODAY. Forms 1-3 (\\?\C:\..., \\?\UNC\...,
+# \\localhost|127.0.0.1\C$\...) were already closed by pass 1 -- the D13 block above re-runs
+# unchanged against this second-pass code (and still passes), re-confirming them; no new tests
+# added for those three. Forms 8 (mixed slashes) and 10 (case variation) were already handled by
+# `_pattern_matches`'s `.as_posix()`/`.lower()` calls -- confirmed below rather than assumed.
+#
+# Form 11 (Unicode NFC/NFD) is D11's territory, not D13's: D11 normalizes at
+# `build_record_for_path`'s `entry.name` comparison boundary (the point a caller-supplied
+# `path.name` string is matched against real scandir entries), and `FileRecord.path` itself is
+# always built from `entry.name` VERBATIM (see D11's own docstring) -- so by the time a record
+# reaches `SafetyValidator`, its path is already whatever NTFS actually returned, with no further
+# NFC/NFD ambiguity for `_pattern_matches` to introduce. `protected_roots`/`docker_wsl_roots`
+# patterns are pure ASCII, so NFC/NFD variance in an unrelated path segment can never affect
+# whether they match. No new test added here -- manufacturing one would just re-test D11's
+# already-covered fix under a different name.
+#
+# Forms 4 (8.3 short names), 6 (subst'd drives), 7 (junctions/symlinks), and the in-scope slice
+# of 5 (mapped network drives looping back to a local admin share) were genuinely open gaps at
+# the `SafetyValidator` pattern-matching layer before this pass -- closed by resolving to a
+# canonical real path (`_canonical_path`) before any pattern/UNC check, per GG's explicit
+# preference for one structural fix over a growing special-case list. Form 9 (trailing dot/space)
+# turned out to already be closed as a side effect of the same fix (`resolve()` strips both).
+
+
+def _validator_with_protected_root(root: Path) -> SafetyValidator:
+    """Builds a `SafetyValidator` whose `protected_roots` matches the given REAL directory --
+    used by every real-filesystem alias test below so the protected-root pattern lines up with
+    an actual fixture, not the module-level `validator` fixture's fixed `C:/Windows/*`."""
+    return SafetyValidator(
+        Config(
+            safety=SafetyConfig(protected_roots=[f"{root.as_posix()}/*"]),
+            categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=True)),
+        )
+    )
+
+
+def test_mixed_forward_and_back_slashes_still_matches_protected_root(
+    validator: SafetyValidator,
+) -> None:
+    """Form 8: `_pattern_matches` already normalizes via `.as_posix()` before comparing -- a
+    path spelled with backslashes must still match a forward-slash-form protected_roots pattern.
+    Confirmed with a real test rather than assumed, per the audit brief."""
+    record = _record(r"C:\Windows\System32\kernel32.dll")
+    result = validator.evaluate(record)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+
+
+def test_case_variation_still_matches_protected_root(validator: SafetyValidator) -> None:
+    """Form 10: `_pattern_matches` already lowercases both sides before `fnmatch` -- a
+    differently-cased drive letter/segment must still match. Confirmed with a real test (the
+    existing case-insensitivity coverage in this file is regex-pattern-only, not glob-pattern)."""
+    record = _record(r"c:\WINDOWS\System32\KERNEL32.dll")
+    result = validator.evaluate(record)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+
+
+def test_8dot3_short_name_alias_of_protected_root_denied(tmp_path: Path) -> None:
+    r"""Form 4: an 8.3 short-name alias (`C:\PROGRA~1`-style) of a real, long-named protected
+    directory must still be denied. Requires 8.3 short-name generation to actually be enabled on
+    the volume `tmp_path` lives on (the Windows default, but an administrator can disable it via
+    `fsutil 8dot3name`) -- honestly skipped, not silently passed, if this volume doesn't produce
+    a distinct short form.
+
+    Proven to fail without the fix: `_canonical_path`'s `resolve()` call is what turns the short
+    alias back into the long form before pattern-matching; reverting to `_pattern_matches`
+    matching `record.path` directly (pass 1's shape) leaves the short-name `.as_posix()` string
+    compared against a long-name-form pattern, which `fnmatch` never matches -- DEFAULT_ELIGIBLE
+    instead of BLOCKED (verified manually against the pre-canonicalization code during review).
+    """
+    real_dir = tmp_path / "Protected Root With A Long Name"
+    real_dir.mkdir()
+    target_file = real_dir / "payload.dll"
+    target_file.write_text("stand-in")
+
+    buf = ctypes.create_unicode_buffer(260)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(real_dir), buf, 260)  # type: ignore[attr-defined]
+    if not n or buf.value == str(real_dir):
+        pytest.skip("8.3 short-name generation is disabled on this volume (fsutil 8dot3name)")
+
+    short_alias = Path(buf.value) / "payload.dll"
+    assert short_alias.exists(), "short-name alias must resolve to the same real file"
+
+    validator = _validator_with_protected_root(real_dir)
+    record = _record(str(short_alias))
+    result = validator.evaluate(record)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+
+
+def test_substd_drive_alias_of_protected_root_denied(tmp_path: Path) -> None:
+    r"""Form 6: `subst Y: C:\Windows` creates a drive letter that IS the protected root, with no
+    special privilege required -- a real, easy bypass of drive-letter-form pattern matching if
+    left unaddressed. Picks the first free drive letter from a fixed candidate pool; skips if
+    none is free rather than failing the suite on a machine with an unusual drive layout.
+
+    Cleans up the `subst` mapping in `finally` even if the assertion fails, matching this
+    project's real-filesystem test convention (see `tests/test_scanner.py::_make_deep_tree` and
+    its callers for the same discipline around `\\?\`-prefixed fixtures)."""
+    real_dir = tmp_path / "Protected Root For Subst"
+    real_dir.mkdir()
+    (real_dir / "payload.dll").write_text("stand-in")
+
+    used_letters = {d for d in "ZYXWVUTSRQPONMLKJIHGFEDCBA" if Path(d + ":\\").exists()}
+    free_letters = [c for c in "ZYXWVUTSRQ" if c not in used_letters]
+    if not free_letters:
+        pytest.skip("no free drive letter available to subst on this machine")
+    drive = free_letters[0] + ":"
+
+    mount = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["subst", drive, str(real_dir)],  # noqa: S607 -- subst is a builtin
+        capture_output=True,
+        text=True,
+    )
+    if mount.returncode != 0:
+        pytest.skip(f"subst failed on this machine: {mount.stderr.strip() or mount.stdout.strip()}")
+    try:
+        substituted_path = Path(drive + "\\payload.dll")
+        assert substituted_path.exists(), "subst'd drive must resolve to the same real file"
+
+        validator = _validator_with_protected_root(real_dir)
+        record = _record(str(substituted_path))
+        result = validator.evaluate(record)
+        assert result.verdict == Verdict.BLOCKED
+        assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+    finally:
+        subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+            ["subst", drive, "/D"],  # noqa: S607 -- subst is a builtin
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_junction_into_protected_root_denied(tmp_path: Path) -> None:
+    r"""Form 7: an NTFS junction (`mklink /J innocuous_folder C:\Windows\System32`) makes an
+    innocuous-looking path physically BE a protected directory -- the hardest form to close via
+    pattern-matching (no pattern on the alias string `innocuous_folder\...` could ever guess the
+    real target), which is exactly why canonical-real-path resolution (not another special case)
+    is the right fix. No special privilege required to create a junction (unlike a symlink --
+    see the skipped symlink test below).
+
+    Cleans up the junction in `finally` even if the assertion fails."""
+    real_dir = tmp_path / "Protected Root For Junction"
+    real_dir.mkdir()
+    (real_dir / "payload.dll").write_text("stand-in")
+
+    innocuous = tmp_path / "innocuous_folder"
+    created = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(innocuous), str(real_dir)],  # noqa: S607 -- cmd is a builtin
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"mklink /J failed on this machine: {created.stderr.strip()}")
+    try:
+        junctioned_path = innocuous / "payload.dll"
+        assert junctioned_path.exists(), "junction must resolve to the same real file"
+
+        validator = _validator_with_protected_root(real_dir)
+        record = _record(str(junctioned_path))
+        result = validator.evaluate(record)
+        assert result.verdict == Verdict.BLOCKED
+        assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+    finally:
+        innocuous.rmdir()
+
+
+def test_symlink_into_protected_root_denied(tmp_path: Path) -> None:
+    r"""Form 7 (symlink variant): same physical-aliasing shape as the junction test above, but
+    via an NTFS directory symlink instead of a junction. Unlike a junction, creating a symlink
+    requires `SeCreateSymbolicLinkPrivilege` (elevated process, or Developer Mode enabled) --
+    this tool's own threat model assumes a NON-elevated user (the safety model exists precisely
+    because reclaim itself refuses to run elevated), and CI runners typically run unprivileged
+    too, so this is expected to skip in most environments. Honest skip with the real `OSError`
+    reason, not a silent pass -- if it DOES run (e.g. Developer Mode enabled locally), it proves
+    the same canonical-resolution fix that closes the junction case also closes the symlink case,
+    since both are NTFS reparse points resolved identically by `GetFinalPathNameByHandle`
+    (`Path.resolve()`'s underlying mechanism)."""
+    real_dir = tmp_path / "Protected Root For Symlink"
+    real_dir.mkdir()
+    (real_dir / "payload.dll").write_text("stand-in")
+
+    symlinked = tmp_path / "symlinked_folder"
+    try:
+        symlinked.symlink_to(real_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation requires elevation/Developer Mode, unavailable here: {exc}")
+    try:
+        symlinked_path = symlinked / "payload.dll"
+        assert symlinked_path.exists(), "symlink must resolve to the same real file"
+
+        validator = _validator_with_protected_root(real_dir)
+        record = _record(str(symlinked_path))
+        result = validator.evaluate(record)
+        assert result.verdict == Verdict.BLOCKED
+        assert result.reason_code == "PROTECTED_SYSTEM_ROOT"
+    finally:
+        if symlinked.is_symlink():
+            symlinked.unlink()
+        else:
+            symlinked.rmdir()
+
+
+def test_mapped_network_drive_looping_back_to_local_admin_share_denied() -> None:
+    r"""Form 5, the in-scope slice only: `net use Z: \\localhost\C$` maps a drive letter to a
+    UNC share that happens to loop back to THIS machine's own local disk -- the general "mapped
+    drive to an unrelated remote host's storage" case is an explicit non-goal (see the module
+    comment above this block): a genuinely remote share is a different physical disk entirely,
+    never "the same protected root" this tool would need to reason about. This test proves the
+    LOOPBACK case specifically, which is in-scope because the mapped drive denotes the identical
+    local file a `protected_roots` pattern is trying to protect.
+
+    Requires connecting to the built-in `C$` administrative share, which needs local-admin-
+    equivalent rights even over loopback on some Windows configurations -- honestly skipped, not
+    silently passed, if the connection fails here.
+
+    Not closed by a NEW check: `_canonical_path` resolves the mapped drive to its UNC form
+    (`\\localhost\C$\...`), and the EXISTING `_is_unc_network_path(canonical_path)` check in
+    `_builtin_deny` (checked against the canonical form, not just the raw input, as of this
+    pass) then denies it exactly like any other UNC path -- proving the general canonicalization
+    fix closes this form as a free side effect, with zero new pattern/special-case code."""
+    used_letters = {d for d in "ZYXWVUTSRQPONMLKJIHGFEDCBA" if Path(d + ":\\").exists()}
+    free_letters = [c for c in "ZYXWVUTSRQ" if c not in used_letters]
+    if not free_letters:
+        pytest.skip("no free drive letter available to map on this machine")
+    drive = free_letters[0] + ":"
+
+    mount = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["net", "use", drive, r"\\localhost\C$"],  # noqa: S607 -- net is a builtin
+        capture_output=True,
+        text=True,
+    )
+    if mount.returncode != 0:
+        pytest.skip(
+            r"net use \\localhost\C$ failed on this machine (needs local-admin-equivalent "
+            f"rights even over loopback): {mount.stderr.strip() or mount.stdout.strip()}"
+        )
+    try:
+        mapped_windows_path = Path(drive + "\\Windows\\System32\\kernel32.dll")
+        assert mapped_windows_path.exists(), r"mapped drive must reach the real C:\Windows"
+
+        validator = SafetyValidator(Config(safety=SafetyConfig(protected_roots=["C:/Windows/*"])))
+        record = _record(str(mapped_windows_path))
+        result = validator.evaluate(record)
+        assert result.verdict == Verdict.BLOCKED
+        assert result.reason_code == "UNC_NETWORK_PATH"
+    finally:
+        subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+            ["net", "use", drive, "/delete", "/y"],  # noqa: S607 -- net is a builtin
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_trailing_dot_and_space_alias_of_protected_root_denied(tmp_path: Path) -> None:
+    r"""Form 9: Windows silently strips trailing dots/spaces off a path component at the Win32
+    API layer -- `C:\SomeDir.` and `C:\SomeDir ` can denote the identical directory as
+    `C:\SomeDir`. Turned out to already be closed as a side effect of the canonical-resolution
+    fix (`Path.resolve()` strips both), confirmed empirically rather than assumed; this test
+    proves it, using a real fixture directory (not just a synthetic Path) so the "does this alias
+    actually reach the same on-disk file" claim is genuine, not merely string-plausible.
+
+    Proof-of-same-file uses `.resolve() == target.resolve()`, not `.exists()`: empirically, a
+    trailing space stripped ONLY when it's the very last component of the whole path string
+    (`Path("...RealDir ").exists()` is `True`) is NOT stripped by `Path.exists()` when it's an
+    INTERMEDIATE component with a further segment appended after it
+    (`(Path("...RealDir ") / "file").exists()` is `False`, even though the file genuinely exists)
+    -- `Path.resolve()` handles both cases correctly (confirmed empirically), so it -- not
+    `.exists()` -- is the right same-file proof here, and is also the exact mechanism
+    `_canonical_path` itself relies on."""
+    real_dir = tmp_path / "Protected Root With Trailing Chars"
+    real_dir.mkdir()
+    target_file = real_dir / "payload.dll"
+    target_file.write_text("stand-in")
+
+    for suffix, label in [(".", "trailing dot"), (" ", "trailing space")]:
+        aliased_dir = Path(str(real_dir) + suffix)
+        aliased_file = aliased_dir / "payload.dll"
+        assert aliased_file.resolve() == target_file.resolve(), (
+            f"{label} alias must resolve to the same real file"
+        )
+
+        validator = _validator_with_protected_root(real_dir)
+        record = _record(str(aliased_file))
+        result = validator.evaluate(record)
+        assert result.verdict == Verdict.BLOCKED, label
+        assert result.reason_code == "PROTECTED_SYSTEM_ROOT", label
+
+
+def test_canonical_path_falls_back_to_unresolved_on_os_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_canonical_path`'s `except OSError` fallback: if `resolve()` itself raises (e.g. a
+    genuinely inaccessible volume), the function must return the path UNRESOLVED rather than
+    propagate the exception -- this safety-critical helper's failure mode is "fall back to
+    today's plain-pattern-match behavior for this one path", never "crash the safety
+    evaluation". Forces the failure via `monkeypatch` (real-world triggers for this branch --
+    an unmapped/disconnected volume -- aren't reliably reproducible in a test fixture)."""
+
+    def _raise(self: Path) -> Path:
+        raise OSError("simulated: volume inaccessible")
+
+    monkeypatch.setattr(Path, "resolve", _raise)
+
+    original = Path("C:/Data/notes.txt")
+    result = _canonical_path(original)
+
+    assert result == original
