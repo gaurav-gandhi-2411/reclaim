@@ -475,20 +475,29 @@ def test_api_service_now_imports_reclaim_ai_for_read_only_suggestions() -> None:
 
 
 def test_apply_selection_candidates_are_deterministic_or_freshly_safety_validated() -> None:
-    """Runtime half of ADR-0025's narrowed guarantee: `reclaim.api.service.apply_selection`'s
-    only two candidate sources are (1) `_all_candidates` (the deterministic detector/dedup
-    pipeline, unchanged) and (2) `_build_user_selected_candidate`, which independently
-    re-evaluates a fresh `FileRecord` through the real `SafetyValidator` before ever
-    constructing a `Candidate` — never an `AICluster`/`AIClusterMember`. This is proven
-    structurally (source inspection: neither function's CODE references those two types at all
-    — a docstring merely mentioning "reclaim.ai" in prose is fine and not checked here) rather
-    than by running a live server, since the whole point is that this is impossible by
-    construction, not merely unexercised in today's tests."""
+    """Runtime half of ADR-0025's narrowed guarantee. `reclaim.api.service.apply_selection` was
+    split by fix/apply-progress-feedback into `resolve_apply_selection` (the synchronous
+    candidate-selection half, unchanged in substance — still the only place `Candidate`s get
+    built for an apply request) and `run_apply` (the background task that takes the
+    already-resolved list and calls `apply_batch` — never re-derives candidates itself). The
+    guarantee this test protects is the same as before the split: candidates come from either
+    (1) `_all_candidates` (the deterministic detector/dedup pipeline, unchanged) or (2)
+    `_build_user_selected_candidate`, which independently re-evaluates a fresh `FileRecord`
+    through the real `SafetyValidator` before ever constructing a `Candidate` — never an
+    `AICluster`/`AIClusterMember`. Proven structurally (source inspection: none of these three
+    functions' CODE references those two types at all — a docstring merely mentioning
+    "reclaim.ai" in prose is fine and not checked here) rather than by running a live server,
+    since the whole point is that this is impossible by construction, not merely unexercised in
+    today's tests."""
     import inspect
 
     from reclaim.api import service
 
-    for fn in (service.apply_selection, service._build_user_selected_candidate):
+    for fn in (
+        service.resolve_apply_selection,
+        service.run_apply,
+        service._build_user_selected_candidate,
+    ):
         source = inspect.getsource(fn)
         assert "AICluster" not in source
         assert "AIClusterMember" not in source
