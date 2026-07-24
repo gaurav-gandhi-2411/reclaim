@@ -136,6 +136,12 @@ def to_scan_status_out(status: ScanStatus) -> ScanStatusOut:
         files_unchanged=status.files_unchanged,
         files_pruned=status.files_pruned,
         elapsed_seconds=status.elapsed_seconds,
+        skipped_unreadable_count=status.skipped_unreadable_count,
+        skipped_unreadable_paths=(
+            list(status.skipped_unreadable_paths)
+            if status.skipped_unreadable_paths is not None
+            else None
+        ),
     )
 
 
@@ -177,6 +183,8 @@ def run_scan(state: AppState, root: Path, started_at: float) -> None:
             files_unchanged=stats.files_unchanged,
             files_pruned=stats.files_pruned,
             elapsed_seconds=stats.elapsed_seconds,
+            skipped_unreadable_count=stats.skipped_unreadable_count,
+            skipped_unreadable_paths=stats.skipped_unreadable_paths,
         )
         # ADR-0025: a new completed scan invalidates any cached AI analysis -- callers compare
         # this against `AIAnalysisStatus.scan_generation` to detect a stale cache.
@@ -207,6 +215,14 @@ def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
 
 
 def build_summary(state: AppState) -> SummaryResponse:
+    # D12: the most recent COMPLETED scan's skipped/unreadable accounting -- in-memory,
+    # process-session state like `scan_status` itself (read under `state.lock`, same pattern
+    # `build_treemap` uses for `scan_status.root`), never persisted to the index (it isn't a
+    # `FileRecord`, there's nothing on disk to store).
+    with state.lock:
+        skipped_unreadable_count = state.scan_status.skipped_unreadable_count or 0
+        skipped_unreadable_paths = list(state.scan_status.skipped_unreadable_paths or ())
+
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return SummaryResponse(
@@ -218,6 +234,8 @@ def build_summary(state: AppState) -> SummaryResponse:
                 tier_b_bytes=0,
                 tier_b_count=0,
                 categories=[],
+                skipped_unreadable_count=skipped_unreadable_count,
+                skipped_unreadable_paths=skipped_unreadable_paths,
             )
         total_indexed_bytes = physical_size_bytes(index.full_inventory())
         candidates = _all_candidates(index, state)
@@ -233,6 +251,8 @@ def build_summary(state: AppState) -> SummaryResponse:
         tier_b_bytes=sum(c.size_bytes for c in tier_b),
         tier_b_count=len(tier_b),
         categories=_category_cards(candidates),
+        skipped_unreadable_count=skipped_unreadable_count,
+        skipped_unreadable_paths=skipped_unreadable_paths,
     )
 
 

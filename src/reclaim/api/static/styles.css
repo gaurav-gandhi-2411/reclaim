@@ -265,6 +265,11 @@ button {
   font-weight: 600;
 }
 
+.rc-scan-status[data-tone="warning"] {
+  color: var(--rc-warning);
+  font-weight: 600;
+}
+
 /* --- State panels (loading / empty / error) ------------------------------------------------- */
 
 .rc-state-panel {

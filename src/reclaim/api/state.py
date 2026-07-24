@@ -31,6 +31,11 @@ class ScanStatus:
     files_unchanged: int | None = None
     files_pruned: int | None = None
     elapsed_seconds: float | None = None
+    # D12: real accounting of entries the scan could not stat/list (permission error, genuine I/O
+    # fault) -- see `reclaim.scanner.SkippedPath`. `None` until a scan has actually completed,
+    # same convention as every other field above.
+    skipped_unreadable_count: int | None = None
+    skipped_unreadable_paths: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True)
