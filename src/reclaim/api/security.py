@@ -83,9 +83,11 @@ def local_origin_violation(request: Request, policy: LocalOriginPolicy) -> str |
         token = request.headers.get(CSRF_HEADER_NAME)
         if token is None or not secrets.compare_digest(token, _current_csrf_token(request)):
             return (
-                "Missing or invalid CSRF token on a mutating request — every apply/restore/"
-                "scan call must carry the per-session token the dashboard reads from its own "
-                f"page (header {CSRF_HEADER_NAME!r})."
+                "Missing or invalid CSRF token on a mutating request. This also fires whenever "
+                "the page you're using was loaded from a server process that is no longer "
+                "running (e.g. the server restarted since you opened this tab) — the token is "
+                "minted fresh per process, so an old page's token never matches a new one. "
+                "Reload the page and try again."
             )
 
     return None
