@@ -85,82 +85,78 @@ that you haven't restored yet. Choose **No** (the default) if you're at all unsu
 ## Screenshots
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/01-first-run.png" alt="First-run screen explaining safe mode before anything else is usable" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/01-first-run.png" alt="First-run screen explaining Simple mode and safe mode before anything else is usable" width="800" />
 </p>
 
-**First run** — safe mode explained before you can do anything else, including what it
-restricts and a link to the license.
+**First run** — Simple mode and safe mode explained before you can do anything else, including
+what's restricted and a link to the license.
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/02-overview-quickclean.png" alt="Overview tab with Quick Clean showing a plain-language category and real measured size" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/02-simple-idle.png" alt="Simple mode idle screen with a single Clean My Computer button" width="800" />
 </p>
 
-**Overview & Quick Clean** — plain-language groups with the real measured size and *why* each
-one is safe (never an invented confidence score), plus every candidate exactly measured, no
-estimates.
+**Simple mode** — one button. No path typing, no categories to configure, no decisions before
+you've seen anything.
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/04-ai-suggestions.png" alt="AI Suggestions tab showing a document version chain and near-duplicate photos" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/03-simple-scanning.png" alt="Simple mode live progress bar with a plain-language time estimate while scanning every fixed drive" width="800" />
 </p>
 
-**AI Suggestions** — recommend-only, never auto-applied. Document version chains ordered
-newest-to-oldest, near-duplicate photos with a keep recommendation and the reason, all
-per-item opt-in.
+**Live progress, never a silent wait** — an animated progress bar and a plain-language time
+estimate while every fixed drive is scanned.
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/06-ai-semantic-browse-only.png" alt="Semantic photo grouping and screenshot burst detection, both labeled browse only with no delete affordance" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/04-simple-results.png" alt="Simple mode results screen showing plain-language categories with real measured sizes and a Clean now button" width="800" />
 </p>
 
-**Browse-only by construction** — semantic photo groups and screenshot bursts that might hold
-meaningful content get no select/delete affordance at all, not just a warning label.
+**Plain-language results** — real measured sizes and *why* each category is safe (never an
+invented confidence score), scoped to categorically-safe clutter only.
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/09-quickclean-success.png" alt="Quick Clean success message stating files were moved to the Recycle Bin, not freed" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/05-quickclean-success.png" alt="Quick Clean success message stating files were moved to the Recycle Bin, not freed" width="800" />
 </p>
 
-**Moved vs. freed, never conflated** — a real apply reports what actually happened: moved to
+**Moved vs. freed, never conflated** — a real clean reports what actually happened: moved to
 the Recycle Bin, with an explicit reminder that emptying it is a separate, manual step.
 
 <details>
-<summary>More screenshots (Review Queue, technical detail, Storage Treemap, Quarantine & Restore, light theme)</summary>
+<summary>More screenshots (Advanced mode: Overview, Review Queue, AI Suggestions, Storage Treemap, Quarantine & Restore, light theme)</summary>
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/03-review-queue.png" alt="Review Queue showing a real duplicate cluster with keep vs. delete rationale" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/06-overview-advanced.png" alt="Advanced mode Overview tab with Quick Clean and full category breakdown" width="800" />
 </p>
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/05-ai-technical-detail.png" alt="Expanded technical detail showing a labeled cosine similarity score, never a fabricated percentage" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/07-review-queue.png" alt="Review Queue showing individual candidates with keep vs. delete rationale" width="800" />
 </p>
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/07-storage-treemap.png" alt="Storage treemap view" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/08-storage-treemap.png" alt="Storage treemap view" width="800" />
 </p>
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/08-quarantine-restore.png" alt="Quarantine and Restore tab pointing to the Windows Recycle Bin for safe-mode batches" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/09-quarantine-restore.png" alt="Quarantine and Restore tab pointing to the Windows Recycle Bin for safe-mode batches" width="800" />
 </p>
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/10-light-theme.png" alt="Overview tab in light theme" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/10-ai-suggestions.png" alt="AI Suggestions tab explaining that AI features are not included in the installer and are recommend-only when available" width="800" />
 </p>
+
+**AI stays recommend-only, and honest about what's installed** — the packaged installer doesn't
+bundle the optional AI/ML layer, and the dashboard says so plainly instead of showing a broken
+or empty tab. When the AI extra *is* installed (source checkouts only, `uv sync --extra ai`),
+every suggestion still goes through the exact same apply/safety check as everything else in
+Reclaim — recommend-only, never auto-applied.
 
 <p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/11-recovery-banner.png" alt="Crash-recovery banner shown when a quarantine operation was interrupted, explaining it will resolve automatically" width="800" />
+  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/11-light-theme.png" alt="Overview tab in light theme" width="800" />
 </p>
-
-**Crash recovery, visible not hidden (v1.2.0)** — if a real crash interrupts an apply/restore/
-purge, the dashboard says so and tells you exactly what to run, rather than staying silent
-about it.
-
-<p>
-  <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/12-apply-progress.png" alt="Live progress bar during a large apply, showing items processed of total and the current category" width="800" />
-</p>
-
-**Live progress for long operations (v1.2.0)** — a large apply now shows real progress instead
-of going quiet, plus an explicit note that closing the tab or stopping the server mid-operation
-is safe.
 
 </details>
+
+Crash-recovery and live-apply-progress screenshots (introduced in v1.2.0) aren't retaken this
+release — only the color tokens changed underneath them, not the behavior — see the v1.2.0
+screenshots in git history for those two states.
 
 ## Questions, bugs, and privacy
 
