@@ -1003,6 +1003,21 @@ a:active {
   min-height: 1.2em;
 }
 
+.rc-scan-confirm-path {
+  background: var(--rc-surface-alt);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-sm);
+  padding: var(--rc-space-3);
+  margin: var(--rc-space-3) 0;
+}
+
+.rc-scan-confirm-path code {
+  font-family: var(--rc-font-mono);
+  font-size: var(--rc-text-lg);
+  font-weight: 600;
+  word-break: break-all;
+}
+
 .rc-dialog-actions {
   display: flex;
   justify-content: flex-end;

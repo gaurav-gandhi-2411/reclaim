@@ -298,31 +298,61 @@ async function loadQuickRoots() {
   }
 }
 
+// Target-confirmation dialog: an incident during development found a quick-scan shortcut could
+// resolve to a real, unintended path (the OS's actual home directory, not a test/demo path) with
+// no visible pause before the scan started. Every manual-path scan -- typed or a "Downloads"/
+// "Home folder" quick-root shortcut -- now routes through this dialog, which shows the exact
+// resolved path prominently before `startManualScan` ever fires. See PLAN.md for the incident
+// this closes.
+let pendingScanPath = null;
+
+function openScanConfirmDialog(path) {
+  pendingScanPath = path;
+  document.getElementById("scan-confirm-path").textContent = path;
+  document.getElementById("scan-confirm-dialog").hidden = false;
+}
+
+function closeScanConfirmDialog() {
+  document.getElementById("scan-confirm-dialog").hidden = true;
+  pendingScanPath = null;
+}
+
+async function startManualScan(path) {
+  const statusEl = document.getElementById("scan-status");
+  const submitBtn = document.querySelector("#scan-form button[type=submit]");
+  submitBtn.disabled = true;
+  statusEl.dataset.tone = "";
+  statusEl.textContent = "Starting scan…";
+  try {
+    await api("/api/scan", { method: "POST", body: JSON.stringify({ path }) });
+    // refreshScanStatus (not pollScanStatus) — it's the one that arms the repeating
+    // setInterval when it observes "running"; pollScanStatus alone only ever checks once,
+    // so a scan caught mid-flight here would otherwise freeze the UI on "Scanning…" forever.
+    refreshScanStatus();
+  } catch (err) {
+    statusEl.dataset.tone = "error";
+    statusEl.textContent = `Scan failed to start: ${err.message}`;
+    submitBtn.disabled = false;
+  }
+}
+
 function initScanBar() {
   const form = document.getElementById("scan-form");
   loadQuickRoots();
-  form.addEventListener("submit", async (event) => {
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
     const input = document.getElementById("scan-path");
-    const statusEl = document.getElementById("scan-status");
-    const submitBtn = form.querySelector("button[type=submit]");
     const path = input.value.trim();
     if (!path) return;
-
-    submitBtn.disabled = true;
-    statusEl.dataset.tone = "";
-    statusEl.textContent = "Starting scan…";
-    try {
-      await api("/api/scan", { method: "POST", body: JSON.stringify({ path }) });
-      // refreshScanStatus (not pollScanStatus) — it's the one that arms the repeating
-      // setInterval when it observes "running"; pollScanStatus alone only ever checks once,
-      // so a scan caught mid-flight here would otherwise freeze the UI on "Scanning…" forever.
-      refreshScanStatus();
-    } catch (err) {
-      statusEl.dataset.tone = "error";
-      statusEl.textContent = `Scan failed to start: ${err.message}`;
-      submitBtn.disabled = false;
-    }
+    openScanConfirmDialog(path);
+  });
+  document
+    .getElementById("scan-confirm-cancel")
+    .addEventListener("click", closeScanConfirmDialog);
+  document.getElementById("scan-confirm-go").addEventListener("click", () => {
+    const path = pendingScanPath;
+    closeScanConfirmDialog();
+    if (path) startManualScan(path);
   });
   refreshScanStatus();
 }
@@ -1351,6 +1381,8 @@ export {
   renderSimpleGroups,
   renderSimpleEmpty,
   buildQuickCleanGroupCard,
+  openScanConfirmDialog,
+  closeScanConfirmDialog,
 };
 
 function updateApplyBar() {

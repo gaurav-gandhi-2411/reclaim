@@ -286,6 +286,25 @@
     </div>
   </div>
 
+  <!-- Scan target confirmation: an incident during development found a quick-scan shortcut
+       (see app.js's "Home folder"/"Downloads" buttons) could resolve to a real, unintended path
+       with no visible pause before the scan started -- this dialog shows the exact resolved path
+       prominently and requires one explicit confirmation before any scan (manual path entry or a
+       quick-root shortcut) actually starts. Scanning itself only reads file metadata (never
+       modifies or deletes anything), but an unexpected root is still worth catching before a
+       long-running operation begins, not after. -->
+  <div id="scan-confirm-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="scan-confirm-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="scan-confirm-title">Scan this location?</h2>
+      <p>Reclaim will index every file under the path below. Scanning only reads file metadata — nothing is changed or deleted by a scan itself.</p>
+      <p class="rc-scan-confirm-path"><code id="scan-confirm-path"></code></p>
+      <div class="rc-dialog-actions">
+        <button id="scan-confirm-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="scan-confirm-go" type="button" class="rc-btn rc-btn-primary">Scan this path</button>
+      </div>
+    </div>
+  </div>
+
   <!-- "How this works" — plain-language explanation of the safety model, on demand. -->
   <div id="how-it-works-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="how-it-works-title" hidden>
     <div class="rc-overlay-panel">

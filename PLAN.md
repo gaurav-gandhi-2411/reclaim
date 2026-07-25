@@ -1778,6 +1778,43 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   which was also leaking the session UUID into screenshots meant for a public README) and
   re-verified every subsequent screenshot's scan root before capturing.
 
+### 2026-07-25 — Closed the stale-session-scan gap from the incident above
+- GG asked for two hardening items against the incident: (a) the scan API rejects/requires
+  re-confirmation when the requesting page predates the current server start, and (b) the
+  dashboard shows the target path prominently before a scan starts.
+- Investigated (a) before building anything new: `AppState.csrf_token` is already minted fresh
+  once per server process (`security.generate_csrf_token`) and `app.js` reads it once at module
+  load from a `<meta>` tag — so a page held open across a server restart already carries a token
+  that mismatches the new process's token, and `local_origin_violation` already rejects every
+  mutating request (including both scan endpoints) on that mismatch. (a) was already
+  structurally closed; the only real gap was the error text being generic security-framed
+  copy ("Missing or invalid CSRF token") rather than naming the actual cause. Reworded it in
+  `security.py` to explicitly name "the server restarted since you loaded this page" as the
+  most common trigger and tell the user to reload — a one-line change, no new mechanism, since a
+  second token-based staleness check would just duplicate CSRF's exact job.
+- Also worth being honest about: re-reading this session's own tool-call transcript, the actual
+  incident above was NOT a stale-server-restart race at all — the demo server was never
+  restarted between the errant scan starting and me finding it. The real cause was clicking
+  "Home folder" (which resolves server-side to the literal OS home directory, unscoped to any
+  demo/test configuration) with zero confirmation step, then not immediately noticing the scan
+  had started. (a)'s fix wouldn't have caught this specific incident; (b) is what actually would
+  have.
+- Built (b) for real: every manual scan — typed path or a "Downloads"/"Home folder" quick-root
+  click — now routes through a new `#scan-confirm-dialog` (`openScanConfirmDialog`/
+  `closeScanConfirmDialog`/`startManualScan` in `app.js`) that renders the exact resolved path
+  in a large monospace block before `POST /api/scan` ever fires. Verified live in a browser:
+  clicking "Home folder" now shows "C:/Users/gaura" in the confirm dialog with zero scan started
+  (`GET /api/scan/status` still `idle`) until "Scan this path" is clicked; "Cancel" leaves it
+  idle permanently; confirming a real (demo-tree) path does start the scan. Scoped to the
+  Advanced/manual scan form only — SIMPLE mode's "Clean My Computer" always targets "every fixed
+  drive" (not a free-text/ambiguous path) and already discloses that scope in the first-run
+  modal, so it doesn't have the same class of gap.
+- `tests/frontend/scan-confirm.test.mjs` (new): dialog show/hide + the same
+  attacker-controlled-looking-path-renders-as-inert-text regression coverage this codebase holds
+  every render path touching an OS-supplied string to (`textContent`, never `innerHTML`).
+- Closed stale PR #25 (`chore/ws-c-checkpoint`) — its content was superseded by the checkpoint
+  merged in #27.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
