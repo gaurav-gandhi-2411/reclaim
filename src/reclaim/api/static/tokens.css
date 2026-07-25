@@ -3,37 +3,53 @@
  * Every component references these custom properties; nothing outside this file hardcodes a
  * hex/px value that has a token here (house rule 15b).
  *
- * Visual identity: "excavation / clearing space." Reclaim frees disk space the way digging
- * clears earth, so the palette runs warm clay/terracotta (occupied, un-cleared ground) against
- * a reclaimed pine/moss green (space given back) on a warm sand/soil neutral scale — not the
- * default blue-SaaS-dashboard palette. The 9-hue categorical set below (one fixed hue per
- * detector category, in a *fixed* order — never cycled/reassigned) was generated and verified
- * against the dataviz skill's palette validator (OKLCH lightness band, chroma floor, CVD
- * separation, contrast vs. surface) for both light and dark surfaces; see PLAN.md/the Stage 6
- * report for the exact validator invocations and output.
+ * Visual identity v2 (WS-B refresh): "excavation / clearing space," evolved from flat warm
+ * clay/pine/sand toward a richer, more dimensional material language — a burnished copper
+ * "ground" (occupied) revealing a vivid jade "reclaimed" space beneath, on a deeper warm-neutral
+ * scale. Keeps the original metaphor (and stays off the generic blue-SaaS-dashboard palette,
+ * still a deliberate non-goal) while modernizing: less "craft/pottery," more "considered,
+ * jewel-toned system tool." Every text/surface/semantic pairing below is computed against WCAG
+ * AA (4.5:1 text, 3:1 large-text/UI-component), not eyeballed — see the WS-B preview PR for the
+ * full contrast table and the script that produced it. `--rc-border` is deliberately NOT held to
+ * the 3:1 non-text floor (WCAG 1.4.11 exempts purely decorative dividers, and this project's v1
+ * border was already ~1.4:1 — a hairline convention, not a UI-component boundary); nudged
+ * slightly darker than v1's equivalent ratio for a touch more definition, nothing more.
+ *
+ * The 9-hue categorical set below is UNCHANGED from v1 — already OKLCH-validated (lightness
+ * band, chroma floor, CVD separation, contrast vs. surface; see PLAN.md's Stage 6 report) and
+ * reconfirmed against these new backgrounds specifically before keeping them as-is (still ≥3:1
+ * against both new bg colors — no regression from the palette refresh).
  */
 
 :root {
   color-scheme: light;
 
   /* Surfaces */
-  --rc-bg: #faf6f0;
+  --rc-bg: #f6f3ee;
   --rc-surface: #ffffff;
-  --rc-surface-alt: #f2ece2;
-  --rc-border: #ded3c2;
+  --rc-surface-alt: #ece5d8;
+  --rc-border: #cfc0a2;
 
   /* Text */
-  --rc-text: #2a2420;
-  --rc-text-muted: #6b5d52;
+  --rc-text: #211c17;
+  --rc-text-muted: #6b6156;
   --rc-text-on-brand: #ffffff;
 
   /* Brand / semantic */
-  --rc-brand: #2f6b52;
-  --rc-brand-hover: #24543f;
+  --rc-brand: #167048;
+  --rc-brand-hover: #12613a;
   --rc-danger: #b3261e;
   --rc-danger-hover: #8f1e18;
-  --rc-warning: #a6720b;
+  --rc-warning: #8a5c09;
   --rc-focus-ring: #1f6f9e;
+
+  /* Mark colors (mirrors logo.svg/favicon.svg's gradient stops — literal hex there since SVG is
+     loaded outside this cascade; kept here too so any future in-app use of the mark's own
+     palette, e.g. an About-page illustration, draws from the same source of truth). */
+  --rc-mark-ground-light: #c9702f;
+  --rc-mark-ground-dark: #8a3f16;
+  --rc-mark-reclaimed-light: #34b378;
+  --rc-mark-reclaimed-dark: #167048;
 
   /* Fixed categorical palette — order matches `category_group` ids in
      src/reclaim/api/schemas.py::category_label and must never be reordered/reused. */
@@ -80,21 +96,26 @@
   :root {
     color-scheme: dark;
 
-    --rc-bg: #1c1815;
-    --rc-surface: #241f1a;
-    --rc-surface-alt: #2c2620;
-    --rc-border: #3c342c;
+    --rc-bg: #16130f;
+    --rc-surface: #1e1a15;
+    --rc-surface-alt: #262019;
+    --rc-border: #3a3126;
 
     --rc-text: #f2ece2;
-    --rc-text-muted: #b8aa9c;
-    --rc-text-on-brand: #10140f;
+    --rc-text-muted: #b3a696;
+    --rc-text-on-brand: #0d1410;
 
-    --rc-brand: #4fae82;
-    --rc-brand-hover: #6cc79b;
+    --rc-brand: #34b378;
+    --rc-brand-hover: #4fc98d;
     --rc-danger: #e0574c;
     --rc-danger-hover: #ef7a70;
-    --rc-warning: #b87a1f;
-    --rc-focus-ring: #4c90c0;
+    --rc-warning: #dba449;
+    --rc-focus-ring: #5aa3d0;
+
+    --rc-mark-ground-light: #c9702f;
+    --rc-mark-ground-dark: #8a3f16;
+    --rc-mark-reclaimed-light: #34b378;
+    --rc-mark-reclaimed-dark: #167048;
 
     --rc-cat-dev-artifacts: #d76b40;
     --rc-cat-package-caches: #b87a1f;
@@ -115,19 +136,23 @@
    always wins over prefers-color-scheme, and persists via localStorage (see app.js). */
 :root[data-theme="light"] {
   color-scheme: light;
-  --rc-bg: #faf6f0;
+  --rc-bg: #f6f3ee;
   --rc-surface: #ffffff;
-  --rc-surface-alt: #f2ece2;
-  --rc-border: #ded3c2;
-  --rc-text: #2a2420;
-  --rc-text-muted: #6b5d52;
+  --rc-surface-alt: #ece5d8;
+  --rc-border: #cfc0a2;
+  --rc-text: #211c17;
+  --rc-text-muted: #6b6156;
   --rc-text-on-brand: #ffffff;
-  --rc-brand: #2f6b52;
-  --rc-brand-hover: #24543f;
+  --rc-brand: #167048;
+  --rc-brand-hover: #12613a;
   --rc-danger: #b3261e;
   --rc-danger-hover: #8f1e18;
-  --rc-warning: #a6720b;
+  --rc-warning: #8a5c09;
   --rc-focus-ring: #1f6f9e;
+  --rc-mark-ground-light: #c9702f;
+  --rc-mark-ground-dark: #8a3f16;
+  --rc-mark-reclaimed-light: #34b378;
+  --rc-mark-reclaimed-dark: #167048;
   --rc-cat-dev-artifacts: #c1512b;
   --rc-cat-package-caches: #a6720b;
   --rc-cat-temp-browser-caches: #4f7a3a;
@@ -143,19 +168,23 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --rc-bg: #1c1815;
-  --rc-surface: #241f1a;
-  --rc-surface-alt: #2c2620;
-  --rc-border: #3c342c;
+  --rc-bg: #16130f;
+  --rc-surface: #1e1a15;
+  --rc-surface-alt: #262019;
+  --rc-border: #3a3126;
   --rc-text: #f2ece2;
-  --rc-text-muted: #b8aa9c;
-  --rc-text-on-brand: #10140f;
-  --rc-brand: #4fae82;
-  --rc-brand-hover: #6cc79b;
+  --rc-text-muted: #b3a696;
+  --rc-text-on-brand: #0d1410;
+  --rc-brand: #34b378;
+  --rc-brand-hover: #4fc98d;
   --rc-danger: #e0574c;
   --rc-danger-hover: #ef7a70;
-  --rc-warning: #b87a1f;
-  --rc-focus-ring: #4c90c0;
+  --rc-warning: #dba449;
+  --rc-focus-ring: #5aa3d0;
+  --rc-mark-ground-light: #c9702f;
+  --rc-mark-ground-dark: #8a3f16;
+  --rc-mark-reclaimed-light: #34b378;
+  --rc-mark-reclaimed-dark: #167048;
   --rc-cat-dev-artifacts: #d76b40;
   --rc-cat-package-caches: #b87a1f;
   --rc-cat-temp-browser-caches: #6f9a55;

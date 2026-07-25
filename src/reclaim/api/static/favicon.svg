@@ -1,32 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
   <!--
-    Reclaim mark: "a block lifted away from a filled square." The whole square starts clay/
-    terracotta (occupied ground); a chunk in the bottom-right has already been cleared, revealing
-    pine green underneath. The small clay block floating top-right, outlined in the sand gap
-    color, is the piece mid-lift — still occupied, but on its way out. Same geometry as
-    logo.svg (this is the tab-icon-sized copy); packaging/build_brand_assets.py re-draws it with
-    flat rectangles so the packaged .ico/.bmp/.png brand assets match exactly.
-    Literal hex values (not CSS custom properties) because a favicon is loaded as a standalone
-    document outside the app's stylesheet cascade; these mirror tokens.css's
-    rc-cat-dev-artifacts, rc-brand, and rc-bg custom properties exactly (light mode) with a
+    Reclaim mark v2 (tab-icon-sized copy of logo.svg) — see that file's comment for the full
+    palette/depth rationale. Literal hex values (not CSS custom properties) because a favicon is
+    loaded as a standalone document outside the app's stylesheet cascade; these mirror
+    tokens.css's rc-mark, rc-brand, and rc-bg custom properties exactly (light mode) with a
     prefers-color-scheme override for the dark-mode tab-bar case.
+
+    NOTE: no literal double-hyphen anywhere in this comment (invalid inside an XML/SVG comment;
+    Chrome silently fails to render the whole file — see logo.svg's comment for why).
   -->
+  <defs>
+    <linearGradient id="rc-grad-copper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c9702f" />
+      <stop offset="1" stop-color="#8a3f16" />
+    </linearGradient>
+    <linearGradient id="rc-grad-jade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34b378" />
+      <stop offset="1" stop-color="#167048" />
+    </linearGradient>
+  </defs>
   <style>
-    .rc-clay { fill: #c1512b; }
-    .rc-green { fill: #2f6b52; }
-    .rc-lift { fill: #c1512b; stroke: #faf6f0; stroke-width: 2; }
+    .rc-ground { fill: url(#rc-grad-copper); }
+    .rc-reclaimed { fill: url(#rc-grad-jade); }
+    .rc-lift { fill: #c9702f; stroke: #f6f3ee; stroke-width: 2; }
     @media (prefers-color-scheme: dark) {
-      .rc-clay { fill: #d76b40; }
-      .rc-green { fill: #4fae82; }
-      .rc-lift { fill: #d76b40; stroke: #1c1815; }
+      .rc-lift { stroke: #16130f; }
     }
   </style>
   <clipPath id="rc-mark-clip">
     <rect width="32" height="32" rx="7" />
   </clipPath>
   <g clip-path="url(#rc-mark-clip)">
-    <rect class="rc-clay" x="0" y="0" width="32" height="32" />
-    <rect class="rc-green" x="11" y="11" width="21" height="21" />
+    <rect class="rc-ground" x="0" y="0" width="32" height="32" />
+    <rect class="rc-reclaimed" x="11" y="11" width="21" height="21" />
     <rect class="rc-lift" x="15" y="1" width="14" height="12" />
   </g>
 </svg>
