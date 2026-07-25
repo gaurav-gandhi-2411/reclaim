@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +93,156 @@ class SkippedPath:
 # protected directory tree) could otherwise accumulate an unbounded sample list for no added value
 # past the first handful.
 _SKIPPED_PATHS_SAMPLE_LIMIT = 20
+
+# --- Progress feedback (full-drive-scan-eta) ----------------------------------------------------
+#
+# SIMPLE mode's "scan my whole computer" action must never be a silent, unbounded-looking
+# operation — this section gives both `count_entries_fast`'s fast pre-pass and `scan_tree` itself
+# an interval-gated progress hook `api.service.run_scan` uses to compute and republish a live ETA
+# while a scan (single-path or full-drive) is running.
+
+_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+def _due(*, last: float, now: float, interval: float) -> bool:
+    """Pure predicate behind the progress-heartbeat gate — mirrors `executor._due`/`dedup._due`'s
+    exact convention (this codebase's established interval-gated-logging/-callback pattern).
+    Duplicated here rather than imported: `executor.py` imports FROM `scanner.py`
+    (`GitRepoCache`, `build_record_for_path`), so importing `_due` back from `executor.py` would
+    be circular, and `dedup.py` doesn't export its copy either — a 2-line pure predicate isn't
+    worth introducing a new inter-module dependency for."""
+    return (now - last) >= interval
+
+
+CountProgressCallback = Callable[[int, float], None]
+"""`(entries_counted_so_far, elapsed_seconds) -> None`. Optional, interval-gated (same
+`_HEARTBEAT_INTERVAL_SECONDS`/`_due` cadence as everything else in this section) progress hook
+for `count_entries_fast`'s own walk — a full-drive "estimating" pre-pass over a genuinely huge
+drive can itself take several seconds, and this is what keeps THAT phase from looking stuck
+too, not just the real scan that follows it."""
+
+
+def count_entries_fast(
+    root: Path,
+    *,
+    on_progress: CountProgressCallback | None = None,
+) -> int:
+    r"""Fast, stat-free entry count under `root` — the "quick sample" `api.service.run_scan`'s
+    live ETA is derived from (full-drive-scan-eta). The real `scan_tree` does one real
+    `os.stat()` per entry (hardlink identity via `st_ino`/`st_dev`), git-repo detection, and
+    SQLite writes; this function does none of that — pure `os.scandir` recursion, counting every
+    entry (files AND directories, matching `ScanStats.entries_total`'s own definition), which
+    must be dramatically cheaper per-entry than a real scan for the two-phase estimate to be
+    worth doing at all.
+
+    Mirrors `scan_tree`'s own skip rules exactly, so the total this produces matches what a real
+    `scan_tree(root, ...)` call will actually visit:
+    - every `os.scandir` call is `\\?\`-prefixed via `long_path()` (D12) — a real >MAX_PATH
+      subtree is counted, never silently dropped;
+    - a reparse point (junction/symlink) is counted itself but never recursed into, detected via
+      `entry.is_dir(follow_symlinks=False)` plus `entry.stat(follow_symlinks=False)
+      .st_file_attributes`'s `FILE_ATTRIBUTE_REPARSE_POINT` bit — the same check `build_record`
+      uses, just without `build_record`'s extra real `os.stat()` call for `st_ino`/`st_dev`
+      (which this function never needs): on Windows, `DirEntry.stat(follow_symlinks=False)` is
+      populated straight from the `FindNextFile` data `scandir` already collected, so this reads
+      as a free, already-cached attribute check, not a second per-entry syscall;
+    - a directory that can't be listed (permission error, genuine I/O fault) is skipped, not
+      fatal — same tolerance `scan_tree`'s own walk has, just without `SkippedPath` accounting
+      (this is a best-effort ESTIMATE, not the real inventory `ScanStats` reports).
+
+    Iterative (explicit stack), not recursive, matching `_walk_subtree`'s own convention — avoids
+    Python's recursion limit on a real deep tree.
+    """
+    start_time = time.monotonic()
+    count = 0
+    last_heartbeat = start_time
+    stack = [root]
+    while stack:
+        current_dir = stack.pop()
+        try:
+            dir_entries = list(os.scandir(long_path(current_dir)))
+        except OSError as exc:
+            logger.warning("scan.count_dir_unreadable", path=str(current_dir), error=str(exc))
+            continue
+
+        for entry in dir_entries:
+            try:
+                is_dir_entry = entry.is_dir(follow_symlinks=False)
+                is_reparse_point = bool(
+                    entry.stat(follow_symlinks=False).st_file_attributes
+                    & FILE_ATTRIBUTE_REPARSE_POINT
+                )
+            except OSError as exc:
+                logger.warning(
+                    "scan.count_entry_unreadable",
+                    path=str(current_dir / entry.name),
+                    error=str(exc),
+                )
+                continue
+
+            count += 1
+            if is_dir_entry and not is_reparse_point:
+                stack.append(current_dir / entry.name)
+
+            if on_progress is not None:
+                now = time.monotonic()
+                if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                    on_progress(count, now - start_time)
+                    last_heartbeat = now
+    return count
+
+
+ScanProgressCallback = Callable[[int, int | None, float], None]
+"""`(entries_processed_so_far, entries_estimated_total_or_None, elapsed_seconds) -> None`.
+Optional hook threaded through `scan_tree`'s walk, interval-gated at the SAME
+`_HEARTBEAT_INTERVAL_SECONDS` cadence as `count_entries_fast`'s own callback and
+`executor.ProgressCallback`'s established convention (never per-entry — would be needlessly
+expensive on a fast walk and would spam a caller). `entries_estimated_total` is whatever the
+caller passed in via `scan_tree`'s own `entries_estimated_total` parameter (typically
+`count_entries_fast`'s result from the preceding "estimating" phase) — `scan_tree` itself never
+computes an ETA; that's `api.service.run_scan`'s job, kept out of this module so the scanner
+stays a pure filesystem-walk primitive with no orchestration/business logic of its own."""
+
+
+class _ProgressTracker:
+    """Thread-safe accumulator behind `scan_tree`'s optional `on_progress` callback — shared
+    across the `ThreadPoolExecutor` workers `scan_tree` fans out to (one per top-level
+    directory), so `entries_processed_so_far` is a real, race-free total across every worker,
+    not just one thread's own local count.
+
+    A plain `threading.Lock` guarding a plain `int` counter (rather than a lock-free primitive)
+    is simplest and sufficient here: the lock is only ever held for a cheap counter
+    increment/due-check, never across the actual `on_progress(...)` call itself (which runs
+    outside the lock, after it's released) — real callback invocations only happen once per
+    `_HEARTBEAT_INTERVAL_SECONDS`, not per entry, so contention stays negligible even with many
+    worker threads all calling `add()` constantly.
+    """
+
+    def __init__(
+        self,
+        on_progress: ScanProgressCallback | None,
+        *,
+        entries_estimated_total: int | None,
+        start_time: float,
+    ) -> None:
+        self._on_progress = on_progress
+        self._entries_estimated_total = entries_estimated_total
+        self._start_time = start_time
+        self._lock = threading.Lock()
+        self._processed = 0
+        self._last_heartbeat = start_time
+
+    def add(self, n: int) -> None:
+        if self._on_progress is None or n <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._processed += n
+            if not _due(last=self._last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+                return
+            self._last_heartbeat = now
+            processed = self._processed
+        self._on_progress(processed, self._entries_estimated_total, now - self._start_time)
 
 
 def is_cloud_sync_root(path: Path) -> bool:
@@ -307,7 +460,7 @@ class _SubtreeResult:
     skipped: list[SkippedPath]
 
 
-def _walk_subtree(start: Path) -> _SubtreeResult:
+def _walk_subtree(start: Path, tracker: _ProgressTracker | None = None) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
 
@@ -316,6 +469,11 @@ def _walk_subtree(start: Path) -> _SubtreeResult:
     cache keys), and only the string handed to `scandir` carries the prefix, matching
     `executor.py`'s own "prefix only the raw filesystem call, never the value the rest of the
     code reasons about" convention.
+
+    `tracker` (full-drive-scan-eta): optional, shared across every concurrent invocation of this
+    function `scan_tree`'s `ThreadPoolExecutor.map` fans out (one call per top-level directory)
+    — `None` (the default) when `scan_tree` itself was called with no `on_progress`, matching
+    every other progress-hook default in this codebase.
     """
     git_cache = GitRepoCache()
     records: list[FileRecord] = []
@@ -338,6 +496,8 @@ def _walk_subtree(start: Path) -> _SubtreeResult:
                 continue
             record, should_recurse = built
             records.append(record)
+            if tracker is not None:
+                tracker.add(1)
             if should_recurse:
                 stack.append(record.path)
 
@@ -350,14 +510,25 @@ def scan_tree(
     *,
     incremental: bool = True,
     max_workers: int | None = None,
+    on_progress: ScanProgressCallback | None = None,
+    entries_estimated_total: int | None = None,
 ) -> ScanStats:
     """Walks `root`, populates `index` with a complete inventory, and prunes rows for entries
     that no longer exist. One `ThreadPoolExecutor` task per top-level directory under `root`
     (os.scandir's underlying syscalls release the GIL, so threading helps despite the
     CPU-bound-looking code); loose files directly under `root` are handled inline.
+
+    `on_progress`/`entries_estimated_total` (full-drive-scan-eta): optional, interval-gated
+    progress hook — see `ScanProgressCallback`'s docstring. Both default to `None` so every
+    existing caller (this test suite's scanner tests included) is unaffected.
+    `entries_estimated_total` is passed straight through to every `on_progress` call unchanged
+    (`scan_tree` never computes an ETA itself; see `ScanProgressCallback`).
     """
     start_time = time.monotonic()
     scanned_at = time.time()
+    tracker = _ProgressTracker(
+        on_progress, entries_estimated_total=entries_estimated_total, start_time=start_time
+    )
 
     # Always loaded (regardless of `incremental`): prune_missing needs the previously-indexed
     # path set to detect deletions either way. `incremental` only controls whether it's also
@@ -381,6 +552,7 @@ def scan_tree(
             continue
         record, should_recurse = built
         top_level_records.append(record)
+        tracker.add(1)
         if should_recurse:
             recurse_into.append(record.path)
 
@@ -388,8 +560,9 @@ def scan_tree(
     all_records: list[FileRecord] = list(top_level_records)
     if recurse_into:
         worker_count = max_workers or min(32, (os.cpu_count() or 4) * 4)
+        walk_subtree_with_progress = functools.partial(_walk_subtree, tracker=tracker)
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            for result in executor.map(_walk_subtree, recurse_into):
+            for result in executor.map(walk_subtree_with_progress, recurse_into):
                 all_records.extend(result.records)
                 dirs_visited += result.dirs_visited
                 all_skipped.extend(result.skipped)
