@@ -130,4 +130,14 @@ def create_app(
             return JSONResponse(status_code=404, content={"detail": "LICENSE file not found"})
         return Response(content=license_path.read_text(encoding="utf-8"), media_type="text/plain")
 
+    @app.get("/NOTICES", include_in_schema=False)
+    def notices_text() -> Response:
+        # Repo-root NOTICES.md (installer copies it to {app}\NOTICES.md — see reclaim.iss), read
+        # fresh on every request, same 404-gracefully posture as license_text() above. Linked
+        # from the dashboard footer's "Third-party notices" link.
+        notices_path = Path("NOTICES.md")
+        if not notices_path.exists():
+            return JSONResponse(status_code=404, content={"detail": "NOTICES.md file not found"})
+        return Response(content=notices_path.read_text(encoding="utf-8"), media_type="text/plain")
+
     return app
