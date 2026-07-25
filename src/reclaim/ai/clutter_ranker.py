@@ -98,8 +98,7 @@ def extract_numeric_features(feature_vector: FeatureVector, *, now: float) -> li
 class ClutterLikelihoodScore:
     """Every result carries `is_generic` hardcoded `True` — structurally documenting that
     this score reflects the generic (knowable-from-metadata) clutter-likelihood property,
-    never a personal prediction, mirroring `cold_start_priority.ColdStartPriority.
-    is_heuristic`'s "make the honesty claim checkable, not just narrated" pattern."""
+    never a personal prediction: "make the honesty claim checkable, not just narrated"."""
 
     raw_score: float  # the LightGBM model's raw predicted relevance -- higher = more
     # likely to be generic clutter. NOT a probability (spec §0.6): never presented as a
