@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "project": "reclaim",
+  "docs": "https://github.com/gaurav-gandhi-2411/gg-portfolio#autonomous-metric-refresh",
+  "metrics": [
+    {
+      "id": "reclaim:honesty-arc",
+      "label": "Exact-duplicate reclaimable estimate, corrected as real safety bugs were found",
+      "value": "~48GB \u2192 23.09GB \u2192 4.26GB \u2192 3.92GB \u2014 never corrected upward",
+      "source_file": "docs/CASE_STUDY.md",
+      "source_line": 761,
+      "commit_sha": "b7d1aa4aa93725e1d7584d4381470e7932fdb8fe",
+      "measured_at": "2026-07-23"
+    }
+  ]
+}
