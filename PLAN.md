@@ -1548,6 +1548,197 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   v1.1.0 marked pre-release/superseded (documented reason: the orphan-file gap this release
   fixes). https://github.com/gaurav-gandhi-2411/reclaim/releases/tag/v1.2.0
 
+### 2026-07-25 — Workstream A (P2 hardening) complete: 5 PRs opened, all draft
+- GG's autonomous work order: P2 hardening (Workstream A), visual identity refresh (B), and
+  simplified SIMPLE/ADVANCED UX modes (C), then a full rebuild/release. This checkpoint covers
+  Workstream A only; B and C follow.
+- **9 audit findings resolved across 5 branches/PRs**, each independently `scripts/verify.py`-
+  green:
+  - PR #14 `fix/p2-hardening-batch1` (F22 port-collision message, A5 ENOSPC handling, D16
+    friendly config-error message, D11 Unicode NFC/NFD path-comparison fix, D15 PIL
+    decompression-bomb cap) — both independent adversarial verifier passes CONFIRMED before
+    opening. 562-line diff (161 source / ~400 tests), over the 400-line auto-merge ceiling —
+    opened draft.
+  - PR #15 `chore/third-party-notices` (WS-A1: `NOTICES.md`, every core/`[ai]`-extra dependency
+    and downloaded model weight license verified via `importlib.metadata` + cited model-card
+    sources; corrected a stale ADR-0022 claim along the way — CLIP's specific pinned checkpoint
+    is Apache-2.0, not the MIT the ADR generalized from `open_clip`'s hub — permissive either
+    way, redistribution verdict unchanged; wired into the installer + a new `/NOTICES` route +
+    dashboard footer link, screenshot captured against a disposable demo tree).
+  - PR #16 `fix/manifest-append-lock` (C10: `msvcrt.locking()`-based OS lock around
+    `manifest.jsonl` appends, covering both same-process cross-thread and cross-process races;
+    concurrency regression test with two real threads, confirmed to fail without the fix).
+  - PR #17 `fix/unc-path-safety-bypass` (D13: blanket-deny UNC-form paths in `SafetyValidator`,
+    checked at `PROTECTED_SYSTEM_ROOT` precedence; **also fixed a related gap found during
+    review** — `\\?\C:\...`-prefixed local paths also failed to match drive-letter patterns
+    because `.as_posix()` carried the prefix into the fnmatch candidate; not independently
+    exploitable via the real scan path today, since `FileRecord.path` never carries that prefix
+    in practice, but `path_is_protected_root` is also called directly by the restore guard, so
+    closed defensively).
+  - PR #18 `chore/remove-dead-ai-code` (H28: `get_config()` and `ColdStartPriority` deleted as
+    genuinely dead — `get_config()` was also a latent footgun, since it bypasses
+    `load_effective_config`'s safe-mode override; `record_feedback_decision` kept, ADR-0020/
+    ADR-0025 both document it as intentional built-ahead infra; **`AIReviewQueue` kept — the
+    audit finding was wrong**, `grep`-ing `src/` alone misses that `evals/test_ai_safety_gate.py`
+    exercises it directly as part of the §7.5 safety-boundary proof).
+- **Incident: 4 of 5 branches' subagents hit a hard session usage limit mid-task** ("resets
+  11:40pm Asia/Calcutta"), failing with a terminated-early API error partway through their final
+  verification step. Each had already done the real implementation + test-writing work in its
+  own isolated git worktree (visible via `git status`/`git diff` in
+  `.claude/worktrees/agent-<id>/` even after the agent process died). Rather than idle-wait for
+  the quota reset, took over each worktree directly: reviewed the diff myself, ran
+  `scripts/verify.py` myself (pointing `UV_PROJECT_ENVIRONMENT` at each worktree's own
+  pre-provisioned `.venv`), fixed what verification caught (a line-length lint error on D13; the
+  extended-length-path gap above, caught by my own review, not mechanical verification), then
+  committed/pushed/opened the PR myself.
+- **Consequence, disclosed honestly, not glossed over**: PRs #15/#16/#17/#18 got only ONE
+  adversarial review pass (mine) instead of the two independent passes this work order requires,
+  because the second subagent slot was unavailable for the same quota reason. Each PR body says
+  this explicitly and recommends a second pass before merge — flagged especially hard on #16
+  (crash-safety-critical manifest path) and #17 (the core safety-boundary module), where I
+  self-imposed "flag for GG's review, don't self-merge even under the size gate" regardless of
+  the eventual second-pass outcome, given those touch the two things this project has
+  historically been most careful about.
+- All 5 PRs opened as **draft** — #14 by the explicit 400-line-diff gate (562 lines); #15/#16/
+  #17/#18 by the disclosed single-verification-pass gap above, not by size (all four are under
+  400 lines). None auto-merged. CI: #14 fully green at PR-open time; #15-#18 still running when
+  this checkpoint was written (`gh pr checks` shows each job either `pass` or `pending`, nothing
+  red so far) — confirm all green before merging any of them, per the standing CI-gate rule
+  above.
+- Next: Workstream B (visual identity refresh — new palette + dimensional depth on the existing
+  "block lifted from a filled square" logo geometry, regenerate all assets via
+  `packaging/build_brand_assets.py`, modernize the dashboard), then Workstream C (SIMPLE/
+  ADVANCED dashboard modes), then the release rebuild.
+
+### 2026-07-25 — Workstream A closed: second adversarial passes clean, #16/#17 merged, main verified
+- GG requested a genuine second adversarial pass on #16 and #17 specifically (both fell short of
+  the two-pass bar, and #17's first pass had already found a second bypass mid-review — treated
+  as a signal the pattern-matching surface was under-explored, not fully closed). Ran both as
+  fresh, independent executor passes against the real PR branches; both landed real findings, not
+  rubber-stamps:
+  - **#17 (D13) restructured, not patched**: replaced the first pass's per-alias-form
+    pattern-matching with `_canonical_path()` -- a `Path.resolve()`-based canonicalization step
+    run once per `evaluate()` call, before any pattern/UNC check. Closed 3 previously-open,
+    real gaps as one structural fix instead of a growing special-case list: 8.3 short names
+    (`C:\PROGRA~1`), `subst`'d drives, and NTFS junctions into a protected root -- each proven
+    with the REAL Windows mechanism (real `subst`, real `mklink /J`, real short-name paths), not
+    mocked. Mapped-network-drive-loopback closed as a free side effect. Mixed slashes and case
+    variation confirmed already-safe by test (not assumption). Unicode NFC/NFD correctly stayed
+    out of scope (D11's territory). Symlinks: honestly `SKIPPED` in this environment
+    (`WinError 1314`, no elevation) rather than silently passed -- junctions already prove the
+    reparse-point resolution mechanism works, since Windows resolves both identically.
+  - **#16 (C10)**: traced every lock-acquisition site (confirmed no deadlock possible -- the only
+    other lock in the codebase, `AppState.lock`, nests strictly one-directionally inside the
+    manifest lock, never the reverse); confirmed lock-acquisition failure is always a clean
+    "batch never touched the filesystem" failure in all three functions (never a mid-batch silent
+    skip); found the original 600s lock-timeout genuinely under-justified (a real production run
+    already hit 23,565 items in one batch) and raised it to 1800s with a message that stops
+    presuming the holder is stuck; found and closed a real gap where the existing crash-recovery
+    tests never actually exercised the lock at all, adding hard-crash-while-locked and
+    hard-crash-while-a-second-batch-is-blocked-on-the-lock cases.
+  - Both re-verified a THIRD time by me, independently, from fresh clones off each PR branch
+    (not just trusting the agents' own reports) -- `scripts/verify.py` full pass on both,
+    `tests/test_recovery.py` (the crash harness) explicitly re-run standalone (18/18), and the 8
+    new D13 real-mechanism tests re-run individually to confirm none were silently skipped beyond
+    the one honest, disclosed symlink exception.
+- GG merged #16 and #17. Pulled latest `main`, then ran the full canonical verification GG asked
+  for, **both install profiles**:
+  - Core-only (`uv run python scripts/verify.py`): PASS -- 707 passed, 23 skipped, 86.43% total
+    coverage, all 5 safety-critical modules meet their floor (`safety.py` 100.00%,
+    `executor.py` 95.21%).
+  - AI-extras profile, mirroring CI's `ai-layer-with-extras` job exactly
+    (`uv sync --frozen --all-groups --extra ai` into a scratch venv, then
+    `uv run ruff check . && uv run mypy && uv run pytest tests/ evals/test_ai_safety_gate.py -v`):
+    PASS -- 770 passed, 3 skipped (the one honest symlink-elevation skip plus two pre-existing
+    environment skips), ruff/mypy clean.
+  - All three safety-gate eval files explicitly run together against merged `main`
+    (`evals/test_safety_gate.py evals/test_safe_mode_gate.py evals/test_ai_safety_gate.py`):
+    47 passed, including the golden-tree UNC fixture cases
+    (`test_unc_alias_of_real_protected_root_fixture_is_denied`,
+    `test_unc_alias_of_real_docker_wsl_root_fixture_is_denied`) and every AI recommend-only
+    structural proof (`test_review_queue_partitions_all_five_tracks_correctly` among them --
+    `AIReviewQueue`, the symbol H28's audit finding wrongly flagged as dead, is exercised
+    directly here).
+- **Workstream A is closed.** All 9 P2-hardening audit findings resolved, both security-critical
+  fixes (C10, D13) carry two independent adversarial passes plus this final merged-main
+  verification, and every safety/safe-mode/AI-recommend-only structural gate this project
+  maintains passes on `main` with the canonical-path resolution and manifest lock both live.
+  PRs #14/#15/#18 remain open awaiting GG's review (disclosed single-pass gap / size gate,
+  unrelated to safety-critical code). Next: Workstream B (visual identity), then C (SIMPLE/
+  ADVANCED UX modes), then the release rebuild -- continuing autonomously per the standing work
+  order.
+
+### 2026-07-25 — Workstream B (visual identity) preview PR opened, awaiting GG's reaction
+- Per GG's explicit steer: designed the 16px icon FIRST, proved it (and 32/48px) clean before
+  finalizing anything, then opened a reviewable preview PR (#20, draft) rather than doing the
+  full asset regeneration blind. Direction: keeps the mark's geometry unchanged ("a block lifted
+  away from a filled square"); palette evolves from flat terracotta/pine/sand to a richer
+  copper (occupied)/jade (reclaimed) on a deeper warm-neutral scale — same excavation metaphor,
+  grounded in a quick 2026 app-design read (restrained analogous-hue gradients, subtle depth,
+  dark-mode-first) rather than either keeping the dated look or chasing a generic trend.
+- 16px legibility: a gradient's inset highlight on the small "lift block" degenerates to nothing
+  once rasterized that small — resolved with size-adaptive rendering (flat/high-contrast at
+  16/32px, dimensional gradient at 48px+), proven with real nearest-neighbor pixel-grid renders,
+  not assumed. `logo.svg`/`favicon.svg` use real SVG gradients (resolution-independent, no
+  flat/gradient split needed there).
+- Every text/surface/semantic color pairing checked against WCAG AA with a script
+  (`contrast_ratio`, WCAG relative-luminance formula) — all pass except one deliberate, disclosed
+  exception (`--rc-border`, a low-contrast hairline divider, matching this project's own v1
+  convention and WCAG 1.4.11's decorative-divider exemption). The 9-hue categorical palette is
+  unchanged and reconfirmed against the new backgrounds.
+- The preview includes a REAL restyled dashboard screen (both themes), not a hand-drawn mockup —
+  the actual running app with the new tokens applied, screenshotted against a disposable local
+  demo tree.
+- **Hit the exact XML-comment bug this project already documented once** (2026-07-23 checkpoint):
+  a literal double-hyphen inside the new logo.svg/favicon.svg's comment silently broke Chrome's
+  rendering again. Caught via my own screenshot review this time (a broken-image icon in the
+  header crop) before it reached a PR, not after — both files now XML-validated.
+- PR #20 (draft, by design — this is GG's one taste-driven call, not an auto-mergeable change):
+  https://github.com/gaurav-gandhi-2411/reclaim/pull/20. Nothing wired to `main`'s default
+  experience yet. Full asset regeneration (`build_brand_assets.py`, `.ico`, wizard bitmaps, OG
+  preview, README lockup) and the dashboard's spacing/depth/elevation modernization (WS-B item
+  12) are explicitly deferred until GG reacts to this preview.
+- Next (pending GG's direction call): finish WS-B regeneration + dashboard modernization, then
+  Workstream C (SIMPLE/ADVANCED UX modes) — already scoped, can start in parallel since it
+  doesn't depend on the palette decision.
+
+### 2026-07-25 — WS-B v3 iteration on PR #20: indigo/mint, real CSS depth (still unmerged)
+- GG reviewed the copper/jade v2 preview and asked for a full iteration: copper read too orange
+  (inherited terracotta's dated cast), wanted more depth, livelier colors, a modern/new-age feel
+  with live CSS rendering rather than flat fills. Picked Direction A: indigo (`#4F46E5` family,
+  occupied/accent) revealing mint (`#34D399` family, reclaimed/success) on a deep cool near-black
+  scale (`#0F1117` family) — off the warm axis entirely, same excavation metaphor.
+- **Split `--rc-brand` (indigo) from `--rc-success` (mint) into distinct tokens** — v1/v2
+  conflated "primary interactive accent" and "operation succeeded" into one green. Answers GG's
+  explicit question (mint vs. success collision): mint IS success now, structurally separate from
+  brand, applied to the Tier-A badge, the "will be kept" row highlight, and a new
+  `.rc-btn-success` variant on the Quick-Clean buttons (cleaning IS the reclaim action).
+  Discovered mid-implementation: at this dark-mode background lightness, no single indigo (or
+  single mint) hex clears both "white text on it as a button" and "the color itself as text on
+  bg" above WCAG AA simultaneously — the two constraints cross adjacent lightness steps without
+  ever both clearing 4.5:1 together (checked across a dozen candidate stops with the script, not
+  assumed). Dark mode carries a solid-fill stop and a separate text/icon stop per token; light
+  mode doesn't need the split but carries the same token names for a branch-free component layer.
+- Categorical data-viz palette re-verified against the new cool backgrounds (still ≥3:1 both
+  themes) and kept deliberately off the brand/success hues.
+- Implemented real CSS depth/motion, not just a recolor: two-layer ambient+contact elevation
+  shadows (new `--rc-shadow-lg` for modals), `backdrop-filter: blur()` on a now-sticky header and
+  the modal overlay (confirmed via screenshot — real blur, not a darkened overlay — with an
+  `@supports`-gated opaque fallback), a very low-opacity mesh gradient wash on the page
+  background, `color-mix(in oklch, ...)`-derived hover/active states, 150-200ms ease-out
+  micro-interactions + `scale(0.98)` on `:active` everywhere, skeleton loaders replacing the
+  spinner in `renderState()` (one shared function, one change point — `.rc-spinner` CSS is now
+  genuinely dead, removed), an animated progress-bar stripe, and a single global
+  `prefers-reduced-motion` gate in tokens.css that every other rule assumes rather than
+  re-guarding itself. Deliberately did NOT add view-transitions/scroll-driven animations —
+  documented as a considered skip (unclear payoff vs. real feature-detection complexity for a
+  data-dense utility, not a marketing site), not an oversight.
+- `uv run python scripts/verify.py` + `tests/frontend` (npm test, since `app.js`'s
+  `renderState()` changed): both fully green, no regressions.
+- PR #20 (still draft) updated in place with the v3 direction, all screenshots regenerated
+  against the real running app (not mockups): https://github.com/gaurav-gandhi-2411/reclaim/pull/20
+  — still nothing wired to `main`'s default experience.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
