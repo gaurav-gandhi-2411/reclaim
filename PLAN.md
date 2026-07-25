@@ -1610,6 +1610,64 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   `packaging/build_brand_assets.py`, modernize the dashboard), then Workstream C (SIMPLE/
   ADVANCED dashboard modes), then the release rebuild.
 
+### 2026-07-25 — Workstream A closed: second adversarial passes clean, #16/#17 merged, main verified
+- GG requested a genuine second adversarial pass on #16 and #17 specifically (both fell short of
+  the two-pass bar, and #17's first pass had already found a second bypass mid-review — treated
+  as a signal the pattern-matching surface was under-explored, not fully closed). Ran both as
+  fresh, independent executor passes against the real PR branches; both landed real findings, not
+  rubber-stamps:
+  - **#17 (D13) restructured, not patched**: replaced the first pass's per-alias-form
+    pattern-matching with `_canonical_path()` -- a `Path.resolve()`-based canonicalization step
+    run once per `evaluate()` call, before any pattern/UNC check. Closed 3 previously-open,
+    real gaps as one structural fix instead of a growing special-case list: 8.3 short names
+    (`C:\PROGRA~1`), `subst`'d drives, and NTFS junctions into a protected root -- each proven
+    with the REAL Windows mechanism (real `subst`, real `mklink /J`, real short-name paths), not
+    mocked. Mapped-network-drive-loopback closed as a free side effect. Mixed slashes and case
+    variation confirmed already-safe by test (not assumption). Unicode NFC/NFD correctly stayed
+    out of scope (D11's territory). Symlinks: honestly `SKIPPED` in this environment
+    (`WinError 1314`, no elevation) rather than silently passed -- junctions already prove the
+    reparse-point resolution mechanism works, since Windows resolves both identically.
+  - **#16 (C10)**: traced every lock-acquisition site (confirmed no deadlock possible -- the only
+    other lock in the codebase, `AppState.lock`, nests strictly one-directionally inside the
+    manifest lock, never the reverse); confirmed lock-acquisition failure is always a clean
+    "batch never touched the filesystem" failure in all three functions (never a mid-batch silent
+    skip); found the original 600s lock-timeout genuinely under-justified (a real production run
+    already hit 23,565 items in one batch) and raised it to 1800s with a message that stops
+    presuming the holder is stuck; found and closed a real gap where the existing crash-recovery
+    tests never actually exercised the lock at all, adding hard-crash-while-locked and
+    hard-crash-while-a-second-batch-is-blocked-on-the-lock cases.
+  - Both re-verified a THIRD time by me, independently, from fresh clones off each PR branch
+    (not just trusting the agents' own reports) -- `scripts/verify.py` full pass on both,
+    `tests/test_recovery.py` (the crash harness) explicitly re-run standalone (18/18), and the 8
+    new D13 real-mechanism tests re-run individually to confirm none were silently skipped beyond
+    the one honest, disclosed symlink exception.
+- GG merged #16 and #17. Pulled latest `main`, then ran the full canonical verification GG asked
+  for, **both install profiles**:
+  - Core-only (`uv run python scripts/verify.py`): PASS -- 707 passed, 23 skipped, 86.43% total
+    coverage, all 5 safety-critical modules meet their floor (`safety.py` 100.00%,
+    `executor.py` 95.21%).
+  - AI-extras profile, mirroring CI's `ai-layer-with-extras` job exactly
+    (`uv sync --frozen --all-groups --extra ai` into a scratch venv, then
+    `uv run ruff check . && uv run mypy && uv run pytest tests/ evals/test_ai_safety_gate.py -v`):
+    PASS -- 770 passed, 3 skipped (the one honest symlink-elevation skip plus two pre-existing
+    environment skips), ruff/mypy clean.
+  - All three safety-gate eval files explicitly run together against merged `main`
+    (`evals/test_safety_gate.py evals/test_safe_mode_gate.py evals/test_ai_safety_gate.py`):
+    47 passed, including the golden-tree UNC fixture cases
+    (`test_unc_alias_of_real_protected_root_fixture_is_denied`,
+    `test_unc_alias_of_real_docker_wsl_root_fixture_is_denied`) and every AI recommend-only
+    structural proof (`test_review_queue_partitions_all_five_tracks_correctly` among them --
+    `AIReviewQueue`, the symbol H28's audit finding wrongly flagged as dead, is exercised
+    directly here).
+- **Workstream A is closed.** All 9 P2-hardening audit findings resolved, both security-critical
+  fixes (C10, D13) carry two independent adversarial passes plus this final merged-main
+  verification, and every safety/safe-mode/AI-recommend-only structural gate this project
+  maintains passes on `main` with the canonical-path resolution and manifest lock both live.
+  PRs #14/#15/#18 remain open awaiting GG's review (disclosed single-pass gap / size gate,
+  unrelated to safety-critical code). Next: Workstream B (visual identity), then C (SIMPLE/
+  ADVANCED UX modes), then the release rebuild -- continuing autonomously per the standing work
+  order.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
