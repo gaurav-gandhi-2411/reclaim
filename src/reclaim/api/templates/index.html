@@ -1,5 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<!-- feat/simple-advanced-mode: data-mode defaults to "simple" here in markup (not just via JS)
+     so there is no flash of the ADVANCED UI before app.js runs -- see initDashboardMode(), which
+     only ever overrides this to "advanced" from a stored preference. -->
+<html lang="en" data-mode="simple">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -28,6 +31,9 @@
          PRIVACY.md) to the clipboard for a bug report. -->
     <button id="copy-diagnostics-btn" type="button" class="rc-btn rc-btn-secondary">Copy diagnostics</button>
     <span id="copy-diagnostics-status" class="rc-visually-hidden" role="status" aria-live="polite"></span>
+    <!-- feat/simple-advanced-mode: single link that switches both ways, same visual weight as
+         the theme toggle it sits next to (reuses .rc-theme-toggle rather than a new style). -->
+    <button id="dashboard-mode-toggle" type="button" class="rc-theme-toggle">Switch to Advanced</button>
     <button id="theme-toggle" type="button" class="rc-theme-toggle">Switch to dark</button>
   </header>
 
@@ -58,6 +64,15 @@
   </nav>
 
   <main id="main-content" class="rc-main">
+    <!-- SIMPLE mode: one primary "Clean My Computer" action -- no tabs, no path typing, no
+         Review Queue/AI Suggestions, ever (feat/simple-advanced-mode). CSS keys visibility off
+         html[data-mode] (see styles.css); app.js's SIMPLE-mode functions render every state
+         (idle/scanning/results/cleaning/success/error) into #simple-view-content. -->
+    <section id="simple-view" class="rc-simple-view" aria-labelledby="simple-view-title">
+      <h1 id="simple-view-title">Clean My Computer</h1>
+      <div id="simple-view-content"></div>
+    </section>
+
     <!-- Overview: summary stats + category cards -->
     <section id="view-overview" class="rc-view" role="tabpanel" aria-labelledby="tab-overview" data-active="true">
       <div class="rc-view-header">
@@ -241,6 +256,7 @@
       <h2 id="first-run-title">Before you start</h2>
       <p>Reclaim scans your files and suggests things to delete — it never deletes anything without your review.</p>
       <ul>
+        <li><strong>Reclaim starts in Simple mode</strong> — one button cleans safe, easy-to-identify clutter. Switch to Advanced any time for more control.</li>
         <li><strong>Safe mode is on by default.</strong> Everything is recommend/review-only: you pick what to remove, nothing is applied automatically.</li>
         <li><strong>Deletes go to the Recycle Bin</strong> in safe mode — never a permanent delete. Restore anything from Windows' own Recycle Bin at any time, the same as if you'd deleted it yourself.</li>
         <li><strong>Some categories stay off by default</strong> (exact-duplicate detection, ML model caches, dev-environment folders) — they reach into places a false positive would hurt most.</li>

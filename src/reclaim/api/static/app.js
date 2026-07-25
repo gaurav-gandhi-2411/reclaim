@@ -32,6 +32,45 @@ function updateThemeButtonLabel() {
   btn.textContent = current === "dark" ? "Switch to light" : "Switch to dark";
 }
 
+// --- SIMPLE / ADVANCED dashboard mode toggle (feat/simple-advanced-mode) ------------------------
+//
+// Mirrors initTheme/toggleTheme/updateThemeButtonLabel above exactly: a data-* attribute on
+// <html>, persisted in localStorage, with a single header button whose label names the OTHER
+// mode (matching "Switch to light/dark"'s own convention). Unlike theme (which has a CSS-only
+// prefers-color-scheme default), dashboard mode has no analogous user-agent signal to fall back
+// on, so index.html's <html data-mode="simple"> hardcodes the default directly in markup --
+// this only ever overrides it from a stored "advanced" preference, never the reverse, so first
+// run is never a flash of the wrong UI.
+
+const DASHBOARD_MODE_KEY = "reclaim-dashboard-mode";
+
+function initDashboardMode() {
+  const stored = localStorage.getItem(DASHBOARD_MODE_KEY);
+  if (stored === "advanced") {
+    document.documentElement.setAttribute("data-mode", "advanced");
+  }
+  updateDashboardModeButtonLabel();
+}
+
+function toggleDashboardMode() {
+  const current = document.documentElement.getAttribute("data-mode") === "advanced"
+    ? "advanced"
+    : "simple";
+  const next = current === "advanced" ? "simple" : "advanced";
+  document.documentElement.setAttribute("data-mode", next);
+  localStorage.setItem(DASHBOARD_MODE_KEY, next);
+  updateDashboardModeButtonLabel();
+}
+
+function updateDashboardModeButtonLabel() {
+  const btn = document.getElementById("dashboard-mode-toggle");
+  if (!btn) return;
+  const current = document.documentElement.getAttribute("data-mode") === "advanced"
+    ? "advanced"
+    : "simple";
+  btn.textContent = current === "advanced" ? "Switch to Simple" : "Switch to Advanced";
+}
+
 // --- Fetch helper -------------------------------------------------------------------------------
 
 // Read once at module load from the <meta> tag reclaim.api.app's index() route renders — a
@@ -512,24 +551,31 @@ async function loadQuickClean() {
 // a fixed lookup table (schemas.py::_PLAIN_LANGUAGE_CATEGORY), never a raw filesystem path —
 // safe to template into innerHTML the same way renderCategoryCards does above. `group.paths`
 // (raw filesystem paths) is NEVER rendered here at all — it only ever feeds the apply request
-// body (see confirmQuickClean) and the dialog's group-name list (openQuickCleanDialog, which
-// uses plain_label/counts via textContent, not paths).
+// body (see runOneClickClean) and the dialog's group-name list (openQuickCleanDialog, which
+// uses plain_label/counts via textContent, not paths). Shared by the Overview tab's Quick Clean
+// grid (renderQuickCleanGroups, below) and SIMPLE mode's own results screen (renderSimpleGroups)
+// (feat/simple-advanced-mode) so the two never drift into two different renderings of the same
+// server data.
+function buildQuickCleanGroupCard(group) {
+  const card = document.createElement("article");
+  card.className = "rc-quick-clean-card";
+  card.style.borderLeftColor = categoryColorVar(group.category_group);
+  card.innerHTML = `
+    <div class="rc-quick-clean-card-head">
+      <h3>${group.plain_label}</h3>
+      <span class="rc-bytes">${group.total_bytes_human}</span>
+    </div>
+    <div class="rc-meta">${group.file_count.toLocaleString()} item(s)</div>
+    ${group.safety_reason ? `<p class="rc-candidate-rationale">${group.safety_reason}</p>` : ""}
+  `;
+  return card;
+}
+
 function renderQuickCleanGroups(groups) {
   const container = document.getElementById("quick-clean-groups");
   container.innerHTML = "";
   for (const group of groups) {
-    const card = document.createElement("article");
-    card.className = "rc-quick-clean-card";
-    card.style.borderLeftColor = categoryColorVar(group.category_group);
-    card.innerHTML = `
-      <div class="rc-quick-clean-card-head">
-        <h3>${group.plain_label}</h3>
-        <span class="rc-bytes">${group.total_bytes_human}</span>
-      </div>
-      <div class="rc-meta">${group.file_count.toLocaleString()} item(s)</div>
-      ${group.safety_reason ? `<p class="rc-candidate-rationale">${group.safety_reason}</p>` : ""}
-    `;
-    container.appendChild(card);
+    container.appendChild(buildQuickCleanGroupCard(group));
   }
 
   const totalCount = groups.reduce((sum, g) => sum + g.file_count, 0);
@@ -539,7 +585,15 @@ function renderQuickCleanGroups(groups) {
   document.getElementById("quick-clean-btn").disabled = groups.length === 0;
 }
 
-function openQuickCleanDialog() {
+// `target` records which caller opened the dialog -- "overview" (the Overview tab's Quick Clean
+// button, the original/default caller) or "simple" (SIMPLE mode's "Clean now" button, feat/
+// simple-advanced-mode) -- so the SHARED confirm button (#quick-clean-confirm) knows where to
+// route the result once the user confirms. The dialog itself is genuinely one piece of global
+// UI, not duplicated per mode: same one-confirmation-then-clean safety behavior either way.
+let quickCleanResultTarget = "overview";
+
+function openQuickCleanDialog(target) {
+  quickCleanResultTarget = target;
   const list = document.getElementById("quick-clean-dialog-groups");
   list.innerHTML = "";
   let totalBytes = 0;
@@ -565,9 +619,12 @@ function closeQuickCleanDialog() {
   document.getElementById("quick-clean-dialog").hidden = true;
 }
 
-async function confirmQuickClean() {
-  closeQuickCleanDialog();
-  const resultEl = document.getElementById("quick-clean-result");
+// Shared apply+poll+render sequence behind BOTH the Overview tab's Quick Clean button and SIMPLE
+// mode's "Clean now" button (feat/simple-advanced-mode) -- identical API call and safety scoping
+// either way (tier "both" + the explicit, one-click-summary-resolved `paths`; "vault" only
+// matters in power mode, safe mode's apply_batch forces recycle_bin regardless); only the result
+// container and what happens next differ per caller.
+async function runOneClickClean(resultEl, { onSuccess, onError } = {}) {
   const paths = lastQuickCleanGroups.flatMap((group) => group.paths);
   if (paths.length === 0) return;
 
@@ -591,10 +648,24 @@ async function confirmQuickClean() {
       throw new ApiError(status.error || "apply failed", 500);
     }
     renderQuickCleanResult(resultEl, status.result);
-    loadQuickClean();
+    onSuccess?.(status.result);
   } catch (err) {
-    renderState(resultEl, "error", { title: "Clean failed", message: err.message });
+    if (onError) onError(err);
+    else renderState(resultEl, "error", { title: "Clean failed", message: err.message });
   }
+}
+
+async function confirmQuickClean() {
+  closeQuickCleanDialog();
+  if (quickCleanResultTarget === "simple") {
+    await runOneClickClean(simpleViewEl(), {
+      onSuccess: (report) => renderSimpleCleanSuccess(report),
+      onError: (err) => renderSimpleCleanError(err),
+    });
+    return;
+  }
+  const resultEl = document.getElementById("quick-clean-result");
+  await runOneClickClean(resultEl, { onSuccess: () => loadQuickClean() });
 }
 
 function renderQuickCleanResult(container, report) {
@@ -651,9 +722,281 @@ function renderQuickCleanResult(container, report) {
 }
 
 function initQuickClean() {
-  document.getElementById("quick-clean-btn").addEventListener("click", openQuickCleanDialog);
+  document
+    .getElementById("quick-clean-btn")
+    .addEventListener("click", () => openQuickCleanDialog("overview"));
   document.getElementById("quick-clean-cancel").addEventListener("click", closeQuickCleanDialog);
   document.getElementById("quick-clean-confirm").addEventListener("click", confirmQuickClean);
+}
+
+// --- SIMPLE mode: "Clean My Computer" (feat/simple-advanced-mode) -------------------------------
+//
+// One screen, one primary action, for a user who understands nothing about disk cleanup: full-
+// drive scan (POST /api/scan/full-drive, full-drive-scan-eta) with a live ETA, then the exact
+// same categorically-safe, safe-mode-enforced, Recycle-Bin-only apply flow ADVANCED mode's Quick
+// Clean already uses (runOneClickClean/openQuickCleanDialog above -- no new deletion logic, no
+// new category scoping decided here). Never surfaces Review Queue, AI Suggestions, or anything
+// needing a keep/delete judgment call -- see styles.css's html[data-mode="simple"] rules, which
+// hide those entirely rather than this module choosing not to render them.
+//
+// Every state (idle/scanning/results/cleaning/success/error) is rendered into the single
+// #simple-view-content container -- simpleViewEl() below -- by fully replacing its contents, the
+// same "one container, swap what's inside" convention loadOverview/loadReviewQueue/etc. already
+// use for their own state/content split.
+
+const SIMPLE_SCAN_POLL_INTERVAL_MS = 1500; // matches the existing ADVANCED scan bar's own cadence
+
+let simplePollHandle = null;
+let simpleLastCleanedNote = null; // session-only "last cleaned: X" note for the idle screen
+
+function simpleViewEl() {
+  return document.getElementById("simple-view-content");
+}
+
+function clearSimplePoll() {
+  if (simplePollHandle) {
+    clearInterval(simplePollHandle);
+    simplePollHandle = null;
+  }
+}
+
+// Plain-language time estimate from `eta_seconds` -- `null` (not yet computable, e.g. the very
+// first progress tick or the "estimating" phase) must never render as a raw "null" to the user,
+// and a raw seconds count would read as false precision this project doesn't actually have (same
+// "no fabricated confidence" posture format_bytes's docstring states for size reporting).
+function formatEtaSeconds(etaSeconds) {
+  if (etaSeconds === null || etaSeconds === undefined) return "Checking…";
+  if (etaSeconds < 10) return "Almost done";
+  if (etaSeconds < 60) return "Less than a minute remaining";
+  const minutes = Math.round(etaSeconds / 60);
+  return `About ${minutes} minute${minutes === 1 ? "" : "s"} remaining`;
+}
+
+function renderSimpleIdle() {
+  clearSimplePoll();
+  const container = simpleViewEl();
+  container.innerHTML = "";
+
+  const intro = document.createElement("p");
+  intro.className = "rc-simple-intro";
+  intro.textContent = "Scans your whole computer and finds safe things to clean up.";
+  container.appendChild(intro);
+
+  const scanBtn = document.createElement("button");
+  scanBtn.type = "button";
+  scanBtn.className = "rc-btn rc-btn-success rc-simple-primary-btn";
+  scanBtn.textContent = "Clean My Computer";
+  scanBtn.addEventListener("click", startSimpleScan);
+  container.appendChild(scanBtn);
+
+  if (simpleLastCleanedNote) {
+    const note = document.createElement("p");
+    note.className = "rc-scan-status";
+    note.textContent = `Last cleaned this session: ${simpleLastCleanedNote}.`;
+    container.appendChild(note);
+  }
+}
+
+async function startSimpleScan() {
+  const container = simpleViewEl();
+  try {
+    await api("/api/scan/full-drive", { method: "POST" });
+  } catch (err) {
+    renderState(container, "error", {
+      title: "Could not start the scan",
+      message: err.message,
+      actionLabel: "Try again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+  pollSimpleScan();
+}
+
+async function pollSimpleScan() {
+  const container = simpleViewEl();
+  let status;
+  try {
+    status = await api("/api/scan/status");
+  } catch (err) {
+    clearSimplePoll();
+    renderState(container, "error", {
+      title: "Could not check scan progress",
+      message: err.message,
+      actionLabel: "Try again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+
+  if (status.status === "running") {
+    renderSimpleScanning(status);
+    if (!simplePollHandle) {
+      simplePollHandle = setInterval(pollSimpleScan, SIMPLE_SCAN_POLL_INTERVAL_MS);
+    }
+    return;
+  }
+
+  clearSimplePoll();
+
+  if (status.status === "failed") {
+    renderState(container, "error", {
+      title: "Scan failed",
+      message: status.error || "Unknown error.",
+      actionLabel: "Try again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+
+  await loadSimpleResults();
+}
+
+// `status.current_drive` is a raw OS drive path (e.g. "D:/") — plain text only via textContent,
+// never innerHTML (mirrors renderClusterTable/renderAISuggestionCard's XSS-safe-rendering
+// discipline for any value that ultimately traces back to something on disk).
+function renderSimpleScanning(status) {
+  const container = simpleViewEl();
+  container.innerHTML = "";
+
+  const panel = document.createElement("div");
+  panel.className = "rc-progress";
+  panel.setAttribute("role", "status");
+  panel.setAttribute("aria-live", "polite");
+
+  const heading = document.createElement("strong");
+  heading.textContent =
+    status.phase === "scanning" ? "Scanning your computer…" : "Checking your computer…";
+  panel.appendChild(heading);
+
+  if (status.phase === "scanning") {
+    // Real progress bar/percentage — only once entries_estimated_total is known (guard
+    // division by zero/null: a null/zero total renders 0%, never a crash or NaN width).
+    const total = status.entries_estimated_total;
+    const processed = status.entries_processed ?? 0;
+    const pct = total && total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+
+    const track = document.createElement("div");
+    track.className = "rc-progress-track";
+    const fill = document.createElement("div");
+    fill.className = "rc-progress-fill";
+    fill.style.width = `${pct}%`;
+    track.appendChild(fill);
+    panel.appendChild(track);
+
+    const etaLine = document.createElement("p");
+    etaLine.className = "rc-progress-label";
+    etaLine.textContent = formatEtaSeconds(status.eta_seconds);
+    panel.appendChild(etaLine);
+  } else {
+    // "estimating" (or phase not yet populated on the very first tick) — the total isn't known
+    // yet, so no fake progress bar; the raw counted-so-far number is still honest, live feedback.
+    const countLine = document.createElement("p");
+    countLine.className = "rc-progress-label";
+    const counted = status.entries_processed ?? 0;
+    countLine.textContent = `Checking your computer… (${counted.toLocaleString()} items so far)`;
+    panel.appendChild(countLine);
+  }
+
+  if (status.drives_total && status.drives_total > 1) {
+    const driveLine = document.createElement("p");
+    driveLine.className = "rc-progress-label";
+    const driveNumber = (status.drives_done ?? 0) + 1;
+    const driveSuffix = status.current_drive ? ` (${status.current_drive})` : "";
+    driveLine.textContent = `Drive ${driveNumber} of ${status.drives_total}${driveSuffix}`;
+    panel.appendChild(driveLine);
+  }
+
+  const safety = document.createElement("p");
+  safety.className = "rc-progress-safety-note";
+  safety.textContent = "It's safe to close this tab or stop the server at any point.";
+  panel.appendChild(safety);
+
+  container.appendChild(panel);
+}
+
+async function loadSimpleResults() {
+  const container = simpleViewEl();
+  renderState(container, "loading", { title: "Checking what's safe to clean…" });
+  try {
+    const summary = await api("/api/clean/one-click-summary");
+    if (!summary.has_scan || summary.total_file_count === 0) {
+      renderSimpleEmpty();
+      return;
+    }
+    lastQuickCleanGroups = summary.groups;
+    renderSimpleGroups(summary);
+  } catch (err) {
+    renderState(container, "error", {
+      title: "Could not check what's safe to clean",
+      message: err.message,
+      actionLabel: "Try again",
+      onAction: renderSimpleIdle,
+    });
+  }
+}
+
+function renderSimpleEmpty() {
+  renderState(simpleViewEl(), "empty", {
+    title: "Your computer's already pretty tidy",
+    message:
+      "Nothing safe to clean up right now — check back after using your computer for a while.",
+    actionLabel: "Scan again",
+    onAction: renderSimpleIdle,
+  });
+}
+
+function renderSimpleGroups(summary) {
+  const container = simpleViewEl();
+  container.innerHTML = "";
+
+  const intro = document.createElement("p");
+  intro.className = "rc-simple-summary-line";
+  intro.textContent =
+    `Found ${summary.total_file_count.toLocaleString()} item(s) safe to clean up — ` +
+    `${summary.total_bytes_human} total.`;
+  container.appendChild(intro);
+
+  const groupsEl = document.createElement("div");
+  groupsEl.className = "rc-quick-clean-groups";
+  for (const group of summary.groups) {
+    groupsEl.appendChild(buildQuickCleanGroupCard(group));
+  }
+  container.appendChild(groupsEl);
+
+  const cleanBtn = document.createElement("button");
+  cleanBtn.type = "button";
+  cleanBtn.className = "rc-btn rc-btn-success rc-simple-primary-btn";
+  cleanBtn.textContent = "Clean now";
+  cleanBtn.addEventListener("click", () => openQuickCleanDialog("simple"));
+  container.appendChild(cleanBtn);
+}
+
+// Appends to (never replaces) whatever runOneClickClean already rendered into #simple-view-
+// content (the same renderQuickCleanResult success panel Quick Clean shows, matched wording) —
+// just adds the way back to a fresh idle screen the spec requires ("a fresh scan next time, not
+// stale data").
+function renderSimpleCleanSuccess(report) {
+  simpleLastCleanedNote = report.bytes_freed_human;
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "rc-btn rc-btn-primary";
+  backBtn.textContent = "Done";
+  backBtn.addEventListener("click", renderSimpleIdle);
+  simpleViewEl().appendChild(backBtn);
+}
+
+function renderSimpleCleanError(err) {
+  renderState(simpleViewEl(), "error", {
+    title: "Clean failed",
+    message: err.message,
+    actionLabel: "Back to start",
+    onAction: renderSimpleIdle,
+  });
+}
+
+function initSimpleMode() {
+  renderSimpleIdle();
 }
 
 // --- "How this works" ----------------------------------------------------------------------------
@@ -1000,7 +1343,15 @@ function renderClusterTable(cluster) {
   return table;
 }
 
-export { renderClusterTable, renderAISuggestionCard };
+export {
+  renderClusterTable,
+  renderAISuggestionCard,
+  formatEtaSeconds,
+  renderSimpleScanning,
+  renderSimpleGroups,
+  renderSimpleEmpty,
+  buildQuickCleanGroupCard,
+};
 
 function updateApplyBar() {
   const countEl = document.getElementById("apply-selected-count");
@@ -1644,11 +1995,16 @@ async function initRecoveryBanner() {
 function init() {
   initTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
+  initDashboardMode();
+  document
+    .getElementById("dashboard-mode-toggle")
+    .addEventListener("click", toggleDashboardMode);
   initTabs();
   initScanBar();
   initReviewQueue();
   initAISuggestions();
   initQuickClean();
+  initSimpleMode();
   initHowItWorks();
   initDiagnostics();
   initModeControls();
