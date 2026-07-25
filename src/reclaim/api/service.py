@@ -33,6 +33,7 @@ from reclaim.api.schemas import (
     DuplicateClusterReviewResponse,
     DuplicateMemberOut,
     FirstRunStatusResponse,
+    FixedDrivesResponse,
     ItemApplyResultOut,
     ModeStatusResponse,
     OneClickCleanSummaryResponse,
@@ -63,6 +64,7 @@ from reclaim.dedup import (
     generate_duplicate_candidates,
 )
 from reclaim.detectors import generate_candidates
+from reclaim.drives import list_fixed_drives
 from reclaim.executor import (
     BatchApplyReport,
     QuarantineManifestEntry,
@@ -85,7 +87,7 @@ from reclaim.mode import (
 from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier, Verdict
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import GitRepoCache, build_record_for_path, scan_tree
+from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
 
 logger = structlog.get_logger(__name__)
 
@@ -134,6 +136,24 @@ def suggested_scan_roots(*, home: Path | None = None) -> SuggestedScanRootsRespo
     return SuggestedScanRootsResponse(roots=roots)
 
 
+def fixed_drives() -> FixedDrivesResponse:
+    """Backs `GET /api/scan/fixed-drives` -- every locally-attached fixed drive on this machine,
+    so a SIMPLE-mode "scan my whole computer" UI can show what's about to be scanned before the
+    user commits (full-drive-scan-eta). Propagates `reclaim.drives.NoFixedDrivesFoundError`
+    straight through -- the route layer converts it to a 500, same posture `SafeModeViolationError`
+    gets in `apply`."""
+    return FixedDrivesResponse(drives=[d.as_posix() for d in list_fixed_drives()])
+
+
+def fixed_drive_roots() -> list[Path]:
+    """Same enumeration as `fixed_drives()`, as raw `Path` objects for `run_scan`'s `roots`
+    parameter rather than the API response's string shape. Kept as its own thin function (rather
+    than having `POST /api/scan/full-drive` reuse `fixed_drives()` and re-parse the response)
+    so a test can monkeypatch just `reclaim.drives.list_fixed_drives` and have both this and
+    `fixed_drives()` pick up the fixture roots identically."""
+    return list_fixed_drives()
+
+
 def to_scan_status_out(status: ScanStatus) -> ScanStatusOut:
     return ScanStatusOut(
         status=status.status,
@@ -153,49 +173,231 @@ def to_scan_status_out(status: ScanStatus) -> ScanStatusOut:
             if status.skipped_unreadable_paths is not None
             else None
         ),
+        phase=status.phase,
+        entries_processed=status.entries_processed,
+        entries_estimated_total=status.entries_estimated_total,
+        eta_seconds=status.eta_seconds,
+        current_drive=status.current_drive,
+        drives_total=status.drives_total,
+        drives_done=status.drives_done,
     )
 
 
-def run_scan(state: AppState, root: Path, started_at: float) -> None:
-    """Background-task body for `POST /api/scan`. Runs on Starlette's worker-thread pool (sync
+# A real rate below this (entries/second) is close enough to zero that trusting it for a
+# division would produce a wild, misleading ETA rather than a conservative one -- `None` (no
+# estimate yet) is the honest answer at that point, not a number.
+_ETA_MIN_RATE_ENTRIES_PER_SECOND = 1e-9
+
+
+def _compute_eta_seconds(
+    entries_processed: int, entries_estimated_total: int | None, elapsed_seconds: float
+) -> float | None:
+    """Pure ETA-computing function behind `run_scan`'s live `on_progress` callbacks -- extracted
+    standalone (matching this codebase's own `_due`-style "pure predicate, cheaply testable"
+    convention) rather than inlined in the callback closures.
+
+    `None` whenever an honest estimate isn't yet possible: no `entries_estimated_total` (the
+    "estimating" phase hasn't finished yet, or a caller genuinely didn't supply one),
+    non-positive `entries_processed`/`elapsed_seconds` (the very first progress tick -- dividing
+    by an unstable near-zero rate would produce a wild number, not a conservative one), or a rate
+    too close to zero to trust (see `_ETA_MIN_RATE_ENTRIES_PER_SECOND`).
+
+    `entries_estimated_total - entries_processed` going negative (the real walk visited MORE
+    than the fast estimate predicted -- a real possibility, since the two passes race against a
+    live, mutating filesystem) clamps to `0.0` -- "basically done", never a negative ETA.
+    """
+    if entries_estimated_total is None or entries_processed <= 0 or elapsed_seconds <= 0:
+        return None
+    rate = entries_processed / elapsed_seconds
+    if rate <= _ETA_MIN_RATE_ENTRIES_PER_SECOND:
+        return None
+    remaining = entries_estimated_total - entries_processed
+    if remaining <= 0:
+        return 0.0
+    return remaining / rate
+
+
+# Sample-list cap for `run_scan`'s `skipped_unreadable_paths`, aggregated across every scanned
+# root -- mirrors `scanner._SKIPPED_PATHS_SAMPLE_LIMIT`'s own reasoning (the COUNT is always
+# exact; only the sample of actual path strings is capped) at this multi-root aggregation layer.
+_AGGREGATE_SKIPPED_PATHS_SAMPLE_LIMIT = 20
+
+
+def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
+    """Background-task body for both `POST /api/scan` (`roots=[the one path]`, `drives_total=1`)
+    and `POST /api/scan/full-drive` (`roots=list_fixed_drives()`) -- ONE orchestration path
+    underneath both (full-drive-scan-eta), so the two-phase estimate+scan flow and its live ETA
+    only ever have one place to be correct. Runs on Starlette's worker-thread pool (sync
     callables passed to `BackgroundTasks.add_task` are dispatched via `run_in_threadpool`), so
     this never blocks the event loop; `state.lock` guards every read/write of `scan_status`
     against a concurrent `GET /api/scan/status` poll from the request-handling thread(s).
 
-    A scan failure is recorded on `scan_status` (surfaced via the status endpoint), never
-    raised into the background-task machinery where it would just be logged and lost.
+    Two phases per root, sequential across roots -- drives are scanned one at a time, never in
+    parallel: a single drive's `scan_tree` already fans out across a `ThreadPoolExecutor` of its
+    own, so running several drives' worker pools concurrently would only contend with each other
+    for no real throughput gain, and keeps this orchestration layer's own progress accounting
+    trivially single-threaded.
+
+    (a) "estimating" -- `scanner.count_entries_fast` walks `root` once, stat-free, to derive
+        `entries_estimated_total`; its own interval-gated progress callback republishes onto
+        `scan_status.entries_processed` so this phase is never silent either, even on a drive
+        large enough for the count itself to take several seconds.
+    (b) "scanning" -- the real `scanner.scan_tree`, whose `on_progress` callback computes a live
+        `eta_seconds` (`_compute_eta_seconds`) from `entries_processed`/`entries_estimated_total`/
+        elapsed time and republishes it onto `scan_status` for every `GET /api/scan/status`
+        poller.
+
+    `scan_status.root`/`current_drive` mirror whichever root is CURRENTLY active while running,
+    so `app.js`'s existing "Scanning {root}…" text stays meaningful for a full-drive scan too,
+    with zero frontend changes needed. On completion, `root` is the single scanned path for a
+    one-root scan (`drives_total == 1` -- true for both an ordinary single-path scan and a
+    full-drive scan that happens to find exactly one fixed drive), or `None` for a genuine
+    multi-drive scan -- no single root would be honest to report there, and `build_treemap`
+    already treats `root=None` as "has data, nothing to enumerate a subtree of" gracefully (the
+    same fallback a fresh-process restart with stale persisted data already exercises).
+
+    `dirs_visited`/`entries_total`/`files_written`/`files_unchanged`/`files_pruned`/
+    `elapsed_seconds`/`skipped_unreadable_count`/`skipped_unreadable_paths` are SUMMED across
+    every scanned root -- the pre-full-drive-scan single-path contract's exact per-scan meaning
+    is preserved when `drives_total == 1` (a sum of one term is that term).
+
+    A failure on any one root aborts the WHOLE scan immediately (`status="failed"`, whatever
+    partial aggregate stats accumulated so far are kept, not discarded) -- a real
+    `scan_tree`/`count_entries_fast` failure partway through a multi-drive full scan means the
+    remaining drives' data would be incomplete anyway, so continuing past it would silently
+    under-report free-space math for a scan that looks like it "completed".
     """
+    roots = list(roots)
+    drives_total = len(roots)
+
+    dirs_visited_total = 0
+    entries_total_total = 0
+    files_written_total = 0
+    files_unchanged_total = 0
+    files_pruned_total = 0
+    elapsed_seconds_total = 0.0
+    skipped_unreadable_count_total = 0
+    skipped_unreadable_paths_sample: list[str] = []
+
     try:
         state.db_path.parent.mkdir(parents=True, exist_ok=True)
         with ScanIndex(state.db_path) as index:
-            stats = scan_tree(root, index, incremental=True)
+            for drive_index, root in enumerate(roots):
+                with state.lock:
+                    state.scan_status = _dataclass_replace(
+                        state.scan_status,
+                        status="running",
+                        root=root,
+                        started_at=started_at,
+                        finished_at=None,
+                        error=None,
+                        phase="estimating",
+                        current_drive=root.as_posix(),
+                        drives_total=drives_total,
+                        drives_done=drive_index,
+                        entries_processed=0,
+                        entries_estimated_total=None,
+                        eta_seconds=None,
+                    )
+
+                def on_count_progress(counted: int, elapsed: float) -> None:
+                    with state.lock:
+                        state.scan_status = _dataclass_replace(
+                            state.scan_status, entries_processed=counted
+                        )
+
+                entries_estimated_total = count_entries_fast(root, on_progress=on_count_progress)
+
+                with state.lock:
+                    state.scan_status = _dataclass_replace(
+                        state.scan_status,
+                        phase="scanning",
+                        entries_processed=0,
+                        entries_estimated_total=entries_estimated_total,
+                    )
+
+                def on_scan_progress(
+                    processed: int, estimated_total: int | None, elapsed: float
+                ) -> None:
+                    eta = _compute_eta_seconds(processed, estimated_total, elapsed)
+                    with state.lock:
+                        state.scan_status = _dataclass_replace(
+                            state.scan_status, entries_processed=processed, eta_seconds=eta
+                        )
+
+                stats = scan_tree(
+                    root,
+                    index,
+                    incremental=True,
+                    on_progress=on_scan_progress,
+                    entries_estimated_total=entries_estimated_total,
+                )
+
+                dirs_visited_total += stats.dirs_visited
+                entries_total_total += stats.entries_total
+                files_written_total += stats.files_written
+                files_unchanged_total += stats.files_unchanged
+                files_pruned_total += stats.files_pruned
+                elapsed_seconds_total += stats.elapsed_seconds
+                skipped_unreadable_count_total += stats.skipped_unreadable_count
+                remaining_slots = _AGGREGATE_SKIPPED_PATHS_SAMPLE_LIMIT - len(
+                    skipped_unreadable_paths_sample
+                )
+                if remaining_slots > 0:
+                    skipped_unreadable_paths_sample.extend(
+                        stats.skipped_unreadable_paths[:remaining_slots]
+                    )
+
+                with state.lock:
+                    state.scan_status = _dataclass_replace(
+                        state.scan_status, drives_done=drive_index + 1
+                    )
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.scan_failed", root=str(root), error=str(exc))
+        logger.warning("api.scan_failed", roots=[str(r) for r in roots], error=str(exc))
         with state.lock:
             state.scan_status = ScanStatus(
                 status="failed",
-                root=root,
+                root=state.scan_status.root,
                 started_at=started_at,
                 finished_at=time.time(),
                 error=str(exc),
+                dirs_visited=dirs_visited_total,
+                entries_total=entries_total_total,
+                files_written=files_written_total,
+                files_unchanged=files_unchanged_total,
+                files_pruned=files_pruned_total,
+                elapsed_seconds=elapsed_seconds_total,
+                skipped_unreadable_count=skipped_unreadable_count_total,
+                skipped_unreadable_paths=tuple(skipped_unreadable_paths_sample),
+                phase=state.scan_status.phase,
+                current_drive=state.scan_status.current_drive,
+                drives_total=drives_total,
+                drives_done=state.scan_status.drives_done,
             )
         return
 
     with state.lock:
         state.scan_status = ScanStatus(
             status="completed",
-            root=root,
+            root=roots[0] if drives_total == 1 else None,
             started_at=started_at,
             finished_at=time.time(),
-            dirs_visited=stats.dirs_visited,
-            entries_total=stats.entries_total,
-            files_written=stats.files_written,
-            files_unchanged=stats.files_unchanged,
-            files_pruned=stats.files_pruned,
-            elapsed_seconds=stats.elapsed_seconds,
-            skipped_unreadable_count=stats.skipped_unreadable_count,
-            skipped_unreadable_paths=stats.skipped_unreadable_paths,
+            dirs_visited=dirs_visited_total,
+            entries_total=entries_total_total,
+            files_written=files_written_total,
+            files_unchanged=files_unchanged_total,
+            files_pruned=files_pruned_total,
+            elapsed_seconds=elapsed_seconds_total,
+            skipped_unreadable_count=skipped_unreadable_count_total,
+            skipped_unreadable_paths=tuple(skipped_unreadable_paths_sample),
+            phase="done",
+            entries_processed=entries_total_total,
+            entries_estimated_total=entries_total_total,
+            eta_seconds=0.0,
+            current_drive=None,
+            drives_total=drives_total,
+            drives_done=drives_total,
         )
         # ADR-0025: a new completed scan invalidates any cached AI analysis -- callers compare
         # this against `AIAnalysisStatus.scan_generation` to detect a stale cache.

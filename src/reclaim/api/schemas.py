@@ -137,6 +137,29 @@ class ScanStatusOut(BaseModel):
     # (permission error, genuine I/O fault) -- see `reclaim.scanner.SkippedPath`.
     skipped_unreadable_count: int | None
     skipped_unreadable_paths: list[str] | None
+    # full-drive-scan-eta: live progress/ETA fields, optional and additive -- every field above
+    # this line is the original, 100% backward-compatible `POST /api/scan` contract, unchanged.
+    # Populated for both the existing single-path scan (`drives_total=1`) and the new full-drive
+    # scan (`POST /api/scan/full-drive`, `drives_total=len(list_fixed_drives())`) -- see
+    # `api.service.run_scan`, the one orchestration path underneath both.
+    phase: str | None
+    entries_processed: int | None
+    entries_estimated_total: int | None
+    eta_seconds: float | None
+    current_drive: str | None
+    drives_total: int | None
+    drives_done: int | None
+
+
+class FixedDrivesResponse(BaseModel):
+    """`GET /api/scan/fixed-drives` -- every locally-attached fixed drive on this machine
+    (`reclaim.drives.list_fixed_drives`), so a SIMPLE-mode "scan my whole computer" UI can show
+    what's about to be scanned before the user commits, without its own drive-enumeration logic
+    (full-drive-scan-eta)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    drives: list[str]
 
 
 # --- Summary / category cards -------------------------------------------------------------
