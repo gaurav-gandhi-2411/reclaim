@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+import reclaim.executor as executor_module
 from reclaim.config import Config, SafetyConfig
 from reclaim.executor import (
+    ManifestLockTimeoutError,
     QuarantineManifestEntry,
     SafeModeViolationError,
     SafetyInvariantError,
@@ -648,3 +650,54 @@ def test_purge_rebuildable_only_skips_non_rebuildable_eligible_entries(tmp_path:
     assert report.files_succeeded == 1
     assert not rebuildable_entry.vault_path.exists()  # type: ignore[union-attr]
     assert non_rebuildable_entry.vault_path.exists()  # type: ignore[union-attr]
+
+
+# --- Audit finding C10 (second pass), point 2: purge_expired's lock-acquisition-failure half ---
+
+
+def test_purge_expired_lock_acquisition_failure_leaves_batch_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `tests/test_executor.py`'s equivalent `apply_batch`/`restore_batch` tests:
+    `purge_expired` opens the manifest -- and therefore acquires the OS-level lock -- exactly
+    ONCE, before its eligible-entries loop even starts (see `purge_expired`'s `manifest_fh =
+    _open_manifest_for_sync(...) if apply and eligible else None` line, above the `for index,
+    (entry, stale) in enumerate(eligible, ...)` loop). A lock-acquisition failure must therefore
+    be a clean "run never started" failure: every vault copy left exactly where it was, no new
+    manifest line written at all.
+
+    Forces `_acquire_manifest_lock` to fail immediately (rather than waiting out the real
+    timeout) by monkeypatching it on `reclaim.executor` -- `purge.py` imports
+    `_open_manifest_for_sync` as its own binding, but that function still resolves the bare name
+    `_acquire_manifest_lock` from ITS OWN defining module's globals (`reclaim.executor`) at call
+    time, so patching it there is what actually intercepts purge's call too (same mechanism
+    `tests/_recovery_crash_harness.py`'s own header comment documents for `_append_and_sync`/
+    `_atomic_move`).
+
+    Confirmed this test fails if `purge_expired` is changed to catch `ManifestLockTimeoutError`
+    around `_open_manifest_for_sync` and proceed with the run anyway -- verified by temporarily
+    wrapping that call in exactly such a try/except during test-writing, which makes
+    `entry.vault_path.exists()` false and `pytest.raises` fail.
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    entry = _vault_entry(tmp_path)
+    append_manifest_entries(manifest_path, [entry])
+    manifest_content_before = manifest_path.read_text(encoding="utf-8")
+    assert entry.vault_path is not None
+
+    def _always_times_out(fh: object) -> None:
+        raise ManifestLockTimeoutError("simulated: lock never acquired")
+
+    monkeypatch.setattr(executor_module, "_acquire_manifest_lock", _always_times_out)
+
+    with pytest.raises(ManifestLockTimeoutError):
+        purge_expired(
+            apply=True,
+            manifest_path=manifest_path,
+            vault_dir=tmp_path / "vault",
+            safety=_safety(),
+            now=_NOW,
+        )
+
+    assert entry.vault_path.exists()  # untouched -- the eligible-entries loop never ran
+    assert manifest_path.read_text(encoding="utf-8") == manifest_content_before  # no new lines

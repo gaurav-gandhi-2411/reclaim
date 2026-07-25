@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import msvcrt
 import os
 import shutil
 import stat
@@ -581,9 +582,106 @@ def append_manifest_entries(
             fh.write("\n")
 
 
+_MANIFEST_LOCK_NBYTES = 1  # a single sentinel byte at a fixed offset (0) is locked as a pure
+# mutual-exclusion token -- the manifest's real content at that offset is irrelevant. Same
+# "lock byte" convention used by common Windows file-locking libraries (e.g. `portalocker`).
+# Locking a FIXED offset (not "wherever the fd happens to be") means every opener -- regardless
+# of how large the file already is when it opens -- contends for exactly the same byte.
+_MANIFEST_LOCK_POLL_SECONDS = 0.25
+_MANIFEST_LOCK_TIMEOUT_SECONDS = 1800.0  # audit C10 (second pass), point 5: bounds the wait
+# instead of hanging forever if a lock is somehow never released (Windows releases byte-range
+# locks automatically when the owning handle closes or the process exits, so this should only
+# ever fire as a deep defensive bound, not an expected path) -- but the original 600s value was
+# under-justified: ADR-0026's 186.02s/23,000-item measurement is the WORST case *recorded*, not
+# a ceiling on how large or slow a legitimate real batch can get. A real production run already
+# hit 23,565 items in one batch (see `restore_batch`'s docstring); a machine with several times
+# that much accumulated clutter is a plausible, not hypothetical, next data point, and real-world
+# antivirus interception of every per-item file-open/fsync/delete syscall (well documented on
+# Windows) can multiply the measured 8.088ms/item several-fold without anything actually being
+# stuck. At the measured per-item rate, 1800s covers roughly 220,000 items (~9.5x the largest
+# recorded real batch) -- no fixed bound can cover an unbounded batch size times an unbounded
+# per-item slowdown, so this is a deliberately generous, evidence-anchored policy choice, not a
+# guarantee that no legitimate batch will ever exceed it; see the softened error message below,
+# which no longer asserts the holder must be stuck.
+
+
+class ManifestLockTimeoutError(RuntimeError):
+    """Raised by `_open_manifest_for_sync` when another thread or process has held the
+    `manifest.jsonl` write lock for longer than `_MANIFEST_LOCK_TIMEOUT_SECONDS`. Audit finding
+    C10 (unsynchronized concurrent writes to `manifest.jsonl` across the dashboard's threadpool-
+    dispatched background tasks and/or a CLI invocation racing a dashboard-triggered batch)."""
+
+
+def _acquire_manifest_lock(fh: TextIO) -> None:
+    """Audit finding C10: blocks (own bounded retry loop, not `msvcrt.locking`'s own hardcoded
+    10-attempt/10-second `LK_LOCK` ceiling -- too short for the multi-minute batches ADR-0026
+    measures) until an OS-level, cross-thread AND cross-process exclusive lock on
+    `manifest.jsonl` is held by THIS file handle.
+
+    `apply_batch`/`restore_batch`/`purge_expired` each hold this lock for their whole batch
+    (acquired once here in `_open_manifest_for_sync`, released once when the handle closes via
+    `_close_manifest_for_sync`) -- this is what serializes two batches (same-process background-
+    task threads dispatched via FastAPI `BackgroundTasks`/`run_in_threadpool`, or two separate OS
+    processes such as a CLI invocation racing the dashboard) writing to the same manifest file,
+    closing the interleaved-partial-line corruption window that unsynchronized concurrent
+    `_append_and_sync` calls would otherwise open. Windows byte-range locks (what `msvcrt.locking`
+    wraps) are associated with the file HANDLE, not the process, so two handles to the same file
+    genuinely contend even when opened by the same process on different threads -- a plain
+    in-process `threading.Lock` alone would not cover the cross-process half of this race.
+
+    `os.lseek` (not `fh.seek`) is used because `msvcrt.locking` locks bytes starting at the
+    underlying OS file descriptor's *current position*, not a position passed as an argument;
+    this must happen before anything is written through `fh`. Safe under 'a' (append) mode:
+    append-mode writes always target end-of-file on Windows regardless of the fd's seek position
+    (verified empirically against this exact open()/lseek()/write() sequence -- see the C10 fix
+    commit), so seeking to byte 0 here to acquire the lock never affects where a later
+    `_append_and_sync` write lands.
+    """
+    fd = fh.fileno()
+    os.lseek(fd, 0, os.SEEK_SET)
+    deadline = time.monotonic() + _MANIFEST_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, _MANIFEST_LOCK_NBYTES)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise ManifestLockTimeoutError(
+                    "could not acquire the manifest.jsonl write lock within "
+                    f"{_MANIFEST_LOCK_TIMEOUT_SECONDS:.0f}s -- another apply/restore/purge batch "
+                    "is either still legitimately running (an exceptionally large batch, a slow "
+                    "disk, or antivirus scanning every file operation can all push a real run "
+                    "past this bound) or a process holding the lock is stuck. Check Task Manager "
+                    "for a running reclaim/python process before assuming anything is wrong, and "
+                    "retry once it has finished or been closed; audit finding C10"
+                ) from None
+            time.sleep(_MANIFEST_LOCK_POLL_SECONDS)
+        else:
+            return
+
+
+def _release_manifest_lock(fh: TextIO) -> None:
+    """Pair of `_acquire_manifest_lock` -- called only from `_close_manifest_for_sync`, never
+    directly, so every `_open_manifest_for_sync` caller's matching close automatically releases
+    the same byte range that was locked. Audit finding C10."""
+    fd = fh.fileno()
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, _MANIFEST_LOCK_NBYTES)
+
+
 def _open_manifest_for_sync(manifest_path: Path) -> TextIO:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    return manifest_path.open("a", encoding="utf-8")
+    fh = manifest_path.open("a", encoding="utf-8")
+    _acquire_manifest_lock(fh)
+    return fh
+
+
+def _close_manifest_for_sync(fh: TextIO) -> None:
+    """Pairs with `_open_manifest_for_sync` -- releases the OS-level write lock acquired there,
+    then closes the handle. `apply_batch`/`restore_batch`/`purge_expired` all call this from
+    their `finally:` blocks instead of `fh.close()` directly, so releasing the lock is never
+    something a call site can forget. Audit finding C10."""
+    _release_manifest_lock(fh)
+    fh.close()
 
 
 def _append_and_sync(fh: TextIO, entry: QuarantineManifestEntry) -> None:
@@ -1019,7 +1117,7 @@ def apply_batch(
             )
     finally:
         if manifest_fh is not None:
-            manifest_fh.close()
+            _close_manifest_for_sync(manifest_fh)
 
     disk_free_after = (
         _measure_disk_free(_disk_usage_anchor(resolved_vault_dir, candidates)) if apply else None
@@ -1347,7 +1445,7 @@ def restore_batch(
             )
     finally:
         if manifest_fh is not None:
-            manifest_fh.close()
+            _close_manifest_for_sync(manifest_fh)
 
     succeeded_items = [item for item in items if item.succeeded]
     unsupported_items = [item for item in items if item.restore_unsupported]
