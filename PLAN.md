@@ -1739,6 +1739,45 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   against the real running app (not mockups): https://github.com/gaurav-gandhi-2411/reclaim/pull/20
   — still nothing wired to `main`'s default experience.
 
+### 2026-07-25 — v1.3.0 released: Simple mode, v3 visual identity, WS-A hardening closed out
+- GG approved WS-B v3 ("looks good, go ahead"); PR #20 merged. Moved straight into Workstream C
+  per GG's direction: full-drive scan + live ETA backend (PR #23), then the SIMPLE/ADVANCED
+  dashboard mode split (PR #24) defaulting to SIMPLE — one "Clean My Computer" button, live
+  progress + plain-language ETA, results scoped to categorically-safe categories only, one
+  confirmation, never surfacing Review Queue or AI Suggestions. Zero new deletion logic: SIMPLE
+  mode's "Clean now" reuses the exact same safety-scoped Quick Clean apply path Advanced mode
+  already had — pure UI-layer reuse, not a parallel deletion pipeline.
+- Cleared the 3 still-open Workstream A PRs before release (GG's call, "merge all 3 first, then
+  release"): #16 (C10 manifest lock) and #17 (D13 UNC-alias, extended to an 11-alias-form
+  canonical-path rewrite on a second pass) merged cleanly; #14 (F22/A5/D16/D11/D15 — port
+  collision, ENOSPC, config errors, Unicode NFC/NFD, Pillow decompression-bomb cap) stayed open
+  at 562 lines, over the rule-70a 400-line auto-merge ceiling — GG merged it directly.
+- Released v1.3.0: version bump (pyproject.toml/reclaim.iss/uv.lock), full README + landing-page
+  screenshot refresh (12 screenshots recaptured against a disposable synthetic demo tree, never
+  the real disk — see incident note below), `docs/index.html`'s inlined design tokens synced to
+  v3 (it had been missed by WS-B entirely and was still hardcoding the old terracotta palette).
+  That PR (#26) hit the same rule-70a ambiguity as #14 on its binary screenshot diffs sitting
+  outside the designated generated-artifact paths — opened as draft per policy rather than
+  self-merged on a judgment call; GG merged it.
+- Installer rebuilt twice (once before PR #14 landed, once after, to include its fixes) from a
+  genuinely clean core-only venv (`uv venv` + `uv pip install -e .`, no `[ai]` extra, no dev
+  group) — 486 C files / 75MB dist both times, matching the known-good v1.2.0 reference exactly,
+  confirming no dev-tool leakage. Packaged safe-mode checks (14 checks) run twice against the
+  final build — raw Nuitka `--standalone` output and a real silent install/serve/uninstall
+  cycle — 26/26 passed. Tagged `v1.3.0` on main, published the GitHub release with
+  `reclaim-setup.exe` + a detached `.sha256`, verified the published asset downloads
+  byte-identical to the local build (`7f02ab7b...` both sides).
+- **Incident, caught and contained**: mid-screenshot-capture, a stale browser page reconnected
+  and had a "Home folder" quick-scan in flight against the real `C:/Users/gaura` (not the
+  disposable demo tree) — caught via `/api/scan/status` reporting `root: "C:/Users/gaura"`
+  before killing the server process. The scan is read-only (indexes metadata only, no file was
+  ever touched), but it violated this session's own stated rule to never scan the real dev
+  machine during verification. Root cause not fully isolated (likely a leftover queued click
+  from before a context-compaction boundary); rebuilt the demo environment from a clean short
+  path (`%TEMP%\reclaim-demo`, replacing the original deeply-nested session-scratchpad path,
+  which was also leaking the session UUID into screenshots meant for a public README) and
+  re-verified every subsequent screenshot's scan root before capturing.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
