@@ -1739,6 +1739,51 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   against the real running app (not mockups): https://github.com/gaurav-gandhi-2411/reclaim/pull/20
   — still nothing wired to `main`'s default experience.
 
+### 2026-07-26 — WS-B merged (GG-approved); Workstream C (SIMPLE/ADVANCED) built, 3 PRs
+- GG approved the WS-B v3 direction and PR #20 merged to `main` (#20) after the full asset
+  regeneration (`packaging/build_brand_assets.py` ported the validated size-adaptive
+  render_mark(), all 5 packaged outputs — `.ico`/wizard bitmaps/OG preview/README lockup —
+  regenerated with the real .ico's 16px frame pixel-inspected post-build). Workstream B closed.
+- Workstream C split into three independent pieces:
+  - **WS-C3 (AI-install honest messaging), merged (#22)**: found the existing AI-unavailable
+    message actively wrong for most real users — Reclaim isn't published to PyPI, so
+    `pip install reclaim[ai]` (the only instruction ever shown) fails for anyone who didn't get
+    Reclaim from a source checkout. Fixed the message to say plainly there's no way to add AI to
+    an installed copy yet, scoped `uv sync --extra ai` to the audience it's true for. **ADR-0029**
+    records the proposed real fix (a bundled/downloaded AI runtime, subprocess-invoked from the
+    packaged `reclaim.exe`) and explicitly why it's NOT built this pass — a genuine architecture
+    change needing the same recommend-only safety rigor ADR-0011's static import-scanning eval
+    already holds `reclaim.ai` to, extended across a new process boundary; real eval-suite work,
+    not a checkbox, not appropriate to rush alongside the rest of Workstream C.
+  - **WS-C1 (full-drive scan + live ETA backend), PR #23, draft (1120-line diff, over the size
+    gate) — both required adversarial passes CONFIRMED**: new `src/reclaim/drives.py`
+    (`list_fixed_drives()` via `GetLogicalDrives`/`GetDriveTypeW`), `scanner.py`'s
+    `count_entries_fast()` (stat-free pre-pass mirroring `scan_tree`'s own skip rules — the
+    "quick sample" the ETA is derived from) and a thread-safe progress-callback-enabled
+    `scan_tree()`, and `api/service.py`'s `run_scan()` as the ONE orchestration path underneath
+    both the pre-existing single-path scan and the new `POST /api/scan/full-drive` — 100%
+    backward compatible, every pre-existing test passes unmodified. Second pass caught nothing
+    new; both passes independently confirmed thread-safety, the closures-in-a-loop pattern is NOT
+    the late-binding bug it looks like, multi-drive partial-failure state, and `_compute_eta_
+    seconds`'s edge-case clamping.
+  - **WS-C2 (SIMPLE/ADVANCED frontend), PR #24, draft, stacked on #23**: one CSS attribute
+    (`html[data-mode]`) drives the whole split — SIMPLE hides the tab nav, scan bar, and every
+    existing view entirely (one screen, not a tab picker), defaulting to SIMPLE via a hardcoded
+    `index.html` attribute (no flash of the wrong UI). SIMPLE's "Clean My Computer" flow reuses
+    (not reimplements) the exact same safe-mode-enforced, one-click-summary-scoped Quick Clean
+    apply path — zero new deletion logic, zero new category scoping decided in the frontend.
+    Verified in a REAL browser (not just the 12 new Node/JSDOM XSS-regression tests): idle and
+    Advanced-toggle screenshots are real page loads; scanning/results screenshots call the actual
+    exported render functions with synthetic data rather than triggering a real full-drive scan
+    of the dev machine — this project's "never scan a real disk without deliberate intent"
+    principle applied to verification too, even though scanning itself is non-destructive.
+- All three verified independently by me (fresh clones / re-run test suites / real browser
+  screenshots), not just trusted from the implementing agents' reports, matching this session's
+  established rigor for WS-A's security-critical work.
+- Next: GG merges #23 then #24 (order matters, #24 is stacked); after that, the release rebuild
+  (installer, version bump, packaged safe-mode re-verification, publish) is the last item on the
+  original work order.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
