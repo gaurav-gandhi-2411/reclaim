@@ -157,10 +157,20 @@ function renderState(container, kind, { title, message, actionLabel, onAction } 
   panel.setAttribute("role", kind === "error" ? "alert" : "status");
 
   if (kind === "loading") {
-    const spinner = document.createElement("span");
-    spinner.className = "rc-spinner";
-    spinner.setAttribute("aria-hidden", "true");
-    panel.appendChild(spinner);
+    // v3: skeleton bars instead of a spinner -- shape-carrying, not just "something is
+    // happening" (see styles.css's .rc-skeleton-group comment). aria-hidden because the
+    // panel's own role="status" + the title text below already carries the accessible meaning;
+    // the bars are decoration, not additional information.
+    const skeleton = document.createElement("div");
+    skeleton.className = "rc-skeleton-group";
+    skeleton.setAttribute("aria-hidden", "true");
+    for (const width of ["92%", "76%", "58%"]) {
+      const bar = document.createElement("div");
+      bar.className = "rc-skeleton-bar";
+      bar.style.width = width;
+      skeleton.appendChild(bar);
+    }
+    panel.appendChild(skeleton);
   }
 
   const strong = document.createElement("strong");

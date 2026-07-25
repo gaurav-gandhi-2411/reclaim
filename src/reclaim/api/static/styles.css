@@ -14,15 +14,29 @@ body {
 }
 
 body {
-  background: var(--rc-bg);
+  /* v3: --rc-bg-wash (a pair of very low-opacity radial gradients) layers UNDER the solid
+     --rc-bg color -- background-image paints above background-color, so the wash is the first
+     value here, the flat color the fallback/base beneath it. Fixed attachment keeps the wash
+     anchored to the viewport rather than scrolling with content, reading as ambient atmosphere
+     behind the page rather than a texture printed on it. */
+  background-image: var(--rc-bg-wash);
+  background-color: var(--rc-bg);
+  background-attachment: fixed;
   color: var(--rc-text);
   font-family: var(--rc-font-sans);
   font-size: var(--rc-text-base);
-  line-height: 1.5;
+  line-height: var(--rc-line-height-body);
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: var(--rc-tracking-heading);
 }
 
 a {
-  color: var(--rc-brand);
+  color: var(--rc-brand-text);
+  transition: color var(--rc-motion-duration) var(--rc-motion-ease);
 }
 
 :focus-visible {
@@ -37,6 +51,17 @@ button {
   cursor: pointer;
 }
 
+/* v3: every interactive element gets the same press feedback -- a barely-there scale-down
+   confirms a click registered before the resulting state change (a network round-trip, a view
+   swap) actually lands, which is exactly when feedback matters most. 0.98 is deliberately subtle
+   (a 2% scale change) -- this is a system utility, not a marketing site; motion should confirm,
+   never entertain. Governed by the same global reduced-motion gate in tokens.css. */
+button:active:not(:disabled),
+.rc-tab:active,
+a:active {
+  transform: scale(0.98);
+}
+
 /* --- Header ------------------------------------------------------------------------------- */
 
 .rc-header {
@@ -44,8 +69,24 @@ button {
   align-items: center;
   gap: var(--rc-space-3);
   padding: var(--rc-space-3) var(--rc-space-5);
+  /* v3: sticky + translucent + blurred -- a real frosted-glass header, not a flat opaque bar.
+     position:sticky (not fixed) keeps it in normal document flow, so it never needs a manual
+     content-padding offset the way position:fixed would. The opaque `background` above is the
+     fallback for the @supports-gated blur below -- browsers without backdrop-filter get a
+     solid, fully legible header instead of see-through text, never a broken one. */
+  position: sticky;
+  top: 0;
+  z-index: 100;
   background: var(--rc-surface);
   border-bottom: 1px solid var(--rc-border);
+}
+
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .rc-header {
+    background: color-mix(in oklch, var(--rc-surface) 78%, transparent);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
 }
 
 .rc-brand-mark {
@@ -83,6 +124,9 @@ button {
   border-radius: var(--rc-radius-md);
   padding: var(--rc-space-2) var(--rc-space-3);
   color: var(--rc-text);
+  transition:
+    border-color var(--rc-motion-duration) var(--rc-motion-ease),
+    transform var(--rc-motion-duration) var(--rc-motion-ease);
 }
 
 .rc-theme-toggle:hover {
@@ -108,6 +152,10 @@ button {
   color: var(--rc-text-muted);
   font-weight: 600;
   white-space: nowrap;
+  transition:
+    color var(--rc-motion-duration) var(--rc-motion-ease),
+    border-color var(--rc-motion-duration) var(--rc-motion-ease),
+    transform var(--rc-motion-duration) var(--rc-motion-ease);
 }
 
 .rc-tab:hover {
@@ -115,7 +163,7 @@ button {
 }
 
 .rc-tab[aria-selected="true"] {
-  color: var(--rc-brand);
+  color: var(--rc-brand-text);
   border-bottom-color: var(--rc-brand);
 }
 
@@ -212,6 +260,11 @@ button {
   border-radius: var(--rc-radius-md);
   padding: var(--rc-space-2) var(--rc-space-4);
   font-weight: 600;
+  transition:
+    background-color var(--rc-motion-duration) var(--rc-motion-ease),
+    border-color var(--rc-motion-duration) var(--rc-motion-ease),
+    transform var(--rc-motion-duration) var(--rc-motion-ease),
+    box-shadow var(--rc-motion-duration) var(--rc-motion-ease);
 }
 
 .rc-btn-primary {
@@ -221,6 +274,23 @@ button {
 
 .rc-btn-primary:hover:not(:disabled) {
   background: var(--rc-brand-hover);
+}
+
+.rc-btn-primary:active:not(:disabled) {
+  background: var(--rc-brand-active);
+}
+
+.rc-btn-success {
+  background: var(--rc-success);
+  color: var(--rc-text-on-brand);
+}
+
+.rc-btn-success:hover:not(:disabled) {
+  background: var(--rc-success-hover);
+}
+
+.rc-btn-success:active:not(:disabled) {
+  background: var(--rc-success-active);
 }
 
 .rc-btn-danger {
@@ -276,7 +346,7 @@ button {
 }
 
 .rc-scan-status[data-tone="success"] {
-  color: var(--rc-brand);
+  color: var(--rc-success-text);
   font-weight: 600;
 }
 
@@ -319,24 +389,41 @@ button {
   background: var(--rc-surface-alt);
 }
 
-.rc-spinner {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 3px solid var(--rc-border);
-  border-top-color: var(--rc-brand);
-  animation: rc-spin 0.8s linear infinite;
+/* v3: skeleton placeholders replace the old spinner for every loading state renderState()
+   produces (see app.js) -- a shimmering approximation of "where content will appear" reads as
+   more informative than a spinner that carries no shape information, and is the standard modern
+   pattern for content-shaped loading (vs. a spinner, better suited to a single indeterminate
+   action with no shape to preview). The shimmer is a background-position animation, not a
+   transform, so it's cheap to run continuously and fully covered by tokens.css's global
+   prefers-reduced-motion gate (animation-duration forced near-zero -- no separate override
+   needed here). */
+.rc-skeleton-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rc-space-2);
+  width: 100%;
+  max-width: 420px;
 }
 
-@keyframes rc-spin {
-  to {
-    transform: rotate(360deg);
+.rc-skeleton-bar {
+  height: 14px;
+  border-radius: var(--rc-radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--rc-surface-alt) 25%,
+    var(--rc-border) 37%,
+    var(--rc-surface-alt) 63%
+  );
+  background-size: 400% 100%;
+  animation: rc-skeleton-shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes rc-skeleton-shimmer {
+  0% {
+    background-position: 100% 50%;
   }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .rc-spinner {
-    animation: none;
+  100% {
+    background-position: 0% 50%;
   }
 }
 
@@ -389,6 +476,14 @@ button {
   border-radius: var(--rc-radius-md);
   padding: var(--rc-space-4);
   box-shadow: var(--rc-shadow-sm);
+  transition:
+    box-shadow var(--rc-motion-duration) var(--rc-motion-ease),
+    transform var(--rc-motion-duration) var(--rc-motion-ease);
+}
+
+.rc-category-card:hover {
+  box-shadow: var(--rc-shadow-md);
+  transform: translateY(-2px);
 }
 
 .rc-category-card h3 {
@@ -440,6 +535,15 @@ button {
   border-left: 6px solid var(--rc-cat-other);
   border-radius: var(--rc-radius-md);
   padding: var(--rc-space-3) var(--rc-space-4);
+  box-shadow: var(--rc-shadow-sm);
+  transition:
+    box-shadow var(--rc-motion-duration) var(--rc-motion-ease),
+    transform var(--rc-motion-duration) var(--rc-motion-ease);
+}
+
+.rc-quick-clean-card:hover {
+  box-shadow: var(--rc-shadow-md);
+  transform: translateY(-2px);
 }
 
 .rc-quick-clean-card-head {
@@ -487,9 +591,12 @@ button {
 }
 
 .rc-badge[data-tier="A"] {
-  background: color-mix(in srgb, var(--rc-brand) 16%, transparent);
-  color: var(--rc-brand);
-  border-color: var(--rc-brand);
+  /* Tier A = "auto-quarantine eligible", a positive/safe judgement -- success (mint), not
+     brand/accent (indigo); v1/v2 used the single green token for both roles, see tokens.css's
+     file header for why v3 splits them. */
+  background: color-mix(in oklch, var(--rc-success) 16%, transparent);
+  color: var(--rc-success-text);
+  border-color: var(--rc-success);
 }
 
 .rc-badge[data-tier="B"] {
@@ -635,7 +742,9 @@ button {
 }
 
 .rc-cluster-table tr[data-keep="true"] {
-  background: color-mix(in srgb, var(--rc-brand) 10%, transparent);
+  /* "this member will be kept" -- a positive/safe determination, success token (see the Tier-A
+     badge rule above for the same reasoning). */
+  background: color-mix(in oklch, var(--rc-success) 10%, transparent);
 }
 
 .rc-duplicate-review {
@@ -799,6 +908,7 @@ button {
   font-size: var(--rc-text-sm);
   font-weight: 600;
   cursor: pointer;
+  transition: transform var(--rc-motion-duration) var(--rc-motion-ease);
 }
 
 .rc-mode-badge[data-mode="safe"] {
@@ -819,9 +929,19 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.5);
+  /* Solid fallback for browsers without backdrop-filter -- opaque enough on its own that the
+     modal panel underneath stays fully legible either way, matching the header's fallback
+     posture above. */
+  background: rgba(15, 17, 23, 0.6);
   z-index: 1000;
   padding: var(--rc-space-5);
+}
+
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .rc-overlay {
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
 }
 
 .rc-overlay[hidden] {
@@ -831,7 +951,9 @@ button {
 .rc-overlay-panel {
   background: var(--rc-surface);
   border-radius: var(--rc-radius-lg);
-  box-shadow: var(--rc-shadow-md);
+  /* v3: modals sit a full elevation step above cards -- shadow-lg, not shadow-md (see
+     tokens.css's file header on why the lg stop exists). */
+  box-shadow: var(--rc-shadow-lg);
   padding: var(--rc-space-6);
   max-width: 560px;
   width: 100%;
@@ -918,9 +1040,34 @@ button {
 
 .rc-progress-fill {
   height: 100%;
-  background: var(--rc-brand);
+  background-color: var(--rc-brand);
+  /* v3: a moving diagonal stripe signals "actively working," not just "this much is done" --
+     the width transition alone only communicates progress at each poll tick (see app.js's
+     pollUntilDone), which can look stalled between ticks on a large batch; the stripe animates
+     continuously regardless of poll timing. Covered by tokens.css's global reduced-motion gate. */
+  background-image: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.18) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.18) 50%,
+    rgba(255, 255, 255, 0.18) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 28px 28px;
   border-radius: var(--rc-radius-sm);
   transition: width 0.3s ease;
+  animation: rc-progress-stripes 1s linear infinite;
+}
+
+@keyframes rc-progress-stripes {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 28px 0;
+  }
 }
 
 .rc-progress-label {

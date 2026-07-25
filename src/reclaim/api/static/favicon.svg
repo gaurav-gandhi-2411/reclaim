@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
   <!--
-    Reclaim mark v2 (tab-icon-sized copy of logo.svg) — see that file's comment for the full
+    Reclaim mark v3 (tab-icon-sized copy of logo.svg) — see that file's comment for the full
     palette/depth rationale. Literal hex values (not CSS custom properties) because a favicon is
     loaded as a standalone document outside the app's stylesheet cascade; these mirror
     tokens.css's rc-mark, rc-brand, and rc-bg custom properties exactly (light mode) with a
@@ -10,21 +10,21 @@
     Chrome silently fails to render the whole file — see logo.svg's comment for why).
   -->
   <defs>
-    <linearGradient id="rc-grad-copper" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#c9702f" />
-      <stop offset="1" stop-color="#8a3f16" />
+    <linearGradient id="rc-grad-indigo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366f1" />
+      <stop offset="1" stop-color="#4338ca" />
     </linearGradient>
-    <linearGradient id="rc-grad-jade" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#34b378" />
-      <stop offset="1" stop-color="#167048" />
+    <linearGradient id="rc-grad-mint" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34d399" />
+      <stop offset="1" stop-color="#047857" />
     </linearGradient>
   </defs>
   <style>
-    .rc-ground { fill: url(#rc-grad-copper); }
-    .rc-reclaimed { fill: url(#rc-grad-jade); }
-    .rc-lift { fill: #c9702f; stroke: #f6f3ee; stroke-width: 2; }
+    .rc-ground { fill: url(#rc-grad-indigo); }
+    .rc-reclaimed { fill: url(#rc-grad-mint); }
+    .rc-lift { fill: #6366f1; stroke: #f6f7fb; stroke-width: 2; }
     @media (prefers-color-scheme: dark) {
-      .rc-lift { stroke: #16130f; }
+      .rc-lift { stroke: #0f1117; }
     }
   </style>
   <clipPath id="rc-mark-clip">
