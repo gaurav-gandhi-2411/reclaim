@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,35 @@ def _candidate(path: Path, *, size_bytes: int) -> Candidate:
         size_guard_exempt=False,
         rebuildable=False,
     )
+
+
+def _install_lock_sync_hooks(module: Any, lock_acquired_marker: str, proceed_marker: str) -> None:
+    """Audit finding C10 (second pass), point 4 — test-only synchronization hook, opt-in via two
+    optional config keys, used only by `tests/test_recovery.py`'s "second batch blocked on the
+    lock during a hard crash" test.
+
+    Wraps `_open_manifest_for_sync` (called exactly once, up front, by every one of `apply_batch`
+    /`restore_batch`/`purge_expired` — see `executor.py`) so that the instant this process
+    actually holds the manifest's OS-level lock, it (1) writes `lock_acquired_marker` to disk —
+    real, observable proof from the PARENT test's perspective that the lock is genuinely held,
+    not merely "probably held by now" — then (2) busy-waits, STILL HOLDING THE LOCK, until
+    `proceed_marker` appears before letting `apply_batch` proceed into its per-item loop (which
+    is where this scenario's crash then fires, per the existing `crash_index`/`checkpoint`
+    machinery below). This is what lets the parent test start a REAL second lock-acquisition
+    attempt and confirm it is genuinely blocked before killing this process — without it, timing
+    between "process A holds the lock" and "process A crashes" would be a race the parent test
+    couldn't observe deterministically.
+    """
+    original = module._open_manifest_for_sync
+
+    def _wrapped(manifest_path: Path) -> Any:
+        fh = original(manifest_path)
+        Path(lock_acquired_marker).write_text("1", encoding="utf-8")
+        while not Path(proceed_marker).exists():
+            time.sleep(0.02)
+        return fh
+
+    module._open_manifest_for_sync = _wrapped
 
 
 def _install_intent_crash(module: Any, crash_index: int) -> None:
@@ -128,6 +158,15 @@ def main() -> None:
     # effect on `purge.py`'s calls.
     target_module = executor_module if operation in ("apply", "restore") else purge_module
     action_attr = "_atomic_move" if operation in ("apply", "restore") else "unlink_clear_readonly"
+
+    # Audit finding C10 (second pass), point 4: optional, opt-in-only lock-acquired/proceed
+    # synchronization — see `_install_lock_sync_hooks`'s docstring. Absent from every existing
+    # crash-harness config (this repo's other tests never pass these keys), so this is a no-op
+    # for all of them.
+    lock_acquired_marker = config.get("lock_acquired_marker")
+    proceed_marker = config.get("proceed_marker")
+    if lock_acquired_marker and proceed_marker:
+        _install_lock_sync_hooks(target_module, str(lock_acquired_marker), str(proceed_marker))
 
     if checkpoint == "after_intent_fsync":
         _install_intent_crash(target_module, crash_index)

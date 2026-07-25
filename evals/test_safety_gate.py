@@ -6,7 +6,7 @@ import pytest
 from fixtures.build_golden_tree import FixtureCase, build_golden_tree
 
 from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, SafetyConfig
-from reclaim.models import Verdict
+from reclaim.models import FileRecord, Verdict
 from reclaim.safety import SafetyValidator
 
 # Spec: "Never enters candidate list" — every category listed there must never come out
@@ -133,3 +133,69 @@ def test_hard_protected_categories_cover_all_manifest_protected_entries(
     }
     missing = blocked_categories - _HARD_PROTECTED_CATEGORIES
     assert not missing, f"BLOCKED categories missing from the hard gate set: {missing}"
+
+
+# --- D13: UNC-aliased-path safety bypass ---------------------------------------------------------
+
+
+def _unc_alias(path: Path) -> Path:
+    r"""Rewrites a real drive-letter path (`C:\some\dir\file`) into its UNC administrative-share
+    alias (`\\localhost\C$\some\dir\file`) -- the exact same on-disk file, a different string
+    form. Used to prove the golden-tree's real, physically-materialized protected-root fixture is
+    still denied when addressed by its UNC alias instead of its drive-letter form."""
+    drive = path.drive  # e.g. "C:"
+    letter = drive.rstrip(":")
+    rest = str(path)[len(drive) :]
+    return Path(f"\\\\localhost\\{letter}$" + rest)
+
+
+def test_unc_alias_of_real_protected_root_fixture_is_denied(
+    golden_tree_cases: list[FixtureCase], golden_tree_config: Config
+) -> None:
+    """The audit's exact adversarial case, against a REAL materialized fixture file (not just a
+    synthetic path): the golden tree's `protected_root_windows` case is a real file physically
+    under `<tmp_path>/Windows/...`; addressed via its UNC admin-share alias
+    (`\\localhost\<drive>$/...`) instead of its drive-letter path, it must still be BLOCKED --
+    proving the pattern-based `protected_roots` deny list cannot be bypassed by UNC aliasing even
+    against a genuine on-disk file, not merely a hand-built path string."""
+    validator = SafetyValidator(golden_tree_config)
+    real_case = next(c for c in golden_tree_cases if c.category == "protected_root_windows")
+    aliased_record = FileRecord(
+        path=_unc_alias(real_case.path),
+        is_dir=real_case.kind == "dir",
+        size_bytes=real_case.size_bytes,
+        attributes=real_case.attributes,
+        ext=real_case.path.suffix.lower(),
+        git_repo_root=real_case.git_repo_root,
+        git_repo_clean=real_case.git_repo_clean,
+    )
+    result = validator.evaluate(aliased_record)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "UNC_NETWORK_PATH"
+
+
+def test_unc_alias_of_real_docker_wsl_root_fixture_is_denied(
+    golden_tree_cases: list[FixtureCase], golden_tree_config: Config
+) -> None:
+    """Same proof as above, for the `docker_wsl_root` category -- confirms the same built-in-deny
+    protection (BLOCKED verdict, upstream of any pattern match) applies for every pattern-based
+    deny list `_any_pattern_matches` backs, not just `protected_roots`. (`DEFAULT_DOCKER_WSL_ROOTS`
+    entries are all leading-`*/`-relative, so this particular real fixture was incidentally still
+    caught by the pre-existing pattern match too, just under `DOCKER_WSL_DATA_ROOT` instead of
+    `UNC_NETWORK_PATH` -- `tests/test_safety.py::
+    test_unc_alias_of_drive_anchored_pattern_list_entry_denied` is the genuine
+    false-negative-closure proof, using a drive-anchored pattern.)"""
+    validator = SafetyValidator(golden_tree_config)
+    real_case = next(c for c in golden_tree_cases if c.category == "docker_wsl_root")
+    aliased_record = FileRecord(
+        path=_unc_alias(real_case.path),
+        is_dir=real_case.kind == "dir",
+        size_bytes=real_case.size_bytes,
+        attributes=real_case.attributes,
+        ext=real_case.path.suffix.lower(),
+        git_repo_root=real_case.git_repo_root,
+        git_repo_clean=real_case.git_repo_clean,
+    )
+    result = validator.evaluate(aliased_record)
+    assert result.verdict == Verdict.BLOCKED
+    assert result.reason_code == "UNC_NETWORK_PATH"

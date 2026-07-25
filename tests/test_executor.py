@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import reclaim.executor as executor_module
 from reclaim.config import Config, SafetyConfig
 from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
+    ManifestLockTimeoutError,
     QuarantineManifestEntry,
     RecycleBinRestoreUnsupportedError,
     RestoreIntegrityError,
     SafeModeViolationError,
     SafetyInvariantError,
     VaultIntegrityError,
+    _append_and_sync,
+    _close_manifest_for_sync,
     _latest_entries_for_batch,
+    _open_manifest_for_sync,
     apply_batch,
     long_path,
     restore_batch,
@@ -1838,3 +1845,356 @@ def test_restore_refuses_whole_batch_when_original_path_is_a_protected_root(
     assert legit_vault_path.exists()
     assert not legit_target.exists()
     assert not tampered_original.exists()
+
+
+# --- Audit finding C10: OS-level lock around manifest.jsonl appends ----------------------------
+
+
+def _manifest_entry_for_lock_test(*, batch_id: str, index: int) -> QuarantineManifestEntry:
+    """A minimal, valid `phase="done"` entry — content is irrelevant to this test, only that
+    every appended line round-trips as valid JSON and none get lost or merged."""
+    return QuarantineManifestEntry(
+        batch_id=batch_id,
+        original_path=Path(f"C:/fake/{batch_id}/item_{index:04d}.txt"),
+        size_bytes=index,
+        is_dir=False,
+        category="test_category",
+        category_group="test_group",
+        rationale="C10 concurrency regression test",
+        rebuild_instruction=None,
+        tier=Tier.A,
+        method="vault",
+        vault_path=Path(f"C:/fake/vault/{batch_id}/item_{index:04d}.txt"),
+        retention_days=30,
+        quarantined_at=_NOW,
+        retention_until=_NOW + 30 * 86400.0,
+    )
+
+
+def test_concurrent_manifest_appends_from_two_threads_never_interleave_partial_lines(
+    tmp_path: Path,
+) -> None:
+    """Audit finding C10: `apply_batch`/`restore_batch`/`purge_expired` each independently call
+    `_open_manifest_for_sync(manifest_path)` once per batch, hold that file handle open for the
+    whole batch, and write via `_append_and_sync` per item. Nothing prevented two of these batch
+    calls from running concurrently against the SAME `manifest_path` — e.g. two dashboard
+    requests dispatched via FastAPI `BackgroundTasks` (`run_in_threadpool` — real OS threads, not
+    cooperative-only) — and two independent file handles opened in append mode, each doing
+    multiple buffered `write()` calls per JSON line, could interleave partial lines from
+    different threads, corrupting the manifest: this tool's entire audit trail and crash-recovery
+    source of truth (`reclaim recover` parses this file to reconcile orphaned intents).
+
+    This spawns two real OS threads (not two processes): Windows byte-range locks — what
+    `msvcrt.locking` wraps inside `_acquire_manifest_lock`/`_release_manifest_lock` — are
+    associated with the file HANDLE, not the process, so two handles opened by two threads in
+    the SAME process contend exactly like two handles opened by two different processes would.
+    A thread-based test exercises the identical OS-level contention path a real cross-process
+    race would hit, without the added flakiness/cost of spawning and synchronizing real
+    subprocesses to prove the same underlying mechanism.
+    `tests/test_recovery.py`/`tests/_recovery_crash_harness.py` already cover genuine
+    cross-process hard-crash recovery separately (`os._exit()` mid-batch, via subprocess) — this
+    test's job is purely to prove the lock actually serializes concurrent writers, not to reprove
+    that a subprocess is a subprocess.
+
+    Confirmed this test fails without the fix: temporarily reverting `_acquire_manifest_lock`/
+    `_release_manifest_lock` to no-ops (so `_open_manifest_for_sync` opens two fully independent,
+    unsynchronized append-mode handles, matching the pre-fix code) makes this test fail
+    reliably — corrupted/unparseable lines and/or a wrong total line count.
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    entries_per_thread = 300
+    errors: list[BaseException] = []
+
+    def _write_batch(batch_id: str) -> None:
+        try:
+            fh = _open_manifest_for_sync(manifest_path)
+            try:
+                for index in range(entries_per_thread):
+                    entry = _manifest_entry_for_lock_test(batch_id=batch_id, index=index)
+                    _append_and_sync(fh, entry)
+            finally:
+                _close_manifest_for_sync(fh)
+        except BaseException as exc:  # pragma: no cover -- surfaced via `errors`, never swallowed
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_write_batch, args=(batch_id,))
+        for batch_id in ("batch_thread_a", "batch_thread_b")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not any(t.is_alive() for t in threads), "a writer thread hung — lock deadlock?"
+    assert not errors, f"writer thread(s) raised: {errors!r}"
+
+    lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    expected_total = 2 * entries_per_thread
+    assert len(lines) == expected_total, (
+        f"expected {expected_total} manifest lines (one per _append_and_sync call across both "
+        f"threads), got {len(lines)} — lines were lost or merged, a symptom of interleaved "
+        "concurrent writes corrupting the manifest"
+    )
+
+    parsed_by_batch: dict[str, int] = {"batch_thread_a": 0, "batch_thread_b": 0}
+    for line in lines:
+        # Every line must independently parse as one complete, valid JSON entry — a corrupted
+        # interleave (two threads' partial writes merged into one garbled line, or one write
+        # split across two lines) fails this.
+        entry = QuarantineManifestEntry.model_validate_json(line)
+        parsed_by_batch[entry.batch_id] += 1
+
+    assert parsed_by_batch == {
+        "batch_thread_a": entries_per_thread,
+        "batch_thread_b": entries_per_thread,
+    }
+
+
+# --- Audit finding C10 (second pass): deadlock/self-block, lock-failure, and ordering proofs ---
+
+
+def test_reentrant_manifest_lock_acquire_on_second_handle_times_out_not_hangs_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit finding C10 (second pass), point 1: `apply_batch`/`restore_batch`/`purge_expired`
+    each call `_open_manifest_for_sync` exactly once per batch, in a local variable, closed
+    exactly once from a `finally:` block -- traced across all three call sites, there is no path
+    today that calls it a second time on the same manifest before releasing the first handle.
+    This test proves what WOULD happen if a future refactor introduced exactly that bug (or any
+    other caller opened a second handle to the same `manifest_path` while the first is still
+    held): Windows byte-range locks are handle-associated, not thread/process-associated (see
+    `_acquire_manifest_lock`'s own docstring), so a second handle contends for the SAME lock
+    exactly like a genuinely separate writer would -- there is no special case that lets "the
+    same process/thread" skip the queue. The real question: does that contention hang FOREVER
+    (a true self-deadlock, since nothing else exists to ever release the first handle), or does
+    it fail loud within the bounded retry loop's timeout? Patches
+    `_MANIFEST_LOCK_TIMEOUT_SECONDS`/`_MANIFEST_LOCK_POLL_SECONDS` down for test speed -- the
+    bound itself, not its production magnitude, is what's being proven here.
+
+    Run on a background thread with a generous `join(timeout=...)`, matching this file's other
+    lock test's `t.join(timeout=60)` convention: if `_acquire_manifest_lock` ever regressed into
+    a genuine infinite loop, this test fails fast with a clear assertion message instead of
+    hanging the whole suite. Confirmed this test fails (times out / `t.is_alive()` stays True)
+    if the `if time.monotonic() >= deadline: raise ...` bound is temporarily removed from
+    `_acquire_manifest_lock`, restoring an actual infinite retry loop.
+    """
+    monkeypatch.setattr(executor_module, "_MANIFEST_LOCK_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(executor_module, "_MANIFEST_LOCK_POLL_SECONDS", 0.05)
+
+    manifest_path = tmp_path / "manifest.jsonl"
+    first_handle = _open_manifest_for_sync(manifest_path)  # holds the lock for the whole test
+
+    result: dict[str, object] = {}
+
+    def _reentrant_open() -> None:
+        start = time.monotonic()
+        try:
+            executor_module._open_manifest_for_sync(manifest_path)
+        except BaseException as exc:  # pragma: no cover -- surfaced via `result`, never swallowed
+            result["error"] = exc
+        result["elapsed"] = time.monotonic() - start
+
+    t = threading.Thread(target=_reentrant_open)
+    t.start()
+    t.join(timeout=10)  # >> the patched 1.0s timeout -- a hang here is a real self-deadlock bug
+    try:
+        assert not t.is_alive(), (
+            "a second _open_manifest_for_sync call against an already-locked manifest_path "
+            "never returned -- infinite self-block, not a bounded timeout"
+        )
+        assert isinstance(result.get("error"), ManifestLockTimeoutError), (
+            f"expected ManifestLockTimeoutError, got {result.get('error')!r}"
+        )
+        elapsed = result["elapsed"]
+        assert isinstance(elapsed, float)
+        # Bounded close to the patched timeout, not near-zero (would mean it never actually
+        # contended) and not near the real production default (would mean the monkeypatch
+        # didn't take effect and this test just got lucky finishing before the real timeout).
+        assert 1.0 <= elapsed < 5.0, f"expected a ~1.0s bounded wait, got {elapsed:.2f}s"
+    finally:
+        _close_manifest_for_sync(first_handle)
+
+
+def test_apply_batch_lock_acquisition_failure_leaves_batch_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit finding C10 (second pass), point 2, apply_batch's half: `apply_batch` opens the
+    manifest -- and therefore acquires the OS-level lock -- exactly ONCE, before its
+    per-candidate loop even starts (see `apply_batch`'s `manifest_fh = _open_manifest_for_sync
+    (...)` line, above the `for index, candidate in enumerate(candidates, ...)` loop). A
+    lock-acquisition failure must therefore be a clean "batch never started" failure: no
+    candidate's source file moved, no manifest line written at all -- never a "some items
+    already applied with no manifest trace" partial-batch failure, which would be silently
+    worse than the interleaved-write corruption C10 exists to prevent.
+
+    Forces `_acquire_manifest_lock` to fail immediately (rather than waiting out the real
+    timeout) by monkeypatching it to always raise -- proves the CONTRACT (what `apply_batch`
+    does with that failure), not the retry loop itself (already covered by the reentrant-lock
+    test above and the real-crash test in `tests/test_recovery.py`).
+
+    Confirmed this test fails if `apply_batch` is changed to catch `ManifestLockTimeoutError`
+    around `_open_manifest_for_sync` and proceed with the batch anyway (a real,
+    severity-escalating regression: files would move with zero audit trail) -- verified by
+    temporarily wrapping that call in exactly such a try/except during test-writing, which makes
+    `source.exists()` false and `pytest.raises` fail.
+    """
+
+    def _always_times_out(fh: Any) -> None:
+        raise ManifestLockTimeoutError("simulated: lock never acquired")
+
+    monkeypatch.setattr(executor_module, "_acquire_manifest_lock", _always_times_out)
+
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    candidate = _candidate(source, size_bytes=source.stat().st_size)
+
+    with pytest.raises(ManifestLockTimeoutError):
+        apply_batch(
+            [candidate],
+            safety=_safety(),
+            apply=True,
+            method="vault",
+            vault_dir=vault_dir,
+            manifest_path=manifest_path,
+            now=_NOW,
+        )
+
+    assert source.exists()  # untouched -- the per-candidate loop never ran
+    assert not vault_dir.exists()  # nothing vaulted
+    # `_open_manifest_for_sync` creates (but never writes to) the manifest file before the lock
+    # acquisition it wraps can fail -- "exists but empty" and "never created" are both valid
+    # "nothing was written" outcomes; only actual manifest content would signal a real bug.
+    assert not manifest_path.exists() or manifest_path.read_text(encoding="utf-8") == ""
+
+
+def test_restore_batch_lock_acquisition_failure_leaves_batch_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit finding C10 (second pass), point 2, restore_batch's half: same "batch never
+    started" contract as `apply_batch`'s version of this test above -- `restore_batch` opens the
+    manifest once, before its `vault_entries` loop, so a lock-acquisition failure must leave the
+    vault copy exactly where it was and the manifest exactly as it was before this call (i.e.
+    only the ORIGINAL apply's own entries, no new restore-intent line at all)."""
+    manifest_path = tmp_path / "manifest.jsonl"
+    vault_dir = tmp_path / "vault"
+    target = tmp_path / "sub" / "file.bin"
+    target.parent.mkdir(parents=True)
+    original_content = b"real-bytes" * 50
+    target.write_bytes(original_content)
+
+    apply_report = apply_batch(
+        [_candidate(target, size_bytes=len(original_content))],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+    assert apply_report.files_succeeded == 1
+    vault_path = apply_report.items[0].vault_path
+    assert vault_path is not None and vault_path.exists()
+    manifest_content_before = manifest_path.read_text(encoding="utf-8")
+
+    def _always_times_out(fh: Any) -> None:
+        raise ManifestLockTimeoutError("simulated: lock never acquired")
+
+    monkeypatch.setattr(executor_module, "_acquire_manifest_lock", _always_times_out)
+
+    with pytest.raises(ManifestLockTimeoutError):
+        restore_batch(
+            apply_report.batch_id,
+            manifest_path=manifest_path,
+            vault_dir=vault_dir,
+            safety=_safety(),
+            now=_NOW + 10,
+        )
+
+    assert not target.exists()  # restore never ran
+    assert vault_path.exists()  # vault copy untouched
+    assert manifest_path.read_text(encoding="utf-8") == manifest_content_before  # no new lines
+
+
+def test_two_serialized_batches_preserve_chronological_order_and_blocked_batch_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Audit finding C10 (second pass), point 3: with two batches serialized by the lock, batch
+    A must fully complete (write every one of its entries and release the lock) BEFORE batch B's
+    `_open_manifest_for_sync` call can even return -- so the manifest's line order must match
+    real chronological completion order (A's entries form a contiguous prefix, B's a contiguous
+    suffix, never interleaved), and B must genuinely write NOTHING while it's blocked waiting --
+    not "wrote something that happened to land after A's", but literally has no open handle to
+    write through until A releases.
+
+    Uses a `threading.Event` to guarantee B only starts trying to acquire the lock AFTER A has
+    confirmed it already holds it -- this makes B's blocked state deterministic (not a timing
+    race that could pass by luck) rather than merely probable, unlike
+    `test_concurrent_manifest_appends_from_two_threads_never_interleave_partial_lines` above
+    (which proves no corruption from two truly-simultaneous writers, but deliberately leaves
+    which one wins the race unspecified, so it can't assert a specific before/after ordering).
+    """
+    manifest_path = tmp_path / "manifest.jsonl"
+    a_holds_lock = threading.Event()
+    a_may_release = threading.Event()
+    entries_per_batch = 20
+
+    def _batch_a() -> None:
+        fh = _open_manifest_for_sync(manifest_path)
+        a_holds_lock.set()
+        a_may_release.wait(timeout=30)
+        for index in range(entries_per_batch):
+            entry = _manifest_entry_for_lock_test(batch_id="batch_a", index=index)
+            _append_and_sync(fh, entry)
+        _close_manifest_for_sync(fh)
+
+    def _batch_b() -> None:
+        a_holds_lock.wait(timeout=30)  # only ever attempt once A genuinely holds the lock
+        fh = _open_manifest_for_sync(manifest_path)  # blocks until A releases
+        for index in range(entries_per_batch):
+            entry = _manifest_entry_for_lock_test(batch_id="batch_b", index=index)
+            _append_and_sync(fh, entry)
+        _close_manifest_for_sync(fh)
+
+    a_thread = threading.Thread(target=_batch_a)
+    b_thread = threading.Thread(target=_batch_b)
+    a_thread.start()
+    assert a_holds_lock.wait(timeout=10), "batch A never signaled it holds the manifest lock"
+    b_thread.start()
+
+    # Give B a real chance to attempt-and-block while A is still deliberately holding the lock.
+    time.sleep(0.5)
+    assert b_thread.is_alive(), (
+        "batch B's _open_manifest_for_sync returned while batch A still holds the lock -- the "
+        "lock did not actually serialize the two batches"
+    )
+    # B is confirmed blocked -- nothing exists on disk yet from EITHER batch (A hasn't written
+    # any entries yet either; it's paused on `a_may_release`), so B has provably written zero
+    # bytes while blocked, not merely "zero bytes so far by coincidence". Checked via file SIZE
+    # (a metadata-only `os.stat`, no data-range access) rather than `read_text()`: A's exclusive
+    # byte-range lock covers byte 0, so a second handle trying to READ that same byte while A
+    # holds it legitimately raises `PermissionError` on Windows too -- confirmed empirically
+    # while writing this test (a `read_text()` attempt here fails exactly that way), which is
+    # itself further proof the lock is real, not merely a write-vs-write convention.
+    assert not manifest_path.exists() or manifest_path.stat().st_size == 0
+
+    a_may_release.set()  # let A write its entries and release the lock
+    a_thread.join(timeout=30)
+    b_thread.join(timeout=30)
+    assert not a_thread.is_alive()
+    assert not b_thread.is_alive()
+
+    lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2 * entries_per_batch
+    parsed = [QuarantineManifestEntry.model_validate_json(line) for line in lines]
+    batch_ids = [entry.batch_id for entry in parsed]
+    # Chronological, non-interleaved: every "batch_a" line before every "batch_b" line.
+    assert batch_ids == ["batch_a"] * entries_per_batch + ["batch_b"] * entries_per_batch
+    # Per-batch internal write order preserved too (index 0..19 in order for each batch) --
+    # `_manifest_entry_for_lock_test` stores `index` as `size_bytes`.
+    a_sizes = [entry.size_bytes for entry in parsed if entry.batch_id == "batch_a"]
+    b_sizes = [entry.size_bytes for entry in parsed if entry.batch_id == "batch_b"]
+    assert a_sizes == list(range(entries_per_batch))
+    assert b_sizes == list(range(entries_per_batch))
