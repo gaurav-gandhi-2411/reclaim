@@ -807,9 +807,18 @@ def has_scan_data(state: AppState) -> bool:
         return index.has_any_records()
 
 
+# Reclaim isn't published to PyPI (installed via the Windows setup file, not `pip`), so a
+# blanket "pip install reclaim[ai]" instruction is actively wrong for that audience -- most of
+# this tool's real users. There is currently no way to add the AI component to an already-
+# installed copy at all (see ADR-0029 for the planned fix -- a bundled/downloaded AI runtime,
+# not yet built); this message says so honestly instead of pointing at a command that will just
+# fail. The `uv sync --extra ai` instruction is real and correct, but only for the source-
+# checkout audience it's scoped to below.
 _AI_UNAVAILABLE_REASON = (
-    "AI features need the optional AI component — install with: pip install reclaim[ai] "
-    "(or `uv sync --extra ai` from a source checkout)."
+    "AI features need extra ML components that aren't included in this installer. There's no "
+    "way to add them to an installed copy of Reclaim yet -- this is a known gap (see the "
+    "project's ADRs), not a setting you're missing. If you're running Reclaim from a source "
+    "checkout instead of the installer, add them with `uv sync --extra ai`."
 )
 
 

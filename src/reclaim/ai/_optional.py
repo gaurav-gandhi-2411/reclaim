@@ -27,5 +27,6 @@ def require(module_name: str, *, feature: str) -> ModuleType:
     except ImportError as exc:
         raise AIExtraNotInstalledError(
             f"{feature} needs the optional '{module_name}' package, which isn't installed. "
-            "Install the AI extras: `uv sync --extra ai` (or `pip install reclaim[ai]`)."
+            "From a source checkout: `uv sync --extra ai`. There is no way to add this to an "
+            "installed (setup.exe) copy of Reclaim yet -- see ADR-0029."
         ) from exc
