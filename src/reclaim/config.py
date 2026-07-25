@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import tomllib
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -502,10 +501,3 @@ def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Con
         else config.categories
     )
     return config.model_copy(update={"mode": resolved_mode, "categories": categories})
-
-
-@lru_cache(maxsize=1)
-def get_config() -> Config:
-    """Process-wide cached config, read once from ./config.toml if present."""
-    default_path = Path("config.toml")
-    return load_config(default_path if default_path.exists() else None)
