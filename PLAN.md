@@ -1668,6 +1668,40 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   ADVANCED UX modes), then the release rebuild -- continuing autonomously per the standing work
   order.
 
+### 2026-07-25 — Workstream B (visual identity) preview PR opened, awaiting GG's reaction
+- Per GG's explicit steer: designed the 16px icon FIRST, proved it (and 32/48px) clean before
+  finalizing anything, then opened a reviewable preview PR (#20, draft) rather than doing the
+  full asset regeneration blind. Direction: keeps the mark's geometry unchanged ("a block lifted
+  away from a filled square"); palette evolves from flat terracotta/pine/sand to a richer
+  copper (occupied)/jade (reclaimed) on a deeper warm-neutral scale — same excavation metaphor,
+  grounded in a quick 2026 app-design read (restrained analogous-hue gradients, subtle depth,
+  dark-mode-first) rather than either keeping the dated look or chasing a generic trend.
+- 16px legibility: a gradient's inset highlight on the small "lift block" degenerates to nothing
+  once rasterized that small — resolved with size-adaptive rendering (flat/high-contrast at
+  16/32px, dimensional gradient at 48px+), proven with real nearest-neighbor pixel-grid renders,
+  not assumed. `logo.svg`/`favicon.svg` use real SVG gradients (resolution-independent, no
+  flat/gradient split needed there).
+- Every text/surface/semantic color pairing checked against WCAG AA with a script
+  (`contrast_ratio`, WCAG relative-luminance formula) — all pass except one deliberate, disclosed
+  exception (`--rc-border`, a low-contrast hairline divider, matching this project's own v1
+  convention and WCAG 1.4.11's decorative-divider exemption). The 9-hue categorical palette is
+  unchanged and reconfirmed against the new backgrounds.
+- The preview includes a REAL restyled dashboard screen (both themes), not a hand-drawn mockup —
+  the actual running app with the new tokens applied, screenshotted against a disposable local
+  demo tree.
+- **Hit the exact XML-comment bug this project already documented once** (2026-07-23 checkpoint):
+  a literal double-hyphen inside the new logo.svg/favicon.svg's comment silently broke Chrome's
+  rendering again. Caught via my own screenshot review this time (a broken-image icon in the
+  header crop) before it reached a PR, not after — both files now XML-validated.
+- PR #20 (draft, by design — this is GG's one taste-driven call, not an auto-mergeable change):
+  https://github.com/gaurav-gandhi-2411/reclaim/pull/20. Nothing wired to `main`'s default
+  experience yet. Full asset regeneration (`build_brand_assets.py`, `.ico`, wizard bitmaps, OG
+  preview, README lockup) and the dashboard's spacing/depth/elevation modernization (WS-B item
+  12) are explicitly deferred until GG reacts to this preview.
+- Next (pending GG's direction call): finish WS-B regeneration + dashboard modernization, then
+  Workstream C (SIMPLE/ADVANCED UX modes) — already scoped, can start in parallel since it
+  doesn't depend on the palette decision.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
