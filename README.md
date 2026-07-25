@@ -27,19 +27,24 @@ further down.
 
 ## First run
 
+Reclaim starts in **Simple mode** — one button, no path typing, no decisions to make:
+
 1. Run the installer — no admin prompt, installs into your own user folder.
 2. Open **Reclaim** from the Start Menu.
 3. Your browser opens automatically to the Reclaim dashboard.
 4. A one-time screen explains safe mode before anything else is usable — read it, then continue.
-5. Pick a folder to scan: use one of the quick-pick buttons (e.g. Downloads, Temp) or type a
-   path yourself.
-6. Click **Scan** — this only reads your files; it changes nothing on disk.
-7. Review the plain-language groups Reclaim finds — each one states why it's considered safe
-   (e.g. "rebuilds automatically on your next `npm install`"). Either use **Quick Clean** to
-   handle the safe groups in one confirmation, or open the Review Queue to look at individual
-   items first.
+5. Click **Clean My Computer**. Reclaim scans every fixed drive on your machine, showing a live
+   progress bar and time estimate the whole way through — never a silent wait.
+6. Once it's done, you'll see exactly what it found, in plain language and real measured sizes
+   (e.g. "Temporary & browser cache files — 890 MB — safe, recreated automatically as you
+   browse"). Only categorically-safe clutter is ever offered here.
+7. Click **Clean now** — one confirmation, then it's done.
 8. Whatever you clean is **moved to the Recycle Bin** — empty the Recycle Bin afterward to
    actually free up the disk space.
+
+Want more control — custom folders, duplicate detection, AI-powered suggestions, individual
+review of every item before it's touched? Click **Switch to Advanced** in the header at any
+time. Nothing in Simple mode is a one-way door; you can move between the two freely.
 
 ## Safe mode
 
@@ -339,7 +344,7 @@ Build it yourself:
 uv add --dev nuitka   # already recorded in pyproject.toml's dev group
 uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
 uv run python -m nuitka --standalone --assume-yes-for-downloads `
-  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=1.2.0 `
+  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=1.3.0 `
   --windows-icon-from-ico=packaging/reclaim.ico `
   --windows-console-mode=attach `
   --include-package=reclaim --include-package=uvicorn --include-package=fastapi `
