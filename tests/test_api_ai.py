@@ -72,7 +72,11 @@ def test_ai_status_is_unavailable_when_extra_not_installed(
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "unavailable"
-    assert "pip install reclaim[ai]" in body["unavailable_reason"]
+    # Reclaim isn't published to PyPI -- "pip install reclaim[ai]" is wrong for the installer-
+    # distributed audience this message is actually written for; the honest, scoped instruction
+    # is `uv sync --extra ai`, explicitly labeled as source-checkout-only.
+    assert "uv sync --extra ai" in body["unavailable_reason"]
+    assert "pip install reclaim" not in body["unavailable_reason"]
 
 
 def test_ai_analyze_returns_unavailable_without_starting_a_background_task(
