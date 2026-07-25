@@ -1087,3 +1087,48 @@ a:active {
   color: var(--rc-warning);
   font-weight: 600;
 }
+
+/* --- SIMPLE / ADVANCED dashboard mode (feat/simple-advanced-mode) ------------------------------
+ *
+ * ONE attribute (html[data-mode]) drives visibility for the whole split -- no per-component JS
+ * show/hide branching needed. SIMPLE mode hides the tab nav, the free-text scan bar, and every
+ * existing .rc-view section entirely (not just Review Queue/AI Suggestions -- SIMPLE mode is one
+ * screen, not a tab picker) and shows #simple-view instead; ADVANCED mode is the reverse. See
+ * app.js's initDashboardMode/toggleDashboardMode for the localStorage persistence (mirrors the
+ * theme toggle's exact pattern) and index.html's <html data-mode="simple"> default (no FOUC).
+ */
+
+#simple-view {
+  display: none;
+}
+
+html[data-mode="simple"] .rc-tabs,
+html[data-mode="simple"] .rc-scan-bar,
+html[data-mode="simple"] .rc-view {
+  display: none;
+}
+
+html[data-mode="simple"] #simple-view {
+  display: block;
+}
+
+.rc-simple-view {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.rc-simple-intro {
+  color: var(--rc-text-muted);
+  margin: 0 0 var(--rc-space-4);
+}
+
+.rc-simple-primary-btn {
+  display: block;
+  margin: 0 auto;
+  font-size: var(--rc-text-xl);
+  padding: var(--rc-space-4) var(--rc-space-7);
+}
+
+.rc-simple-summary-line {
+  margin: 0 0 var(--rc-space-4);
+}
