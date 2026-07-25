@@ -191,6 +191,252 @@ def test_scan_already_running_returns_409(tmp_path: Path) -> None:
     assert "already running" in response.json()["detail"]
 
 
+# --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
+
+
+def test_scan_fixed_drives_endpoint_returns_a_real_drive_list(tmp_path: Path) -> None:
+    """Real machine, real Win32 call (this test file already targets Windows/NTFS only) -- every
+    CI runner and real dev machine has at least a fixed C:\\ drive."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/scan/fixed-drives")
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body["drives"], list)
+    assert len(body["drives"]) >= 1
+    assert all(d.endswith(":/") or d.endswith(":\\") for d in body["drives"])
+
+
+def test_scan_fixed_drives_endpoint_returns_500_when_none_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.drives import NoFixedDrivesFoundError
+
+    def fake_list_fixed_drives() -> list[Path]:
+        raise NoFixedDrivesFoundError("no fixed drives on this fixture machine")
+
+    monkeypatch.setattr(service, "list_fixed_drives", fake_list_fixed_drives)
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.get("/api/scan/fixed-drives")
+    assert response.status_code == 500
+    assert "no fixed drives" in response.json()["detail"]
+
+
+def _build_small_tree(root: Path, *, file_count: int) -> None:
+    root.mkdir(parents=True)
+    for i in range(file_count):
+        (root / f"f{i}.txt").write_text("x" * (i + 1), encoding="utf-8")
+
+
+def test_full_drive_scan_orchestrates_sequentially_across_fixture_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`POST /api/scan/full-drive` never touches a real Windows drive in this test -- real drive
+    enumeration is `list_fixed_drives`'s own job, unit-tested in isolation in test_drives.py.
+    Here, `reclaim.api.service.list_fixed_drives` is monkeypatched to two small real fixture
+    trees standing in for "the machine's fixed drives" (same dependency-injection pattern
+    `_scan_and_wait` already relies on for the single-path case: TestClient runs
+    BackgroundTasks synchronously, so this needs no polling loop)."""
+    from reclaim.api import service
+
+    drive_a = tmp_path / "drive_a"
+    drive_b = tmp_path / "drive_b"
+    _build_small_tree(drive_a, file_count=3)
+    _build_small_tree(drive_b, file_count=5)
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 202, response.text
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "completed", status
+    assert status["phase"] == "done"
+    assert status["drives_total"] == 2
+    assert status["drives_done"] == 2
+    assert status["root"] is None  # no single root is honest for a real multi-drive scan
+    assert status["current_drive"] is None
+    assert status["entries_total"] == 3 + 5  # summed across both fixture "drives"
+    assert status["eta_seconds"] == 0.0
+    assert status["entries_processed"] == status["entries_estimated_total"] == 8
+
+
+def test_full_drive_scan_with_exactly_one_fixed_drive_reports_it_as_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    only_drive = tmp_path / "only_drive"
+    _build_small_tree(only_drive, file_count=2)
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [only_drive])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 202
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "completed"
+    assert status["drives_total"] == 1
+    assert status["root"] == only_drive.as_posix()  # single-root case reports it, unlike multi
+
+
+def test_full_drive_scan_already_running_returns_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [tmp_path / "drive_a"])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.scan_status = ScanStatus(status="running", root=tmp_path, started_at=time.time())
+
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
+def test_full_drive_scan_completes_correctly_with_maximal_progress_callback_frequency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forces `_HEARTBEAT_INTERVAL_SECONDS` down to 0 so `run_scan`'s `on_count_progress`/
+    `on_scan_progress` closures fire on nearly every entry instead of the real 5s-gated cadence
+    -- proves the live status-republishing wiring itself (not just the pure `_compute_eta_seconds`
+    function) runs correctly under realistic call volume without deadlocking or corrupting
+    `scan_status`."""
+    import reclaim.scanner as scanner_module
+    from reclaim.api import service
+
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+
+    drive_a = tmp_path / "drive_a"
+    drive_b = tmp_path / "drive_b"
+    _build_small_tree(drive_a, file_count=10)
+    _build_small_tree(drive_b, file_count=10)
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 202
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "completed"
+    assert status["entries_total"] == 20
+    assert status["drives_done"] == 2
+
+
+def test_full_drive_scan_failure_on_one_root_aborts_the_whole_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real failure partway through a multi-drive scan must abort the WHOLE scan
+    (`status="failed"`), not silently report success having skipped a drive -- whatever partial
+    aggregate stats already accumulated (from `drive_a`, scanned first) are kept, not discarded."""
+    from reclaim.api import service
+
+    drive_a = tmp_path / "drive_a"
+    drive_b = tmp_path / "drive_b"  # never actually scanned -- count_entries_fast fails first
+    _build_small_tree(drive_a, file_count=3)
+    drive_b.mkdir()
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
+
+    real_count_entries_fast = service.count_entries_fast
+
+    def fake_count_entries_fast(root: Path, **kwargs: object) -> int:
+        if root == drive_b:
+            raise OSError("simulated I/O fault on drive_b")
+        return real_count_entries_fast(root, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "count_entries_fast", fake_count_entries_fast)
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 202
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "failed"
+    assert status["error"] is not None and "simulated I/O fault" in status["error"]
+    assert status["entries_total"] == 3  # drive_a's real work, kept -- not discarded
+    assert status["drives_total"] == 2
+
+
+def test_full_drive_scan_returns_500_when_no_fixed_drives_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.drives import NoFixedDrivesFoundError
+
+    def fake_list_fixed_drives() -> list[Path]:
+        raise NoFixedDrivesFoundError("no fixed drives on this fixture machine")
+
+    monkeypatch.setattr(service, "list_fixed_drives", fake_list_fixed_drives)
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive")
+    assert response.status_code == 500
+    assert "no fixed drives" in response.json()["detail"]
+
+
+def test_single_path_scan_status_carries_the_new_phase_and_eta_fields(tmp_path: Path) -> None:
+    """`POST /api/scan`'s original contract (`status`/`root`/`entries_total`/...) is unchanged --
+    this only proves the new full-drive-scan-eta fields are ALSO populated correctly for the
+    single-path case (`drives_total=1`), not just for `POST /api/scan/full-drive`."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    client = _make_app(tmp_path, config=_config(root))
+    status = _scan_and_wait(client, root)
+
+    assert status["phase"] == "done"
+    assert status["drives_total"] == 1
+    assert status["drives_done"] == 1
+    assert status["root"] == root.as_posix()
+    assert status["current_drive"] is None
+    assert status["entries_processed"] == status["entries_total"]
+    assert status["eta_seconds"] == 0.0
+
+
+# --- full-drive-scan-eta: pure ETA-computing function ------------------------------------------
+
+
+def test_compute_eta_seconds_is_none_without_an_estimated_total() -> None:
+    from reclaim.api.service import _compute_eta_seconds
+
+    assert _compute_eta_seconds(10, None, 5.0) is None
+
+
+def test_compute_eta_seconds_is_none_on_the_very_first_tick() -> None:
+    from reclaim.api.service import _compute_eta_seconds
+
+    assert _compute_eta_seconds(0, 100, 5.0) is None
+    assert _compute_eta_seconds(10, 100, 0.0) is None
+
+
+def test_compute_eta_seconds_computes_remaining_time_at_the_observed_rate() -> None:
+    from reclaim.api.service import _compute_eta_seconds
+
+    # 50 entries in 5s -> rate 10/s; 50 remaining of 100 -> 5s left.
+    assert _compute_eta_seconds(50, 100, 5.0) == pytest.approx(5.0)
+
+
+def test_compute_eta_seconds_clamps_negative_remaining_to_zero() -> None:
+    from reclaim.api.service import _compute_eta_seconds
+
+    # The real walk visited more than the fast estimate predicted.
+    assert _compute_eta_seconds(120, 100, 5.0) == 0.0
+
+
+def test_compute_eta_seconds_is_none_when_the_observed_rate_is_effectively_zero() -> None:
+    from reclaim.api.service import _compute_eta_seconds
+
+    # 1 entry over an absurdly long elapsed time -> a rate far below the trust threshold.
+    assert _compute_eta_seconds(1, 100, 1e12) is None
+
+
 def test_apply_already_running_returns_409(tmp_path: Path) -> None:
     """fix/apply-progress-feedback: `POST /api/apply` became a background-task + single-flight
     pattern, same guard `ScanStatus`/`AIAnalysisStatus` already have -- mirrors

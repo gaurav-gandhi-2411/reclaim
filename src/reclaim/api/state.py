@@ -18,6 +18,12 @@ ScanStatusLiteral = Literal["idle", "running", "completed", "failed"]
 AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
 ApplyStatusLiteral = Literal["idle", "running", "completed", "failed"]
 RestoreStatusLiteral = Literal["idle", "running", "completed", "failed"]
+# full-drive-scan-eta: which of `api.service.run_scan`'s two phases (per root) is currently
+# active -- "estimating" while `scanner.count_entries_fast` is deriving `entries_estimated_total`,
+# "scanning" while the real `scanner.scan_tree` walk is running, "done" once every root has
+# completed. `None` before a scan has ever started this process session, same convention as every
+# other optional `ScanStatus` field.
+ScanPhaseLiteral = Literal["estimating", "scanning", "done"]
 
 
 @dataclass(slots=True)
@@ -40,6 +46,18 @@ class ScanStatus:
     # same convention as every other field above.
     skipped_unreadable_count: int | None = None
     skipped_unreadable_paths: tuple[str, ...] | None = None
+    # full-drive-scan-eta: live progress/ETA for the CURRENT root being scanned, plus how far
+    # through the (possibly multi-drive) `roots` list the scan is overall. Populated for both the
+    # existing single-path scan (`drives_total=1`) and the new full-drive scan
+    # (`drives_total=len(list_fixed_drives())`) -- see `api.service.run_scan`, the one
+    # orchestration path underneath both.
+    phase: ScanPhaseLiteral | None = None
+    entries_processed: int | None = None
+    entries_estimated_total: int | None = None
+    eta_seconds: float | None = None
+    current_drive: str | None = None
+    drives_total: int | None = None
+    drives_done: int | None = None
 
 
 @dataclass(slots=True)

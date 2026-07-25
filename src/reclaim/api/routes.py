@@ -15,6 +15,7 @@ from reclaim.api.schemas import (
     DiagnosticsResponse,
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
+    FixedDrivesResponse,
     ModeStatusResponse,
     OneClickCleanSummaryResponse,
     PowerModeRequest,
@@ -28,6 +29,7 @@ from reclaim.api.schemas import (
     TreemapResponse,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.drives import NoFixedDrivesFoundError
 from reclaim.executor import (
     BatchNotFoundError,
     DirectDeleteRestoreImpossibleError,
@@ -67,10 +69,18 @@ def start_scan(
                 status_code=409,
                 detail=f"a scan is already running for {state.scan_status.root}",
             )
-        state.scan_status = ScanStatus(status="running", root=root, started_at=started_at)
+        state.scan_status = ScanStatus(
+            status="running",
+            root=root,
+            started_at=started_at,
+            phase="estimating",
+            current_drive=root.as_posix(),
+            drives_total=1,
+            drives_done=0,
+        )
         status_snapshot = state.scan_status
 
-    background_tasks.add_task(service.run_scan, state, root, started_at)
+    background_tasks.add_task(service.run_scan, state, [root], started_at)
     return service.to_scan_status_out(status_snapshot)
 
 
@@ -84,6 +94,52 @@ def scan_status(request: Request) -> ScanStatusOut:
 @router.get("/scan/suggested-roots", response_model=SuggestedScanRootsResponse)
 def scan_suggested_roots() -> SuggestedScanRootsResponse:
     return service.suggested_scan_roots()
+
+
+@router.get("/scan/fixed-drives", response_model=FixedDrivesResponse)
+def scan_fixed_drives() -> FixedDrivesResponse:
+    """SIMPLE mode's "scan my whole computer" action shows what's about to be scanned before the
+    user commits (full-drive-scan-eta) -- lets the frontend render the drive list without its
+    own drive-enumeration logic."""
+    try:
+        return service.fixed_drives()
+    except NoFixedDrivesFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/scan/full-drive", response_model=ScanStatusOut, status_code=202)
+def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -> ScanStatusOut:
+    """SIMPLE mode's "scan my whole computer" action (full-drive-scan-eta) -- same background-
+    task + single-flight + polling shape as `POST /api/scan` (indeed the same background task,
+    `service.run_scan`, just with `roots=list_fixed_drives()` instead of a single user-supplied
+    path), reusing `GET /api/scan/status` for progress/ETA polling rather than a second status
+    endpoint."""
+    state = get_state(request)
+    try:
+        roots = service.fixed_drive_roots()
+    except NoFixedDrivesFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    started_at = time.time()
+    with state.lock:
+        if state.scan_status.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"a scan is already running for {state.scan_status.root}",
+            )
+        state.scan_status = ScanStatus(
+            status="running",
+            root=roots[0],
+            started_at=started_at,
+            phase="estimating",
+            current_drive=roots[0].as_posix(),
+            drives_total=len(roots),
+            drives_done=0,
+        )
+        status_snapshot = state.scan_status
+
+    background_tasks.add_task(service.run_scan, state, roots, started_at)
+    return service.to_scan_status_out(status_snapshot)
 
 
 @router.get("/summary", response_model=SummaryResponse)

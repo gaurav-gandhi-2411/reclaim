@@ -8,11 +8,15 @@ from pathlib import Path
 
 import pytest
 
+import reclaim.scanner as scanner_module
 from reclaim.index import ScanIndex, logical_size_bytes, physical_size_bytes
 from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
 from reclaim.scanner import (
+    _HEARTBEAT_INTERVAL_SECONDS,
     GitRepoCache,
+    _due,
     build_record_for_path,
+    count_entries_fast,
     is_cloud_sync_root,
     long_path,
     scan_tree,
@@ -352,3 +356,246 @@ def test_build_record_for_path_fails_closed_on_8dot3_short_name_input(tmp_path: 
     record = build_record_for_path(short_form_path, GitRepoCache())
 
     assert record is None
+
+
+# --- full-drive-scan-eta: progress-heartbeat pure predicate --------------------------------
+
+
+def test_due_is_false_before_the_interval_elapses() -> None:
+    assert (
+        _due(
+            last=100.0,
+            now=100.0 + _HEARTBEAT_INTERVAL_SECONDS - 0.001,
+            interval=_HEARTBEAT_INTERVAL_SECONDS,
+        )
+        is False
+    )
+
+
+def test_due_is_true_once_the_interval_elapses() -> None:
+    assert (
+        _due(
+            last=100.0,
+            now=100.0 + _HEARTBEAT_INTERVAL_SECONDS,
+            interval=_HEARTBEAT_INTERVAL_SECONDS,
+        )
+        is True
+    )
+
+
+# --- full-drive-scan-eta: count_entries_fast -------------------------------------------------
+
+
+def test_count_entries_fast_matches_scan_tree_entries_total_on_a_normal_tree(
+    tmp_path: Path,
+) -> None:
+    """The fast pre-pass's whole purpose is to predict what a real `scan_tree` call will visit
+    -- if the two disagree on a plain tree with no reparse points/long paths/unreadable
+    directories, the ETA this feeds is systematically wrong from the start."""
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "nested").mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+    (root / "sub" / "b.txt").write_text("b" * 5, encoding="utf-8")
+    (root / "sub" / "nested" / "c.txt").write_text("c", encoding="utf-8")
+
+    fast_count = count_entries_fast(root)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+
+    assert fast_count == stats.entries_total
+
+
+def test_count_entries_fast_reparse_point_is_counted_but_not_recursed_into(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    target = tmp_path / "junction_target"
+    target.mkdir(parents=True)
+    (target / "should_not_appear.txt").write_text("secret", encoding="utf-8")
+    root.mkdir()
+    link = root / "link_to_target"
+
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 -- cmd is a builtin
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
+
+    count = count_entries_fast(root)
+
+    assert count == 1  # the junction itself, never `should_not_appear.txt`
+
+
+def test_count_entries_fast_walks_past_max_path_without_dropping_the_subtree(
+    tmp_path: Path,
+) -> None:
+    """D12 regression class: cross-checked against `scan_tree`'s own already-proven MAX_PATH
+    handling (`test_scan_tree_walks_past_max_path_without_dropping_the_subtree`) -- if
+    `count_entries_fast` silently dropped everything past MAX_PATH while `scan_tree` didn't, the
+    two counts would diverge exactly on this fixture."""
+    root = tmp_path / "root"
+    root.mkdir()
+    leaf = _make_deep_tree(root)
+    payload = leaf / "payload.bin"
+    with open(long_path(payload), "wb") as fh:  # noqa: PTH123 -- \\?\ str, not Path
+        fh.write(b"deep-payload-past-max-path")
+
+    fast_count = count_entries_fast(root)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+
+    assert fast_count == stats.entries_total
+
+
+def test_count_entries_fast_tolerates_an_unreadable_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuinely unreadable subdirectory is skipped, not fatal -- the sibling entry and the
+    unreadable directory's own listing entry (counted when ITS parent was listed) still count;
+    only what's INSIDE the unreadable directory is missing from the total."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    blocked_dir = root / "blocked_dir"
+    blocked_dir.mkdir()
+    (blocked_dir / "inner.txt").write_text("hidden", encoding="utf-8")
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "blocked_dir" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+    count = count_entries_fast(root)
+
+    assert count == 2  # readable.txt + blocked_dir itself, never inner.txt
+
+
+def test_count_entries_fast_reports_interval_gated_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    root.mkdir()
+    for i in range(5):
+        (root / f"f{i}.txt").write_text("x", encoding="utf-8")
+
+    calls: list[tuple[int, float]] = []
+    count = count_entries_fast(
+        root, on_progress=lambda counted, elapsed: calls.append((counted, elapsed))
+    )
+
+    assert count == 5
+    assert len(calls) >= 1
+    assert [c[0] for c in calls] == sorted(c[0] for c in calls)  # non-decreasing
+    assert calls[-1][0] <= count
+    assert all(elapsed >= 0.0 for _, elapsed in calls)
+
+
+def test_count_entries_fast_never_calls_progress_when_none(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+    # No on_progress passed -- must not raise, matches every other progress-hook default in
+    # this codebase.
+    assert count_entries_fast(root) == 1
+
+
+# --- full-drive-scan-eta: scan_tree's own on_progress ----------------------------------------
+
+
+def test_scan_tree_reports_interval_gated_progress_with_estimated_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    for i in range(5):
+        (root / f"f{i}.txt").write_text("x", encoding="utf-8")
+    (root / "sub" / "g.txt").write_text("y", encoding="utf-8")
+
+    calls: list[tuple[int, int | None, float]] = []
+
+    def on_progress(processed: int, estimated_total: int | None, elapsed: float) -> None:
+        calls.append((processed, estimated_total, elapsed))
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index, on_progress=on_progress, entries_estimated_total=42)
+
+    assert len(calls) >= 1
+    assert all(estimated_total == 42 for _, estimated_total, _ in calls)
+    assert all(0 < processed <= stats.entries_total for processed, _, _ in calls)
+
+
+def test_scan_tree_progress_defaults_to_none_estimated_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    calls: list[int | None] = []
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(root, index, on_progress=lambda _p, total, _e: calls.append(total))
+
+    assert calls  # at least one heartbeat fired
+    assert all(total is None for total in calls)
+
+
+def test_scan_tree_progress_counter_stays_consistent_across_worker_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_ProgressTracker` is shared across every `ThreadPoolExecutor` worker `scan_tree` fans
+    out to (one per top-level directory) -- this proves the shared counter survives real
+    concurrent `add()` calls from multiple worker threads without over/under-counting: the
+    final aggregate `entries_total` must exactly match the fixture's known entry count, and no
+    individual progress report can ever exceed it."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    root.mkdir()
+    num_dirs, files_per_dir = 8, 20
+    for d in range(num_dirs):
+        subdir = root / f"dir_{d}"
+        subdir.mkdir()
+        for f in range(files_per_dir):
+            (subdir / f"f_{f}.txt").write_text("x", encoding="utf-8")
+
+    calls: list[int] = []
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(
+            root,
+            index,
+            on_progress=lambda processed, _total, _elapsed: calls.append(processed),
+            max_workers=8,
+        )
+
+    expected_total = num_dirs + num_dirs * files_per_dir  # each dir itself + its files
+    assert stats.entries_total == expected_total
+    assert len(calls) >= 1
+    assert max(calls) <= expected_total
+    assert min(calls) >= 1
+
+
+def test_scan_tree_on_progress_none_is_the_default_and_never_called(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        # Every pre-existing scan_tree test in this file already calls it with no on_progress at
+        # all -- this test just makes the "default None, zero behavior change" contract explicit.
+        stats = scan_tree(root, index)
+
+    assert stats.entries_total == 1
