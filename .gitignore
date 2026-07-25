@@ -68,3 +68,6 @@ packaging/dist/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# scripts/verify.py junit output
+pytest-results.xml

@@ -4,6 +4,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -224,6 +225,80 @@ def test_scan_tree_prunes_deleted_files(tmp_path: Path) -> None:
 
     assert second.files_pruned == 1
     assert {r.path for r in inventory} == {keep}
+
+
+# --- A5: disk-full during the index write is a clean abort, not an uncaught crash --------------
+
+
+def test_scan_tree_raises_scan_disk_full_error_on_enospc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan walk itself is read-only; the only write is the index upsert at the end of
+    `scan_tree`. Simulating the OS raising ENOSPC there must abort the scan with a distinct,
+    catchable `ScanDiskFullError` rather than an uncaught `OSError` traceback."""
+    import errno
+
+    from reclaim.index import ScanIndex as ScanIndexClass
+    from reclaim.scanner import ScanDiskFullError
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    def fake_upsert(self: object, records: object, *, scanned_at: float) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ScanIndexClass, "upsert_records", fake_upsert)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index, pytest.raises(ScanDiskFullError):
+        scan_tree(root, index)
+
+
+def test_scan_tree_raises_scan_disk_full_error_on_sqlite_disk_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SQLite itself intercepts the OS write failure and reports it as
+    `sqlite3.OperationalError: database or disk is full` (no errno) rather than letting a raw
+    OSError through -- that's the realistic shape this fix must also catch, not just a synthetic
+    OSError."""
+    import sqlite3
+
+    from reclaim.index import ScanIndex as ScanIndexClass
+    from reclaim.scanner import ScanDiskFullError
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    def fake_upsert(self: object, records: object, *, scanned_at: float) -> int:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(ScanIndexClass, "upsert_records", fake_upsert)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index, pytest.raises(ScanDiskFullError):
+        scan_tree(root, index)
+
+
+def test_scan_tree_does_not_swallow_unrelated_write_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a genuine disk-full condition gets the friendly `ScanDiskFullError` treatment -- any
+    other write failure must still propagate as itself, not be misreported as disk-full."""
+    import errno
+
+    from reclaim.index import ScanIndex as ScanIndexClass
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    def fake_upsert(self: object, records: object, *, scanned_at: float) -> int:
+        raise OSError(errno.EIO, "some other I/O error")
+
+    monkeypatch.setattr(ScanIndexClass, "upsert_records", fake_upsert)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index, pytest.raises(OSError, match="I/O error"):
+        scan_tree(root, index)
 
 
 # --- D12: long-path-safe scan walk + visible skipped/unreadable accounting ----------------------
@@ -599,3 +674,34 @@ def test_scan_tree_on_progress_none_is_the_default_and_never_called(tmp_path: Pa
         stats = scan_tree(root, index)
 
     assert stats.entries_total == 1
+
+
+def test_build_record_for_path_matches_nfd_disk_entry_against_nfc_lookup_path(
+    tmp_path: Path,
+) -> None:
+    """D11 regression: NTFS stores filenames as raw UTF-16 with no Unicode normalization, so a
+    filename written to disk in decomposed (NFD) form -- e.g. by a macOS-authored file, or any
+    tool that builds combining-character sequences instead of precomposed codepoints -- round-
+    trips back from `os.scandir` byte-for-byte as NFD, even when the caller's in-memory `path`
+    for that exact same file is in composed (NFC) form. Before this fix, `build_record_for_path`
+    compared `entry.name == path.name` with no normalization, so this real-same-file case wrongly
+    fell through the loop and returned `None` -- e.g. `executor.py`'s pre-delete safety re-check
+    (ADR-0001) would treat a genuinely-existing candidate as vanished.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    nfc_name = "café.txt"  # single precomposed U+00E9 codepoint
+    nfd_name = unicodedata.normalize("NFD", nfc_name)  # "e" + combining acute accent U+0301
+    assert nfc_name != nfd_name, "fixture invalid -- both forms collapsed to the same string"
+
+    (root / nfd_name).write_text("nfd-content", encoding="utf-8")
+    lookup_path = root / nfc_name  # caller only has the NFC-form path, never touched the disk name
+
+    record = build_record_for_path(lookup_path, GitRepoCache())
+
+    assert record is not None
+    assert record.size_bytes == len(b"nfd-content")
+    # entry.name is used verbatim for FileRecord.path (per this function's docstring) -- only the
+    # equality check itself is normalization-scoped, so the record still reports the on-disk NFD
+    # form, not the NFC lookup form.
+    assert record.path.name == nfd_name

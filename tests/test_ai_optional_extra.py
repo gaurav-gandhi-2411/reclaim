@@ -8,6 +8,7 @@ import sys
 import pytest
 
 import reclaim.ai
+from reclaim.ai import _optional
 from reclaim.ai._optional import AIExtraNotInstalledError, require
 
 # Hard Gate 3: the core deterministic tool must install and run WITHOUT the `ai` extra's
@@ -165,3 +166,19 @@ def test_require_returns_the_real_cv2_when_ai_extras_are_genuinely_installed() -
     the simulated-absence tests above."""
     cv2 = require("cv2", feature="sharpness scoring")
     assert hasattr(cv2, "Laplacian")
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("PIL") is None, reason="ai extras not installed in this env"
+)
+def test_require_pil_image_sets_the_decompression_bomb_cap() -> None:
+    """D15: `require("PIL.Image", ...)` must pin `PIL.Image.MAX_IMAGE_PIXELS` to this module's
+    explicit, documented cap (`_optional._MAX_IMAGE_PIXELS`) rather than leaving Pillow's own
+    much higher default (~89.5M px, only a WARNING until 2x that) in place — every call site
+    (`phash.compute_image_hashes`, `image_embeddings.compute_image_embedding`) relies on this
+    single centralized assignment for its decompression-bomb protection, so a regression here
+    would silently remove the guard from every one of them at once."""
+    pil_image = require("PIL.Image", feature="image loading")
+
+    assert pil_image.MAX_IMAGE_PIXELS == _optional._MAX_IMAGE_PIXELS
+    assert pil_image.MAX_IMAGE_PIXELS == 64_000_000

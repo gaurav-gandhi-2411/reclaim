@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import struct
+import zlib
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,28 @@ def _make_image(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, color=color).save(path, format="PNG")
+
+
+def _make_decompression_bomb_png(path: Path, *, declared_size: tuple[int, int]) -> None:
+    """D15 fixture: a real, tiny (4x4-pixel) PNG whose IHDR chunk is patched post-save to
+    CLAIM `declared_size` instead of its real dimensions — Pillow's decompression-bomb check
+    (`Image._decompression_bomb_check`) runs inside `Image.open()` against the DECLARED header
+    size, before any pixel data is decoded/allocated, so this triggers `DecompressionBombError`
+    with a file that's a few dozen bytes on disk, no multi-hundred-megabyte real image needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = io.BytesIO()
+    Image.new("RGB", (4, 4), color=(1, 2, 3)).save(stream, format="PNG")
+    buf = bytearray(stream.getvalue())
+
+    width, height = declared_size
+    buf[16:20] = struct.pack(">I", width)  # IHDR width field (big-endian uint32)
+    buf[20:24] = struct.pack(">I", height)  # IHDR height field (big-endian uint32)
+    # IHDR's CRC covers the 4-byte chunk type + 13-byte chunk data (bytes 12:29) — must be
+    # recomputed after patching width/height or Pillow's PNG parser rejects the chunk outright
+    # before ever reaching the size check.
+    buf[29:33] = struct.pack(">I", zlib.crc32(bytes(buf[12:29])) & 0xFFFFFFFF)
+
+    path.write_bytes(bytes(buf))
 
 
 def _make_patterned_image(
@@ -39,6 +64,23 @@ def test_compute_image_hashes_returns_none_for_unreadable_file(tmp_path: Path) -
     not_an_image = tmp_path / "fake.jpg"
     not_an_image.write_bytes(b"this is definitely not image data")
     assert compute_image_hashes(not_an_image) is None
+
+
+def test_compute_image_hashes_returns_none_for_declared_dimensions_past_bomb_cap(
+    tmp_path: Path,
+) -> None:
+    """D15 regression: a file whose DECLARED (header) dimensions exceed the decompression-bomb
+    cap `require("PIL.Image", ...)` sets (`_optional._MAX_IMAGE_PIXELS`) must raise
+    `PIL.Image.DecompressionBombError` inside `Image.open()` and be treated exactly like any
+    other unopenable image -- caught by this function's existing broad `except Exception: return
+    None`, never propagated up to abort the whole scan. The fixture file itself is a few dozen
+    bytes on disk (real pixel data is 4x4) -- only the HEADER claims 20000x20000 (400M declared
+    pixels, well past the cap), proving this is Pillow's declared-size check catching a
+    would-be bomb, not an accident of a genuinely huge real image."""
+    bomb = tmp_path / "bomb.png"
+    _make_decompression_bomb_png(bomb, declared_size=(20000, 20000))
+
+    assert compute_image_hashes(bomb) is None
 
 
 def test_compute_image_hashes_returns_none_for_missing_file(tmp_path: Path) -> None:

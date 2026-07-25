@@ -286,6 +286,182 @@ def test_serve_refuses_to_run_elevated(
     assert "simulated: process is elevated" in capsys.readouterr().err
 
 
+# --- malformed config.toml is a friendly message, not a raw traceback — audit D16 ---------------
+
+
+def test_apply_reports_clean_message_for_malformed_toml_syntax(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invalid TOML syntax (`tomllib.TOMLDecodeError`) must never surface as a raw traceback --
+    it should print one actionable line naming the file and exit 1."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+def test_apply_reports_clean_message_for_unknown_config_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recognized-syntax TOML file with an unrecognized key raises `UnknownConfigKeyError`
+    (a `ValueError` subclass) -- same friendly-message treatment as bad TOML syntax, not a raw
+    traceback."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("a_typo_or_attack_key = true\n", encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+def test_apply_reports_clean_message_for_pydantic_validation_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recognized key with an invalid value raises `pydantic.ValidationError` -- same
+    friendly-message treatment, not a raw traceback."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    bad_config = tmp_path / "config.toml"
+    # schema_version is declared as an int everywhere in this codebase; a string fails
+    # Config.model_validate with a real pydantic.ValidationError.
+    bad_config.write_text('schema_version = "not-an-int"\n', encoding="utf-8")
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(["apply", str(root), "--db", str(db), "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim apply:" in err
+    assert str(bad_config) in err
+
+
+@pytest.mark.parametrize("command", ["serve", "undo", "purge"])
+def test_other_config_consuming_commands_report_clean_message_too(
+    command: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D16 wires the friendly-message helper into every CLI entry point that loads config.toml,
+    not just `apply` -- `serve`/`undo`/`purge` each get the same treatment."""
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+
+    args = [command, "--config", str(bad_config)]
+    if command == "undo":
+        args.append("some-batch-id")
+    else:
+        # "serve"/"purge" both resolve the live mode before loading config; point at an
+        # isolated, guaranteed-nonexistent mode log rather than depending on whatever
+        # data/mode_log.jsonl happens (or doesn't) to exist relative to the test runner's cwd.
+        args.extend(["--mode-log", str(tmp_path / "mode_log.jsonl")])
+
+    exit_code = main(args)
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert f"reclaim {command}:" in err
+    assert str(bad_config) in err
+
+
+# --- serve: clean messages for port-bind failures — audit F22 ----------------------------------
+
+
+def test_serve_reports_clean_message_when_port_already_in_use(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bind-in-use failure from `uvicorn.run` must never surface as a raw OSError
+    traceback -- it should print one actionable line to stderr and exit 1."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["serve", "--db", str(db)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "port 8420 is already in use" in err
+    assert "--port" in err
+
+
+def test_serve_reports_clean_message_when_port_bind_denied(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission-denied bind failure (e.g. a privileged port) is a distinct condition
+    from port-in-use and must get its own clear message, not be conflated with EADDRINUSE."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["serve", "--db", str(db)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "permission denied" in err
+    assert "port 8420" in err
+
+
+def test_serve_does_not_swallow_unrelated_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the two known bind-failure conditions get a friendly message -- any other
+    OSError must still propagate so it isn't silently hidden from the user."""
+    import errno
+
+    import uvicorn
+
+    def _boom(app: object, **kw: object) -> None:
+        raise OSError(errno.EIO, "some other I/O error")
+
+    monkeypatch.setattr(uvicorn, "run", _boom)
+
+    db = tmp_path / "index.sqlite3"
+    with pytest.raises(OSError, match="some other I/O error"):
+        main(["serve", "--db", str(db)])
+
+
 def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Read-only `scan` touches nothing and must never be blocked by the elevation guard —
     only the mutating commands (apply/undo/purge/serve) check it."""
@@ -300,6 +476,35 @@ def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.Monke
     (root / "a.bin").write_bytes(b"x" * 100)
     db = tmp_path / "index.sqlite3"
     assert main(["scan", str(root), "--db", str(db)]) == 0
+
+
+# --- scan: clean message on disk-full during the index write — audit A5 ------------------------
+
+
+def test_scan_reports_clean_message_when_disk_is_full(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk-full failure writing the index must never surface as an uncaught traceback --
+    it should print one actionable line to stderr and exit 1, same pattern as F22's serve
+    port-collision handling."""
+    import errno
+
+    from reclaim.index import ScanIndex as ScanIndexClass
+
+    def fake_upsert(self: object, records: object, *, scanned_at: float) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ScanIndexClass, "upsert_records", fake_upsert)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+
+    exit_code = main(["scan", str(root), "--db", str(db)])
+
+    assert exit_code == 1
+    assert "disk is full" in capsys.readouterr().err
 
 
 # --- dashboard: serve + auto-open browser -------------------------------------------------------
