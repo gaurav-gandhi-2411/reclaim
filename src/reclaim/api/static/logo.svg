@@ -1,31 +1,52 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
   <!--
-    Reclaim mark: "a block lifted away from a filled square." The whole square starts clay/
-    terracotta (occupied ground); a chunk in the bottom-right has already been cleared, revealing
-    pine green underneath. The small clay block floating top-right, outlined in the sand gap
-    color, is the piece mid-lift — still occupied, but on its way out. Same geometry as
-    favicon.svg (kept legible at 16px) and re-drawn with flat rectangles in
-    packaging/build_brand_assets.py so the packaged .ico/.bmp/.png brand assets match exactly.
-    Literal hex values (not CSS custom properties) for the same standalone-document reason as
-    favicon.svg; these mirror tokens.css's rc-cat-dev-artifacts, rc-brand, and rc-bg custom
-    properties exactly (light mode), with a prefers-color-scheme override for dark surfaces.
+    Reclaim mark v3: "a block lifted away from a filled square" — same geometry as v1/v2, palette
+    moved off the warm axis entirely per GG's Direction A (WS-B visual identity refresh). The
+    whole square starts indigo (occupied ground); a chunk in the bottom-right has already been
+    cleared, revealing mint underneath. The small indigo block floating top-right, outlined in
+    the surface color, is the piece mid-lift — still occupied, but on its way out.
+
+    Depth: a top-lit vertical gradient on the two large regions (indigo, mint) — restrained,
+    analogous-hue (light-to-dark within the same color, not a rainbow), matching 2026 icon
+    convention of "depth without losing small-size legibility" (see PLAN.md's WS-B research
+    note). The lift block is a FLAT fill, not a nested gradient: proven empirically (see the
+    WS-B preview branch) that a second gradient inside a box this small degenerates to nothing
+    once rasterized at 16px — one flat tone plus one outline reads at every size; a nested
+    highlight inside about 7px does not. packaging/build_brand_assets.py's raster renderer
+    mirrors this: gradient at 48px+, flat below (same legibility reasoning, since PIL can't
+    rely on a resolution-independent renderer the way this SVG can).
+
+    NOTE: two hyphens in a row are NOT safe inside an XML/SVG comment (invalid per the XML spec;
+    Chrome silently fails to render the whole file — a real bug this project already hit once,
+    see PLAN.md's 2026-07-23 late checkpoint). Use the em dash character above instead, in this
+    comment and any future edit to it.
+
+    Same geometry as favicon.svg (this is the larger in-app copy).
   -->
+  <defs>
+    <linearGradient id="rc-grad-indigo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366f1" />
+      <stop offset="1" stop-color="#4338ca" />
+    </linearGradient>
+    <linearGradient id="rc-grad-mint" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34d399" />
+      <stop offset="1" stop-color="#047857" />
+    </linearGradient>
+  </defs>
   <style>
-    .rc-clay { fill: #c1512b; }
-    .rc-green { fill: #2f6b52; }
-    .rc-lift { fill: #c1512b; stroke: #faf6f0; stroke-width: 2; }
+    .rc-ground { fill: url(#rc-grad-indigo); }
+    .rc-reclaimed { fill: url(#rc-grad-mint); }
+    .rc-lift { fill: #6366f1; stroke: #f6f7fb; stroke-width: 2; }
     @media (prefers-color-scheme: dark) {
-      .rc-clay { fill: #d76b40; }
-      .rc-green { fill: #4fae82; }
-      .rc-lift { fill: #d76b40; stroke: #1c1815; }
+      .rc-lift { stroke: #0f1117; }
     }
   </style>
   <clipPath id="rc-logo-clip">
     <rect width="32" height="32" rx="7" />
   </clipPath>
   <g clip-path="url(#rc-logo-clip)">
-    <rect class="rc-clay" x="0" y="0" width="32" height="32" />
-    <rect class="rc-green" x="11" y="11" width="21" height="21" />
+    <rect class="rc-ground" x="0" y="0" width="32" height="32" />
+    <rect class="rc-reclaimed" x="11" y="11" width="21" height="21" />
     <rect class="rc-lift" x="15" y="1" width="14" height="12" />
   </g>
 </svg>

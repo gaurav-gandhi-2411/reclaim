@@ -3,37 +3,82 @@
  * Every component references these custom properties; nothing outside this file hardcodes a
  * hex/px value that has a token here (house rule 15b).
  *
- * Visual identity: "excavation / clearing space." Reclaim frees disk space the way digging
- * clears earth, so the palette runs warm clay/terracotta (occupied, un-cleared ground) against
- * a reclaimed pine/moss green (space given back) on a warm sand/soil neutral scale — not the
- * default blue-SaaS-dashboard palette. The 9-hue categorical set below (one fixed hue per
- * detector category, in a *fixed* order — never cycled/reassigned) was generated and verified
- * against the dataviz skill's palette validator (OKLCH lightness band, chroma floor, CVD
- * separation, contrast vs. surface) for both light and dark surfaces; see PLAN.md/the Stage 6
- * report for the exact validator invocations and output.
+ * Visual identity v3 (WS-B refresh, GG's Direction A): indigo (occupied/accent) revealing mint
+ * (reclaimed/success) on a deep cool near-black scale — off the warm axis entirely (v2's copper
+ * read too close to the terracotta this refresh exists to retire). Every text/surface/semantic
+ * pairing below is computed against WCAG AA (4.5:1 text, 3:1 large-text/UI-component) with a
+ * script, not eyeballed — see the WS-B preview PR for the full contrast table.
+ *
+ * `--rc-brand` (indigo) and `--rc-success` (mint) are now DISTINCT tokens — v1/v2 conflated
+ * "brand/interactive accent" and "operation succeeded" into one green. In this product the two
+ * concepts usually coincide (a completed clean IS a reclaim event), but keeping them separate
+ * tokens means a future state that needs "positive but not a brand action" (e.g. a passive safe/
+ * eligible indicator) doesn't have to fight the primary-button color for meaning.
+ *
+ * Dark mode needs a SPLIT within each of brand/success: at this bg lightness, no single indigo
+ * (or single mint) hex clears BOTH "white text on it as a solid button fill" (>=4.5) and "the
+ * color itself as text/icon directly on bg" (>=4.5) simultaneously — the two constraints cross
+ * around adjacent lightness steps, never overlapping above the floor together (checked with the
+ * script across a dozen candidate stops, not assumed). So dark mode carries `--rc-brand`/
+ * `--rc-success` (solid fill, paired with `--rc-text-on-brand`) AND `--rc-brand-text`/
+ * `--rc-success-text` (direct text/icon/badge/link use) as separate stops. Light mode doesn't
+ * need the split — one value clears both roles there — but carries the same token names (set
+ * equal) so every component can reference `--rc-brand-text`/`--rc-success-text` unconditionally
+ * without a per-theme branch.
+ *
+ * `--rc-border` is deliberately NOT held to the 3:1 non-text floor (WCAG 1.4.11 exempts purely
+ * decorative dividers; this project's v1 border was already ~1.4:1 — a hairline convention, not
+ * a UI-component boundary).
+ *
+ * The 9-hue categorical set is UNCHANGED — re-verified against these new cool backgrounds
+ * specifically (still >=3:1 both themes, no regression) and kept deliberately off the brand/
+ * success hues: a categorical/legend palette sharing a hue with an interactive brand color would
+ * read as "this data point is a button," not a distinct convention worth losing.
+ *
+ * Hover/active states use `color-mix(in oklch, ...)` against the base token rather than a
+ * separately-authored hex — perceptually-even lightening/darkening in OKLCH space, computed by
+ * the browser from one source of truth instead of two hand-picked values drifting apart over
+ * future edits.
  */
 
 :root {
   color-scheme: light;
 
   /* Surfaces */
-  --rc-bg: #faf6f0;
+  --rc-bg: #f6f7fb;
   --rc-surface: #ffffff;
-  --rc-surface-alt: #f2ece2;
-  --rc-border: #ded3c2;
+  --rc-surface-alt: #eef0f6;
+  --rc-border: #d7dae5;
 
   /* Text */
-  --rc-text: #2a2420;
-  --rc-text-muted: #6b5d52;
+  --rc-text: #13151d;
+  --rc-text-muted: #585e72;
   --rc-text-on-brand: #ffffff;
 
-  /* Brand / semantic */
-  --rc-brand: #2f6b52;
-  --rc-brand-hover: #24543f;
-  --rc-danger: #b3261e;
-  --rc-danger-hover: #8f1e18;
-  --rc-warning: #a6720b;
-  --rc-focus-ring: #1f6f9e;
+  /* Brand / accent (indigo) — one value clears both the solid-fill and text/icon role in light
+     mode, see file header. */
+  --rc-brand: #4f46e5;
+  --rc-brand-text: #4f46e5;
+  --rc-brand-hover: color-mix(in oklch, var(--rc-brand) 85%, black);
+  --rc-brand-active: color-mix(in oklch, var(--rc-brand) 72%, black);
+
+  /* Success / reclaimed (mint) — distinct from brand, see file header. */
+  --rc-success: #047857;
+  --rc-success-text: #047857;
+  --rc-success-hover: color-mix(in oklch, var(--rc-success) 85%, black);
+  --rc-success-active: color-mix(in oklch, var(--rc-success) 72%, black);
+
+  --rc-danger: #be123c;
+  --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 85%, black);
+  --rc-warning: #b45309;
+  --rc-focus-ring: #0284c7;
+
+  /* Mark colors (mirrors logo.svg/favicon.svg's gradient stops — literal hex there since SVG is
+     loaded outside this cascade). */
+  --rc-mark-ground-light: #6366f1;
+  --rc-mark-ground-dark: #4338ca;
+  --rc-mark-reclaimed-light: #34d399;
+  --rc-mark-reclaimed-dark: #047857;
 
   /* Fixed categorical palette — order matches `category_group` ids in
      src/reclaim/api/schemas.py::category_label and must never be reordered/reused. */
@@ -61,9 +106,12 @@
   --rc-radius-md: 8px;
   --rc-radius-lg: 14px;
 
-  /* Type */
+  /* Type — "Segoe UI Variable" is the variable-font family Windows 11 ships (weight axis without
+     separate static-weight font files); falls back to static "Segoe UI" on Windows 10 or any
+     non-Windows browser, then the same generic stack as before. */
   --rc-font-sans:
-    "Segoe UI", system-ui, -apple-system, "Inter", "Helvetica Neue", Arial, sans-serif;
+    "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Inter", "Helvetica Neue",
+    Arial, sans-serif;
   --rc-font-mono: "Cascadia Code", "Consolas", "SFMono-Regular", Menlo, monospace;
   --rc-text-xs: 12px;
   --rc-text-sm: 13px;
@@ -71,30 +119,77 @@
   --rc-text-lg: 18px;
   --rc-text-xl: 22px;
   --rc-text-2xl: 28px;
+  --rc-line-height-body: 1.6;
+  --rc-tracking-heading: -0.02em;
 
-  --rc-shadow-sm: 0 1px 2px rgba(42, 36, 32, 0.08);
-  --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+  /* Elevation: two-layer "ambient + contact" shadows (a soft, wide, low-opacity ambient occlusion
+     layer plus a tighter, slightly-stronger contact layer right at the edge) rather than one
+     single box-shadow — the standard modern-elevation shape (Material's shadow system, macOS's
+     window shadows) because a single shadow reads flatter/harder-edged than two stacked at
+     different spreads. `--rc-shadow-lg` is new (v3): overlays/modals sit at a third elevation
+     step above cards, so they need their own stop, not a scaled-up `--shadow-md`. */
+  --rc-shadow-sm: 0 1px 2px rgba(19, 21, 29, 0.06), 0 1px 1px rgba(19, 21, 29, 0.08);
+  --rc-shadow-md: 0 6px 16px rgba(19, 21, 29, 0.08), 0 2px 6px rgba(19, 21, 29, 0.06);
+  --rc-shadow-lg: 0 24px 48px rgba(19, 21, 29, 0.18), 0 8px 20px rgba(19, 21, 29, 0.1);
+
+  /* Motion (v3): one shared duration/easing pair for every hover/active/focus micro-interaction,
+     so timing stays consistent without repeating the same two numbers at every call site.
+     150-200ms ease-out per house UI convention — fast enough to feel immediate, slow enough to
+     read as intentional rather than a flicker. `prefers-reduced-motion` zeroes this out globally
+     (see below), so every rule using it is automatically motion-safe without a second override. */
+  --rc-motion-duration: 180ms;
+  --rc-motion-ease: cubic-bezier(0, 0, 0.2, 1);
+
+  /* Very low-opacity mesh wash for the page background — two soft radial gradients (brand +
+     success hues) UNDER the solid --rc-bg color, not replacing it. Kept deliberately faint (6%
+     peak opacity, fully transparent by each gradient's midpoint) so it reads as ambient
+     atmosphere, never competes with text contrast computed above (all of which is measured
+     against the SOLID --rc-bg value, so the wash is additive polish, not load-bearing for any
+     contrast claim in this file). */
+  --rc-bg-wash: radial-gradient(
+      ellipse 900px 600px at 15% -10%,
+      color-mix(in oklch, var(--rc-brand) 6%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 800px 500px at 100% 10%,
+      color-mix(in oklch, var(--rc-success) 5%, transparent),
+      transparent 60%
+    );
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
 
-    --rc-bg: #1c1815;
-    --rc-surface: #241f1a;
-    --rc-surface-alt: #2c2620;
-    --rc-border: #3c342c;
+    --rc-bg: #0f1117;
+    --rc-surface: #171a23;
+    --rc-surface-alt: #1e2230;
+    --rc-border: #2a2f3f;
 
-    --rc-text: #f2ece2;
-    --rc-text-muted: #b8aa9c;
-    --rc-text-on-brand: #10140f;
+    --rc-text: #eef0f5;
+    --rc-text-muted: #9aa1b5;
+    --rc-text-on-brand: #ffffff;
 
-    --rc-brand: #4fae82;
-    --rc-brand-hover: #6cc79b;
-    --rc-danger: #e0574c;
-    --rc-danger-hover: #ef7a70;
-    --rc-warning: #b87a1f;
-    --rc-focus-ring: #4c90c0;
+    --rc-brand: #4f46e5;
+    --rc-brand-text: #8b8ff9;
+    --rc-brand-hover: color-mix(in oklch, var(--rc-brand) 88%, white);
+    --rc-brand-active: color-mix(in oklch, var(--rc-brand) 76%, white);
+
+    --rc-success: #047857;
+    --rc-success-text: #34d399;
+    --rc-success-hover: color-mix(in oklch, var(--rc-success) 88%, white);
+    --rc-success-active: color-mix(in oklch, var(--rc-success) 76%, white);
+
+    --rc-danger: #fb7185;
+    --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 88%, white);
+    --rc-warning: #fbbf24;
+    --rc-focus-ring: #38bdf8;
+
+    --rc-mark-ground-light: #6366f1;
+    --rc-mark-ground-dark: #4338ca;
+    --rc-mark-reclaimed-light: #34d399;
+    --rc-mark-reclaimed-dark: #047857;
 
     --rc-cat-dev-artifacts: #d76b40;
     --rc-cat-package-caches: #b87a1f;
@@ -106,8 +201,24 @@
     --rc-cat-duplicates: #b56a97;
     --rc-cat-other: #b87a2f;
 
-    --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-    --rc-shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);
+    /* Dark-mode elevation: pure-black shadows barely register on an already-dark surface, so
+       depth reads primarily through the surface/surface-alt lightness step (--rc-surface-alt is
+       lighter than --rc-surface, "closer to the light" = "higher"); shadows here are a much
+       fainter reinforcement of that, not the primary depth cue the way they are in light mode. */
+    --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.3);
+    --rc-shadow-md: 0 6px 16px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3);
+    --rc-shadow-lg: 0 24px 48px rgba(0, 0, 0, 0.55), 0 8px 20px rgba(0, 0, 0, 0.35);
+
+    --rc-bg-wash: radial-gradient(
+        ellipse 900px 600px at 15% -10%,
+        color-mix(in oklch, var(--rc-brand) 10%, transparent),
+        transparent 60%
+      ),
+      radial-gradient(
+        ellipse 800px 500px at 100% 10%,
+        color-mix(in oklch, var(--rc-success) 8%, transparent),
+        transparent 60%
+      );
   }
 }
 
@@ -115,19 +226,29 @@
    always wins over prefers-color-scheme, and persists via localStorage (see app.js). */
 :root[data-theme="light"] {
   color-scheme: light;
-  --rc-bg: #faf6f0;
+  --rc-bg: #f6f7fb;
   --rc-surface: #ffffff;
-  --rc-surface-alt: #f2ece2;
-  --rc-border: #ded3c2;
-  --rc-text: #2a2420;
-  --rc-text-muted: #6b5d52;
+  --rc-surface-alt: #eef0f6;
+  --rc-border: #d7dae5;
+  --rc-text: #13151d;
+  --rc-text-muted: #585e72;
   --rc-text-on-brand: #ffffff;
-  --rc-brand: #2f6b52;
-  --rc-brand-hover: #24543f;
-  --rc-danger: #b3261e;
-  --rc-danger-hover: #8f1e18;
-  --rc-warning: #a6720b;
-  --rc-focus-ring: #1f6f9e;
+  --rc-brand: #4f46e5;
+  --rc-brand-text: #4f46e5;
+  --rc-brand-hover: color-mix(in oklch, var(--rc-brand) 85%, black);
+  --rc-brand-active: color-mix(in oklch, var(--rc-brand) 72%, black);
+  --rc-success: #047857;
+  --rc-success-text: #047857;
+  --rc-success-hover: color-mix(in oklch, var(--rc-success) 85%, black);
+  --rc-success-active: color-mix(in oklch, var(--rc-success) 72%, black);
+  --rc-danger: #be123c;
+  --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 85%, black);
+  --rc-warning: #b45309;
+  --rc-focus-ring: #0284c7;
+  --rc-mark-ground-light: #6366f1;
+  --rc-mark-ground-dark: #4338ca;
+  --rc-mark-reclaimed-light: #34d399;
+  --rc-mark-reclaimed-dark: #047857;
   --rc-cat-dev-artifacts: #c1512b;
   --rc-cat-package-caches: #a6720b;
   --rc-cat-temp-browser-caches: #4f7a3a;
@@ -137,25 +258,46 @@
   --rc-cat-large-logs: #1f6f9e;
   --rc-cat-duplicates: #954a80;
   --rc-cat-other: #946218;
-  --rc-shadow-sm: 0 1px 2px rgba(42, 36, 32, 0.08);
-  --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+  --rc-shadow-sm: 0 1px 2px rgba(19, 21, 29, 0.06), 0 1px 1px rgba(19, 21, 29, 0.08);
+  --rc-shadow-md: 0 6px 16px rgba(19, 21, 29, 0.08), 0 2px 6px rgba(19, 21, 29, 0.06);
+  --rc-shadow-lg: 0 24px 48px rgba(19, 21, 29, 0.18), 0 8px 20px rgba(19, 21, 29, 0.1);
+  --rc-bg-wash: radial-gradient(
+      ellipse 900px 600px at 15% -10%,
+      color-mix(in oklch, var(--rc-brand) 6%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 800px 500px at 100% 10%,
+      color-mix(in oklch, var(--rc-success) 5%, transparent),
+      transparent 60%
+    );
 }
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --rc-bg: #1c1815;
-  --rc-surface: #241f1a;
-  --rc-surface-alt: #2c2620;
-  --rc-border: #3c342c;
-  --rc-text: #f2ece2;
-  --rc-text-muted: #b8aa9c;
-  --rc-text-on-brand: #10140f;
-  --rc-brand: #4fae82;
-  --rc-brand-hover: #6cc79b;
-  --rc-danger: #e0574c;
-  --rc-danger-hover: #ef7a70;
-  --rc-warning: #b87a1f;
-  --rc-focus-ring: #4c90c0;
+  --rc-bg: #0f1117;
+  --rc-surface: #171a23;
+  --rc-surface-alt: #1e2230;
+  --rc-border: #2a2f3f;
+  --rc-text: #eef0f5;
+  --rc-text-muted: #9aa1b5;
+  --rc-text-on-brand: #ffffff;
+  --rc-brand: #4f46e5;
+  --rc-brand-text: #8b8ff9;
+  --rc-brand-hover: color-mix(in oklch, var(--rc-brand) 88%, white);
+  --rc-brand-active: color-mix(in oklch, var(--rc-brand) 76%, white);
+  --rc-success: #047857;
+  --rc-success-text: #34d399;
+  --rc-success-hover: color-mix(in oklch, var(--rc-success) 88%, white);
+  --rc-success-active: color-mix(in oklch, var(--rc-success) 76%, white);
+  --rc-danger: #fb7185;
+  --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 88%, white);
+  --rc-warning: #fbbf24;
+  --rc-focus-ring: #38bdf8;
+  --rc-mark-ground-light: #6366f1;
+  --rc-mark-ground-dark: #4338ca;
+  --rc-mark-reclaimed-light: #34d399;
+  --rc-mark-reclaimed-dark: #047857;
   --rc-cat-dev-artifacts: #d76b40;
   --rc-cat-package-caches: #b87a1f;
   --rc-cat-temp-browser-caches: #6f9a55;
@@ -165,6 +307,34 @@
   --rc-cat-large-logs: #4c90c0;
   --rc-cat-duplicates: #b56a97;
   --rc-cat-other: #b87a2f;
-  --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --rc-shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4);
+  --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.3);
+  --rc-shadow-md: 0 6px 16px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3);
+  --rc-shadow-lg: 0 24px 48px rgba(0, 0, 0, 0.55), 0 8px 20px rgba(0, 0, 0, 0.35);
+  --rc-bg-wash: radial-gradient(
+      ellipse 900px 600px at 15% -10%,
+      color-mix(in oklch, var(--rc-brand) 10%, transparent),
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 800px 500px at 100% 10%,
+      color-mix(in oklch, var(--rc-success) 8%, transparent),
+      transparent 60%
+    );
+}
+
+/* Global motion-safety gate (v3): every transition/animation this stylesheet defines is written
+   assuming this rule exists — none of them are individually re-guarded, this single query is the
+   one place that turns all of them off. `!important` is deliberate here (not elsewhere in this
+   file): an accessibility override must win over any more-specific selector a future component
+   rule might add, the same reasoning `:focus-visible` styles usually get flagged for but rarely
+   receive in practice. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

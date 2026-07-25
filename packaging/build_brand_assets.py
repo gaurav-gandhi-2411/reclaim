@@ -3,8 +3,17 @@ logo lockup) from the same flat-rectangle geometry as `src/reclaim/api/static/lo
 
 Deliberately redraws the mark with Pillow's `ImageDraw` primitives instead of adding an
 SVG-rasterizer dependency (cairosvg/resvg) — the mark is three rectangles plus a rounded-corner
-clip, cheap to reproduce exactly, so a new dependency would buy nothing. If the mark ever grows
-curves or gradients, that trade-off should be revisited.
+clip, cheap to reproduce exactly, so a new dependency would buy nothing.
+
+v3 (WS-B visual identity refresh, GG's Direction A): indigo (occupied ground) revealing mint
+(reclaimed space) on a deep cool near-black scale — see tokens.css's file header for the full
+palette rationale and the WCAG contrast table. Size-adaptive rendering: a top-lit vertical
+gradient on the two large regions at 48px and above; flat, high-contrast fills below that.
+Proven empirically (WS-B preview PR #20) that a gradient's inset highlight on the small "lift"
+block degenerates to nothing once rasterized at 16px, and that 2026 icon-design convention
+backs flat/high-contrast at genuinely small sizes regardless — real pixel-grid renders, not
+assumed. Built with `Image.linear_gradient` + `ImageOps.colorize` (pure PIL, no new dependency
+here either).
 
 Run with: `uv run python packaging/build_brand_assets.py`
 """
@@ -13,17 +22,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# Mirrors logo.svg / favicon.svg's light-mode literals, which in turn mirror tokens.css's
-# --rc-cat-dev-artifacts / --rc-brand / --rc-bg / --rc-text / --rc-text-muted (see those files'
-# comments) — kept as literals here too since these are standalone raster assets, not part of
-# the app's CSS cascade.
-CLAY = "#c1512b"
-GREEN = "#2f6b52"
-SAND = "#faf6f0"
-TEXT = "#2a2420"
-TEXT_MUTED = "#6b5d52"
+# Mirrors tokens.css's light-mode --rc-mark-*/--rc-bg/--rc-text/--rc-text-muted literals (see
+# that file's header comment) — kept as literals here too since these are standalone raster
+# assets, not part of the app's CSS cascade.
+GROUND_LIGHT = "#6366f1"  # indigo (occupied ground) -- lighter gradient stop
+GROUND_DARK = "#4338ca"  # indigo -- darker gradient stop
+RECLAIMED_LIGHT = "#34d399"  # mint (reclaimed space) -- lighter gradient stop
+RECLAIMED_DARK = "#047857"  # mint -- darker gradient stop
+BG = "#f6f7fb"
+TEXT = "#13151d"
+TEXT_MUTED = "#585e72"
+
+# Below this pixel size, gradients are skipped in favor of flat fills -- see the module
+# docstring for why (an inset highlight on the ~7px "lift" block at 16px degenerates to nothing
+# once rasterized, so flat/high-contrast reads better there than a muddy gradient attempt).
+_GRADIENT_MIN_SIZE = 48
 
 # The mark's own 32x32 viewBox from logo.svg, expressed as fractions so it can be re-rendered at
 # any pixel size without redrawing the geometry by hand each time.
@@ -34,20 +49,36 @@ _LIFT_BOX_FRACTION = (15.0 / _VIEWBOX, 1.0 / _VIEWBOX, 29.0 / _VIEWBOX, 13.0 / _
 _LIFT_STROKE_FRACTION = 2.0 / _VIEWBOX
 
 # Windows ships Segoe UI at this path on every supported install — matches tokens.css's
-# --rc-font-sans stack, whose first entry is "Segoe UI". This script only ever runs on the
-# Windows dev machine that builds the installer, so no cross-platform fallback path is needed
-# beyond the PIL bitmap font safety net in `_font()`.
+# --rc-font-sans stack. This script only ever runs on the Windows dev machine that builds the
+# installer, so no cross-platform fallback path is needed beyond the PIL bitmap font safety net
+# in `_font()`.
 _FONT_DIR = Path("C:/Windows/Fonts")
 
 
-def render_mark(size: int) -> Image.Image:
-    """Render the Reclaim mark (clay square, green reveal, lifted clay block) as an RGBA image.
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    r, g, b = (int(value[i : i + 2], 16) for i in (0, 2, 4))
+    return (r, g, b)
 
-    Reproduces `logo.svg`'s geometry at an arbitrary pixel size: a clay square clipped to a
-    rounded rect, a green rectangle cut into its bottom-right corner (the already-cleared
-    space), and a smaller clay square floating top-right with a sand-colored outline (the piece
-    still mid-lift).
+
+def _vertical_gradient(size: int, light: str, dark: str) -> Image.Image:
+    """Top-lit vertical gradient (light source directly above) -- reads cleanly at any size,
+    unlike a diagonal gradient fighting the mark's own diagonal split. Built from
+    `Image.linear_gradient` + `ImageOps.colorize`, pure PIL, no new dependency."""
+    base = Image.linear_gradient("L").resize((size, size))
+    return ImageOps.colorize(base, black=_hex_to_rgb(dark), white=_hex_to_rgb(light)).convert("RGB")
+
+
+def render_mark(size: int) -> Image.Image:
+    """Render the Reclaim mark (indigo ground, mint reveal, indigo lift block) as an RGBA image.
+
+    Reproduces `logo.svg`'s geometry at an arbitrary pixel size: an indigo square clipped to a
+    rounded rect, a mint rectangle cut into its bottom-right corner (the already-cleared space),
+    and a smaller indigo square floating top-right with a surface-colored outline (the piece
+    still mid-lift). Gradient depth at `size >= _GRADIENT_MIN_SIZE`, flat fills below that.
     """
+    gradient = size >= _GRADIENT_MIN_SIZE
+
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         [0, 0, size - 1, size - 1],
@@ -56,16 +87,29 @@ def render_mark(size: int) -> Image.Image:
     )
 
     content = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(content)
-    draw.rectangle([0, 0, size, size], fill=CLAY)
+    if gradient:
+        ground_fill = _vertical_gradient(size, GROUND_LIGHT, GROUND_DARK)
+        reclaimed_fill = _vertical_gradient(size, RECLAIMED_LIGHT, RECLAIMED_DARK)
+    else:
+        ground_fill = Image.new("RGB", (size, size), _hex_to_rgb(GROUND_LIGHT))
+        reclaimed_fill = Image.new("RGB", (size, size), _hex_to_rgb(RECLAIMED_LIGHT))
+    content.paste(ground_fill, (0, 0))
 
     hole = round(size * _HOLE_INSET_FRACTION)
-    draw.rectangle([hole, hole, size, size], fill=GREEN)
+    content.paste(reclaimed_fill.crop((hole, hole, size, size)), (hole, hole))
 
+    # Lift block: a SOLID fill (the gradient's lightest stop), not an inset highlight crop -- at
+    # 16px the lift box is ~7px net of its own outline, too small for a nested highlight to
+    # survive resampling. One flat tone + one outline is legible at every size; a second
+    # internal gradient inside a 7px box is not (see module docstring).
     lift_x0, lift_y0, lift_x1, lift_y1 = (round(size * f) for f in _LIFT_BOX_FRACTION)
     stroke_width = max(1, round(size * _LIFT_STROKE_FRACTION))
+    draw = ImageDraw.Draw(content)
     draw.rectangle(
-        [lift_x0, lift_y0, lift_x1, lift_y1], fill=CLAY, outline=SAND, width=stroke_width
+        [lift_x0, lift_y0, lift_x1, lift_y1],
+        fill=GROUND_LIGHT,
+        outline=BG,
+        width=stroke_width,
     )
 
     mark = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -110,18 +154,18 @@ def build_ico(path: Path) -> None:
 
 
 def build_wizard_small(path: Path) -> None:
-    """Write Inno Setup's WizardSmallImageFile — 55x58, sand background, centered mark."""
+    """Write Inno Setup's WizardSmallImageFile — 55x58, bg background, centered mark."""
     width, height = 55, 58
-    canvas = Image.new("RGB", (width, height), SAND)
+    canvas = Image.new("RGB", (width, height), BG)
     mark = render_mark(40)
     canvas.paste(mark, ((width - 40) // 2, (height - 40) // 2), mark)
     canvas.save(path, format="BMP")
 
 
 def build_wizard_large(path: Path) -> None:
-    """Write Inno Setup's WizardImageFile — 164x314, sand background, mark + wordmark."""
+    """Write Inno Setup's WizardImageFile — 164x314, bg background, mark + wordmark."""
     width, height = 164, 314
-    canvas = Image.new("RGB", (width, height), SAND)
+    canvas = Image.new("RGB", (width, height), BG)
     mark_size = 96
     mark = render_mark(mark_size)
     mark_top = 48
@@ -136,7 +180,7 @@ def build_wizard_large(path: Path) -> None:
 def build_og_preview(path: Path) -> None:
     """Write the GitHub social-preview image — 1200x630, mark + wordmark + one-line tagline."""
     width, height = 1200, 630
-    canvas = Image.new("RGB", (width, height), SAND)
+    canvas = Image.new("RGB", (width, height), BG)
     mark_size = 220
     mark = render_mark(mark_size)
     mark_left = 140
@@ -156,9 +200,9 @@ def build_og_preview(path: Path) -> None:
 
 
 def build_logo_lockup(path: Path) -> None:
-    """Write the README header lockup — ~600x160, mark + wordmark, sand background."""
+    """Write the README header lockup — ~600x160, mark + wordmark, bg background."""
     width, height = 600, 160
-    canvas = Image.new("RGB", (width, height), SAND)
+    canvas = Image.new("RGB", (width, height), BG)
     mark_size = 96
     mark_left = 32
     mark = render_mark(mark_size)
