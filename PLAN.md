@@ -1668,6 +1668,77 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
   ADVANCED UX modes), then the release rebuild -- continuing autonomously per the standing work
   order.
 
+### 2026-07-25 — Workstream B (visual identity) preview PR opened, awaiting GG's reaction
+- Per GG's explicit steer: designed the 16px icon FIRST, proved it (and 32/48px) clean before
+  finalizing anything, then opened a reviewable preview PR (#20, draft) rather than doing the
+  full asset regeneration blind. Direction: keeps the mark's geometry unchanged ("a block lifted
+  away from a filled square"); palette evolves from flat terracotta/pine/sand to a richer
+  copper (occupied)/jade (reclaimed) on a deeper warm-neutral scale — same excavation metaphor,
+  grounded in a quick 2026 app-design read (restrained analogous-hue gradients, subtle depth,
+  dark-mode-first) rather than either keeping the dated look or chasing a generic trend.
+- 16px legibility: a gradient's inset highlight on the small "lift block" degenerates to nothing
+  once rasterized that small — resolved with size-adaptive rendering (flat/high-contrast at
+  16/32px, dimensional gradient at 48px+), proven with real nearest-neighbor pixel-grid renders,
+  not assumed. `logo.svg`/`favicon.svg` use real SVG gradients (resolution-independent, no
+  flat/gradient split needed there).
+- Every text/surface/semantic color pairing checked against WCAG AA with a script
+  (`contrast_ratio`, WCAG relative-luminance formula) — all pass except one deliberate, disclosed
+  exception (`--rc-border`, a low-contrast hairline divider, matching this project's own v1
+  convention and WCAG 1.4.11's decorative-divider exemption). The 9-hue categorical palette is
+  unchanged and reconfirmed against the new backgrounds.
+- The preview includes a REAL restyled dashboard screen (both themes), not a hand-drawn mockup —
+  the actual running app with the new tokens applied, screenshotted against a disposable local
+  demo tree.
+- **Hit the exact XML-comment bug this project already documented once** (2026-07-23 checkpoint):
+  a literal double-hyphen inside the new logo.svg/favicon.svg's comment silently broke Chrome's
+  rendering again. Caught via my own screenshot review this time (a broken-image icon in the
+  header crop) before it reached a PR, not after — both files now XML-validated.
+- PR #20 (draft, by design — this is GG's one taste-driven call, not an auto-mergeable change):
+  https://github.com/gaurav-gandhi-2411/reclaim/pull/20. Nothing wired to `main`'s default
+  experience yet. Full asset regeneration (`build_brand_assets.py`, `.ico`, wizard bitmaps, OG
+  preview, README lockup) and the dashboard's spacing/depth/elevation modernization (WS-B item
+  12) are explicitly deferred until GG reacts to this preview.
+- Next (pending GG's direction call): finish WS-B regeneration + dashboard modernization, then
+  Workstream C (SIMPLE/ADVANCED UX modes) — already scoped, can start in parallel since it
+  doesn't depend on the palette decision.
+
+### 2026-07-25 — WS-B v3 iteration on PR #20: indigo/mint, real CSS depth (still unmerged)
+- GG reviewed the copper/jade v2 preview and asked for a full iteration: copper read too orange
+  (inherited terracotta's dated cast), wanted more depth, livelier colors, a modern/new-age feel
+  with live CSS rendering rather than flat fills. Picked Direction A: indigo (`#4F46E5` family,
+  occupied/accent) revealing mint (`#34D399` family, reclaimed/success) on a deep cool near-black
+  scale (`#0F1117` family) — off the warm axis entirely, same excavation metaphor.
+- **Split `--rc-brand` (indigo) from `--rc-success` (mint) into distinct tokens** — v1/v2
+  conflated "primary interactive accent" and "operation succeeded" into one green. Answers GG's
+  explicit question (mint vs. success collision): mint IS success now, structurally separate from
+  brand, applied to the Tier-A badge, the "will be kept" row highlight, and a new
+  `.rc-btn-success` variant on the Quick-Clean buttons (cleaning IS the reclaim action).
+  Discovered mid-implementation: at this dark-mode background lightness, no single indigo (or
+  single mint) hex clears both "white text on it as a button" and "the color itself as text on
+  bg" above WCAG AA simultaneously — the two constraints cross adjacent lightness steps without
+  ever both clearing 4.5:1 together (checked across a dozen candidate stops with the script, not
+  assumed). Dark mode carries a solid-fill stop and a separate text/icon stop per token; light
+  mode doesn't need the split but carries the same token names for a branch-free component layer.
+- Categorical data-viz palette re-verified against the new cool backgrounds (still ≥3:1 both
+  themes) and kept deliberately off the brand/success hues.
+- Implemented real CSS depth/motion, not just a recolor: two-layer ambient+contact elevation
+  shadows (new `--rc-shadow-lg` for modals), `backdrop-filter: blur()` on a now-sticky header and
+  the modal overlay (confirmed via screenshot — real blur, not a darkened overlay — with an
+  `@supports`-gated opaque fallback), a very low-opacity mesh gradient wash on the page
+  background, `color-mix(in oklch, ...)`-derived hover/active states, 150-200ms ease-out
+  micro-interactions + `scale(0.98)` on `:active` everywhere, skeleton loaders replacing the
+  spinner in `renderState()` (one shared function, one change point — `.rc-spinner` CSS is now
+  genuinely dead, removed), an animated progress-bar stripe, and a single global
+  `prefers-reduced-motion` gate in tokens.css that every other rule assumes rather than
+  re-guarding itself. Deliberately did NOT add view-transitions/scroll-driven animations —
+  documented as a considered skip (unclear payoff vs. real feature-detection complexity for a
+  data-dense utility, not a marketing site), not an oversight.
+- `uv run python scripts/verify.py` + `tests/frontend` (npm test, since `app.js`'s
+  `renderState()` changed): both fully green, no regressions.
+- PR #20 (still draft) updated in place with the v3 direction, all screenshots regenerated
+  against the real running app (not mockups): https://github.com/gaurav-gandhi-2411/reclaim/pull/20
+  — still nothing wired to `main`'s default experience.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
