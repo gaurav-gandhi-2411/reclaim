@@ -8,19 +8,22 @@
 <style>
   /* Design tokens, inlined from src/reclaim/api/static/tokens.css so this standalone GitHub
      Pages page shares Reclaim's actual visual identity without depending on the app's asset
-     pipeline (this file must stay self-contained: no CDN fonts, no external requests). */
+     pipeline (this file must stay self-contained: no CDN fonts, no external requests).
+     Visual identity v3 (WS-B refresh): indigo brand / mint accent on a cool near-black-capable
+     scale — kept in sync with tokens.css's light-mode stops (this page is light-only, no theme
+     toggle, so only the light block is needed here). */
   :root {
-    --rc-bg: #faf6f0;
+    --rc-bg: #f6f7fb;
     --rc-surface: #ffffff;
-    --rc-surface-alt: #f2ece2;
-    --rc-border: #ded3c2;
-    --rc-text: #2a2420;
-    --rc-text-muted: #6b5d52;
+    --rc-surface-alt: #eef0f6;
+    --rc-border: #d7dae5;
+    --rc-text: #13151d;
+    --rc-text-muted: #585e72;
     --rc-text-on-brand: #ffffff;
-    --rc-brand: #2f6b52;
-    --rc-brand-hover: #24543f;
-    --rc-accent: #c1512b;
-    --rc-focus-ring: #1f6f9e;
+    --rc-brand: #4f46e5;
+    --rc-brand-hover: color-mix(in oklch, #4f46e5 85%, black);
+    --rc-accent: #047857;
+    --rc-focus-ring: #0284c7;
     --rc-radius-md: 8px;
     --rc-radius-lg: 14px;
     --rc-space-2: 8px;
@@ -29,8 +32,10 @@
     --rc-space-5: 24px;
     --rc-space-6: 32px;
     --rc-space-7: 48px;
-    --rc-font-sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-    --rc-shadow-md: 0 4px 14px rgba(42, 36, 32, 0.12);
+    --rc-font-sans:
+      "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Inter", "Helvetica Neue",
+      Arial, sans-serif;
+    --rc-shadow-md: 0 6px 16px rgba(19, 21, 29, 0.08), 0 2px 6px rgba(19, 21, 29, 0.06);
   }
 
   * { box-sizing: border-box; }
@@ -210,7 +215,7 @@
       <p class="rc-value-prop">
         Reclaim finds files that are safe to remove — caches your tools rebuild, temp files,
         duplicate copies — shows you exactly why, and never deletes anything without your
-        review.
+        review. Starts in Simple mode: one button, no path typing, no decisions to make.
       </p>
       <a class="rc-download-btn" href="https://github.com/gaurav-gandhi-2411/reclaim/releases/latest">
         Download for Windows
@@ -248,28 +253,28 @@
         <h2 id="gallery-heading">See it in action</h2>
         <div class="rc-gallery-grid">
           <figure>
-            <img src="./assets/screenshots/02-overview-quickclean.png" alt="Overview tab with Quick Clean showing a plain-language category and real measured size" loading="lazy" />
+            <img src="./assets/screenshots/01-first-run.png" alt="First-run screen explaining Simple mode and safe mode before anything else is usable" loading="lazy" />
+            <figcaption>Simple mode and safe mode explained before you can do anything else.</figcaption>
+          </figure>
+          <figure>
+            <img src="./assets/screenshots/02-simple-idle.png" alt="Simple mode idle screen with a single Clean My Computer button" loading="lazy" />
+            <figcaption>One button. No path typing, no categories to configure.</figcaption>
+          </figure>
+          <figure>
+            <img src="./assets/screenshots/04-simple-results.png" alt="Simple mode results screen showing plain-language categories with real measured sizes and a Clean now button" loading="lazy" />
             <figcaption>Plain-language groups, real measured sizes — never a made-up confidence score.</figcaption>
           </figure>
           <figure>
-            <img src="./assets/screenshots/04-ai-suggestions.png" alt="AI Suggestions tab showing a document version chain and near-duplicate photos" loading="lazy" />
-            <figcaption>AI suggestions stay recommend-only — a version chain and near-duplicate photos, each with a plain-language reason.</figcaption>
-          </figure>
-          <figure>
-            <img src="./assets/screenshots/06-ai-semantic-browse-only.png" alt="Semantic photo grouping and screenshot burst detection labeled browse only, with no delete affordance" loading="lazy" />
-            <figcaption>Browse-only by construction: no select/delete affordance at all when content might matter.</figcaption>
-          </figure>
-          <figure>
-            <img src="./assets/screenshots/09-quickclean-success.png" alt="Quick Clean success message stating files were moved to the Recycle Bin, not freed" loading="lazy" />
+            <img src="./assets/screenshots/05-quickclean-success.png" alt="Quick Clean success message stating files were moved to the Recycle Bin, not freed" loading="lazy" />
             <figcaption>Moved vs. freed, never conflated — emptying the Recycle Bin is always a separate, manual step.</figcaption>
           </figure>
           <figure>
-            <img src="./assets/screenshots/11-recovery-banner.png" alt="Crash-recovery banner shown when a quarantine operation was interrupted, explaining it will resolve automatically" loading="lazy" />
-            <figcaption>v1.2.0: a crash mid-operation is surfaced, not hidden — with exactly what to run next.</figcaption>
+            <img src="./assets/screenshots/07-review-queue.png" alt="Review Queue showing individual candidates with keep vs. delete rationale" loading="lazy" />
+            <figcaption>Advanced mode: every candidate exactly measured, with the rationale pulled verbatim from the detector.</figcaption>
           </figure>
           <figure>
-            <img src="./assets/screenshots/12-apply-progress.png" alt="Live progress bar during a large apply, showing items processed of total and the current category" loading="lazy" />
-            <figcaption>v1.2.0: real progress for long operations, plus a note that stopping mid-way is safe.</figcaption>
+            <img src="./assets/screenshots/10-ai-suggestions.png" alt="AI Suggestions tab explaining that AI features are not included in the installer and are recommend-only when available" loading="lazy" />
+            <figcaption>AI stays recommend-only, and honest about what's actually installed.</figcaption>
           </figure>
         </div>
       </section>

@@ -8,7 +8,7 @@
 ; paths land somewhere the user already owns.
 
 #define MyAppName "Reclaim"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Gaurav Gandhi"
 #define MyAppExeName "reclaim.exe"
 #define MyDistDir "build\entry_point.dist"
