@@ -1899,6 +1899,130 @@ all evidenced from the run above:
 checkpoint. Next (pending go-ahead): fix findings 1-5 with regression tests proving bounded
 memory and CLI progress output on a scaled fixture, then move to P0-B (AI/ONNX).
 
+### 2026-07-30 — Findings 1-5 fixed, re-verified on the same real disk (STOP POINT 1 closed)
+
+GG confirmed the diagnosis and specified the fix order (1+4 together, then 2, then 3, then 5),
+explicitly naming the real mechanism: 5,085MB peak RSS for 2.67M files extrapolates to 15-25GB
+on a true full-drive scan, which is the actual OOM behind "scans take forever and fail."
+
+**Findings #1 + #4 (streaming batched writes, WAL, seen-table pruning):**
+- `scanner.py`: `_BatchIndexWriter` replaces the whole-walk `all_records` list — every worker
+  (`_walk_subtree`, and the top-level entries loop) now classifies each record as changed/new
+  vs. unchanged inline (`_classify_record`) and flushes in `_WRITE_BATCH_SIZE=5000`-record
+  batches through a shared, lock-guarded writer, so peak memory is bounded by
+  `worker_count * _WRITE_BATCH_SIZE`, not by total file count. A crash mid-walk now loses at
+  most the last unflushed batch per worker, not the entire walk.
+- `index.py`: `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL` added to every `ScanIndex`
+  connection (universal, not scan-specific — `apply`/`purge` writes benefit too).
+  `begin_scan_tracking`/`record_seen`/`prune_unseen_under_root`/`end_scan_tracking` replace
+  `scan_tree`'s use of `prune_missing`: an exact set-difference (same semantics, not a
+  `last_scanned`-timestamp approximation — `prune_missing`'s own docstring documents a
+  deliberate prior choice not to rewrite unchanged rows just to prove they still exist, which a
+  timestamp approach would have undone) computed via a per-scan SQLite TEMP TABLE anti-join
+  instead of two full Python collections. `prune_missing` itself is untouched and still
+  directly tested — only `scan_tree`'s caller-side usage changed.
+- **Deferred index creation (part of finding #4's original scope) was investigated and
+  deliberately NOT done**: `tests/test_query_plan_coverage.py`'s `indexed_bulk` fixture
+  constructs a fresh `ScanIndex` and inserts 5,000 rows directly (no `scan_tree` involved) then
+  asserts every query hits an index — eagerly creating all 6 indices in `ScanIndex.__init__` is
+  a real, tested contract for every non-scan caller (`apply`/`purge`/`serve`/`recover`/tests),
+  not just an accident. Deferring it would require every such caller to remember to call a new
+  `ensure_indexes()`, for a one-time bulk-load win that's minor next to the multi-hour scan
+  itself — not worth the risk. Documented here rather than silently dropped.
+- `stat_cache` is now only loaded when `incremental=True` (previously always loaded,
+  unconditionally, even though `prune_missing`'s old Python set-difference doesn't need it when
+  `incremental=False` — the new SQL-side prune never needed it at all) — a `--full`/forced
+  rescan of an existing large index no longer pays for it.
+
+**Finding #2 (CLI progress):** `cli.py::_run_scan` now wires `on_progress` to a heartbeat
+printer (`_on_scan_progress_printer`) at the existing `_HEARTBEAT_INTERVAL_SECONDS=5.0` cadence.
+Deliberately did NOT mirror the dashboard's `count_entries_fast` estimating pre-pass (a second
+full stat-free tree walk purely to produce a total/ETA) — doubling I/O on every CLI invocation
+isn't worth it just to show a growing count instead of a count-with-denominator; "clearly still
+working" was the actual gap, not an ETA.
+
+**Finding #3 (stat timeout guard + as_completed):** `_guarded_stat` mirrors `dedup.py`'s
+`_hash_with_guard` pattern exactly — every `os.stat()` call in the walk now goes through a
+shared, `_STAT_TIMEOUT_WORKERS=8`-sized pool with a 30s guard (`stat_executor=None` default
+preserves `build_record_for_path`'s existing unguarded behavior — it's a one-off lookup, never
+a scan hot loop). `scan_tree`'s worker-result consumption switched from `executor.map()`
+(submission-order-blocking — a slow first-submitted directory delays consuming every later,
+already-finished one) to `as_completed()`.
+- **Honest performance cost, measured, not assumed (rule 65a)**: an isolated A/B on a 4,025-file
+  fixture (same run, same machine, only `_guarded_stat`'s executor path toggled) —
+  **10,696 files/sec without the guard, 6,323 files/sec with it (~41% slower)**. This is very
+  likely the dominant driver of the real-disk before/after wall-time regression below (a
+  same-ratio projection from the OLD 425s baseline lands at ~718s, close to the observed 681s).
+  Both figures stay far above the CI smoke floor (150/sec) and the spec's ~1,667/sec target, and
+  no stat call has ever actually been observed to hang on either real run — this guard is
+  prophylactic, not a fix for an observed failure. Flagged as a real, disclosed trade-off, not
+  silently absorbed; a cheaper mitigation (e.g. adaptive guarding only when a directory is
+  already running slow) is a reasonable future refinement if the wall-time cost proves to matter
+  in practice, not implemented here since it wasn't asked for and adds real complexity.
+
+**Finding #5 (git "dubious ownership" noise):** `_query_git_clean` now catches
+`CalledProcessError` specifically and checks `.stderr` for Git's "detected dubious ownership"
+text, logging at `debug` (silent by default) instead of `warning` for that one case — every
+other git failure still warns, unchanged. Still fails safe (`git_repo_clean=False`) either way;
+this was purely about log-noise volume, not behavior.
+
+**Also investigated per GG's "continue to" list — both already fully solved, nothing to build:**
+- **`\\?\` prefixing**: `long_path()` (D12) already wraps every `os.scandir`/`os.stat` call
+  throughout the walk, `GitRepoCache.repo_root_for`, and `executor.py`'s vault/move path (ADR-
+  0004) — comprehensive, pre-existing, covered by `test_scan_tree_walks_past_max_path_without_
+  dropping_the_subtree` and siblings.
+- **Staged size -> partial-hash -> full-hash dedup**: `dedup.py::find_duplicate_clusters`
+  already implements exactly this (size bucket -> 64KB partial hash -> BLAKE3 full hash only on
+  partial collisions), with its own 30s per-file hash-read timeout guard and batched writes —
+  the spec's P0-A "never hash everything" ask was already built before this Wave.
+- **`longPathAware` app manifest: investigated, deliberately NOT added.** Nuitka 4.1.3 (this
+  project's pinned build tool) has no flag for it, and this machine has neither `mt.exe` nor
+  `rc.exe` (Windows SDK) to post-process the compiled binary's manifest — adding it would mean
+  pulling in a whole new, heavyweight build-toolchain dependency this project doesn't otherwise
+  need. Given the app's OWN filesystem code already comprehensively `\\?\`-prefixes every real
+  touchpoint (the point above), `longPathAware`'s remaining practical value is marginal — it
+  would only matter for Nuitka/CPython-runtime-internal file access that doesn't go through
+  Reclaim's own path-handling convention, not for anything Reclaim's application code does.
+  Judgment call (rule 54a): not worth the new toolchain dependency for that residual, unproven
+  benefit. Revisit if a concrete failure is ever found that traces to this specifically.
+
+**Re-verification: same real machine, same `C:\Users\gaura` target, direct `python.exe`
+invocation (not `uv run`'s wrapper) for accurate memory sampling — corrected from the first
+diagnostic run, which was actually watching `uv run`'s launcher shim two process-hops removed
+from the real worker (caught via `Get-CimInstance Win32_Process` process-tree inspection; the
+BEFORE numbers already accounted for this).**
+
+| Metric | Before (2026-07-30 diagnosis) | After (this fix) | Change |
+|---|---|---|---|
+| Peak RSS | 5,085 MB | **244 MB** | **-95.2%** |
+| Wall time | 425.23s | 672.41s | +58.1% |
+| Entries scanned | 2,672,201 | 2,624,864 | real disk changed between runs (other sessions' activity) |
+| Dirs visited | 284,479 | 285,114 | ″ |
+| Skipped/unreadable | 1 | 1 | same |
+| Index DB size on disk | 2.35 GB | 2.28 GB | ″ |
+| Exit code | 0 (no crash either time) | 0 | — |
+| CLI progress output | none (silent for entire run) | heartbeat every 5s with real growing counts (verified live: `2,590,283 entries visited (655s elapsed)` etc.) | fixed |
+
+The peak-RSS fix is the one that matters: GG's own framing (2.67M-file profile scan
+extrapolating to 15-25GB on a full `C:\`) is the confirmed root cause of real OOM failures at
+true full-drive scale, and this run proves it bounded at 244MB regardless — a ~21x reduction,
+holding flat rather than climbing for the entire 672s run (see `evals/test_scanner_memory.py`
+for the structural proof at smaller, CI-tractable scale: 1.96x peak-memory growth for a 4x
+file-count increase, versus what would be close to 4x on the old code). The wall-time increase
+is real and disclosed above, traced to finding #3's stat-timeout guard specifically (not the
+batching/WAL changes) — a deliberate, asked-for correctness/operability trade against a
+theoretical hang that has not actually been observed on either real run.
+
+**Verification**: `scripts/verify.py` full pass — 748 passed, 27 skipped (775 total, +4 new:
+stat-timeout guard, 2 git-dubious-ownership log-level tests, CLI progress heartbeat), ruff/mypy
+clean, 86.94% coverage (>80% floor), all 5 safety-critical module floors held.
+`evals/test_scanner_memory.py` (new) and `evals/test_scanner_perf.py` (existing, re-run) both
+pass — perf smoke: 5,996-6,323 files/sec depending on run, still ~4-38x the CI floor.
+
+Branch `wave-1-scan-reliability`, not yet committed as of this checkpoint (commit follows this
+entry). Next: STOP before P0-B (ONNX/AI packaging) per the standing work order, pending GG's
+review of the above.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

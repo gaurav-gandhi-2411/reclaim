@@ -478,6 +478,33 @@ def test_scan_does_not_check_elevation(tmp_path: Path, monkeypatch: pytest.Monke
     assert main(["scan", str(root), "--db", str(db)]) == 0
 
 
+# --- scan: progress output, Wave 1 finding #2 (2026-07-30 real-disk diagnosis) ------------------
+
+
+def test_scan_prints_progress_heartbeat(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The raw CLI `scan` command previously called `scan_tree` with no `on_progress` at all --
+    a real 2.67M-file scan sat silent on the terminal for 7+ minutes, indistinguishable from a
+    hang. Forces the heartbeat interval to 0 (matching `test_scanner.py`'s own convention) so
+    this test doesn't depend on real wall-clock timing to see at least one heartbeat line."""
+    import reclaim.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.bin").write_bytes(b"x" * 100)
+    (root / "b.bin").write_bytes(b"y" * 100)
+    db = tmp_path / "index.sqlite3"
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+
+    out = capsys.readouterr().out
+    assert "reclaim scan: scanning..." in out
+    assert "entries visited" in out
+
+
 # --- scan: clean message on disk-full during the index write — audit A5 ------------------------
 
 

@@ -257,6 +257,19 @@ class ScanIndex:
     def __init__(self, db_path: Path) -> None:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Wave 1 finding #4 (2026-07-30 real-disk diagnosis): default rollback-journal mode
+        # fsyncs on every commit, which made the batched-transaction rewrite in scanner.py's
+        # `_BatchIndexWriter` (finding #1 — see its docstring) far less effective than it should
+        # be, since each of those batch commits would still pay a full fsync. WAL also lets a
+        # concurrent reader (e.g. the dashboard's `/api/scan/status` poll) proceed against the
+        # index while a scan's writes are still in flight, which DELETE-mode journaling blocks.
+        # `synchronous=NORMAL` is the documented safe pairing with WAL (only FULL survives an OS
+        # crash with zero possible loss; NORMAL can lose the last few not-yet-checkpointed
+        # commits on a power-loss/OS crash specifically, never on an application crash — an
+        # acceptable trade for a rebuildable local scan index, never applied to the quarantine
+        # manifest/vault, which stay on their own separate, still-fsync-durable write paths).
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
         self._ensure_name_and_path_lower_columns()
         for statement in _INDEXES:
@@ -347,6 +360,64 @@ class ScanIndex:
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in stale])
         self._conn.commit()
         return len(stale)
+
+    # --- Wave 1 finding #1/#4: streaming-safe staleness tracking --------------------------------
+    #
+    # `prune_missing` above needs two full Python collections (`indexed_paths`/`seen_paths`) held
+    # in memory to compute its set-difference — fine at unit-test scale, but `scan_tree` used to
+    # build `seen_paths` by accumulating one `FileRecord` per visited entry across an entire
+    # multi-million-file walk before ever calling it (the exact bug the 2026-07-30 real-disk
+    # diagnosis measured at 5,085MB peak RSS for 2.67M files — see PLAN.md's Wave 1 checkpoint).
+    # `begin_scan_tracking`/`record_seen`/`prune_unseen_under_root` move that same set-difference
+    # INTO SQLite (a temp table, batch-appended as the walk progresses) so `scan_tree` never
+    # holds more than one small batch of paths in Python memory at a time, while still preserving
+    # `prune_missing`'s own documented choice to evaluate an EXACT set-difference rather than a
+    # `last_scanned` timestamp comparison (a timestamp approach would require rewriting every
+    # unchanged file's row just to bump its timestamp, undoing the whole point of the incremental
+    # skip below — see `upsert_records`' docstring reasoning, unchanged here).
+
+    def begin_scan_tracking(self) -> None:
+        """Starts a new staleness-tracking session for one `scan_tree` call: drops any leftover
+        temp table from a prior session on this same connection (e.g. an aborted scan) and
+        creates a fresh one. Temp tables are connection-scoped and never touch the real `files`
+        table or the on-disk `.sqlite3` file."""
+        self._conn.execute("DROP TABLE IF EXISTS temp.scan_seen")
+        self._conn.execute("CREATE TEMP TABLE scan_seen (path TEXT PRIMARY KEY)")
+
+    def record_seen(self, paths: Sequence[str]) -> None:
+        """Batch-appends paths visited so far this scan into the tracking table — called once
+        per `_BatchIndexWriter` flush (a bounded batch, never the whole walk) for both changed
+        AND unchanged entries, since `prune_unseen_under_root` needs to know everything that
+        still exists on disk, not just what got rewritten."""
+        if not paths:
+            return
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO scan_seen (path) VALUES (?)", [(p,) for p in paths]
+        )
+        self._conn.commit()
+
+    def prune_unseen_under_root(self, root: Path) -> int:
+        """Deletes every row under `root` (same `path = ? OR (path >= lo AND path < hi)` scoping
+        `load_stat_cache`/`direct_children` already use, via `_prefix_range`) whose path was
+        never passed to `record_seen` this session — the exact set-difference `prune_missing`
+        computes, evaluated entirely inside SQLite via an anti-join against the temp table
+        instead of two full Python collections. Must be called after every real entry under
+        `root` has reached `record_seen` at least once."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "DELETE FROM files WHERE (path = ? OR (path >= ? AND path < ?)) "
+            "AND path NOT IN (SELECT path FROM temp.scan_seen)",
+            (prefix, lower, upper),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def end_scan_tracking(self) -> None:
+        """Drops the temp table — always safe to call (even if `begin_scan_tracking` never ran,
+        e.g. an early failure), since a dropped connection-scoped temp table costs nothing to
+        recreate next time."""
+        self._conn.execute("DROP TABLE IF EXISTS temp.scan_seen")
 
     def load_stat_cache(self, root: Path | None = None) -> dict[str, StoredStat]:
         """Loads path -> (size, mtime) for every indexed row (optionally scoped under `root`)

@@ -423,6 +423,20 @@ def _load_config_or_none(
         return None
 
 
+def _on_scan_progress_printer(processed: int, _estimated_total: int | None, elapsed: float) -> None:
+    """Wave 1 finding #2 (2026-07-30 real-disk diagnosis): the raw `reclaim scan` CLI command
+    used to call `scan_tree` with no `on_progress` at all -- a real 2.67M-file scan sat silent
+    on the terminal for 7+ minutes, indistinguishable from a hang. `scan_tree`'s own
+    `_ProgressTracker` already interval-gates calls to this (every `_HEARTBEAT_INTERVAL_SECONDS`
+    -- never per-entry), so this only needs to print, not throttle. Deliberately does NOT run
+    `count_entries_fast`'s pre-pass first the way the dashboard's live-ETA view does (see
+    `api.service.run_scan`) -- that pre-pass is a second full stat-free tree walk purely to
+    produce a total/ETA, and doubling I/O on every CLI invocation isn't worth it just to show a
+    growing count instead of a count-with-a-denominator; "clearly still working" is the actual
+    gap being closed here, not an ETA."""
+    print(f"reclaim scan: scanning... {processed:,} entries visited ({elapsed:.0f}s elapsed)")  # noqa: T201
+
+
 def _run_scan(args: argparse.Namespace) -> int:
     root: Path = args.path
     if not root.is_dir():
@@ -432,7 +446,13 @@ def _run_scan(args: argparse.Namespace) -> int:
     args.db.parent.mkdir(parents=True, exist_ok=True)
     try:
         with ScanIndex(args.db) as index:
-            stats = scan_tree(root, index, incremental=not args.full, max_workers=args.workers)
+            stats = scan_tree(
+                root,
+                index,
+                incremental=not args.full,
+                max_workers=args.workers,
+                on_progress=_on_scan_progress_printer,
+            )
     except ScanDiskFullError as exc:
         print(f"reclaim scan: {exc}", file=sys.stderr)  # noqa: T201
         return 1

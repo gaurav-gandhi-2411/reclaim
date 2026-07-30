@@ -4,6 +4,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+import time
 import unicodedata
 from pathlib import Path
 
@@ -705,3 +706,114 @@ def test_build_record_for_path_matches_nfd_disk_entry_against_nfc_lookup_path(
     # equality check itself is normalization-scoped, so the record still reports the on-disk NFD
     # form, not the NFC lookup form.
     assert record.path.name == nfd_name
+
+
+# --- Wave 1 finding #3: per-entry stat() timeout guard (2026-07-30 real-disk diagnosis) --------
+
+
+def test_stalled_stat_is_skipped_not_hung(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single stalled `os.stat()` call must be skipped via the shared, timeout-guarded
+    `stat_executor` `scan_tree` now threads through `build_record` -- never hang the whole scan
+    (the real-disk diagnosis found this was the only per-entry syscall in the walk with no
+    timeout at all, unlike dedup.py's already-guarded hash reads). Shortens
+    `_STAT_TIMEOUT_SECONDS` so this test itself doesn't take 30 real seconds; the sibling file
+    must still be scanned normally -- one bad entry never aborts the rest."""
+    monkeypatch.setattr(scanner_module, "_STAT_TIMEOUT_SECONDS", 0.3)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    slow_name = "slow.txt"
+    (root / slow_name).write_text("slow", encoding="utf-8")
+
+    real_stat = os.stat
+
+    def slow_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if os.path.basename(str(path)) == slow_name:  # noqa: PTH119 -- raw str, not Path
+            time.sleep(2.0)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", slow_stat)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        start = time.monotonic()
+        stats = scan_tree(root, index)
+        elapsed = time.monotonic() - start
+        inventory = index.full_inventory(under=root)
+
+    assert elapsed < 5.0, f"scan took {elapsed:.1f}s -- the stat timeout guard did not fire"
+    paths = {r.path for r in inventory}
+    assert root / "readable.txt" in paths
+    assert root / slow_name not in paths
+    assert stats.skipped_unreadable_count == 1
+
+
+# --- Wave 1 finding #5: quiet git "dubious ownership" noise (2026-07-30 real-disk diagnosis) ---
+
+
+class _RecordingLogger:
+    """Same hand-rolled recorder pattern as `tests/test_mode.py` -- this project's structlog
+    isn't wired to stdlib logging in tests, so `caplog` can't capture it."""
+
+    def __init__(self) -> None:
+        self.debugs: list[tuple[str, dict[str, object]]] = []
+        self.warnings: list[tuple[str, dict[str, object]]] = []
+
+    def debug(self, event: str, **kwargs: object) -> None:
+        self.debugs.append((event, kwargs))
+
+    def warning(self, event: str, **kwargs: object) -> None:
+        self.warnings.append((event, kwargs))
+
+
+def test_query_git_clean_dubious_ownership_logs_quietly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git's 'dubious ownership' safe.directory protection (CVE-2022-24765) already fails safe
+    (not-clean, same as every other `_query_git_clean` failure) -- confirmed hitting dozens of
+    real, legitimately-owned repos on the 2026-07-30 real-disk diagnosis run. The fix is purely
+    about log noise at scale (thousands of these on one real scan competing with genuinely
+    actionable warnings for the rotating log's fixed budget): this specific failure must log at
+    debug, never warning."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(scanner_module, "logger", recorder)
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "status", "--porcelain"],
+            output="",
+            stderr="fatal: detected dubious ownership in repository at 'C:/x'\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = scanner_module._query_git_clean(repo_root)
+
+    assert result is False
+    assert recorder.warnings == []
+    assert any(event == "scan.git_dubious_ownership" for event, _ in recorder.debugs)
+
+
+def test_query_git_clean_other_failure_still_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine, non-dubious-ownership git failure must still surface at warning level --
+    only the specific, already-safe, high-volume case above gets quieted."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(scanner_module, "logger", recorder)
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            1, ["git", "status", "--porcelain"], output="", stderr="fatal: some other error\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = scanner_module._query_git_clean(repo_root)
+
+    assert result is False
+    assert any(event == "scan.git_status_failed" for event, _ in recorder.warnings)
