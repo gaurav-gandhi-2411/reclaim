@@ -1,0 +1,31 @@
+{
+  "int8": {
+    "operating_threshold": 0.95,
+    "torch_fp32": {
+      "precision": 1.0,
+      "recall": 0.8694444444444445,
+      "tp": 313,
+      "fp": 0,
+      "fn": 47
+    },
+    "onnx_int8": {
+      "precision": 1.0,
+      "recall": 0.8666666666666667,
+      "tp": 312,
+      "fp": 0,
+      "fn": 48
+    },
+    "torch_per_tier_recall": {
+      "mild": 1.0,
+      "moderate": 0.6083333333333333,
+      "collab_paste": 1.0
+    },
+    "onnx_per_tier_recall": {
+      "mild": 1.0,
+      "moderate": 0.6,
+      "collab_paste": 1.0
+    },
+    "n_positive_pairs": 360,
+    "n_negative_pairs": 7140
+  }
+}

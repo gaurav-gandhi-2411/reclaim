@@ -1,0 +1,28 @@
+{
+  "measured_2026-07-30": {
+    "clip_vision_encoder": {
+      "fp32_torch_checkpoint": "~338MB (open_clip ViT-B-32-quickgelu/openai, per ADR-0022)",
+      "fp32_onnx": 351480741,
+      "int8_onnx_dynamic": 88455973,
+      "fp16_onnx": 175784030
+    },
+    "minilm_full_pipeline": {
+      "fp32_onnx": 91400000,
+      "int8_onnx_dynamic": 23600000,
+      "fp16_onnx": 46200000
+    },
+    "onnxruntime_cpu_python_bindings": {
+      "core_dll": 17000000,
+      "pybind11_binding": 18000000,
+      "total_installed": 40000000,
+      "note": "Not a new/additive cost -- rapidocr-onnxruntime (already an [ai] extras dependency, Feature 2 OCR) already requires onnxruntime."
+    },
+    "recommended_bundle": {
+      "clip": "fp16 (175.8MB) -- int8 rejected, see clip_torch_vs_onnx.json",
+      "minilm": "int8 (23.6MB) -- quality-equivalent, see minilm_torch_vs_onnx.json",
+      "total_new_payload_mb": 199.4,
+      "vs_spec_target_mb": 250,
+      "vs_current_torch_ai_extras_delta_mb": 1028.0
+    }
+  }
+}

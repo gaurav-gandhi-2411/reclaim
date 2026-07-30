@@ -1,0 +1,42 @@
+{
+  "int8": {
+    "shipped_threshold": {
+      "threshold": 0.82,
+      "torch_fp32": {
+        "precision": 0.7897473275024296,
+        "recall": 0.7142857142857143,
+        "f1": 0.7501234590692802
+      },
+      "onnx_int8": {
+        "precision": 0.6790573372206026,
+        "recall": 0.7414965986394558,
+        "f1": 0.7089047351452982
+      },
+      "delta_precision": -0.11068999028182702,
+      "delta_recall": 0.027210884353741527,
+      "delta_f1": -0.04121872392398207
+    },
+    "sweep": [],
+    "best": null
+  },
+  "fp16": {
+    "shipped_threshold": {
+      "threshold": 0.82,
+      "torch_fp32": {
+        "precision": 0.7897473275024296,
+        "recall": 0.7142857142857143,
+        "f1": 0.7501234590692802
+      },
+      "onnx_fp16": {
+        "precision": 0.7897473275024296,
+        "recall": 0.7142857142857143,
+        "f1": 0.7501234590692802
+      },
+      "delta_precision": 0.0,
+      "delta_recall": 0.0,
+      "delta_f1": 0.0
+    },
+    "sweep": [],
+    "best": null
+  }
+}

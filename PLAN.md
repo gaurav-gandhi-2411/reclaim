@@ -2090,6 +2090,135 @@ than treating every local NTFS file as an equal hang risk:
 tests replacing/extending the prior guard tests), ruff/mypy clean, 86.91% coverage, all 5
 safety-critical module floors held.
 
+## P0-B — ONNX quality-parity report (STOP POINT 2, torch NOT yet dropped)
+
+### 2026-07-30 — CLIP + MiniLM converted, decision-grade parity measured on real fixed eval sets
+
+Per the standing work order's mandatory second stop point: report the ONNX quality-parity delta
+*before* dropping torch. This checkpoint is that report — **torch/open-clip-torch/sentence-
+transformers are still in `pyproject.toml`'s `[ai]` extras; nothing production has changed.**
+All conversion/eval work happened in a disposable scratch venv
+(`UV_PROJECT_ENVIRONMENT`-redirected `uv sync --extra ai`, plus `onnx`/`onnxruntime`/
+`onnxconverter-common`/`onnxscript` installed via `uv pip install --python <scratch-venv>` —
+**note**: `uv pip install` does NOT respect `UV_PROJECT_ENVIRONMENT` the way `uv sync` does; a
+first attempt landed `onnx`/`onnxruntime` in the real project `.venv` by mistake, caught
+immediately and reverted via `uv pip uninstall`, confirmed clean before continuing).
+
+**Method**: both models exported via `torch.onnx.export` (opset 17) directly from the
+project's own pinned, integrity-verified checkpoints (`image_embeddings._model_and_preprocess`,
+`text_embeddings._model`) — not re-derived from a different checkpoint. fp32 ONNX output
+verified against torch (max abs diff 7.6e-6 CLIP, 2.2e-7 MiniLM) before quantizing further, so
+the graph-translation step itself is confirmed lossless. int8 via
+`onnxruntime.quantization.quantize_dynamic` (QInt8, weight-only dynamic — static/calibration-
+based quantization was NOT attempted, a disclosed scope limit, not chased since fp16 already
+gave a clean answer for the one model that needed it). fp16 via `onnxconverter_common.float16.
+convert_float_to_float16`.
+
+**Eval sets — reused the project's own existing gold fixtures unchanged, not new/invented
+ones**: CLIP compared on the exact same real INRIA Copydays 40-block subset (98 images) and
+BCubed methodology `evals/test_ai_semantic_grouping_gold.py` already uses (`group_by_semantic_
+similarity` called unchanged — only the embedding backend differs, so any BCubed delta isolates
+the model backend's contribution, not a clustering-logic difference). MiniLM compared on the
+real Gutenberg realistic-tier distribution `evals/test_ai_document_gold.py`'s embedding-
+recall check uses (120 base chunks x 3 transform profiles = 360 positive pairs, plus all
+C(120,2)=7,140 distinct-chunk negative pairs — a real precision measurement, not recall-only).
+Both are this project's own PRIMARY (non-adversarial) quality measurements for these models,
+not a secondary/adversarial boundary tier like PAWS.
+
+**CLIP result — int8 REJECTED, fp16 recommended** (full report:
+`reports/ai/onnx_quality_parity/clip_torch_vs_onnx.json`). At the shipped operating threshold
+(cosine >= 0.82, ADR-0022's measured value):
+
+| | torch-fp32 | onnx-int8 | delta | onnx-fp16 | delta |
+|---|---|---|---|---|---|
+| BCubed precision | 0.7897 | 0.6791 | **-0.1107** | 0.7897 | 0.0000 |
+| BCubed recall | 0.7143 | 0.7415 | +0.0272 | 0.7143 | 0.0000 |
+| BCubed F1 | 0.7501 | 0.7089 | **-0.0412** | 0.7501 | 0.0000 |
+
+int8's -11pp precision drop at the shipped threshold is material — for a browse-tidiness
+grouping feature this isn't catastrophic (never a deletion suggestion), but it's a real,
+user-visible quality regression, and "do NOT ship it to save disk" is the right call per GG's
+own stated bar. fp16 is bit-for-bit-equivalent BCubed behavior (delta 0.0000 across all three
+metrics) — per-image cosine drift measured separately at 0.999999 (essentially lossless), so
+this isn't a coincidence of the threshold sweep, it's the model genuinely preserving fp32
+behavior. The user's suggested "int8-text-encoder-only" hedge does NOT apply here and isn't
+force-fit into the recommendation: this app never uses CLIP's text encoder at all (confirmed
+via `image_embeddings.py` — `compute_image_embedding` only ever calls `model.encode_image`),
+so there is no text-encoder component to selectively quantize.
+
+**MiniLM result — int8 ACCEPTED, quality-equivalent** (full report:
+`reports/ai/onnx_quality_parity/minilm_torch_vs_onnx.json`). At the operating threshold
+(cosine >= 0.95, `document_similarity.py`'s Stage-2 `embedding_threshold`):
+
+| | torch-fp32 | onnx-int8 | delta |
+|---|---|---|---|
+| Precision (7,140 negatives) | 1.0000 | 1.0000 | 0.0000 |
+| Recall (360 positives) | 0.8694 (313/360) | 0.8667 (312/360) | **-0.0028** |
+| Per-tier recall: mild | 1.0000 | 1.0000 | 0.0000 |
+| Per-tier recall: moderate | 0.6083 | 0.6000 | -0.0083 |
+| Per-tier recall: collab_paste | 1.0000 | 1.0000 | 0.0000 |
+
+Zero new false positives across all 7,140 negative pairs in either backend; exactly one
+additional false negative out of 360 positives under int8 (313 -> 312 true positives) — not a
+material difference. Honest note on why this looks different from a naive per-embedding cosine
+spot-check: an early sanity check on 3 arbitrary sentences showed torch-vs-onnx cosine as low
+as 0.937 (a real, measurable per-embedding quantization drift) — but that measures absolute
+drift between backends on the SAME text, not whether within-backend relative similarity
+rankings still cross the operating threshold correctly, which is what actually matters for
+near-dupe detection and is what this eval measures directly. This is exactly why GG's
+instruction to run the real decision-grade eval (not a proxy) mattered — the proxy would have
+wrongly suggested a problem that the real measurement shows isn't there.
+
+**pHash + LightGBM — confirmed unaffected, not re-measured** (per GG's explicit instruction):
+`phash.py` imports only `imagehash`/`PIL.Image`; `clutter_ranker.py` imports only `lightgbm`/
+`numpy`/`blake3` — grep-confirmed zero torch/onnx presence in either module. Neither has any
+embedding-model dependency for quantization to touch.
+
+**Payload sizes measured** (full detail: `reports/ai/onnx_quality_parity/payload_sizes.json`):
+
+| Component | fp32 | int8 | fp16 |
+|---|---|---|---|
+| CLIP vision encoder | 351.5MB | 88.5MB | 175.8MB |
+| MiniLM (full pipeline: transformer+pooling+normalize) | 91.4MB | 23.6MB | 46.2MB* |
+
+*MiniLM fp16 export has an unresolved ONNX Runtime load error (`onnxconverter_common`'s
+float16 conversion produces a type-mismatched internal cast node, `disable_shape_infer=True`
+didn't resolve it) — not chased further since MiniLM int8 already passed with no need for a
+fp16 fallback. Flagged honestly as a known gap, not silently worked around, in case a future
+reason to want MiniLM-fp16 specifically comes up.
+
+**Recommended bundle: CLIP fp16 + MiniLM int8 = 199.4MB new payload** (vs the spec's <250MB
+target — comfortably under, with ~50MB of headroom). Plus onnxruntime's CPU Python bindings
+(~40MB installed) — **not a new/additive cost**: `rapidocr-onnxruntime` (Feature 2 OCR) already
+requires onnxruntime as a transitive dependency today, so this is shared infrastructure, not a
+second payment. This compares to the CURRENT torch-based `[ai]` extras delta of ~1,028MB
+(ADR-0024's own measurement, site-packages core-only 13.6MB vs `[ai]` 1,041.8MB) — roughly an
+81% reduction in the AI payload while keeping MiniLM quality-equivalent and CLIP genuinely
+lossless (not "acceptably close," bit-identical BCubed behavior).
+
+**Alternative bundles, for completeness** (not recommended): all-int8 (CLIP 88.5 + MiniLM 23.6
+= 112.1MB, smaller but CLIP quality unacceptable per above) — all-fp16 (CLIP 175.8 + MiniLM
+46.2* = 222.0MB, both lossless but larger and MiniLM-fp16 currently doesn't load).
+
+**Honest scope limits, disclosed not hidden**:
+- Only dynamic (weight-only) int8 quantization was tried for CLIP; static/calibration-based
+  quantization might recover some of int8's lost precision and wasn't attempted — a real,
+  disclosed avenue for future size reduction if 175.8MB ever becomes a real constraint, not
+  chased here since fp16 already cleanly meets the <250MB target.
+- The Copydays 40-block eval inherits the SAME disclosed proxy-distribution limitation the
+  existing gold eval already carries (adversarial print-scan/blur/paint derivatives of one
+  photo, not genuinely different photos of the same scene/event — Track B's actual target use
+  case) — not a new gap introduced by this comparison, the same one the shipped 0.82 threshold
+  was already measured against.
+- MiniLM fp16 doesn't currently load in ONNX Runtime (see above) — irrelevant to the actual
+  recommendation (int8 passed) but noted for completeness.
+
+**Not yet done** (deliberately, per the stop point): torch/open-clip-torch/sentence-
+transformers have NOT been removed from `pyproject.toml`; `image_embeddings.py`/`text_
+embeddings.py` have NOT been rewritten to call ONNX Runtime instead of torch; no lazy-load/
+graceful-degradation wiring for a downloadable AI pack has been built yet. All of that is real
+remaining P0-B work, gated on GG's go-ahead past this stop point.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
