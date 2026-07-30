@@ -461,7 +461,8 @@ def _run_scan(args: argparse.Namespace) -> int:
         f"reclaim scan: {stats.entries_total} entries under {stats.root} "
         f"({stats.dirs_visited} dirs visited, {stats.files_written} written, "
         f"{stats.files_unchanged} unchanged, {stats.files_pruned} pruned, "
-        f"{stats.skipped_unreadable_count} skipped/unreadable) "
+        f"{stats.skipped_unreadable_count} skipped/unreadable, "
+        f"{stats.guarded_stat_count} guarded-path stat, {stats.fast_stat_count} fast-path stat) "
         f"in {stats.elapsed_seconds:.2f}s"
     )
     # D12: a skip is a real permission/IO failure (long-path-only failures no longer land here

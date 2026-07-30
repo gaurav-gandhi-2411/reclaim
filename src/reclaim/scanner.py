@@ -314,6 +314,13 @@ class ScanStats:
     # `_SKIPPED_PATHS_SAMPLE_LIMIT`) of the actual paths, never the full list.
     skipped_unreadable_count: int
     skipped_unreadable_paths: tuple[str, ...]
+    # 2026-07-30 telemetry addendum (see `_RiskCounter`): how many entries this run's real
+    # `os.stat()` calls actually took the timeout-guarded path (reparse points, cloud
+    # placeholders, or a network-mapped/UNC root) vs the fast unguarded path. Turns "why did
+    # wall time only partly recover after risk-targeting the guard" into a measurement on every
+    # real scan, not a one-off diagnostic A/B.
+    guarded_stat_count: int
+    fast_stat_count: int
 
 
 class GitRepoCache:
@@ -475,6 +482,27 @@ def _guarded_stat(stat_executor: ThreadPoolExecutor | None, path: str) -> os.sta
     return future.result(timeout=_STAT_TIMEOUT_SECONDS)
 
 
+class _RiskCounter:
+    """Thread-safe tally of guarded-vs-fast-path stat routing (2026-07-30 telemetry addendum):
+    turns "why did wall time only partly recover after risk-targeting" from a guess into a
+    measurement on every real scan from here on, reported via `ScanStats.guarded_stat_count`/
+    `fast_stat_count` — legitimate guarded-path volume (real reparse points/cloud placeholders/
+    network roots on the scanned machine) is a different story than an unexplained residual
+    cost, and this is what tells the two apart without re-running a diagnostic A/B each time."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.guarded = 0
+        self.fast = 0
+
+    def record(self, *, guarded: bool) -> None:
+        with self._lock:
+            if guarded:
+                self.guarded += 1
+            else:
+                self.fast += 1
+
+
 def build_record(
     entry: os.DirEntry[str],
     current_dir: Path,
@@ -483,6 +511,7 @@ def build_record(
     stat_executor: ThreadPoolExecutor | None = None,
     *,
     force_guard: bool = False,
+    risk_counter: _RiskCounter | None = None,
 ) -> tuple[FileRecord, bool] | None:
     """Builds a FileRecord for one os.scandir entry.
 
@@ -497,7 +526,8 @@ def build_record(
     `force_guard` (Wave 1 finding #3, risk-targeted revision — see the guard's own module
     comment): `True` for every entry under a network-mapped/UNC scan root; otherwise the
     per-entry reparse-point/cloud-placeholder check (`_entry_is_risky`) decides. Only entries
-    classified risky pay the `stat_executor` thread-hop cost.
+    classified risky pay the `stat_executor` thread-hop cost. `risk_counter`, if given, records
+    which path each entry took — see `_RiskCounter`.
     """
     entry_path = current_dir / entry.name
     try:
@@ -517,6 +547,8 @@ def build_record(
         # a reparse point is stat'd as itself, not as whatever it points to — required to read
         # the reparse-point attribute bit correctly.
         risky = _entry_is_risky(entry, force_guard=force_guard)
+        if risk_counter is not None:
+            risk_counter.record(guarded=risky)
         executor_for_call = stat_executor if risky else None
         st = _guarded_stat(executor_for_call, entry.path)
         is_dir_entry = entry.is_dir(follow_symlinks=False)
@@ -666,6 +698,7 @@ def _walk_subtree(
     writer: _BatchIndexWriter,
     stat_executor: ThreadPoolExecutor | None,
     force_guard: bool,
+    risk_counter: _RiskCounter,
     tracker: _ProgressTracker | None = None,
 ) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
@@ -703,7 +736,13 @@ def _walk_subtree(
 
         for entry in entries:
             built = build_record(
-                entry, current_dir, git_cache, skipped, stat_executor, force_guard=force_guard
+                entry,
+                current_dir,
+                git_cache,
+                skipped,
+                stat_executor,
+                force_guard=force_guard,
+                risk_counter=risk_counter,
             )
             if built is None:
                 continue
@@ -772,6 +811,7 @@ def scan_tree(
     # Checked once for the whole scan, not per-entry or per-directory — see
     # `_entry_is_risky`/`is_network_drive`'s docstrings.
     force_guard = is_network_drive(root)
+    risk_counter = _RiskCounter()
 
     all_skipped: list[SkippedPath] = []
     try:
@@ -789,7 +829,13 @@ def scan_tree(
     try:
         for entry in top_level_entries:
             built = build_record(
-                entry, root, root_git_cache, all_skipped, stat_executor, force_guard=force_guard
+                entry,
+                root,
+                root_git_cache,
+                all_skipped,
+                stat_executor,
+                force_guard=force_guard,
+                risk_counter=risk_counter,
             )
             if built is None:
                 continue
@@ -813,6 +859,7 @@ def scan_tree(
                     writer=writer,
                     stat_executor=stat_executor,
                     force_guard=force_guard,
+                    risk_counter=risk_counter,
                     tracker=tracker,
                 )
                 # as_completed, not executor.map: map()'s iterator yields in SUBMISSION order,
@@ -849,4 +896,6 @@ def scan_tree(
         skipped_unreadable_paths=tuple(
             skipped_path.path for skipped_path in all_skipped[:_SKIPPED_PATHS_SAMPLE_LIMIT]
         ),
+        guarded_stat_count=risk_counter.guarded,
+        fast_stat_count=risk_counter.fast,
     )

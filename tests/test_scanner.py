@@ -796,6 +796,36 @@ def test_local_file_stat_bypasses_the_guarded_pool(
     )
 
 
+def test_scan_stats_reports_guarded_vs_fast_stat_counts(tmp_path: Path) -> None:
+    """2026-07-30 telemetry addendum: `ScanStats.guarded_stat_count`/`fast_stat_count` must add
+    up to `entries_total` and correctly separate a real reparse point (guarded) from plain local
+    files (fast) -- turns "how much of a real scan's wall time is legitimate guarded-path
+    volume" from a one-off diagnostic A/B into a number every real run reports."""
+    root = tmp_path / "root"
+    target = tmp_path / "junction_target"
+    target.mkdir(parents=True)
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+    (root / "b.txt").write_text("b", encoding="utf-8")
+    link = root / "link"
+
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 -- cmd is a builtin
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+
+    assert stats.guarded_stat_count == 1  # the junction
+    assert stats.fast_stat_count == 2  # a.txt, b.txt
+    assert stats.guarded_stat_count + stats.fast_stat_count == stats.entries_total
+
+
 # --- Wave 1 finding #5: quiet git "dubious ownership" noise (2026-07-30 real-disk diagnosis) ---
 
 
