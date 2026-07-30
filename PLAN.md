@@ -1815,6 +1815,90 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
 - Closed stale PR #25 (`chore/ws-c-checkpoint`) — its content was superseded by the checkpoint
   merged in #27.
 
+## Wave 1 — Reliability, Performance & Packaging Overhaul (`spec-reclaim-overhaul.md`)
+
+New work order (2026-07-30), separate from the v1.0-v1.3 build above. Branch:
+`wave-1-scan-reliability`. Priority order per spec: P0 scan reliability/perf -> P0 AI
+packaging -> P1 E2E + startup -> P2 identity + distribution hardening. Two mandatory stop
+points: (1) report scan-failure root cause before fixing; (2) report ONNX quality-parity
+delta before dropping torch.
+
+### 2026-07-30 — Premise audit + P0-A diagnosis complete (STOP POINT 1)
+
+**Premise audit** (rule 99 — verified the spec's claims against current code before acting;
+full detail in the orchestrator's report to GG): of the spec's 5 problem claims, 2 are
+partially stale (Nuitka is already `--standalone`, not `--onefile`; crash diagnostics and
+uninstall vault handling already shipped in v1.2/v1.3) and 3 are still real (AI packaging —
+ADR-0029 confirms "proposed, not built", torch/open-clip-torch still hard `[ai]`-extra
+deps, ~1,028MB delta; `longPathAware` manifest genuinely absent from `packaging/reclaim.iss`;
+E2E has a real foundation (`evals/test_executor_e2e.py`, golden fixture tree) but no 100k+
+scale tier and no CI-gated perf budget, matching the spec).
+
+**P0-A diagnosis** — reproduced on GG's real, live home directory (`C:\Users\gaura`, not a
+synthetic fixture): 2,672,201 entries / 284,479 dirs, live OneDrive cloud-sync root present,
+dozens of live git repos/venvs/conda envs, several protected paths (`.ssh`, `.aws`,
+`.gnupg`, `.docker`). Ran `reclaim scan` via the real `.venv` CLI entry point (not `uv run`'s
+wrapper — that only measures the launcher shim; the actual work happens in a grandchild
+`python.exe`, confirmed via `Get-CimInstance Win32_Process` process-tree inspection), full
+structlog logging on, wall-clock + 10s-interval `Get-Process` memory sampling against the
+correct PID throughout.
+
+**Result: the scan did NOT crash.** Exit code 0, `2,672,201 entries ... in 425.23s`, 1
+skipped/unreadable path (a self-inflicted permission-denied temp dir from an unrelated
+concurrent session, not a Reclaim bug), 2.35GB SQLite index on disk. So the spec's literal
+"scans... FAIL" claim did not reproduce at this scale on this machine — reported honestly,
+not force-fit to match the brief.
+
+**But real, previously-undocumented architectural root causes were found that explain both
+"looks like it's failing" and a genuine failure mode at larger scale than tested here**,
+all evidenced from the run above:
+
+1. **Unbounded in-memory record accumulation (the most likely real crash mechanism at true
+   full-drive scale).** `scanner.py::scan_tree` holds every `FileRecord` for the entire walk
+   in one Python list (`all_records`, plus each worker thread's own `_SubtreeResult.records`)
+   and writes to SQLite exactly ONCE, at the very end, in a single `upsert_records()` call —
+   there is no streaming/batching despite `index.py` already having a `_WRITE_BATCH_SIZE`-style
+   pattern in `dedup.py` it could mirror. Measured: peak working set 5,085MB for 2.67M files
+   (~1.9KB/record). This scan only covered the user profile, not `C:\`'s full ~10-20M+ files
+   (Windows, Program Files, WindowsApps, hidden system volumes) — linear extrapolation puts a
+   real full-drive scan at 15-25GB+ peak RSS, which will OOM on any machine with less RAM than
+   that free. This directly contradicts the spec's own explicit requirement ("never materialise
+   all file records in a list") and is the strongest candidate for genuine, reproducible
+   real-world scan failure on typical consumer hardware. Not yet fixed — Task P0-A-fix.
+2. **The raw CLI `scan` path has zero progress output for the entire run.**
+   `cli.py::_run_scan` calls `scan_tree(...)` without passing `on_progress`, even though
+   `scan_tree` already supports it (added for the dashboard's SIMPLE-mode ETA). A CLI user
+   (or this diagnosis) sees nothing for 7+ minutes on a 2.67M-file scan — indistinguishable
+   from a hang. The dashboard/API path (`api/service.py::run_scan`) already wires progress
+   correctly; this gap is CLI-only but real.
+3. **No timeout guard on the scan's own per-entry `os.stat()` calls.** `dedup.py`'s hash stage
+   has a 30s-timeout thread-guard (`_hash_with_guard`) specifically because a locked/pathological
+   file must never wedge the pipeline; `scanner.py::build_record`'s `os.stat()` call has no
+   equivalent. Combined with `ThreadPoolExecutor.map()`'s submission-order-blocking iteration
+   in `scan_tree` (a completed-but-later-submitted directory's results sit unconsumed behind
+   one still-pending, earlier-submitted directory), a single stalled stat syscall on one
+   top-level directory can silently stall the entire scan's visible output indefinitely, with
+   no error ever raised. Not reproduced today (no stat call hung on this run) but structurally
+   real and unguarded — plausible root cause for reports of scans that never return.
+4. **No WAL mode / no batched transactions.** `index.py::ScanIndex.__init__` opens SQLite with
+   plain `sqlite3.connect()` (default rollback-journal, default `synchronous=FULL`) and creates
+   all 6 indices (including a `COLLATE NOCASE` index) up front, before any bulk insert — the
+   exact anti-pattern the spec calls out. Compounds finding 1: because nothing is written
+   until the walk fully completes, a crash/OOM near the end of a multi-hour full-drive walk
+   loses 100% of that walk's progress, not just the tail — "fails, and has to start over" is a
+   direct, mechanical consequence of findings 1+4 together, not two independent complaints.
+5. **Secondary, lower-priority finding**: `git status --porcelain` fails with exit 128
+   (consistent with Git's "dubious ownership" safe.directory protection) on a large fraction of
+   real repo roots under `%TEMP%` on this machine — fails closed to `git_repo_clean=False`
+   (safe, per `_query_git_clean`'s own documented conservative default) but adds subprocess
+   overhead and rotates the diagnostic log fast at scale. Not a correctness bug; worth a cheap
+   fix (recognize exit 128 + "dubious ownership" and skip the subprocess call rather than
+   treating it as a generic failure) while touching this code for the timeout fix (#3) anyway.
+
+**STOP POINT 1 — reported to GG before proceeding to fix**, per spec's explicit mandatory
+checkpoint. Next (pending go-ahead): fix findings 1-5 with regression tests proving bounded
+memory and CLI progress output on a scaled fixture, then move to P0-B (AI/ONNX).
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
