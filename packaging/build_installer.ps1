@@ -2,7 +2,7 @@
 # installer, end to end. Replaces the previously-manual process documented in README.md's
 # "Building the Windows installer" section with a single reproducible, unattended-safe script.
 #
-# Two real incidents on 2026-07-30 motivate everything below that isn't just "run Nuitka":
+# Three real incidents on 2026-07-30 motivate everything below that isn't just "run Nuitka":
 #   1. A build venv `uv sync --extra ai`'d WITHOUT `--no-dev` silently carried the whole dev
 #      toolchain (mypy -- including its mypyc-compiled internals -- pytest, ruff, pyarrow,
 #      ollama) into the compile. Nuitka tried to compile all of it (on top of faiss's already-
@@ -15,10 +15,18 @@
 #      middleware) took 1,300-3,000+ seconds each to compile, while system-wide CPU sat at only
 #      ~33% utilized and free RAM fell from 16.7GB to 9.4GB -- the signature of a shared
 #      dev-machine under contention from OTHER concurrent workloads, not something Nuitka's own
-#      flags can fix. Step 3's monitor loop watches for exactly this pattern (no new compiler
+#      flags can fix. Step 4's monitor loop watches for exactly this pattern (no new compiler
 #      output for a while AND system CPU not actually busy) and aborts within minutes instead of
 #      running blind for hours -- see packaging/RELEASE_RUNBOOK.md for the preconditions to
 #      check BEFORE starting a real release build.
+#   3. Even after both of the above were fixed, a third attempt aborted the same way -- and this
+#      time it was genuinely contended, not a monitoring false-positive: the machine had 6+
+#      other `claude` processes plus Docker Desktop and browser tabs live, confirmed via a live
+#      process listing at the time of the abort. `--low-memory --jobs` were never set explicitly
+#      before this (Nuitka picked its own default parallelism), which under contention just meant
+#      more processes competing for the same starved cores. Once the machine is verified quiet
+#      (Step 0), `--low-memory` is dropped and `--jobs` is raised deliberately -- see the
+#      $NuitkaJobs default below.
 #
 # Usage: pwsh packaging/build_installer.ps1
 # (Run from anywhere -- resolves paths relative to this script's own location.)
@@ -29,10 +37,17 @@ param(
     [string]$TelemetryPath = "$PSScriptRoot\build\nuitka_build_telemetry.csv",
     [int]$StallTimeoutSeconds = 300, # no new compiler output for this long...
     [int]$StallCpuThresholdPercent = 60, # ...AND system CPU below this -> confirmed contention.
+    # On a genuinely quiet machine this margin is generous, not tight: trivial modules should
+    # compile in low single-digit seconds, so 300s of true silence is already several times any
+    # expected per-file compile time -- it stays armed as a safety net, not a tuned-tight gate.
     [int]$MinFreeRamGb = 2, # abort immediately if free RAM drops below this, regardless of the
     # stall-timeout check above -- a real, imminent thrashing risk, not just "slow".
     [int]$PreflightMinFreeRamGb = 8, # refuse to even START a build without this much headroom.
     [int]$PollIntervalSeconds = 15,
+    [int]$NuitkaJobs = 0, # 0 = auto: 6 if preflight free RAM >= 16GB, else 4. Pass explicitly to
+    # override. Only meaningful on a verified-quiet machine (Step 0) -- raising parallelism under
+    # real contention just adds more processes competing for the same starved cores.
+    [switch]$SkipDefenderExclusions, # opt out of the Step 3 Add-MpPreference attempt entirely.
     [string]$InnoSetupCompiler = "C:\Program Files\Inno Setup 7\ISCC.exe"
 )
 
@@ -56,9 +71,23 @@ function Get-CpuPercent {
     }
 }
 
-# --- Step 1: clean build venv, dev toolchain structurally excluded ------------------------------
+# --- Step 1: machine-quiet report (informational -- does not gate; Step 3's RAM check does) ------
 
-Write-Output "==> [1/4] Provisioning a clean build venv (uv sync --extra ai --no-dev)..."
+Write-Output "==> [1/6] Machine state (see packaging/RELEASE_RUNBOOK.md's preconditions)..."
+Write-Output "    Free RAM: $(Get-FreeRamGb)GB -- Instantaneous CPU: $(Get-CpuPercent)%"
+$heavyProcs = Get-Process | Where-Object { $_.CPU -gt 30 } | Sort-Object CPU -Descending | Select-Object -First 10
+if ($heavyProcs) {
+    Write-Output "    Processes with >30s cumulative CPU time (lifetime counter, not live load):"
+    foreach ($p in $heavyProcs) {
+        Write-Output ("      {0,-24} PID {1,-8} CPU {2,10:N1}s  WS {3,8:N0}MB" -f $p.Name, $p.Id, $p.CPU, ($p.WS / 1MB))
+    }
+} else {
+    Write-Output "    No processes found with >30s cumulative CPU time."
+}
+
+# --- Step 2: clean build venv, dev toolchain structurally excluded -------------------------------
+
+Write-Output "==> [2/6] Provisioning a clean build venv (uv sync --extra ai --no-dev)..."
 if (Test-Path $BuildVenvPath) { Remove-Item -Recurse -Force $BuildVenvPath -Confirm:$false }
 $env:UV_PROJECT_ENVIRONMENT = $BuildVenvPath
 uv sync --extra ai --no-dev
@@ -89,20 +118,52 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Output "    OK: mypy/pytest/ruff confirmed unimportable in the build venv."
 
-# --- Step 2: pre-flight contention check ---------------------------------------------------------
+# --- Step 3: pre-flight contention check -----------------------------------------------------------
 
 $preflightFreeRam = Get-FreeRamGb
-Write-Output "==> [2/4] Pre-flight: ${preflightFreeRam}GB free RAM."
+Write-Output "==> [3/6] Pre-flight: ${preflightFreeRam}GB free RAM."
 if ($preflightFreeRam -lt $PreflightMinFreeRamGb) {
     throw ("Only ${preflightFreeRam}GB free RAM before the build has even started (floor: " +
         "${PreflightMinFreeRamGb}GB) -- close other heavy sessions/workloads first. See " +
         "packaging/RELEASE_RUNBOOK.md for the expected preconditions. Refusing to start a " +
         "build that's already likely to stall under contention.")
 }
+if ($NuitkaJobs -le 0) {
+    $NuitkaJobs = if ($preflightFreeRam -ge 16) { 6 } else { 4 }
+}
+Write-Output "    Using --jobs=$NuitkaJobs for the Nuitka/Scons C compilation stage."
 
-# --- Step 3: Nuitka standalone build, monitored for contention-driven stalls ---------------------
+# --- Step 4: Windows Defender exclusions for build directories -----------------------------------
+# Real-time scanning of thousands of generated .c/.o files (plus ccache/gcc's own downloaded
+# toolchain under Nuitka's cache dir) is a real, measurable multiplier on Nuitka builds.
+# Add-MpPreference requires an elevated (Run as Administrator) PowerShell session; this is
+# attempted best-effort and never blocks the build if it fails or is skipped.
 
-Write-Output "==> [3/4] Running Nuitka standalone build (bundled AI layer)..."
+if ($SkipDefenderExclusions) {
+    Write-Output "==> [4/6] Skipping Windows Defender exclusions (-SkipDefenderExclusions)."
+} else {
+    Write-Output "==> [4/6] Adding Windows Defender exclusions for build directories..."
+    $defenderExclusionPaths = @(
+        "$PSScriptRoot\build",
+        "$env:LOCALAPPDATA\Nuitka\Nuitka\Cache"
+    )
+    try {
+        foreach ($p in $defenderExclusionPaths) {
+            Add-MpPreference -ExclusionPath $p -ErrorAction Stop
+        }
+        Write-Output "    OK: Defender real-time-scan exclusions added (elevated session) for:"
+        foreach ($p in $defenderExclusionPaths) { Write-Output "      $p" }
+    } catch {
+        Write-Output ("    SKIPPED: Add-MpPreference failed -- {0}" -f $_.Exception.Message)
+        Write-Output ("    This requires an elevated (Run as Administrator) PowerShell session. " +
+            "Continuing without the exclusions; the build will still succeed, just without this " +
+            "speedup. Re-run from an elevated prompt to get it.")
+    }
+}
+
+# --- Step 5: Nuitka standalone build, monitored for contention-driven stalls ---------------------
+
+Write-Output "==> [5/6] Running Nuitka standalone build (bundled AI layer)..."
 if (Test-Path "$PSScriptRoot\build\entry_point.build") {
     Remove-Item -Recurse -Force "$PSScriptRoot\build\entry_point.build" -Confirm:$false
 }
@@ -122,7 +183,7 @@ if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
 # pass argv on .NET -- used here instead.
 $nuitkaArgs = @(
     "-m", "nuitka", "--standalone", "--assume-yes-for-downloads",
-    "--low-memory",
+    "--jobs=$NuitkaJobs",
     "--nofollow-import-to=*.tests", "--nofollow-import-to=*.testing",
     "--company-name=Gaurav Gandhi", "--product-name=Reclaim", "--product-version=1.3.0",
     "--windows-icon-from-ico=packaging/reclaim.ico",
@@ -246,9 +307,9 @@ $distDir = "$PSScriptRoot\build\entry_point.dist"
 $distSizeBytes = (Get-ChildItem $distDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output ("    Dist folder size: {0:N1} MB" -f ($distSizeBytes / 1MB))
 
-# --- Step 4: Inno Setup packaging -----------------------------------------------------------------
+# --- Step 6: Inno Setup packaging -----------------------------------------------------------------
 
-Write-Output "==> [4/4] Packaging with Inno Setup..."
+Write-Output "==> [6/6] Packaging with Inno Setup..."
 if (-not (Test-Path $InnoSetupCompiler)) {
     throw "Inno Setup compiler not found at $InnoSetupCompiler -- pass -InnoSetupCompiler with the correct path."
 }

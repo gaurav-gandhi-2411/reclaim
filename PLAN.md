@@ -2397,3 +2397,46 @@ real build, not by reasoning about the code:**
 All three fixes are in the same `packaging/build_installer.ps1` now being relaunched. The
 actual successful build — Nuitka compile time, dist folder size, final installer size, and the
 fresh-Windows-VM gate — is the next checkpoint entry once that run completes.
+
+**Third relaunch (after all three fixes above) reached real C compilation for the first time**
+(991s elapsed, past `Nuitka: Running C compilation via Scons.`) then aborted again at the same
+300s/60%-CPU threshold. This time confirmed as genuine contention, not another monitoring bug:
+16 logical processors (8 cores) means a single maxed *core* would only ever read as ~6% of
+`\Processor(_Total)\%`, so the observed 24-50% aggregate during the stall corresponds to
+4-7 cores actually busy — too much for one legitimately-heavy single-threaded compile to
+explain away as a false low-CPU reading. Direct process listing at the time confirmed it: 6+
+separate `claude` processes with substantial cumulative CPU time, plus Docker Desktop and
+several browser tabs, all live. No orphaned processes were left behind this time (fix #3 held).
+GG is freeing the machine (closing other CC sessions, `wsl --shutdown` for Docker Desktop,
+closing heavy tabs) before the next attempt.
+
+**Build script hardened further for the quiet-machine retry** (`packaging/build_installer.ps1`,
+not yet run): `--low-memory` (a contention-compensation flag, never actually needed once the
+machine is quiet) replaced with `--jobs=N` (auto: 6 if preflight free RAM ≥16GB else 4 — only
+sensible once contention is confirmed gone); added a Step 1 machine-state report (free RAM,
+instantaneous CPU%, processes with >30s cumulative CPU time) printed before any real work
+starts, so contention is visible up front instead of inferred after an abort; added a
+best-effort Step 4 Windows Defender exclusion for `packaging/build/` and Nuitka's own
+compiler-cache dir (`Add-MpPreference -ExclusionPath`, requires an elevated session — logs
+SKIPPED and continues if not elevated, never blocks the build; `-SkipDefenderExclusions` opts
+out explicitly). Stall-detector thresholds (300s / 60% CPU) left unchanged — on a genuinely
+quiet machine that margin is generous rather than tight, so it stays as a safety net rather
+than a tuned-tight gate.
+
+## Deferred roadmap (not scheduled — noted for a later wave, not built now)
+
+- **Move the release build to a GitHub Actions Windows runner** so it never competes with GG's
+  own workstation for CPU/RAM again — the root cause of two of this session's three build
+  failures was a shared local machine, not the build itself. Requirements to work out when this
+  is picked up: (1) **Git LFS on the runner** — `actions/checkout` needs `lfs: true` (or an
+  explicit `git lfs pull` step) to get the real `clip_vision_fp16.onnx` (175.8MB) rather than a
+  pointer stub, and GitHub's free-tier LFS bandwidth/storage quota (1GB/month each as of this
+  writing) is easy to exhaust with repeated full-file checkouts across CI runs — needs either a
+  paid LFS data pack, `actions/cache` keyed on the LFS object SHA to avoid re-pulling on every
+  run, or a self-hosted runner (sidesteps the quota, reintroduces "shared machine" risk if it's
+  GG's own hardware). (2) Windows Defender / AV posture on GitHub-hosted Windows runners is
+  unknown and may need its own exclusion or acceptance of slower compiles. (3) Nuitka's own
+  toolchain download (MinGW64 via `--assume-yes-for-downloads`) happens fresh per run unless
+  cached — `actions/cache` on Nuitka's cache dir would help build time significantly across
+  runs. (4) Artifact handoff: the built `reclaim-setup.exe` needs to land somewhere GG can run
+  the fresh-Windows-VM gate against it (a workflow artifact download, or a draft GitHub Release).
