@@ -1,42 +1,69 @@
 {
-  "int8": {
-    "shipped_threshold": {
-      "threshold": 0.82,
-      "torch_fp32": {
-        "precision": 0.7897473275024296,
-        "recall": 0.7142857142857143,
-        "f1": 0.7501234590692802
-      },
-      "onnx_int8": {
-        "precision": 0.6790573372206026,
-        "recall": 0.7414965986394558,
-        "f1": 0.7089047351452982
-      },
-      "delta_precision": -0.11068999028182702,
-      "delta_recall": 0.027210884353741527,
-      "delta_f1": -0.04121872392398207
+  "production_shipped_result": {
+    "note": "AUTHORITATIVE -- measured against the actual shipped production code (reclaim.ai.image_embeddings + semantic_image_grouping), PIL-only preprocessing (no torchvision, since torch is no longer a dependency), fp16 ONNX model. Same 40-block/98-image real Copydays subset, same BCubed methodology, same shipped 0.82 threshold. Reproduced twice independently (scratch validation script and the production module itself) with identical results.",
+    "threshold": 0.82,
+    "torch_fp32_torchvision_preprocessing_baseline": {
+      "precision": 0.7897473275024296,
+      "recall": 0.7142857142857143,
+      "f1": 0.7501234590692802
     },
-    "sweep": [],
-    "best": null
+    "onnx_fp16_pil_preprocessing_production": {
+      "precision": 0.7720088035214085,
+      "recall": 0.7142857142857143,
+      "f1": 0.7420263656381311
+    },
+    "delta_precision": -0.017738524,
+    "delta_recall": 0.0,
+    "delta_f1": -0.008097,
+    "delta_attributed_to": "preprocessing reimplementation (PIL bicubic+reducing_gap vs torchvision antialiased bicubic), NOT model quantization -- the model conversion itself was proven bit-identical BCubed behavior (see conversion_only_measurement below) when preprocessing was held constant. This residual drift is unavoidable given torch/torchvision are no longer a dependency (ANY torch-free ONNX approach, int8 or fp16, needs some non-torchvision resize), not specific to the fp16 choice.",
+    "still_clears_track_b_precision_floor": "0.7720 > 0.70 (Track B's own stated 'looser precision bar, browse-tidiness not deletion suggestion' floor from evals/test_ai_semantic_grouping_gold.py)"
   },
-  "fp16": {
-    "shipped_threshold": {
-      "threshold": 0.82,
-      "torch_fp32": {
-        "precision": 0.7897473275024296,
-        "recall": 0.7142857142857143,
-        "f1": 0.7501234590692802
-      },
-      "onnx_fp16": {
-        "precision": 0.7897473275024296,
-        "recall": 0.7142857142857143,
-        "f1": 0.7501234590692802
-      },
-      "delta_precision": 0.0,
-      "delta_recall": 0.0,
-      "delta_f1": 0.0
+  "conversion_only_measurement": {
+    "note": "Earlier measurement using the ORIGINAL torchvision preprocessing pipeline for both backends (isolates model-quantization-only effect from the preprocessing-reimplementation effect above). Not what ships -- kept for the record to show quantization vs preprocessing contributions separately.",
+    "int8": {
+      "shipped_threshold": {
+        "threshold": 0.82,
+        "torch_fp32": {
+          "precision": 0.7897473275024296,
+          "recall": 0.7142857142857143,
+          "f1": 0.7501234590692802
+        },
+        "onnx_int8": {
+          "precision": 0.6790573372206026,
+          "recall": 0.7414965986394558,
+          "f1": 0.7089047351452982
+        },
+        "delta_precision": -0.11068999028182702,
+        "delta_recall": 0.027210884353741527,
+        "delta_f1": -0.04121872392398207
+      }
     },
-    "sweep": [],
-    "best": null
-  }
+    "fp16": {
+      "shipped_threshold": {
+        "threshold": 0.82,
+        "torch_fp32": {
+          "precision": 0.7897473275024296,
+          "recall": 0.7142857142857143,
+          "f1": 0.7501234590692802
+        },
+        "onnx_fp16": {
+          "precision": 0.7897473275024296,
+          "recall": 0.7142857142857143,
+          "f1": 0.7501234590692802
+        },
+        "delta_precision": 0.0,
+        "delta_recall": 0.0,
+        "delta_f1": 0.0
+      }
+    }
+  },
+  "production_with_int8_for_comparison": {
+    "note": "Production-shaped (PIL) preprocessing + int8 model, for completeness -- confirms int8 is worse than fp16 under BOTH preprocessing pipelines, not just the original one.",
+    "threshold": 0.82,
+    "precision": 0.7157,
+    "recall": 0.7483,
+    "f1": 0.7317,
+    "delta_f1_vs_torch": -0.0185
+  },
+  "decision": "SHIP CLIP AS FP16. int8 rejected under both preprocessing pipelines (delta_f1 -0.041 with torchvision preprocessing, -0.019 with production PIL preprocessing) -- consistently worse than fp16 (delta_f1 0.000 / -0.008 respectively) by roughly 2x. fp16 remains comfortably above Track B's 0.70 precision floor in the actual shipped configuration."
 }

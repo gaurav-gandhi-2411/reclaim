@@ -1,5 +1,12 @@
 # 0024. Stage 2 Part B: installer tooling and AI-dependency bundling decision
 
+> **Decision 2 (core-only public installer) is SUPERSEDED by
+> [ADR-0030](0030-onnx-conversion-and-bundled-ai-installer.md) (2026-07-30).** Wave 1 P0-B
+> converted CLIP/MiniLM to ONNX and dropped torch entirely, shrinking the AI-specific payload
+> from ~1,028MB to 199.4MB — small enough that this ADR's own rejection reason no longer
+> applies. Decision 1 (Nuitka + Inno Setup) is unaffected and still stands. Left in place below,
+> not rewritten, per this project's own "document decisions, don't silently erase them" practice.
+
 ## Context
 
 Stage 2 Part A (ADR-0023) made safe mode a structural default. Part B turns the tool into a

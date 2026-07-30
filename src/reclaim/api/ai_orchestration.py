@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 
-from reclaim.ai._optional import AIExtraNotInstalledError
+from reclaim.ai._optional import AIExtraNotInstalledError, AIModelMissingError
 from reclaim.ai.clutter_ranker import DEFAULT_MODEL_PATH, ClutterRanker
 from reclaim.ai.document_similarity import build_near_dup_document_clusters
 from reclaim.ai.document_text import is_supported_document
@@ -159,7 +159,14 @@ def _run_pipeline(
     never sink every other pipeline's real results (ADR-0025 decision 3)."""
     try:
         clusters = fn()
-    except AIExtraNotInstalledError as exc:
+    except (AIExtraNotInstalledError, AIModelMissingError) as exc:
+        # AIExtraNotInstalledError: a pip package genuinely missing (`uv sync --extra ai`).
+        # AIModelMissingError (Wave 1 P0-B): the bundled ONNX model file itself is missing or
+        # failed integrity verification — a distinct but equally "clean, expected, actionable"
+        # skip, not a bug in this pipeline. Both get the SAME graceful per-track skip treatment
+        # (ADR-0025 decision 3: one pipeline's problem never sinks every other pipeline's real
+        # results) rather than AIModelMissingError falling into the generic "unexpected error"
+        # branch below, which would misleadingly suggest a real bug.
         tracks_skipped.append(PipelineSkip(track=track, reason=str(exc)))
         logger.info("ai_orchestration.pipeline_skipped", track=track, reason=str(exc))
         return []

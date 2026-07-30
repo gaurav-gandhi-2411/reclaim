@@ -26,13 +26,28 @@ dependencies = [
 # document near-dup + sentence-embedding residual + version-chain) adds the rest (ADR-0017
 # covers licenses); Feature 2 adds rapidocr (ADR-0019); the generic clutter-likelihood ranker
 # adds numpy + lightgbm (ADR-0021); Track B (semantic image grouping, browse-only) adds
-# open-clip-torch + faiss-cpu (ADR-0022).
+# onnxruntime + faiss-cpu (ADR-0022, superseded by Wave 1 P0-B below).
+#
+# Wave 1 P0-B (2026-07-30): torch/open-clip-torch/sentence-transformers DROPPED entirely —
+# CLIP and MiniLM now ship as pre-converted, pinned, SHA256-verified ONNX files bundled under
+# `reclaim/ai/models/` (see image_embeddings.py/text_embeddings.py's own module docstrings and
+# reports/ai/onnx_quality_parity/ for the quality-parity measurement that justified this: CLIP
+# as fp16 — bit-identical BCubed grouping quality to the original torch model; MiniLM as
+# int8 — quality-equivalent near-dupe detection at the shipped operating threshold). This
+# extras group installs the runtime (onnxruntime + the lightweight `tokenizers` package for
+# MiniLM's WordPiece tokenization) needed to RUN inference against those bundled files — it
+# does NOT include the tooling needed to REGENERATE them from the original checkpoints; that's
+# the separate `ai-export` group below, used only by `scripts/export_ai_models.py`.
 ai = [
     "imagehash>=4.3",             # BSD-2-Clause — pHash/dHash perceptual hashing
     "opencv-python-headless>=4.9", # Apache-2.0 — Laplacian-variance sharpness scoring
     "pillow>=10.0",                # HPND (permissive) — image I/O, resolution/exposure checks
     "datasketch>=1.6",             # MIT — MinHash/LSH near-dup prefilter (Feature 1b Stage 1)
-    "sentence-transformers>=3.0",  # Apache-2.0 — all-MiniLM-L6-v2 (Feature 1b Stage 2, residual only)
+    "tokenizers>=0.22",             # Apache-2.0 — MiniLM WordPiece tokenization (Feature 1b
+    # Stage 2, residual only), the lightweight Rust-backed library sentence-transformers used
+    # internally, now used directly against the bundled `minilm_tokenizer.json` — no torch/
+    # transformers/sentence-transformers dependency (~7.5MB installed vs. sentence-
+    # transformers' full torch-backed stack).
     "python-docx>=1.1",            # MIT — local .docx text extraction, never logged
     "pypdf>=5.0",                  # BSD-3-Clause — local .pdf text extraction, never logged
     "rapidocr-onnxruntime>=1.3",   # Apache-2.0 — local OCR (Feature 2), pip-only (no system
@@ -42,28 +57,16 @@ ai = [
     # `cv2` module; whichever installs last determines the on-disk build, but this has not
     # been observed to break any existing `cv2` usage (keep_best.py's headless-only calls —
     # Laplacian variance, grayscale imread — work identically either way). See ADR-0019.
+    "onnxruntime>=1.27",             # MIT — CLIP + MiniLM inference (Wave 1 P0-B) and (via
+    # rapidocr-onnxruntime, already a transitive dependency) OCR — one shared runtime for
+    # every ONNX model this project uses, not a second payment.
     "numpy>=1.26",                 # BSD-3-Clause — cosine-similarity math (text_embeddings.py,
     # Feature 1b) and clutter-ranker feature-array construction (clutter_ranker.py, ADR-0021);
-    # already a transitive dependency of sentence-transformers/lightgbm, listed explicitly
-    # since it's imported directly via `require()`, not just relied on indirectly.
+    # already a transitive dependency of onnxruntime/lightgbm, listed explicitly since it's
+    # imported directly via `require()`, not just relied on indirectly.
     "lightgbm>=4.7.0",              # MIT — generic clutter-likelihood LambdaMART ranker
     # (Feature 3/ADR-0021). Zero GPU requirement, CPU training/inference — satisfies the
     # zero-cost/local-first default same as every other AI-layer dependency.
-    "torch>=2.0",                   # Apache-2.0/BSD/MIT component mix (PyTorch's own summary:
-    # BSD-style) — imported directly via `require("torch", ...)` in image_embeddings.py's
-    # inference call (`torch.no_grad()`); already a transitive dependency of both
-    # sentence-transformers and open-clip-torch, listed explicitly per this file's own
-    # discipline (see the `numpy` entry above) rather than left implicit.
-    "open-clip-torch>=3.3.0",       # MIT — CLIP ViT-B/32 semantic image embeddings (Track B,
-    # ADR-0022). Considered against Apple's MobileCLIP: rejected — MobileCLIP's CODE is MIT
-    # but its pretrained WEIGHTS are gated under Apple's "ML Research Model" Terms of Use,
-    # which explicitly excludes "commercial exploitation, product development, or use in any
-    # commercial product or service" — a hard prohibition, not ambiguity, and also not
-    # pip-installable (requires cloning the repo + manual checkpoint download). OpenCLIP's
-    # ViT-B/32 "openai" checkpoint is MIT end-to-end (code + weights), pip-only,
-    # ~338MB, depends only on PyTorch (itself permissively licensed — Apache-2.0/BSD/MIT
-    # component mix) and torchvision (BSD) — both already resolvable via `open-clip-torch`
-    # alone, no extra pins needed.
     "faiss-cpu>=1.14.3",             # MIT — ANN cosine-similarity search over CLIP embeddings.
     # hnswlib (the spec's other named option) was tried first and rejected on pip-
     # installability grounds: it has no prebuilt wheel for this Python/platform combination
@@ -71,6 +74,29 @@ ai = [
     # the "needs a system binary" problem this project's dependency discipline avoids
     # (same reasoning that chose rapidocr-onnxruntime over Tesseract for Feature 2).
     # faiss-cpu ships a prebuilt Windows wheel, zero extra setup.
+]
+# Wave 1 P0-B: NOT part of the normal dev/runtime install, NOT needed to build or run Reclaim
+# — only to regenerate `reclaim/ai/models/*.onnx` from the original torch checkpoints (e.g. if
+# the pinned upstream revision ever changes). `uv sync --extra ai-export` then
+# `uv run python scripts/export_ai_models.py`. Deliberately kept out of `ai` above so a normal
+# `uv sync --extra ai` (what end users effectively get via the installer, and what every other
+# dev workflow uses) never pulls torch back in.
+ai-export = [
+    "torch>=2.0",                     # Apache-2.0/BSD/MIT component mix — see the `ai` group's
+    # pre-P0-B history for the full license/rejection rationale (unchanged, just scoped to
+    # this export-only group now).
+    "open-clip-torch>=3.3.0",         # MIT — source of the CLIP checkpoint being converted.
+    "sentence-transformers>=3.0",     # Apache-2.0 — source of the MiniLM checkpoint being
+    # converted (also exports the WordPiece `tokenizer.json` bundled under `ai/models/`).
+    "onnx>=1.22",                     # Apache-2.0 — ONNX graph format/tooling.
+    "onnxscript>=0.7",                 # MIT — required by torch's ONNX exporter (torch>=2.9's
+    # dynamo-based `torch.onnx.export` path).
+    "onnxconverter-common>=1.16",     # MIT — fp16 conversion (`float16.convert_float_to_
+    # float16`), used for the CLIP export specifically (see image_embeddings.py's module
+    # docstring for why CLIP ships fp16, not int8).
+    "huggingface-hub>=0.35",           # Apache-2.0 — pinned-revision checkpoint download +
+    # sha256 integrity verification (ADR-0028), used directly by this export script now that
+    # it's the only place in the codebase still downloading the original torch checkpoints.
 ]
 
 [project.scripts]

@@ -30,12 +30,15 @@ def test_installer_script_version_matches_pyproject() -> None:
     )
 
 
-def test_readme_documented_build_command_version_matches_pyproject() -> None:
-    readme_text = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    versions = re.findall(r"--product-version=([\w.\-]+)", readme_text)
-    assert versions, "README no longer documents a --product-version flag"
+def test_build_script_version_matches_pyproject() -> None:
+    # The Nuitka --product-version flag moved out of README.md and into build_installer.ps1
+    # (packaging/build_installer.ps1) when the manual build command became a script -- this is
+    # now the single place that flag is declared, so it's the one this gate has to watch.
+    script_text = (_REPO_ROOT / "packaging" / "build_installer.ps1").read_text(encoding="utf-8")
+    versions = re.findall(r"--product-version=([\w.\-]+)", script_text)
+    assert versions, "packaging/build_installer.ps1 no longer documents a --product-version flag"
     for found in versions:
         assert found == _pyproject_version(), (
-            f"README documents --product-version={found} but pyproject.toml says "
-            f"{_pyproject_version()!r} — a reader following the docs builds a mislabeled exe."
+            f"build_installer.ps1 declares --product-version={found} but pyproject.toml says "
+            f"{_pyproject_version()!r} — running the build script ships a mislabeled exe."
         )

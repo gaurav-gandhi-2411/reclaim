@@ -1,78 +1,78 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from reclaim.ai._optional import require
+from reclaim.ai._optional import require, require_bundled_model
 
 # Feature 1b Stage 2 (spec §2): sentence embeddings for the RESIDUAL only — clusters
 # MinHash/LSH (minhash_lsh.py) couldn't cleanly resolve. `all-MiniLM-L6-v2` (Apache-2.0, tiny,
 # CPU-fast) per spec, matching spec §0.6: raw cosine similarity is the reported number, never
 # manufactured into a probability. Mirrors phash.py -> image_similarity.py's two-stage role,
 # just for the text pipeline's second stage instead of a whole-set prefilter.
+#
+# Wave 1 P0-B (2026-07-30): rewritten from sentence-transformers/torch to ONNX Runtime +
+# the lightweight `tokenizers` package — sentence-transformers (and its own torch/transformers
+# dependency) dropped entirely. The full pipeline (BertModel forward -> mean pooling -> L2
+# normalize) ships as a single pinned, SHA256-verified int8 ONNX file (23.6MB); a decision-
+# grade PR comparison on the real Gutenberg realistic-tier distribution at the shipped 0.95
+# operating threshold measured int8 as quality-equivalent to the original torch-fp32 model
+# (recall 313/360 -> 312/360, precision 1.0 unchanged across all 7,140 negative pairs) — see
+# reports/ai/onnx_quality_parity/ for the full numbers. Tokenization uses the model's own
+# exported `tokenizer.json` (WordPiece vocab, identical to what sentence-transformers used
+# internally) loaded via the `tokenizers` package alone — confirmed byte-identical token
+# ids/attention masks against the original sentence-transformers tokenizer before this
+# replaced it.
 
-_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+_PACKAGE_DIR = Path(__file__).parent
+_MODELS_DIR = _PACKAGE_DIR / "models"
 
-# Supply-chain integrity (audit findings E17/E18, ADR-0028): pinned to an explicit commit hash
-# so a future HF Hub `main` repoint can never silently change what gets downloaded -- the
-# revision below is what `main` resolves to today, determined via
-# `HfApi().model_info(_MODEL_NAME).sha` (network-resolved) and cross-checked against this
-# machine's local HF Hub cache `refs/main` file (both agreed). `SentenceTransformer` itself
-# accepts `revision=` directly (unlike open_clip's tag-based loading -- see
-# image_embeddings.py), so no bypass is needed here.
-_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"  # pinned; see ADR-0028
-_MODEL_WEIGHTS_FILENAME = "model.safetensors"
-_MODEL_WEIGHTS_SHA256 = "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+_MINILM_ONNX_FILENAME = "minilm_int8.onnx"
+_MINILM_ONNX_SHA256 = "3dafd08bc939d0c870495d2abbf6a70101d7ac44497eb28bd4597f64cee38096"
+_TOKENIZER_FILENAME = "minilm_tokenizer.json"
+_TOKENIZER_SHA256 = "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0"
+# all-MiniLM-L6-v2's own configured max sequence length (SentenceTransformer.max_seq_length) —
+# hardcoded since sentence-transformers, the only thing that used to expose this, is gone.
+_MAX_SEQ_LENGTH = 256
 
-# Lazily constructed once per process — loading the model is the expensive part (disk read +
-# weight materialization), computing an embedding from an already-loaded model is fast. Not
-# thread-safe by construction (module-level mutable cache); this codebase's AI-layer code has
-# no concurrent-access requirement today (see ADR-0011 — "no UI wiring" posture).
-_model_cache: object | None = None
+# Lazily constructed once per process — loading the ONNX session/tokenizer is the expensive
+# part; running inference against an already-loaded session is fast. Not thread-safe by
+# construction (module-level mutable cache), same posture as image_embeddings.py's
+# `_session_cache` — this codebase's AI-layer code has no concurrent-access requirement today
+# (ADR-0011 — "no UI wiring" posture).
+_session_cache: object | None = None
+_tokenizer_cache: object | None = None
 
 
-def _verify_pinned_weights_or_quarantine() -> None:
-    """Downloads (or reuses the local HF Hub cache for) the pinned MiniLM weights file and
-    verifies its SHA-256 against the known-good digest above before `SentenceTransformer`
-    loads it (E18). HF Hub's own download path is already atomic (tmp-file + rename,
-    size-checked before the rename happens), so a genuinely partial/interrupted download is
-    never left where it could be loaded as if complete; this adds an independent content-hash
-    check on top, catching a case the size-only check inside `huggingface_hub` cannot: a
-    server (or a compromised mirror/proxy) that serves the wrong but correctly-sized bytes for
-    the pinned revision. A mismatch deletes the bad local blob (quarantine) rather than
-    letting it be cached silently as if valid."""
-    huggingface_hub = require("huggingface_hub", feature="model weight integrity verification")
-    weights_path = Path(
-        huggingface_hub.hf_hub_download(
-            repo_id=_MODEL_NAME, filename=_MODEL_WEIGHTS_FILENAME, revision=_MODEL_REVISION
+def _session() -> object:
+    global _session_cache
+    if _session_cache is None:
+        onnxruntime = require("onnxruntime", feature="sentence-embedding residual resolution")
+        model_path = require_bundled_model(
+            _MODELS_DIR / _MINILM_ONNX_FILENAME,
+            expected_sha256=_MINILM_ONNX_SHA256,
+            feature="sentence-embedding residual resolution",
         )
-    )
-    digest = hashlib.sha256()
-    with weights_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    actual_sha256 = digest.hexdigest()
-    if actual_sha256 != _MODEL_WEIGHTS_SHA256:
-        weights_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"sentence-transformers weight integrity check failed for {weights_path}: expected "
-            f"sha256 {_MODEL_WEIGHTS_SHA256}, got {actual_sha256}. The corrupted/tampered file "
-            "has been deleted; retry to re-download."
+        _session_cache = onnxruntime.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
         )
+    return _session_cache
 
 
-def _model() -> object:
-    global _model_cache
-    if _model_cache is None:
-        sentence_transformers = require(
-            "sentence_transformers", feature="sentence-embedding residual resolution"
+def _tokenizer() -> object:
+    global _tokenizer_cache
+    if _tokenizer_cache is None:
+        tokenizers_module = require("tokenizers", feature="sentence-embedding residual resolution")
+        tokenizer_path = require_bundled_model(
+            _MODELS_DIR / _TOKENIZER_FILENAME,
+            expected_sha256=_TOKENIZER_SHA256,
+            feature="sentence-embedding residual resolution",
         )
-        _verify_pinned_weights_or_quarantine()
-        _model_cache = sentence_transformers.SentenceTransformer(
-            _MODEL_NAME, revision=_MODEL_REVISION
-        )
-    return _model_cache
+        tokenizer = tokenizers_module.Tokenizer.from_file(str(tokenizer_path))
+        tokenizer.enable_padding()
+        tokenizer.enable_truncation(max_length=_MAX_SEQ_LENGTH)
+        _tokenizer_cache = tokenizer
+    return _tokenizer_cache
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +87,16 @@ def compute_document_embedding(path: Path, text: str) -> DocumentEmbedding | Non
     embed, same "skip, don't abort" posture as every other AI-layer compute function."""
     if not text.strip():
         return None
-    model = _model()
-    vector = model.encode(text, convert_to_numpy=True, show_progress_bar=False)  # type: ignore[attr-defined]
-    return DocumentEmbedding(path=path, vector=tuple(float(v) for v in vector))
+    numpy = require("numpy", feature="cosine similarity computation")
+    tokenizer = _tokenizer()
+    encoded = tokenizer.encode(text)  # type: ignore[attr-defined]
+    input_ids = numpy.array([encoded.ids], dtype=numpy.int64)
+    attention_mask = numpy.array([encoded.attention_mask], dtype=numpy.int64)
+    session = _session()
+    output = session.run(  # type: ignore[attr-defined]
+        None, {"input_ids": input_ids, "attention_mask": attention_mask}
+    )[0]
+    return DocumentEmbedding(path=path, vector=tuple(float(v) for v in output[0]))
 
 
 def cosine_similarity(embedding_a: DocumentEmbedding, embedding_b: DocumentEmbedding) -> float:

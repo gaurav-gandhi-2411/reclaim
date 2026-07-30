@@ -1,4 +1,7 @@
 {
+  "production_verification": {
+    "note": "Re-run against the actual shipped production code (reclaim.ai.text_embeddings, real tokenizers-package tokenization, real ONNX Runtime int8 inference) after the module rewrite -- reproduces the conversion-script measurement below EXACTLY, confirming the production integration matches (tp=312/360, fp=0/7140, per-tier recall identical). No preprocessing-drift concern here (unlike CLIP): tokenization is a deterministic, exact transform, not a lossy resize -- confirmed byte-identical token ids/attention masks between the old sentence-transformers tokenizer and the new bundled `tokenizers`-package one before this replaced it."
+  },
   "int8": {
     "operating_threshold": 0.95,
     "torch_fp32": {

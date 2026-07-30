@@ -174,7 +174,7 @@ def test_notices_route_serves_third_party_notices(tmp_path: Path) -> None:
     response = client.get("/NOTICES")
     assert response.status_code == 200
     assert "Third-party notices" in response.text
-    assert "open-clip-torch" in response.text
+    assert "onnxruntime" in response.text
 
 
 # --- Error paths -------------------------------------------------------------------------------

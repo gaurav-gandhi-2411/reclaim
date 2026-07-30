@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+from pathlib import Path
 from types import ModuleType
 
 
@@ -8,6 +10,47 @@ class AIExtraNotInstalledError(ImportError):
     """Raised in place of a raw ImportError/ModuleNotFoundError when an AI-layer function
     needs an optional dependency that isn't installed — carries an actionable message
     instead of a stack trace pointing at some third-party import line."""
+
+
+class AIModelMissingError(RuntimeError):
+    """Raised when a bundled ONNX AI model file (CLIP/MiniLM, under `reclaim/ai/models/`) is
+    missing or fails its pinned SHA256 integrity check — Wave 1 P0-B's replacement for the
+    old pinned-HF-Hub-checkpoint pattern (`image_embeddings._verify_checkpoint_sha256_or_
+    quarantine`/`text_embeddings._verify_pinned_weights_or_quarantine`), now that the models
+    ship bundled with the app instead of being downloaded on first use. Distinct from
+    `AIExtraNotInstalledError` (a missing PIP package, fixed by `uv sync --extra ai`) because
+    there's no equivalent one-line fix for a missing bundled file — see `require_bundled_
+    model`'s message for the actual remediation steps."""
+
+
+def require_bundled_model(path: Path, *, expected_sha256: str, feature: str) -> Path:
+    """Verifies a bundled AI model file exists and matches its pinned SHA256 before returning
+    its path. Defense-in-depth against a corrupted or tampered install — mirrors the "fail
+    loud with an actionable message, never silently load a suspect file" philosophy the old
+    pinned-checkpoint-download verification already had, adapted for a file that's bundled at
+    build time rather than downloaded at first use (so there's no "delete and let it
+    re-download" remediation here — the fix is reinstalling, or for a source checkout,
+    regenerating the model via `scripts/export_ai_models.py`)."""
+    if not path.exists():
+        raise AIModelMissingError(
+            f"{feature} needs the bundled AI model file at {path}, which is missing. "
+            "From a source checkout: `uv sync --extra ai-export` then `uv run python "
+            "scripts/export_ai_models.py`. On an installed copy of Reclaim, this means the "
+            "installation is incomplete or corrupted — reinstall."
+        )
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise AIModelMissingError(
+            f"{feature}'s bundled model file at {path} failed integrity verification "
+            f"(expected sha256 {expected_sha256}, got {actual_sha256}) — possibly corrupted "
+            "or tampered. Reinstall Reclaim, or from a source checkout, re-run "
+            "`uv run python scripts/export_ai_models.py`."
+        )
+    return path
 
 
 # D15: Pillow's own default (`PIL.Image.MAX_IMAGE_PIXELS`, ~89.5M px) only WARNS past 1x that

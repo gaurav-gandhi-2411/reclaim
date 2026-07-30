@@ -295,15 +295,16 @@ double-click Windows installer aimed at people who won't read the source first:
   (`reclaim-setup.exe`, starting at v1.0.0) — that's the artifact the Download section at the
   top of this README links to. The build-it-yourself instructions below remain useful for
   verifying the binary yourself from source, or for building a fresh copy.
-- **Core-only, by design.** The installer ships the deterministic engine only — no AI-layer
-  dependencies. Measured (clean `uv venv` install, this session): core `site-packages` is
-  **13.6 MB**; the `[ai]` extra adds **~1,028 MB** (`torch` alone is 464 MB, shared by both
-  Feature 1b's document dedup and Track B's CLIP grouping — there's no way to get "semantic
-  grouping" without it). Every AI feature is recommend-only or browse-only, so a fresh install
-  loses nothing essential by not carrying it; if you want the AI layer, install from source with
-  `uv sync --extra ai` / `pip install reclaim[ai]` (a separate Python environment — the
-  Nuitka-compiled `reclaim.exe` cannot `pip install` into itself; see ADR-0024's consequences
-  section for this disclosed gap).
+- **AI layer bundled, zero user steps** (Wave 1 P0-B, [ADR-0030](docs/architecture/adr/0030-onnx-conversion-and-bundled-ai-installer.md) — supersedes ADR-0024's
+  original core-only decision). CLIP and MiniLM ship as pre-converted, pinned, SHA256-verified
+  ONNX files (CLIP fp16, 175.8MB; MiniLM int8, 23.6MB — **199.4MB total**, vs. the old
+  torch-based `[ai]` extra's ~1,028MB delta) bundled directly into the installer — no separate
+  `pip install reclaim[ai]` step, no terminal, no Python knowledge required. Quality-parity
+  measurement against the original torch models (on this project's own real gold eval sets, not
+  a proxy): `reports/ai/onnx_quality_parity/`. Models load lazily (first AI-analysis click, never
+  at app startup) and degrade gracefully — if a bundled model file is ever missing or corrupted,
+  that specific AI track is skipped with a clear reason, the rest of the app (including every
+  other AI track) keeps working.
 ### First run: SmartScreen and antivirus prompts (expected, not a compromise signal)
 
 **This installer and `reclaim.exe` are unsigned.** Stage 2 Part C assessed code-signing options
