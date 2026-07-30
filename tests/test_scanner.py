@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -711,24 +712,38 @@ def test_build_record_for_path_matches_nfd_disk_entry_against_nfc_lookup_path(
 # --- Wave 1 finding #3: per-entry stat() timeout guard (2026-07-30 real-disk diagnosis) --------
 
 
-def test_stalled_stat_is_skipped_not_hung(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A single stalled `os.stat()` call must be skipped via the shared, timeout-guarded
-    `stat_executor` `scan_tree` now threads through `build_record` -- never hang the whole scan
-    (the real-disk diagnosis found this was the only per-entry syscall in the walk with no
-    timeout at all, unlike dedup.py's already-guarded hash reads). Shortens
-    `_STAT_TIMEOUT_SECONDS` so this test itself doesn't take 30 real seconds; the sibling file
-    must still be scanned normally -- one bad entry never aborts the rest."""
+def test_stalled_stat_on_risky_entry_is_skipped_not_hung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single stalled `os.stat()` call on a RISKY entry -- a reparse point, the class of entry
+    the risk-targeted guard (`_entry_is_risky`) actually routes through the timeout-guarded pool
+    -- must be skipped, never hang the whole scan. A plain local file is deliberately NOT used
+    here: the risk-targeted revision no longer routes those through the guard at all (see
+    `test_local_file_stat_bypasses_the_guarded_pool` for that other half of the fix). Shortens
+    `_STAT_TIMEOUT_SECONDS` so this test itself doesn't take 30 real seconds; the sibling
+    readable file must still be scanned normally -- one bad entry never aborts the rest."""
     monkeypatch.setattr(scanner_module, "_STAT_TIMEOUT_SECONDS", 0.3)
     root = tmp_path / "root"
+    target = tmp_path / "junction_target"
+    target.mkdir(parents=True)
     root.mkdir()
     (root / "readable.txt").write_text("ok", encoding="utf-8")
-    slow_name = "slow.txt"
-    (root / slow_name).write_text("slow", encoding="utf-8")
+    link_name = "slow_link"
+    link = root / link_name
+
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 -- cmd is a builtin
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
 
     real_stat = os.stat
 
     def slow_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
-        if os.path.basename(str(path)) == slow_name:  # noqa: PTH119 -- raw str, not Path
+        if os.path.basename(str(path).rstrip("\\")).lower() == link_name:  # noqa: PTH119
             time.sleep(2.0)
         return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -743,8 +758,42 @@ def test_stalled_stat_is_skipped_not_hung(tmp_path: Path, monkeypatch: pytest.Mo
     assert elapsed < 5.0, f"scan took {elapsed:.1f}s -- the stat timeout guard did not fire"
     paths = {r.path for r in inventory}
     assert root / "readable.txt" in paths
-    assert root / slow_name not in paths
+    assert link not in paths
     assert stats.skipped_unreadable_count == 1
+
+
+def test_local_file_stat_bypasses_the_guarded_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wave 1 finding #3's risk-targeted revision (the throughput fix itself): an ordinary local
+    file -- no reparse-point/cloud-placeholder attributes, no network-mapped/UNC root -- must
+    call `os.stat()` directly, never route through the timeout-guarded `stat_executor`. Proven
+    structurally (not just via a wall-clock A/B) by spying on every `ThreadPoolExecutor.submit`
+    call and asserting `os.stat` never appears among them. A flat, single-file, no-subdirectory
+    fixture keeps this isolated from `scan_tree`'s OTHER (unrelated) executor -- the
+    top-level-directory worker pool -- which never gets a submit call at all here since there's
+    nothing to recurse into."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "plain.txt").write_text("x", encoding="utf-8")
+
+    submitted_fn_names: list[str] = []
+    real_submit = ThreadPoolExecutor.submit
+
+    def spying_submit(
+        self: ThreadPoolExecutor, fn: object, *args: object, **kwargs: object
+    ) -> object:
+        submitted_fn_names.append(getattr(fn, "__name__", str(fn)))
+        return real_submit(self, fn, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", spying_submit)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(root, index)
+
+    assert "stat" not in submitted_fn_names, (
+        f"os.stat was routed through the guarded pool for a plain local file: {submitted_fn_names}"
+    )
 
 
 # --- Wave 1 finding #5: quiet git "dubious ownership" noise (2026-07-30 real-disk diagnosis) ---

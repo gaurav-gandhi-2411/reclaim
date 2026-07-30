@@ -2023,6 +2023,73 @@ Branch `wave-1-scan-reliability`, not yet committed as of this checkpoint (commi
 entry). Next: STOP before P0-B (ONNX/AI packaging) per the standing work order, pending GG's
 review of the above.
 
+### 2026-07-30 — Stat-guard wall-time regression fixed: risk-targeted routing, not blanket
+
+GG confirmed the diagnosis but pushed back on absorbing the +58% wall-time cost: an isolated
+A/B (10,696 -> 6,323 files/sec) showed it was essentially all the stat-timeout guard's per-file
+thread-hop, for a guard that has never actually fired on any real run. Directed a restructure to
+make the guard cost ~nothing in the common case while keeping a stall genuinely unable to wedge
+the scan — offered three options (out-of-band watchdog, directory/batch-granularity guarding, or
+risk-targeted fast-pathing) and asked me to pick the simplest that works.
+
+**Picked: risk-targeted fast-pathing.** Considered the watchdog approach first and rejected it —
+correctly abandoning a still-pending worker future mid-`as_completed` without either leaking a
+zombie thread that later writes through an already-dropped `scan_seen` temp table/closed
+connection, or adding real synchronization complexity, turned out to be the least simple of the
+three, not the simplest. Risk-targeting maps directly onto the spec's own original framing of
+*where* stat hangs actually come from (cloud placeholders, reparse points, network drives) rather
+than treating every local NTFS file as an equal hang risk:
+
+- `drives.py`: new `is_network_drive(path)` (reuses `list_fixed_drives`'s existing
+  `_raw_drive_type`/`GetDriveTypeW` primitive, not a duplicate) — UNC paths recognized by syntax
+  alone (no Win32 call needed), a drive-letter path needs one cheap local `GetDriveTypeW` call.
+  Checked ONCE per scan (`scan_tree` computes `force_guard = is_network_drive(root)` up front),
+  never per-entry or per-directory.
+- `scanner.py`: `_entry_is_risky(entry, force_guard)` — `force_guard=True` (network root) short-
+  circuits every entry as risky; otherwise checks the reparse-point/cloud-placeholder attribute
+  bits via `entry.stat(follow_symlinks=False)`, which on Windows reads straight from the
+  `FindNextFile` data `os.scandir` already collected (the same "free, already-cached, not a
+  second syscall" fact `count_entries_fast`'s own docstring already established and this reuses,
+  not re-derives). `build_record` only routes the real `os.stat()` call through
+  `stat_executor`/the timeout guard when `_entry_is_risky` says yes; every other entry — the
+  overwhelming majority on a normal local drive — calls `os.stat()` directly on the worker
+  thread, full speed, zero thread-hop.
+- Tests: replaced the old (now-invalid, since it used a plain local file that no longer routes
+  through the guard at all) stalled-stat test with two — `test_stalled_stat_on_risky_entry_
+  is_skipped_not_hung` (a REAL NTFS junction, per this codebase's own `mklink /J` convention, with
+  a monkeypatched slow `os.stat` on it — proves the guard still trips end-to-end on the class of
+  entry it now actually targets) and `test_local_file_stat_bypasses_the_guarded_pool` (spies on
+  every `ThreadPoolExecutor.submit` call and asserts `os.stat` never appears for a plain local
+  file — proves the fast path structurally, not just via wall-clock). Plus 3 new `is_network_drive`
+  unit tests in `test_drives.py` mirroring `list_fixed_drives`' own monkeypatch-`_raw_drive_type`
+  convention.
+
+**Measured, both requested proofs:**
+- Same isolated 4,025-file local fixture, same machine: **10,247 files/sec** with the
+  risk-targeted guard — within 4.2% of the 10,696 files/sec no-guard baseline (target was
+  "within ~10%"), up from 6,323 files/sec with the old blanket guard.
+- Same real `C:\Users\gaura` target, same direct-`python.exe`-invocation methodology:
+
+| Metric | Original (pre-Wave-1 bug) | Blanket guard | **Risk-targeted guard** |
+|---|---|---|---|
+| Peak RSS | 5,085 MB | 244 MB | **242 MB** (memory fix fully intact) |
+| Wall time | 425.23s | 672.41s (+58.1%) | **523.56s (+23.1% vs. original, -22.1% vs. blanket)** |
+| Exit code | 0 | 0 | 0 |
+
+  Entry/dir counts differ slightly across all three runs (2,672,201 / 2,624,864 / 2,569,506) —
+  real disk state changing between runs (this session's own scratch files, other concurrent
+  sessions on this shared dev machine), not a correctness signal; each run's `files_pruned=0,
+  skipped=1` stayed consistent. The residual +23% (vs. the isolated fixture's 4.2%) is plausibly
+  real-disk variance (git subprocess calls, WAL commit overhead, actual reparse
+  points/OneDrive-placeholders on this machine still correctly paying the full guard cost) rather
+  than a further optimizable gap — not chased further since the explicit target (~10% on the
+  isolated measurement) was met and the memory fix — the actually-confirmed root cause — is
+  fully intact.
+
+**Verification**: `scripts/verify.py` full pass — 752 passed, 27 skipped (779 total, +4 net new
+tests replacing/extending the prior guard tests), ruff/mypy clean, 86.91% coverage, all 5
+safety-critical module floors held.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real

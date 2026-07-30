@@ -17,8 +17,13 @@ from pathlib import Path
 
 import structlog
 
+from reclaim.drives import is_network_drive
 from reclaim.index import ScanIndex, StoredStat, is_unchanged
-from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT, FileRecord
+from reclaim.models import (
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_REPARSE_POINT,
+    FileRecord,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -423,8 +428,38 @@ def _query_git_clean(repo_root: Path) -> bool:
 # than block the caller forever" pattern as `dedup._hash_with_guard` — Python has no
 # cross-platform way to preempt a blocked syscall, so a timed-out thread leaks rather than dies,
 # same trade-off `dedup.py` already accepts.
+#
+# First version of this guard routed EVERY entry through the timeout-guarded pool unconditionally
+# — correct, but measured (real A/B, same machine) at 10,696 files/sec unguarded vs 6,323
+# files/sec guarded, a ~41% throughput cost paid on every single local file for a guard that has
+# never actually fired on either real-disk run. Risk-targeted instead: only entries that are
+# actually plausible stat-hang candidates (a reparse point — the target could be anything, a
+# broken/circular junction, a slow network path; a cloud placeholder — hydration risk; or any
+# entry under a network-mapped/UNC root — an unresponsive server) route through the guard.
+# Everything else calls `os.stat()` directly on the worker thread, at full unguarded speed.
 _STAT_TIMEOUT_SECONDS = 30.0
 _STAT_TIMEOUT_WORKERS = 8
+_RISK_ATTRIBUTES = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+
+def _entry_is_risky(entry: os.DirEntry[str], *, force_guard: bool) -> bool:
+    """True if `entry` is a plausible stat-hang candidate and should route through the
+    timeout-guarded pool. `force_guard` (set once per scan by `scan_tree` via
+    `is_network_drive(root)`, never recomputed per-entry) short-circuits every entry under a
+    network-mapped/UNC root as risky without needing a per-entry check. Otherwise, checks the
+    reparse-point/cloud-placeholder attribute bits via `entry.stat(follow_symlinks=False)` — on
+    Windows this reads straight from the `FindNextFile` data `os.scandir` already collected (see
+    `count_entries_fast`'s docstring: "a free, already-cached attribute check, not a second
+    per-entry syscall"), so this check itself costs nothing extra. A `stat()` failure here (rare
+    — the entry was just listed by scandir) fails toward `True`: if the cheap check itself can't
+    tell, guard the real stat rather than assume it's safe."""
+    if force_guard:
+        return True
+    try:
+        attributes = entry.stat(follow_symlinks=False).st_file_attributes
+    except OSError:
+        return True
+    return bool(attributes & _RISK_ATTRIBUTES)
 
 
 def _guarded_stat(stat_executor: ThreadPoolExecutor | None, path: str) -> os.stat_result:
@@ -446,6 +481,8 @@ def build_record(
     git_cache: GitRepoCache,
     skipped: list[SkippedPath],
     stat_executor: ThreadPoolExecutor | None = None,
+    *,
+    force_guard: bool = False,
 ) -> tuple[FileRecord, bool] | None:
     """Builds a FileRecord for one os.scandir entry.
 
@@ -456,6 +493,11 @@ def build_record(
     reparse-point attribute bit, never on `entry.is_dir()` — Windows junctions carry
     `FILE_ATTRIBUTE_DIRECTORY` alongside the reparse bit and some Python/Windows combinations
     still report them as traversable via `is_dir()`.
+
+    `force_guard` (Wave 1 finding #3, risk-targeted revision — see the guard's own module
+    comment): `True` for every entry under a network-mapped/UNC scan root; otherwise the
+    per-entry reparse-point/cloud-placeholder check (`_entry_is_risky`) decides. Only entries
+    classified risky pay the `stat_executor` thread-hop cost.
     """
     entry_path = current_dir / entry.name
     try:
@@ -474,7 +516,9 @@ def build_record(
         # `executor.py`'s `_atomic_move`/`_tree_stats` already document. follow_symlinks=False so
         # a reparse point is stat'd as itself, not as whatever it points to — required to read
         # the reparse-point attribute bit correctly.
-        st = _guarded_stat(stat_executor, entry.path)
+        risky = _entry_is_risky(entry, force_guard=force_guard)
+        executor_for_call = stat_executor if risky else None
+        st = _guarded_stat(executor_for_call, entry.path)
         is_dir_entry = entry.is_dir(follow_symlinks=False)
     except (OSError, FutureTimeoutError) as exc:
         logger.warning("scan.entry_unreadable", path=str(entry_path), error=str(exc))
@@ -621,6 +665,7 @@ def _walk_subtree(
     incremental: bool,
     writer: _BatchIndexWriter,
     stat_executor: ThreadPoolExecutor | None,
+    force_guard: bool,
     tracker: _ProgressTracker | None = None,
 ) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
@@ -657,7 +702,9 @@ def _walk_subtree(
             continue
 
         for entry in entries:
-            built = build_record(entry, current_dir, git_cache, skipped, stat_executor)
+            built = build_record(
+                entry, current_dir, git_cache, skipped, stat_executor, force_guard=force_guard
+            )
             if built is None:
                 continue
             record, should_recurse = built
@@ -703,8 +750,12 @@ def scan_tree(
     computed inside SQLite via a seen-tracking temp table (finding #4) instead of two full
     Python collections; worker results are consumed via `as_completed` rather than
     submission-ordered `executor.map` (finding #3), so one slow top-level directory can't delay
-    processing already-finished ones; and every `os.stat()` call goes through a shared,
-    timeout-guarded pool (finding #3) so a single stalled syscall can't wedge the walk silently.
+    processing already-finished ones; and every `os.stat()` call on a plausible stat-hang
+    candidate (a reparse point, a cloud placeholder, or anything under a network-mapped/UNC
+    root) goes through a shared, timeout-guarded pool (finding #3, risk-targeted revision — see
+    `_entry_is_risky`'s module comment) so a single stalled syscall can't wedge the walk
+    silently, without paying a per-file thread-hop cost on the overwhelming majority of entries
+    that are never actually at risk of stalling.
     """
     start_time = time.monotonic()
     scanned_at = time.time()
@@ -717,6 +768,10 @@ def scan_tree(
     # previously-indexed path set (it queries `files` directly), so a `--full`/forced rescan of
     # an existing large index no longer pays for a stat_cache it would never consult anyway.
     stat_cache: dict[str, StoredStat] | None = index.load_stat_cache(root) if incremental else None
+
+    # Checked once for the whole scan, not per-entry or per-directory — see
+    # `_entry_is_risky`/`is_network_drive`'s docstrings.
+    force_guard = is_network_drive(root)
 
     all_skipped: list[SkippedPath] = []
     try:
@@ -733,7 +788,9 @@ def scan_tree(
     stat_executor = ThreadPoolExecutor(max_workers=_STAT_TIMEOUT_WORKERS)
     try:
         for entry in top_level_entries:
-            built = build_record(entry, root, root_git_cache, all_skipped, stat_executor)
+            built = build_record(
+                entry, root, root_git_cache, all_skipped, stat_executor, force_guard=force_guard
+            )
             if built is None:
                 continue
             record, should_recurse = built
@@ -755,6 +812,7 @@ def scan_tree(
                     incremental=incremental,
                     writer=writer,
                     stat_executor=stat_executor,
+                    force_guard=force_guard,
                     tracker=tracker,
                 )
                 # as_completed, not executor.map: map()'s iterator yields in SUBMISSION order,
