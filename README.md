@@ -338,32 +338,33 @@ code changes either way.
 Build it yourself:
 
 ```powershell
-uv add --dev nuitka   # already recorded in pyproject.toml's dev group
 uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
-uv run python -m nuitka --standalone --assume-yes-for-downloads `
-  --company-name="Gaurav Gandhi" --product-name="Reclaim" --product-version=1.3.0 `
-  --windows-icon-from-ico=packaging/reclaim.ico `
-  --windows-console-mode=attach `
-  --include-package=reclaim --include-package=uvicorn --include-package=fastapi `
-  --include-package=starlette `
-  --include-data-dir=src/reclaim/api/static=reclaim/api/static `
-  --include-data-dir=src/reclaim/api/templates=reclaim/api/templates `
-  --output-dir=packaging/build --output-filename=reclaim.exe `
-  packaging/entry_point.py
-# --windows-console-mode=attach (not the default `force`, and not `disable`): the Start Menu /
-# desktop shortcut launches `reclaim.exe dashboard` with no console around it, so `attach` means
-# no console window pops up for that path. But `reclaim.exe scan ...` run from an existing
-# terminal still needs its stdout to land in that terminal — `disable` would silently drop it
-# (Nuitka: "doesn't create or use a console at all"), while `attach` uses whatever console
-# already exists and creates none otherwise. Verified against `python -m nuitka --help`.
 
-# Build from a CORE-ONLY environment (no [ai] extra) so nothing AI-related can leak into the
-# installer — Nuitka's static import analysis won't follow reclaim.ai's lazy
-# importlib.import_module() calls anyway, but a clean venv makes the guarantee airtight rather
-# than incidental. Then package it:
-"C:\Program Files\Inno Setup 7\ISCC.exe" packaging\reclaim.iss
+# Requires Git LFS (git lfs pull) so the bundled clip_vision_fp16.onnx (175.8MB, exceeds
+# GitHub's 100MB plain-git limit) is a real file, not a pointer stub — see
+# packaging/RELEASE_RUNBOOK.md's preconditions (free RAM, disk space, closing other heavy
+# sessions) before running a real release build.
+pwsh packaging/build_installer.ps1
 # -> packaging\dist\reclaim-setup.exe
 ```
+
+`build_installer.ps1` runs the whole pipeline unattended and reproducibly: provisions a clean,
+dev-toolchain-free build venv (`uv sync --extra ai --no-dev`, with a hard assertion that
+`mypy`/`pytest`/`ruff` are genuinely unimportable before Nuitka starts — a contaminated venv
+previously caused an out-of-memory Nuitka failure trying to compile mypy's own internals),
+compiles with Nuitka `--standalone` (every AI-layer package needs an explicit
+`--include-package` — Nuitka's static analysis doesn't follow this codebase's lazy
+`importlib.import_module()` calls), monitors the compile for machine-contention stalls (aborts
+within minutes rather than hanging for hours if compiler output stops while system CPU isn't
+actually busy — a real incident on a shared dev machine, see PLAN.md's Wave 1 P0-B checkpoint),
+then packages with Inno Setup and reports the final installer size. Full preconditions and
+expected numbers: `packaging/RELEASE_RUNBOOK.md`.
+
+(`--windows-console-mode=attach`, baked into the script: the Start Menu/desktop shortcut
+launches `reclaim.exe dashboard` with no console around it, so `attach` means no console window
+pops up for that path; `reclaim.exe scan ...` run from an existing terminal still gets its
+stdout in that terminal — `disable` would silently drop it, `attach` uses whatever console
+already exists and creates none otherwise.)
 
 `packaging/test_packaged_safe_mode.ps1` is the safety proof that runs against the **actual
 compiled artifact** (not the dev tree): fresh-install defaults to safe mode, a real `--apply`

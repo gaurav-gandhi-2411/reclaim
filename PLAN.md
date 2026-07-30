@@ -2219,6 +2219,126 @@ embeddings.py` have NOT been rewritten to call ONNX Runtime instead of torch; no
 graceful-degradation wiring for a downloadable AI pack has been built yet. All of that is real
 remaining P0-B work, gated on GG's go-ahead past this stop point.
 
+### 2026-07-30 — P0-B implementation: torch dropped, ONNX shipped, bundled in the installer
+
+GG approved (CLIP fp16 + MiniLM int8, 199.4MB) and directed the full implementation: rewrite
+the modules, drop torch entirely (confirmed via grep — no `require("torch"/"open_clip"/
+"sentence_transformers")` call site remains anywhere in `src/`), lazy-load + measure cold
+start, test graceful degradation explicitly, bundle in the installer (preferred over an
+in-app download button), re-run the gold evals against the SHIPPED code (not the conversion
+scripts), full verify, commit.
+
+**Module rewrite**: `image_embeddings.py`/`text_embeddings.py` rewritten around ONNX Runtime
+sessions instead of torch models — public API (`ImageEmbedding`/`DocumentEmbedding`/
+`compute_*_embedding`/`cosine_similarity`) unchanged, so `semantic_image_grouping.py`/
+`document_similarity.py`/every downstream caller needed zero changes. New
+`reclaim.ai._optional.AIModelMissingError`/`require_bundled_model` (SHA256-verify a bundled
+file, distinct from the old "download from HF Hub" pinned-checkpoint pattern — no download path
+exists anymore since the files are bundled, so a missing/corrupted bundled file fails loud with
+"reinstall Reclaim" instead of "retry the download"). `ImageEmbeddingCache`'s `model_id` bumped
+so old torch-era cached embeddings become unreachable cache misses, never silently compared
+against new ONNX ones (the cache's own pre-existing contract). Full technical detail + the
+license/redistribution analysis for shipping a quantized derivative of an Apache-2.0 checkpoint:
+[ADR-0030](docs/architecture/adr/0030-onnx-conversion-and-bundled-ai-installer.md) (also
+formally supersedes ADR-0024 Decision 2 and ADR-0029's unbuilt "separate AI runtime" plan).
+
+**Real bug caught by actually running the new code, not just reading it**: `_preprocess_image`'s
+first draft called `pil_image.BICUBIC` where `pil_image` was the IMAGE INSTANCE, not the PIL
+module — an `AttributeError` on the very first real invocation. Fixed by threading the module
+object through separately. A second real bug: `scripts/export_ai_models.py`'s first draft
+imported `_model_and_preprocess`/`_model` FROM the now-ONNX-only production modules it was
+supposed to regenerate models FOR — those functions no longer exist there (Wave 1 P0-B removed
+them). Fixed by giving the export script its own fully self-contained pinned-checkpoint-loading
+code, since it's the one remaining place in the codebase that still needs torch/open_clip/
+sentence-transformers at all (via the new `ai-export` extras group, never installed by a normal
+`uv sync --extra ai`).
+
+**Preprocessing had to be reimplemented, and it mattered**: CLIP's image preprocessing
+(previously torchvision, sourced from open_clip's own config) has no torch-free equivalent —
+reimplemented in pure PIL + numpy. A first correctness check (single-image cosine similarity
+between the torchvision and PIL pipelines' resulting embeddings) showed real drift (0.994, not
+1.0) — not assumed harmless, actually RE-RAN the full BCubed eval with the production-shaped
+(PIL) preprocessing rather than trusting the earlier torchvision-preprocessing numbers. Result:
+a small additional real cost (fp16 F1 delta -0.008 vs the shipped threshold, still comfortably
+above Track B's 0.70 precision floor) — disclosed in the updated
+`reports/ai/onnx_quality_parity/clip_torch_vs_onnx.json`, not hidden behind the earlier,
+now-superseded torchvision-preprocessing numbers. MiniLM's tokenization has no such gap — the
+lightweight `tokenizers` package loading the model's own exported `tokenizer.json` produces
+byte-identical token ids/attention masks to the old sentence-transformers tokenizer (verified
+directly before trusting it), so no preprocessing-drift concern there.
+
+**Graceful degradation, tested at two levels, not just asserted**: (1) unit level — `_clip_
+session()`/`_session()` raise `AIModelMissingError` with an actionable message when the bundled
+file is missing or fails SHA256 verification; (2) API level — `api/ai_orchestration.py::_run_
+pipeline` now catches `AIModelMissingError` alongside the existing `AIExtraNotInstalledError`,
+verified live against a simulated missing-model-directory: the pipeline returns cleanly (empty
+clusters, `tracks_skipped` populated, structured log line), no crash, no exception propagating —
+confirmed by actually running it, not just reading the except clause. `scripts/verify.py`
+passing in the CORE-ONLY main venv (no AI extras installed at all) is the other half of "rules-
+first features work fully" — already true before this change and re-confirmed after.
+**Disclosed, not fixed**: `tracks_skipped` (the per-track skip reasons) isn't currently
+surfaced in the dashboard UI at all — a pre-existing gap (any pipeline failure, not just a
+missing AI model, hits it), out of scope for this change; only the top-level `unavailable_
+reason` (whole-`ai`-extra-missing case) is shown today, which remains the primary, most likely
+real-world case and is already handled.
+
+**Lazy loading preserved, measured before/after is honest about what changed**: module import
+(`import reclaim.ai.image_embeddings`) costs ~21ms with the session cache confirmed `None` —
+zero model loading at import time, same as the old code. First real AI use: CLIP ~2,488ms
+(~260ms of that is SHA256-verifying the 175.8MB file; the rest is ONNX Runtime's own session
+construction), MiniLM ~425ms; both then stay warm for the rest of the process (CLIP 192ms/call,
+MiniLM 5ms/call warm). Full numbers: `reports/ai/onnx_quality_parity/lazy_load_latency.json`.
+Honestly disclosed: the OLD torch-based first-use latency was NOT re-measured this session
+(would need reinstalling torch into a separate environment for a currently-unclear marginal
+benefit) — the qualitative comparison (a much lighter ONNX session vs. constructing a torch
+`nn.Module` from a safetensors checkpoint, which the old code's own docstring already called
+"the expensive part") stands without it, and the load-bearing claim — cold APP start is
+unaffected either way, since both old and new code were already lazy — doesn't need it either.
+
+**Git LFS introduced** (a real, disclosed infrastructure decision, not silently absorbed):
+`clip_vision_fp16.onnx` (175.8MB) exceeds GitHub's 100MB-per-file plain-git push limit.
+`git lfs track "src/reclaim/ai/models/*.onnx"` — standard, reversible, keeps the build
+reproducible from a bare git clone rather than requiring a separate release-asset-download step.
+
+**Re-ran the gold evals against the ACTUAL SHIPPED production code** (not the conversion
+scripts, not a scratch shim) — the specific proof GG asked for, since "the conversion passing
+doesn't prove the integration does": both reproduced their scratch-validated numbers EXACTLY
+(CLIP: precision=0.7720/recall=0.7143/F1=0.7420; MiniLM: precision=1.0/recall=0.8667,
+tp=312/fp=0/fn=48) — confirms the production module wiring (real bundled-file loading, real
+PIL preprocessing, real `tokenizers`-package tokenization) matches what was measured, not just
+the standalone conversion.
+
+**Verification**: `scripts/verify.py` full pass in the CORE-ONLY main venv (no AI extras) —
+756 passed, 27 skipped, ruff/mypy clean, 86.96% coverage, all safety-critical floors held.
+Separately, full `tests/ + evals/test_ai_safety_gate.py` re-run in a freshly-`uv sync --extra
+ai`'d scratch venv (torch-free, matching the new `[ai]` extras exactly) — 819 passed, 7 skipped,
+zero failures — proves the new torch-free `[ai]` extras profile is itself fully green, not just
+the core-only one.
+
+**Installer build**: Nuitka `--standalone` rebuilt from the torch-free `[ai]`-extras venv, with
+every AI-layer package (`onnxruntime`, `tokenizers`, `faiss`, `lightgbm`, `imagehash`, `PIL`,
+`cv2`, `numpy`, `scipy`, `datasketch`, `docx`, `pypdf`, `rapidocr_onnxruntime`) explicitly
+`--include-package`'d (Nuitka's static analysis doesn't follow this codebase's lazy
+`importlib.import_module()` calls, so each needs an explicit flag) plus
+`--include-data-dir=src/reclaim/ai/models=reclaim/ai/models` for the bundled ONNX models —
+measured results and Inno Setup packaging in the next checkpoint entry.
+
+**First attempt failed — `cc1.exe: out of memory` compiling faiss's SWIG-generated C++ wrapper
+(`module.faiss.swigfaiss.cxx`, a single translation unit that alone took 749s and still ran out
+of memory) — and, wastefully, Nuitka was ALSO compiling numpy's own bundled test suite AND
+dozens of `mypy` modules (including its `mypyc`-compiled-extension internals) neither of which
+should have been anywhere near this build. Root cause: the venv the build ran from was `uv sync
+--extra ai`'d WITHOUT `--no-dev`, so it carried the full dev toolchain (`mypy`/`pytest`/`ruff`/
+`pyarrow`/`ollama`) alongside the runtime `[ai]` extras — `uv sync` includes the default `dev`
+dependency-group unless told not to, a detail this session's earlier `ai-eval-venv` provisioning
+missed since that venv was only ever used for eval/test work, where the dev-tool bloat didn't
+matter. Fixed by building from a genuinely clean venv (`uv sync --extra ai --no-dev`, confirmed
+`mypy` unimportable in it) plus `--low-memory --jobs=2` (this is a shared dev machine — other
+sessions' own workloads were visibly running concurrently in the process list, same "don't
+assume contention-free" lesson as house rule 46a's GPU-contention guidance, applied to CPU/RAM
+here) and `--nofollow-import-to=*.tests --nofollow-import-to=*.testing` to stop bundling test
+suites that were never going to be needed.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
@@ -2231,3 +2351,49 @@ remaining P0-B work, gated on GG's go-ahead past this stop point.
 - pytest's `tmp_path` fixture resolves under the OS `%TEMP%` directory — any future eval/test
   that needs to distinguish "under Temp" from "not under Temp" paths must root its own fixture
   tree elsewhere (e.g. `data/_test_scratch/`), or every fixture path will spuriously match.
+
+**Second build attempt (from the clean venv) genuinely stalled from machine contention** —
+small, trivial FastAPI files took 1,300-3,000+ seconds each to compile while system-wide CPU
+sat at only ~33% utilized and free RAM fell from 16.7GB toward 9.4GB: a shared-dev-machine
+contention signature, not a Nuitka or code problem. Stopped rather than let it run for hours
+(house rule 46a's GPU-contention "don't idle-wait, escalate" guidance, applied to CPU/RAM by
+analogy), reported to GG, who directed building permanent unattended-safe tooling instead of
+blindly retrying: `packaging/build_installer.ps1` (clean-venv provisioning with a hard
+dev-toolchain-absence assertion, a pre-flight free-RAM check, and a monitored Nuitka compile
+that aborts within minutes of detected contention instead of hanging silently for hours) and
+`packaging/RELEASE_RUNBOOK.md` (documented preconditions/expected numbers). See "Build script
+hardening" below for two more real bugs this surfaced before the tooling could be trusted.
+
+**Build script hardening — two more real bugs, found by actually running the tool against a
+real build, not by reasoning about the code:**
+1. **`Start-Process -ArgumentList` argument-splitting bug.** A plain array handed to
+   `-ArgumentList` gets re-joined into a single command-line *string* before Windows ever sees
+   it — `"--company-name=Gaurav Gandhi"` (one array element containing a space) silently split
+   back into two argv tokens, so Nuitka received `Gandhi` and `packaging/entry_point.py` as two
+   stray positional arguments and refused to start ("specify only one positional argument").
+   Fixed by switching to `System.Diagnostics.ProcessStartInfo` with `.ArgumentList.Add($a)` per
+   argument (a real ordered collection, immune to re-parsing) plus async
+   `Register-ObjectEvent`-based output capture to `StreamWriter` log files.
+2. **The stall detector watched the wrong file, guaranteeing a false-positive abort on every
+   run.** Nuitka writes almost everything — inclusion warnings, plugin notices, its own
+   progress lines — to **stderr**, not stdout; `nuitka_build.log` (stdout) stayed genuinely
+   empty for the entire build. The monitor loop tracked only `$LogPath` (stdout)'s
+   `LastWriteTime` for its "seconds since last output" stall signal, so that value tracked
+   `elapsed` 1:1 from t=0 regardless of real progress — every build looked permanently stalled
+   from the first poll. This fired for real on a relaunched build: `entry_point.build` had only
+   1 file (1KB) when the monitor declared contention and killed it — Nuitka was still in its
+   legitimately slow, single-core, low-CPU module-graph-building phase, not actually stalled.
+   Fixed by tracking the newer of stdout's and stderr's `LastWriteTime` instead of stdout alone.
+   Caught by directly inspecting the live telemetry CSV and the partial build directory after a
+   real run, not by re-reading the script.
+3. **`$proc.Kill($true)` (documented to kill the whole descendant tree) did not, in practice,
+   kill Nuitka's re-exec'd worker interpreter** — after the false-positive abort above threw,
+   `Get-CimInstance Win32_Process` still showed the actual compile process alive and consuming
+   RAM. Root cause not fully isolated (plausibly the worker re-parented itself outside the
+   tracked tree); fixed defensively rather than by diagnosing further: the abort path now also
+   sweeps any `python.exe` whose command line contains the build venv's path, by name, as a
+   backstop independent of whatever `Kill($true)` actually does.
+
+All three fixes are in the same `packaging/build_installer.ps1` now being relaunched. The
+actual successful build — Nuitka compile time, dist folder size, final installer size, and the
+fresh-Windows-VM gate — is the next checkpoint entry once that run completes.
