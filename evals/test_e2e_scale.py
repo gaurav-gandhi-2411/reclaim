@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from ctypes import wintypes
@@ -619,23 +620,89 @@ def test_restore_returns_bit_identical_files(scale_root: Path, tmp_path: Path) -
 # --- 6. scan cancellation -- documented gap, not fabricated -------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "GAP (not fabricated): no scan-cancellation mechanism exists anywhere in this codebase "
-        "today. Confirmed by reading reclaim/scanner.py (scan_tree has no cancellation token/"
-        "Event parameter of any kind) and grepping the whole src/reclaim tree "
-        "(`cancel|Cancel|abort|stop_scan`, case-insensitive) -- the only hits are the "
-        "dashboard's scan-CONFIRMATION dialog's Cancel button (src/reclaim/api/static/app.js) "
-        "and an unrelated ThreadPoolExecutor.shutdown(cancel_futures=False) call, neither of "
-        "which cancels an in-progress scan_tree walk. `reclaim.api.service.run_scan` runs a scan "
-        "to completion or raises (a real filesystem error), with no cooperative-cancellation "
-        "path in between. This test is left explicitly skipped, documenting the gap, rather than "
-        "asserting against a mechanism that doesn't exist -- see this task's final report for "
-        "the full finding."
-    )
-)
-def test_cancel_mid_scan_leaves_a_consistent_index() -> None:
-    raise AssertionError("unreachable -- see skip reason")
+def test_cancel_mid_scan_leaves_a_consistent_index(
+    scale_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un-skipped (Wave 1 scan cancellation): `scan_tree` now accepts a cooperative
+    `cancel_event` (see `reclaim.scanner.scan_tree`'s own docstring for the full mechanism --
+    checked at directory/entry granularity during the walk, every already-flushed batch stays
+    durable, `prune_unseen_under_root` is skipped entirely on a cancelled run).
+
+    This proves the real, load-bearing property a cancellation mechanism must guarantee against
+    this codebase's actual special-case-heavy fixture (long path, junctions, unicode names,
+    permission-denied dir, exact/near-dup sets -- not just a plain synthetic tree): a scan
+    cancelled genuinely MID-WALK (not before it starts, not after it's already finished) leaves
+    the index in a consistent, queryable state with no torn writes and no wrongly-pruned entries,
+    and a second, uncancelled `scan_tree` pass over the SAME root then completes the inventory --
+    the "resume" property the incremental design already gives for free (see
+    `test_resumed_scan_after_a_partial_stop_completes_correctly` above), now exercised from a
+    REAL cancellation rather than that test's narrower-root approximation.
+
+    `_HEARTBEAT_INTERVAL_SECONDS` monkeypatched to 0.0 (this repo's established convention for
+    exercising `on_progress`-driven behavior deterministically -- see
+    `tests/test_scanner.py::test_scan_tree_cancel_event_stops_the_walk_early`) makes
+    `scan_tree`'s progress callback fire on essentially every entry, so cancellation triggers on
+    a deterministic entry-count threshold, never a wall-clock race that could flake on a slower
+    CI runner.
+    """
+    import reclaim.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    manifest = build_scale_tree(scale_root, filler_file_count=DEFAULT_FILLER_FILE_COUNT)
+
+    db_path = scale_root.parent / "_index.sqlite3"
+    cancel_event = threading.Event()
+    _CANCEL_AT = 200  # well under this fixture's real entry count (>3,000 filler files alone)
+
+    def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+        if processed >= _CANCEL_AT:
+            cancel_event.set()
+
+    with ScanIndex(db_path) as index:
+        partial_stats = scan_tree(
+            manifest.root,
+            index,
+            incremental=False,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+        )
+        partial_inventory = index.full_inventory(under=manifest.root)
+
+        # The scan call itself returned cleanly -- no exception, no hang -- and genuinely
+        # stopped mid-walk rather than racing to completion before the threshold could land.
+        assert partial_stats.cancelled is True
+        assert partial_stats.entries_total >= _CANCEL_AT
+        assert partial_stats.files_pruned == 0
+        # No torn state: the index holds exactly what the (partial) scan reports, no more and
+        # no fewer -- every already-flushed batch is durable, nothing half-written.
+        assert len(partial_inventory) == partial_stats.entries_total
+
+        # A second, uncancelled pass over the SAME root/index completes the inventory --
+        # incremental=True exercises the real rescan-on-top-of-partial-state code path a real
+        # resume would use, not a from-scratch rebuild.
+        full_stats = scan_tree(manifest.root, index, incremental=True)
+        full_inventory = index.full_inventory(under=manifest.root)
+
+    assert full_stats.cancelled is False
+    # Proves the first pass really was partial (not accidentally already-complete): the second
+    # pass covers strictly more ground, and the final index strictly grew.
+    assert full_stats.entries_total > partial_stats.entries_total
+    assert len(full_inventory) == full_stats.entries_total
+    assert len(full_inventory) > len(partial_inventory)
+    assert full_stats.files_pruned == 0  # nothing was actually deleted from disk mid-test
+
+    # The completed index is a genuinely correct full inventory, not just "bigger" -- every
+    # special-case leaf entry test_full_scan_records_every_special_case_leaf_entry already pins
+    # in isolation must also be present here, post-cancellation-and-resume.
+    indexed_paths = {record.path for record in full_inventory}
+    assert manifest.long_path_file in indexed_paths
+    assert manifest.zero_byte_file in indexed_paths
+    assert manifest.large_file in indexed_paths
+    assert manifest.sparse_file.path in indexed_paths
+    for unicode_path in manifest.unicode_emoji_files:
+        assert unicode_path in indexed_paths, f"{unicode_path} missing from scan inventory"
+    if manifest.junction.created:
+        assert manifest.junction.link_path in indexed_paths
 
 
 # --- 7. a resumed scan (after a clean stop) completes correctly ---------------------------------

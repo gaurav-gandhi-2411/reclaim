@@ -135,6 +135,7 @@ def count_entries_fast(
     root: Path,
     *,
     on_progress: CountProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> int:
     r"""Fast, stat-free entry count under `root` — the "quick sample" `api.service.run_scan`'s
     live ETA is derived from (full-drive-scan-eta). The real `scan_tree` does one real
@@ -161,12 +162,22 @@ def count_entries_fast(
 
     Iterative (explicit stack), not recursive, matching `_walk_subtree`'s own convention — avoids
     Python's recursion limit on a real deep tree.
+
+    `cancel_event` (scan cancellation): checked at the top of every directory popped off the
+    stack AND on every individual entry — a single huge flat directory must not be able to delay
+    a cancellation until it's fully enumerated. `None` (the default) never checks anything, zero
+    behavior change for every existing caller. On cancellation this simply stops early and
+    returns whatever partial count was reached — this function's result only ever feeds an ETA
+    estimate, so a partial count is never treated as authoritative the way `scan_tree`'s own
+    `ScanStats.cancelled` is.
     """
     start_time = time.monotonic()
     count = 0
     last_heartbeat = start_time
     stack = [root]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         current_dir = stack.pop()
         try:
             dir_entries = list(os.scandir(long_path(current_dir)))
@@ -175,6 +186,8 @@ def count_entries_fast(
             continue
 
         for entry in dir_entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             try:
                 is_dir_entry = entry.is_dir(follow_symlinks=False)
                 is_reparse_point = bool(
@@ -321,6 +334,16 @@ class ScanStats:
     # real scan, not a one-off diagnostic A/B.
     guarded_stat_count: int
     fast_stat_count: int
+    # Scan cancellation: `True` only when a caller-supplied `cancel_event` was actually observed
+    # SET during this walk (never inferred from anything else, e.g. "returned early for some
+    # other reason") — `False` for a normal, uncancelled completion, matching every other bool
+    # field in this codebase's "explicit, never implied" convention. Every already-flushed batch
+    # is durable regardless (see `_BatchIndexWriter`'s docstring); this field is what tells a
+    # caller "the walk stopped before covering the whole tree, don't treat the aggregate counts
+    # above as a complete inventory" — `files_pruned` is always `0` on a cancelled run, since
+    # `prune_unseen_under_root` must never run against a partial `scan_seen` set (it would wrongly
+    # delete every real, still-existing entry this run simply never got to).
+    cancelled: bool
 
 
 class GitRepoCache:
@@ -700,6 +723,7 @@ def _walk_subtree(
     force_guard: bool,
     risk_counter: _RiskCounter,
     tracker: _ProgressTracker | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
@@ -717,6 +741,14 @@ def _walk_subtree(
     shared across every concurrent invocation (Wave 1 finding #1/#3) — records are written in
     `_WRITE_BATCH_SIZE`-sized batches as this walk progresses, never accumulated for the whole
     subtree and returned.
+
+    `cancel_event` (scan cancellation): the SAME shared `threading.Event` every concurrent
+    invocation of this function gets, checked at the top of every directory popped off the stack
+    AND on every individual entry (same granularity as `count_entries_fast`) — a single huge flat
+    directory must not delay a cancellation until it's fully enumerated. On cancellation the loop
+    simply stops; the unconditional `writer.flush(...)` below still runs on the way out, so
+    whatever this worker had pending is flushed as one clean, complete batch — never abandoned
+    mid-transaction (see `_BatchIndexWriter`'s docstring).
     """
     git_cache = GitRepoCache()
     skipped: list[SkippedPath] = []
@@ -725,6 +757,8 @@ def _walk_subtree(
     pending_unchanged: list[str] = []
     stack = [start]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         current_dir = stack.pop()
         dirs_visited += 1
         try:
@@ -735,6 +769,8 @@ def _walk_subtree(
             continue
 
         for entry in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             built = build_record(
                 entry,
                 current_dir,
@@ -771,6 +807,7 @@ def scan_tree(
     max_workers: int | None = None,
     on_progress: ScanProgressCallback | None = None,
     entries_estimated_total: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ScanStats:
     """Walks `root`, populates `index` with a complete inventory, and prunes rows for entries
     that no longer exist. One `ThreadPoolExecutor` task per top-level directory under `root`
@@ -795,6 +832,19 @@ def scan_tree(
     `_entry_is_risky`'s module comment) so a single stalled syscall can't wedge the walk
     silently, without paying a per-file thread-hop cost on the overwhelming majority of entries
     that are never actually at risk of stalling.
+
+    `cancel_event` (scan cancellation): optional, shared `threading.Event` — checked in the
+    top-level loop below AND passed straight through to every `_walk_subtree` worker (same
+    shared instance, so setting it once stops every in-flight worker, not just the top-level
+    loop). `None` (the default) is a permanent no-op — zero behavior change for every existing
+    caller. Every already-flushed `_WRITE_BATCH_SIZE` batch (top-level and per-worker) is already
+    durable in `index` the moment cancellation is observed (see `_BatchIndexWriter`'s docstring);
+    the unconditional `writer.flush(...)` calls (here and in `_walk_subtree`) additionally flush
+    whatever partial batch was still pending, so a cancelled run never abandons a half-written
+    transaction. `ScanStats.files_pruned` is forced to `0` and `index.prune_unseen_under_root`
+    is skipped entirely on a cancelled run — pruning assumes `scan_seen` reflects the WHOLE tree,
+    and running it against a partial walk would wrongly delete every real, still-existing entry
+    this run simply never got to. `ScanStats.cancelled` reports whether this actually happened.
     """
     start_time = time.monotonic()
     scanned_at = time.time()
@@ -828,6 +878,8 @@ def scan_tree(
     stat_executor = ThreadPoolExecutor(max_workers=_STAT_TIMEOUT_WORKERS)
     try:
         for entry in top_level_entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             built = build_record(
                 entry,
                 root,
@@ -861,6 +913,7 @@ def scan_tree(
                     force_guard=force_guard,
                     risk_counter=risk_counter,
                     tracker=tracker,
+                    cancel_event=cancel_event,
                 )
                 # as_completed, not executor.map: map()'s iterator yields in SUBMISSION order,
                 # blocking on an earlier-submitted-but-still-pending directory even once every
@@ -874,7 +927,10 @@ def scan_tree(
                         dirs_visited += result.dirs_visited
                         all_skipped.extend(result.skipped)
 
-            files_pruned = index.prune_unseen_under_root(root)
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            # See `cancel_event`'s docstring above: pruning against a partial `scan_seen` set
+            # would wrongly delete every real entry this cancelled run never reached.
+            files_pruned = 0 if cancelled else index.prune_unseen_under_root(root)
         except (OSError, sqlite3.OperationalError) as exc:
             if _is_disk_full(exc):
                 raise ScanDiskFullError("disk is full — free up space and try again") from exc
@@ -898,4 +954,5 @@ def scan_tree(
         ),
         guarded_stat_count=risk_counter.guarded,
         fast_stat_count=risk_counter.fast,
+        cancelled=cancelled,
     )

@@ -268,6 +268,16 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     `scan_tree`/`count_entries_fast` failure partway through a multi-drive full scan means the
     remaining drives' data would be incomplete anyway, so continuing past it would silently
     under-report free-space math for a scan that looks like it "completed".
+
+    Scan cancellation: `state.cancel_scan_event` (cleared by the route handler before this task
+    is ever scheduled -- see `AppState.cancel_scan_event`'s docstring) is threaded into every
+    `count_entries_fast`/`scan_tree` call below. A cancellation observed during "estimating"
+    stops before that root's real scan phase ever starts; a cancellation observed during
+    "scanning" is reported by `scan_tree` itself via `ScanStats.cancelled`. Either way, this
+    function stops processing any REMAINING roots (unlike a genuine failure, which also stops
+    immediately, a cancellation is not an error -- `status="cancelled"`, `error=None`, and
+    whatever partial aggregate stats accumulated so far are kept, same "never discard partial
+    progress" posture the failure branch already has).
     """
     roots = list(roots)
     drives_total = len(roots)
@@ -280,6 +290,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     elapsed_seconds_total = 0.0
     skipped_unreadable_count_total = 0
     skipped_unreadable_paths_sample: list[str] = []
+    cancelled = False
 
     try:
         state.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -308,7 +319,13 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                             state.scan_status, entries_processed=counted
                         )
 
-                entries_estimated_total = count_entries_fast(root, on_progress=on_count_progress)
+                entries_estimated_total = count_entries_fast(
+                    root, on_progress=on_count_progress, cancel_event=state.cancel_scan_event
+                )
+
+                if state.cancel_scan_event.is_set():
+                    cancelled = True
+                    break
 
                 with state.lock:
                     state.scan_status = _dataclass_replace(
@@ -333,6 +350,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                     incremental=True,
                     on_progress=on_scan_progress,
                     entries_estimated_total=entries_estimated_total,
+                    cancel_event=state.cancel_scan_event,
                 )
 
                 dirs_visited_total += stats.dirs_visited
@@ -354,6 +372,10 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                     state.scan_status = _dataclass_replace(
                         state.scan_status, drives_done=drive_index + 1
                     )
+
+                if stats.cancelled:
+                    cancelled = True
+                    break
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
         logger.warning("api.scan_failed", roots=[str(r) for r in roots], error=str(exc))
@@ -377,6 +399,34 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                 drives_total=drives_total,
                 drives_done=state.scan_status.drives_done,
             )
+        return
+
+    if cancelled:
+        with state.lock:
+            state.scan_status = ScanStatus(
+                status="cancelled",
+                root=state.scan_status.root,
+                started_at=started_at,
+                finished_at=time.time(),
+                error=None,
+                dirs_visited=dirs_visited_total,
+                entries_total=entries_total_total,
+                files_written=files_written_total,
+                files_unchanged=files_unchanged_total,
+                files_pruned=files_pruned_total,
+                elapsed_seconds=elapsed_seconds_total,
+                skipped_unreadable_count=skipped_unreadable_count_total,
+                skipped_unreadable_paths=tuple(skipped_unreadable_paths_sample),
+                phase=state.scan_status.phase,
+                current_drive=None,
+                drives_total=drives_total,
+                drives_done=state.scan_status.drives_done,
+            )
+            # A cancelled run can still have written real records to the index (every batch
+            # flushed before the stop point is durable -- see scanner.scan_tree's cancel_event
+            # docstring), so any cached AI analysis must be treated as stale exactly like a
+            # normal completion -- see ADR-0025.
+            state.scan_generation += 1
         return
 
     with state.lock:
