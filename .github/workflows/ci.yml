@@ -152,3 +152,19 @@ jobs:
       # high-severity finding), not a looser substitute for it.
       - name: pip-audit (fails the build on any known vulnerability)
         run: uvx pip-audit --desc -r requirements-audit.txt
+
+  manifest-provenance:
+    # 2026-08-05 audit: a metric in .portfolio/metrics.json without a
+    # committed artifact behind it can silently drift from what the portfolio
+    # site shows, with nobody able to tell -- this is a build failure, not a
+    # warning. See gg-portfolio's provenance.md wave 19 section.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Every manifest metric must have a committed artifact
+        run: python scripts/check_manifest_provenance.py

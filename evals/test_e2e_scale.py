@@ -69,12 +69,23 @@ _DOCUMENT_EMBEDDING_THRESHOLD = 0.95
 # (this fixture's own, much lower, number) -- kept separate on purpose.
 #
 # MEASURED (this session, this machine, worktree HEAD at the time of writing), 4 fresh runs of
-# the fast-tier scan alone: 6,075 / 6,321 / 6,886 / 9,777 entries/sec. Floor anchored to the
-# MINIMUM observed (6,075), not the mean/max -- matches this codebase's "conservative, not
-# just-above-measured" convention (see evals/test_scanner_perf.py's own floor-setting comment).
-# 70% tolerance on that minimum -> ~4,253 entries/sec; rounded DOWN to 4,000 for extra headroom on
-# a slower/more-contended CI runner than this dev machine.
-_FAST_TIER_MIN_ENTRIES_PER_SECOND = 4_000.0
+# the fast-tier scan alone: 6,075 / 6,321 / 6,886 / 9,777 entries/sec. The 4,000 floor this
+# produced (70% of the 6,075 minimum, rounded down "for extra headroom on a slower CI runner")
+# turned out to be WRONG in practice, not just untested guesswork: real GitHub Actions CI
+# (windows-latest) flaked on this exact assertion on unchanged code -- PR #31, run
+# 30998493407, first attempt measured 2,368 entries/sec (well under 4,000) and FAILED; an
+# immediate rerun of the identical commit PASSED. That's real CI-fleet hardware/scheduling
+# variance, not a code regression (rule: flaky tests get fixed the day they flake, not tolerated).
+# Root cause this floor didn't account for: the fast tier's own scan is very short (~1-1.5s wall
+# time for ~3,100 entries), so a fixed amount of one-time overhead (Defender scanning freshly
+# created fixture files, OS filesystem cache still cold, a GC pause, a noisy-neighbor VM) is a much
+# larger RELATIVE hit on a ~1s measurement than on the 100k-tier's ~170s one -- short-duration
+# throughput floors are inherently noisier than long ones, and 4,000 didn't leave real margin for
+# that. New floor set well below the one observed real CI failure (2,368), not re-derived from the
+# dev-machine-only sample above -- this is now a "catch an order-of-magnitude regression" tripwire,
+# not a tight performance gate; the dev-machine numbers above stay as a local sanity-check
+# reference, not what CI is actually held to.
+_FAST_TIER_MIN_ENTRIES_PER_SECOND = 1_200.0
 
 # MEASURED (this session, this machine), one fresh run (the 100k+ tier is too slow to sample
 # repeatedly in routine development -- see this test's own @pytest.mark.scale gating): 7,255
