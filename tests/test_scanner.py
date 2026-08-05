@@ -4,6 +4,7 @@ import ctypes
 import os
 import shutil
 import subprocess
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -896,3 +897,121 @@ def test_query_git_clean_other_failure_still_warns(
 
     assert result is False
     assert any(event == "scan.git_status_failed" for event, _ in recorder.warnings)
+
+
+# --- scan cancellation ---------------------------------------------------------------------
+
+
+def _make_fanout_tree(root: Path, *, num_dirs: int = 8, files_per_dir: int = 300) -> int:
+    """A tree wide enough (many top-level directories, each with many files) that a mid-walk
+    `cancel_event` genuinely has walk work left to interrupt across several concurrent
+    `ThreadPoolExecutor` workers, not just a handful of files any one thread could race through
+    before ever checking the event again. Returns the total entry count (dirs + files) a full,
+    uncancelled `scan_tree` would report."""
+    root.mkdir(parents=True, exist_ok=True)
+    for d in range(num_dirs):
+        subdir = root / f"dir_{d}"
+        subdir.mkdir()
+        for f in range(files_per_dir):
+            (subdir / f"f_{f}.txt").write_text("x", encoding="utf-8")
+    return num_dirs + num_dirs * files_per_dir
+
+
+def test_scan_tree_cancel_event_stops_the_walk_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `cancel_event` set partway through a real walk must actually stop it well short of the
+    full tree -- not just be accepted as a parameter and ignored. `_HEARTBEAT_INTERVAL_SECONDS`
+    monkeypatched to 0.0 (this file's own established convention, see
+    `test_scan_tree_reports_interval_gated_progress_with_estimated_total`) makes `on_progress`
+    fire on essentially every entry, so the cancellation trigger is a deterministic entry-count
+    threshold rather than a wall-clock race that could flake on a slow CI runner."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    cancel_event = threading.Event()
+    _CANCEL_AT = 50  # well under total_entries (2408), leaves plenty of walk work to interrupt
+
+    def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+        if processed >= _CANCEL_AT:
+            cancel_event.set()
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index, on_progress=on_progress, cancel_event=cancel_event)
+        inventory = index.full_inventory(under=root)
+
+    assert stats.cancelled is True
+    assert stats.entries_total >= _CANCEL_AT  # at least got to the trigger point
+    assert stats.entries_total < total_entries  # but genuinely stopped short of the full tree
+    # No torn state: every record `scan_tree` reports as written is durably readable back, no
+    # more and no fewer -- a cancelled run's aggregate counts describe exactly what's in the
+    # index, not an overcount of records that never actually landed.
+    assert len(inventory) == stats.entries_total
+    assert stats.files_pruned == 0
+
+
+def test_scan_tree_cancel_event_never_prunes_a_partial_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The most important consistency property: a cancelled rescan must NEVER delete real,
+    still-existing entries it simply didn't get back around to visiting. `prune_unseen_under_root`
+    assumes `scan_seen` reflects the WHOLE tree -- running it against a partial walk would treat
+    every not-yet-revisited entry as "gone" and wrongly delete it."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        # Seed the index with a full, uncancelled inventory first -- this is the "real,
+        # still-existing data" a cancelled rescan must not touch.
+        first = scan_tree(root, index)
+        assert first.cancelled is False
+        assert first.entries_total == total_entries
+
+        cancel_event = threading.Event()
+
+        def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+            if processed >= 50:
+                cancel_event.set()
+
+        second = scan_tree(root, index, on_progress=on_progress, cancel_event=cancel_event)
+        inventory = index.full_inventory(under=root)
+
+    assert second.cancelled is True
+    assert second.files_pruned == 0
+    # Every one of the original entries survives, even the ones the cancelled second pass never
+    # got back around to re-visiting.
+    assert len(inventory) == total_entries
+
+
+def test_scan_tree_cancel_event_none_is_the_default_and_never_cancels(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        # Every pre-existing scan_tree test in this file already calls it with no cancel_event
+        # at all -- this makes the "default None, zero behavior change, never cancelled" contract
+        # explicit, matching this file's own on_progress=None convention.
+        stats = scan_tree(root, index)
+
+    assert stats.cancelled is False
+
+
+def test_count_entries_fast_cancel_event_stops_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    cancel_event = threading.Event()
+
+    def on_progress(counted: int, _elapsed: float) -> None:
+        if counted >= 50:
+            cancel_event.set()
+
+    result = count_entries_fast(root, on_progress=on_progress, cancel_event=cancel_event)
+
+    assert 50 <= result < total_entries

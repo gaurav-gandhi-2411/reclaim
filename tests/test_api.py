@@ -18,6 +18,7 @@ from reclaim.config import (
     SafetyConfig,
 )
 from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
+from reclaim.index import ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 from reclaim.models import Tier
 
@@ -200,6 +201,103 @@ def test_scan_already_running_returns_409(tmp_path: Path) -> None:
     response = client.post("/api/scan", json={"path": str(target)})
     assert response.status_code == 409
     assert "already running" in response.json()["detail"]
+
+
+# --- scan cancellation ---------------------------------------------------------------------
+
+
+def test_scan_cancel_endpoint_is_a_no_op_when_nothing_is_running(tmp_path: Path) -> None:
+    """Safe to call speculatively (e.g. a UI racing its own poll loop) -- never a 409, always
+    the current (unchanged) status."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "idle"
+
+
+def test_scan_cancel_endpoint_stops_a_running_scan_with_a_consistent_partial_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real cancellation, end to end through the actual route: `service.run_scan` is run in a
+    real background `threading.Thread` (matching `test_run_apply_completes_and_leaves_a_durable_
+    manifest_with_zero_status_polls`'s own established pattern -- TestClient runs BackgroundTasks
+    SYNCHRONOUSLY as part of the request/response cycle, so driving the scan through
+    `client.post("/api/scan", ...)` itself would block until the whole scan finished and leave no
+    way to interleave a genuinely concurrent cancel), while the test's own thread issues a real
+    `POST /api/scan/cancel` once the scan has demonstrably made progress -- not before it starts,
+    not after it's already finished."""
+    import threading
+
+    import reclaim.scanner as scanner_module
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    # Deterministic, not a wall-clock race: fires on nearly every entry (this file's own
+    # `test_full_drive_scan_completes_correctly_with_maximal_progress_callback_frequency` already
+    # establishes this convention for exercising the live progress-republishing wiring).
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+
+    root = tmp_path / "tree"
+    num_dirs, files_per_dir = 8, 300
+    for d in range(num_dirs):
+        subdir = root / f"dir_{d}"
+        subdir.mkdir(parents=True)
+        for f in range(files_per_dir):
+            (subdir / f"f_{f}.txt").write_text("x", encoding="utf-8")
+    total_entries = num_dirs + num_dirs * files_per_dir
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "other"))
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+
+    started_at = time.time()
+    with state.lock:
+        # Mirrors exactly what `POST /api/scan`'s route handler does before scheduling
+        # `run_scan` -- see `AppState.cancel_scan_event`'s docstring for why the clear happens
+        # here, synchronously, rather than inside `run_scan` itself.
+        state.cancel_scan_event.clear()
+        state.scan_status = ScanStatus(
+            status="running",
+            root=root,
+            started_at=started_at,
+            phase="estimating",
+            current_drive=root.as_posix(),
+            drives_total=1,
+            drives_done=0,
+        )
+
+    thread = threading.Thread(target=service.run_scan, args=(state, [root], started_at))
+    thread.start()
+
+    deadline = time.monotonic() + 10.0
+    made_progress = False
+    while time.monotonic() < deadline:
+        with state.lock:
+            processed = state.scan_status.entries_processed or 0
+            still_running = state.scan_status.status == "running"
+        if not still_running:
+            break
+        if processed >= 20:
+            made_progress = True
+            break
+        time.sleep(0.005)
+    assert made_progress, "scan never reached the progress threshold before finishing/timing out"
+
+    response = client.post("/api/scan/cancel")
+    assert response.status_code == 200
+
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "run_scan did not stop within 30s of being cancelled"
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "cancelled"
+    assert status["error"] is None
+    assert status["entries_total"] is not None and status["entries_total"] < total_entries
+    assert status["files_pruned"] == 0
+
+    with ScanIndex(state.db_path) as index:
+        inventory = index.full_inventory(under=root)
+    # No torn state: the index is consistent with exactly what the (cancelled) scan reported.
+    assert len(inventory) == status["entries_total"]
 
 
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
