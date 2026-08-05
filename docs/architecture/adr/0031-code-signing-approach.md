@@ -182,22 +182,24 @@ the same commit as this ADR:
 
 - **What the user actually sees** — the SmartScreen unrecognised-app flow, step by step, so the
   release notes and support answers describe the real UI rather than paraphrasing it.
-- **Publishing and verifying the SHA-256 checksum** — the manual `Get-FileHash` command that
-  produces the sidecar, the exact sidecar format, and copy-pasteable verification instructions to
-  put in front of end users.
+- **Publishing and verifying the SHA-256 checksum** — the `Get-FileHash` step that produces the
+  sidecar, the exact sidecar format, and copy-pasteable verification instructions to put in front
+  of end users.
 
-The checksum sidecar was verified to exist, and verified *not* to be automatic:
-`packaging/build_installer.ps1` (590 lines) contains no `Get-FileHash`, no `sha256`, and no
-checksum step — its last action is to print the installer size. The sidecar is produced by hand at
-publish time. All four published releases carry one
+At the time this ADR was written, the checksum sidecar was verified to exist and verified *not* to
+be automatic: `packaging/build_installer.ps1` (590 lines) contained no `Get-FileHash`, no
+`sha256`, and no checksum step — its last action was to print the installer size. The sidecar was
+produced by hand at publish time. All four published releases carry one
 (`api.github.com/repos/gaurav-gandhi-2411/reclaim/releases`, fetched 2026-08-05: v1.0.0, v1.1.0,
 v1.2.0, v1.3.0 each have exactly `reclaim-setup.exe` and `reclaim-setup.exe.sha256`, the sidecar
 84 bytes in every case), and v1.3.0's sidecar downloads as
 `7f02ab7b488e51212e7bde0e686c742b448d90073df103da9ce2885f6460d7c3  reclaim-setup.exe` — matching
-the hash PLAN.md's 2026-07-25 checkpoint recorded for that release. Automating the sidecar inside
-`build_installer.ps1` is an obvious follow-up but is deliberately **not** done here: this is a
-research/docs pass and a build-script change belongs in its own commit with its own build
-verification.
+the hash PLAN.md's 2026-07-25 checkpoint recorded for that release. **Update, same wave:**
+`build_installer.ps1` now generates this sidecar automatically as the last action of its Inno Setup
+packaging step and prints the hash to stdout — see `packaging/RELEASE_RUNBOOK.md`'s "Publishing:
+SHA-256 checksum sidecar" section for the current, byte-verified behaviour. The re-download and
+re-hash of the *published* asset (the round-trip integrity check) remains manual by necessity — it
+has to happen after the artifact reaches GitHub, which the build script cannot do.
 
 ## Consequences
 
