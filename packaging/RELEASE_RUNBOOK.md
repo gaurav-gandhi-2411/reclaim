@@ -114,7 +114,20 @@ investigate before retrying, don't just re-run.
       an exact confirmation phrase, by design, so it can't happen by accident. Repeat f–g with
       "Vault (restorable)" selected in the Quarantine method dropdown instead of Recycle Bin.
       Switch back to Safe mode afterward (no confirmation needed for that direction).
-   i. **Uninstall.** From the Start Menu, run "Uninstall Reclaim." It should prompt "Also delete
+   i. **Cancel a scan** (new this session). Start "Clean My Computer" (Simple mode) or a scan
+      from Advanced mode on a large-enough folder that it's still running after a couple
+      seconds. A "Cancel scan" button should appear next to the scan control while it's running
+      (hidden the rest of the time). Click it. The scan should stop within a few seconds (not
+      instantly, not hang) and the status should read as cancelled — NOT styled as an error
+      banner. Re-running the same scan afterward should complete normally and pick up where the
+      cancelled one left off (already-indexed items aren't redone from scratch).
+   j. **Update check** (new this session). It's OFF by default, matching `PRIVACY.md`'s "no
+      phone-home" promise — the existing static "Check for updates" link should still work as a
+      manual fallback either way. Only test the automatic path if you deliberately opt in via
+      `config.toml`'s `[update_check] enabled = true`; if you do, a small badge should appear
+      once it detects a newer release, with no visible change at all if you leave it off (that's
+      correct behavior, not a bug to chase).
+   k. **Uninstall.** From the Start Menu, run "Uninstall Reclaim." It should prompt "Also delete
       this data folder now?" — default answer is No (data under `data\` including anything
       still in the vault survives uninstall by default, matching the "never lose data by
       surprise" posture). Confirm the app is actually removed from Programs/Start Menu after.
@@ -122,6 +135,73 @@ investigate before retrying, don't just re-run.
    Report pass/fail per step, not just an overall verdict — a step that "mostly worked but the
    wording was a little off" is still useful signal, not a failure to hide.
 4. Update the "Expected numbers" table above with the real measurement + commit SHA.
+
+## If a VM gate step fails — what to capture
+
+Don't just note "it broke" — grab this so the failure is reportable, not mysterious:
+
+- **The exact step letter (a-k above) and what you saw** vs. what this doc says you should see —
+  a screenshot of the actual screen beats a paraphrase.
+- **Click "Copy diagnostics"** (top-right header button, present on every screen) — it copies
+  Reclaim's version, current mode, whether the AI extra is detected as installed, the OS version,
+  the log file path, and the last ~200 lines of the structured JSON log to your clipboard in one
+  click. Paste that into the report as-is.
+- **The log file directly**, if the app is too broken for the in-app button to work:
+  `<install folder>\data\logs\reclaim.log` (JSON lines, rotated, capped at a few MB — the
+  install folder is whatever the wizard showed you at install time, normally
+  `%LocalAppData%\Programs\Reclaim` for a per-user/non-admin install, which this always is).
+- **The quarantine manifest**, if a vault-move/restore step looks wrong:
+  `<install folder>\data\quarantine\manifest.jsonl`.
+- **The mode log**, if a Safe/Power mode switch looks wrong:
+  `<install folder>\data\mode_log.jsonl`.
+- **If the app won't even start** (no browser window, no error dialog you can screenshot): check
+  `%LocalAppData%\CrashDumps\reclaim.exe.*.dmp` — Windows' own crash-dump capture for an
+  unhandled native crash, independent of anything Reclaim's own logging can catch. Its mere
+  presence/absence is itself useful signal (a dump means a hard native crash; its absence with a
+  silently-vanished process points more toward a missing-DLL-style launch failure — see the
+  runtime-dependency note below).
+- **A screenshot of the actual error**, if a "missing DLL" style Windows dialog appears on
+  launch — the exact DLL name it names is the single most useful piece of information for
+  diagnosing a genuinely missing runtime dependency (see below).
+
+## Runtime dependencies the clean VM does (and doesn't) need
+
+Verified by inspecting the actual dist folder contents (`packaging\build\entry_point.dist\`),
+not assumed from what Nuitka is supposed to do:
+
+- **Visual C++ runtime: bundled, not required on the VM.** `vcruntime140.dll`,
+  `vcruntime140_1.dll`, `msvcp140.dll`, `msvcp140_1.dll`, and `vcomp140.dll` all ship directly in
+  the dist folder root (confirmed present via directory listing 2026-08-05). `faiss` additionally
+  carries its own private copy under `faiss_cpu.libs\msvcp140.dll`. A clean VM should NOT need
+  the separately-installed "Visual C++ Redistributable" package — if you see an error naming one
+  of these DLLs as missing, that's a real packaging bug (something didn't get bundled), not a
+  VM-provisioning gap to work around by installing the redistributable yourself.
+- **Universal C Runtime (`ucrtbase.dll` etc.): NOT bundled, relies on the OS.** This is expected,
+  not a gap — Windows 10 (1607+, i.e. every supported version) and Windows 11 ship UCRT as a
+  built-in OS component, not something an app bundles. Only a genuinely ancient or deliberately
+  stripped-down Windows image would be missing it. If the VM is a minimal/Server Core-style image
+  rather than a normal Windows 10/11 desktop install, this is the first thing to suspect on a
+  launch failure.
+- **.NET / WebView2: no dependency found.** Grepped `reclaim.iss` and the dist folder contents —
+  nothing references either. Reclaim's UI is a normal web page opened in the user's OS-default
+  browser (`webbrowser.open`), not an embedded WebView.
+- **A default browser must be registered.** Reclaim doesn't bundle one — it shells out to
+  whatever the OS considers the default (Edge, out of the box on every Windows 10/11 install
+  unless deliberately changed). If nothing opens after install, check whether a default browser
+  is actually set before assuming it's a Reclaim bug.
+- **Architecture: x64 only.** `reclaim.iss` sets `ArchitecturesAllowed=x64compatible` — a native
+  x64 or ARM64-with-x64-emulation VM works; a VM with x64 emulation disabled will not.
+- **Admin rights: never needed.** `PrivilegesRequired=lowest` in `reclaim.iss`, and
+  `reclaim.elevation.assert_not_elevated` refuses to run elevated even if you right-click "Run as
+  administrator" — this is a deliberate invariant, not an oversight, so don't try to "fix" a
+  problem by elevating it.
+
+**Honest limit on this list**: this is what's bundled vs. what's assumed present from the OS,
+inferred from inspecting the current dist folder and installer script — it has NOT been verified
+against an actual clean VM with zero dev tooling, which is exactly what your VM gate run is for.
+If the app fails to launch at all, the single most diagnostic thing you can do is screenshot
+whatever Windows error dialog appears (see "If a VM gate step fails" above) — a named missing DLL
+there directly contradicts or confirms this list.
 
 ## Publishing: SHA-256 checksum sidecar (automated by the build script)
 
