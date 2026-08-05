@@ -1815,6 +1815,530 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
 - Closed stale PR #25 (`chore/ws-c-checkpoint`) — its content was superseded by the checkpoint
   merged in #27.
 
+## Wave 1 — Reliability, Performance & Packaging Overhaul (`spec-reclaim-overhaul.md`)
+
+New work order (2026-07-30), separate from the v1.0-v1.3 build above. Branch:
+`wave-1-scan-reliability`. Priority order per spec: P0 scan reliability/perf -> P0 AI
+packaging -> P1 E2E + startup -> P2 identity + distribution hardening. Two mandatory stop
+points: (1) report scan-failure root cause before fixing; (2) report ONNX quality-parity
+delta before dropping torch.
+
+### 2026-07-30 — Premise audit + P0-A diagnosis complete (STOP POINT 1)
+
+**Premise audit** (rule 99 — verified the spec's claims against current code before acting;
+full detail in the orchestrator's report to GG): of the spec's 5 problem claims, 2 are
+partially stale (Nuitka is already `--standalone`, not `--onefile`; crash diagnostics and
+uninstall vault handling already shipped in v1.2/v1.3) and 3 are still real (AI packaging —
+ADR-0029 confirms "proposed, not built", torch/open-clip-torch still hard `[ai]`-extra
+deps, ~1,028MB delta; `longPathAware` manifest genuinely absent from `packaging/reclaim.iss`;
+E2E has a real foundation (`evals/test_executor_e2e.py`, golden fixture tree) but no 100k+
+scale tier and no CI-gated perf budget, matching the spec).
+
+**P0-A diagnosis** — reproduced on GG's real, live home directory (`C:\Users\gaura`, not a
+synthetic fixture): 2,672,201 entries / 284,479 dirs, live OneDrive cloud-sync root present,
+dozens of live git repos/venvs/conda envs, several protected paths (`.ssh`, `.aws`,
+`.gnupg`, `.docker`). Ran `reclaim scan` via the real `.venv` CLI entry point (not `uv run`'s
+wrapper — that only measures the launcher shim; the actual work happens in a grandchild
+`python.exe`, confirmed via `Get-CimInstance Win32_Process` process-tree inspection), full
+structlog logging on, wall-clock + 10s-interval `Get-Process` memory sampling against the
+correct PID throughout.
+
+**Result: the scan did NOT crash.** Exit code 0, `2,672,201 entries ... in 425.23s`, 1
+skipped/unreadable path (a self-inflicted permission-denied temp dir from an unrelated
+concurrent session, not a Reclaim bug), 2.35GB SQLite index on disk. So the spec's literal
+"scans... FAIL" claim did not reproduce at this scale on this machine — reported honestly,
+not force-fit to match the brief.
+
+**But real, previously-undocumented architectural root causes were found that explain both
+"looks like it's failing" and a genuine failure mode at larger scale than tested here**,
+all evidenced from the run above:
+
+1. **Unbounded in-memory record accumulation (the most likely real crash mechanism at true
+   full-drive scale).** `scanner.py::scan_tree` holds every `FileRecord` for the entire walk
+   in one Python list (`all_records`, plus each worker thread's own `_SubtreeResult.records`)
+   and writes to SQLite exactly ONCE, at the very end, in a single `upsert_records()` call —
+   there is no streaming/batching despite `index.py` already having a `_WRITE_BATCH_SIZE`-style
+   pattern in `dedup.py` it could mirror. Measured: peak working set 5,085MB for 2.67M files
+   (~1.9KB/record). This scan only covered the user profile, not `C:\`'s full ~10-20M+ files
+   (Windows, Program Files, WindowsApps, hidden system volumes) — linear extrapolation puts a
+   real full-drive scan at 15-25GB+ peak RSS, which will OOM on any machine with less RAM than
+   that free. This directly contradicts the spec's own explicit requirement ("never materialise
+   all file records in a list") and is the strongest candidate for genuine, reproducible
+   real-world scan failure on typical consumer hardware. Not yet fixed — Task P0-A-fix.
+2. **The raw CLI `scan` path has zero progress output for the entire run.**
+   `cli.py::_run_scan` calls `scan_tree(...)` without passing `on_progress`, even though
+   `scan_tree` already supports it (added for the dashboard's SIMPLE-mode ETA). A CLI user
+   (or this diagnosis) sees nothing for 7+ minutes on a 2.67M-file scan — indistinguishable
+   from a hang. The dashboard/API path (`api/service.py::run_scan`) already wires progress
+   correctly; this gap is CLI-only but real.
+3. **No timeout guard on the scan's own per-entry `os.stat()` calls.** `dedup.py`'s hash stage
+   has a 30s-timeout thread-guard (`_hash_with_guard`) specifically because a locked/pathological
+   file must never wedge the pipeline; `scanner.py::build_record`'s `os.stat()` call has no
+   equivalent. Combined with `ThreadPoolExecutor.map()`'s submission-order-blocking iteration
+   in `scan_tree` (a completed-but-later-submitted directory's results sit unconsumed behind
+   one still-pending, earlier-submitted directory), a single stalled stat syscall on one
+   top-level directory can silently stall the entire scan's visible output indefinitely, with
+   no error ever raised. Not reproduced today (no stat call hung on this run) but structurally
+   real and unguarded — plausible root cause for reports of scans that never return.
+4. **No WAL mode / no batched transactions.** `index.py::ScanIndex.__init__` opens SQLite with
+   plain `sqlite3.connect()` (default rollback-journal, default `synchronous=FULL`) and creates
+   all 6 indices (including a `COLLATE NOCASE` index) up front, before any bulk insert — the
+   exact anti-pattern the spec calls out. Compounds finding 1: because nothing is written
+   until the walk fully completes, a crash/OOM near the end of a multi-hour full-drive walk
+   loses 100% of that walk's progress, not just the tail — "fails, and has to start over" is a
+   direct, mechanical consequence of findings 1+4 together, not two independent complaints.
+5. **Secondary, lower-priority finding**: `git status --porcelain` fails with exit 128
+   (consistent with Git's "dubious ownership" safe.directory protection) on a large fraction of
+   real repo roots under `%TEMP%` on this machine — fails closed to `git_repo_clean=False`
+   (safe, per `_query_git_clean`'s own documented conservative default) but adds subprocess
+   overhead and rotates the diagnostic log fast at scale. Not a correctness bug; worth a cheap
+   fix (recognize exit 128 + "dubious ownership" and skip the subprocess call rather than
+   treating it as a generic failure) while touching this code for the timeout fix (#3) anyway.
+
+**STOP POINT 1 — reported to GG before proceeding to fix**, per spec's explicit mandatory
+checkpoint. Next (pending go-ahead): fix findings 1-5 with regression tests proving bounded
+memory and CLI progress output on a scaled fixture, then move to P0-B (AI/ONNX).
+
+### 2026-07-30 — Findings 1-5 fixed, re-verified on the same real disk (STOP POINT 1 closed)
+
+GG confirmed the diagnosis and specified the fix order (1+4 together, then 2, then 3, then 5),
+explicitly naming the real mechanism: 5,085MB peak RSS for 2.67M files extrapolates to 15-25GB
+on a true full-drive scan, which is the actual OOM behind "scans take forever and fail."
+
+**Findings #1 + #4 (streaming batched writes, WAL, seen-table pruning):**
+- `scanner.py`: `_BatchIndexWriter` replaces the whole-walk `all_records` list — every worker
+  (`_walk_subtree`, and the top-level entries loop) now classifies each record as changed/new
+  vs. unchanged inline (`_classify_record`) and flushes in `_WRITE_BATCH_SIZE=5000`-record
+  batches through a shared, lock-guarded writer, so peak memory is bounded by
+  `worker_count * _WRITE_BATCH_SIZE`, not by total file count. A crash mid-walk now loses at
+  most the last unflushed batch per worker, not the entire walk.
+- `index.py`: `PRAGMA journal_mode=WAL` + `PRAGMA synchronous=NORMAL` added to every `ScanIndex`
+  connection (universal, not scan-specific — `apply`/`purge` writes benefit too).
+  `begin_scan_tracking`/`record_seen`/`prune_unseen_under_root`/`end_scan_tracking` replace
+  `scan_tree`'s use of `prune_missing`: an exact set-difference (same semantics, not a
+  `last_scanned`-timestamp approximation — `prune_missing`'s own docstring documents a
+  deliberate prior choice not to rewrite unchanged rows just to prove they still exist, which a
+  timestamp approach would have undone) computed via a per-scan SQLite TEMP TABLE anti-join
+  instead of two full Python collections. `prune_missing` itself is untouched and still
+  directly tested — only `scan_tree`'s caller-side usage changed.
+- **Deferred index creation (part of finding #4's original scope) was investigated and
+  deliberately NOT done**: `tests/test_query_plan_coverage.py`'s `indexed_bulk` fixture
+  constructs a fresh `ScanIndex` and inserts 5,000 rows directly (no `scan_tree` involved) then
+  asserts every query hits an index — eagerly creating all 6 indices in `ScanIndex.__init__` is
+  a real, tested contract for every non-scan caller (`apply`/`purge`/`serve`/`recover`/tests),
+  not just an accident. Deferring it would require every such caller to remember to call a new
+  `ensure_indexes()`, for a one-time bulk-load win that's minor next to the multi-hour scan
+  itself — not worth the risk. Documented here rather than silently dropped.
+- `stat_cache` is now only loaded when `incremental=True` (previously always loaded,
+  unconditionally, even though `prune_missing`'s old Python set-difference doesn't need it when
+  `incremental=False` — the new SQL-side prune never needed it at all) — a `--full`/forced
+  rescan of an existing large index no longer pays for it.
+
+**Finding #2 (CLI progress):** `cli.py::_run_scan` now wires `on_progress` to a heartbeat
+printer (`_on_scan_progress_printer`) at the existing `_HEARTBEAT_INTERVAL_SECONDS=5.0` cadence.
+Deliberately did NOT mirror the dashboard's `count_entries_fast` estimating pre-pass (a second
+full stat-free tree walk purely to produce a total/ETA) — doubling I/O on every CLI invocation
+isn't worth it just to show a growing count instead of a count-with-denominator; "clearly still
+working" was the actual gap, not an ETA.
+
+**Finding #3 (stat timeout guard + as_completed):** `_guarded_stat` mirrors `dedup.py`'s
+`_hash_with_guard` pattern exactly — every `os.stat()` call in the walk now goes through a
+shared, `_STAT_TIMEOUT_WORKERS=8`-sized pool with a 30s guard (`stat_executor=None` default
+preserves `build_record_for_path`'s existing unguarded behavior — it's a one-off lookup, never
+a scan hot loop). `scan_tree`'s worker-result consumption switched from `executor.map()`
+(submission-order-blocking — a slow first-submitted directory delays consuming every later,
+already-finished one) to `as_completed()`.
+- **Honest performance cost, measured, not assumed (rule 65a)**: an isolated A/B on a 4,025-file
+  fixture (same run, same machine, only `_guarded_stat`'s executor path toggled) —
+  **10,696 files/sec without the guard, 6,323 files/sec with it (~41% slower)**. This is very
+  likely the dominant driver of the real-disk before/after wall-time regression below (a
+  same-ratio projection from the OLD 425s baseline lands at ~718s, close to the observed 681s).
+  Both figures stay far above the CI smoke floor (150/sec) and the spec's ~1,667/sec target, and
+  no stat call has ever actually been observed to hang on either real run — this guard is
+  prophylactic, not a fix for an observed failure. Flagged as a real, disclosed trade-off, not
+  silently absorbed; a cheaper mitigation (e.g. adaptive guarding only when a directory is
+  already running slow) is a reasonable future refinement if the wall-time cost proves to matter
+  in practice, not implemented here since it wasn't asked for and adds real complexity.
+
+**Finding #5 (git "dubious ownership" noise):** `_query_git_clean` now catches
+`CalledProcessError` specifically and checks `.stderr` for Git's "detected dubious ownership"
+text, logging at `debug` (silent by default) instead of `warning` for that one case — every
+other git failure still warns, unchanged. Still fails safe (`git_repo_clean=False`) either way;
+this was purely about log-noise volume, not behavior.
+
+**Also investigated per GG's "continue to" list — both already fully solved, nothing to build:**
+- **`\\?\` prefixing**: `long_path()` (D12) already wraps every `os.scandir`/`os.stat` call
+  throughout the walk, `GitRepoCache.repo_root_for`, and `executor.py`'s vault/move path (ADR-
+  0004) — comprehensive, pre-existing, covered by `test_scan_tree_walks_past_max_path_without_
+  dropping_the_subtree` and siblings.
+- **Staged size -> partial-hash -> full-hash dedup**: `dedup.py::find_duplicate_clusters`
+  already implements exactly this (size bucket -> 64KB partial hash -> BLAKE3 full hash only on
+  partial collisions), with its own 30s per-file hash-read timeout guard and batched writes —
+  the spec's P0-A "never hash everything" ask was already built before this Wave.
+- **`longPathAware` app manifest: investigated, deliberately NOT added.** Nuitka 4.1.3 (this
+  project's pinned build tool) has no flag for it, and this machine has neither `mt.exe` nor
+  `rc.exe` (Windows SDK) to post-process the compiled binary's manifest — adding it would mean
+  pulling in a whole new, heavyweight build-toolchain dependency this project doesn't otherwise
+  need. Given the app's OWN filesystem code already comprehensively `\\?\`-prefixes every real
+  touchpoint (the point above), `longPathAware`'s remaining practical value is marginal — it
+  would only matter for Nuitka/CPython-runtime-internal file access that doesn't go through
+  Reclaim's own path-handling convention, not for anything Reclaim's application code does.
+  Judgment call (rule 54a): not worth the new toolchain dependency for that residual, unproven
+  benefit. Revisit if a concrete failure is ever found that traces to this specifically.
+
+**Re-verification: same real machine, same `C:\Users\gaura` target, direct `python.exe`
+invocation (not `uv run`'s wrapper) for accurate memory sampling — corrected from the first
+diagnostic run, which was actually watching `uv run`'s launcher shim two process-hops removed
+from the real worker (caught via `Get-CimInstance Win32_Process` process-tree inspection; the
+BEFORE numbers already accounted for this).**
+
+| Metric | Before (2026-07-30 diagnosis) | After (this fix) | Change |
+|---|---|---|---|
+| Peak RSS | 5,085 MB | **244 MB** | **-95.2%** |
+| Wall time | 425.23s | 672.41s | +58.1% |
+| Entries scanned | 2,672,201 | 2,624,864 | real disk changed between runs (other sessions' activity) |
+| Dirs visited | 284,479 | 285,114 | ″ |
+| Skipped/unreadable | 1 | 1 | same |
+| Index DB size on disk | 2.35 GB | 2.28 GB | ″ |
+| Exit code | 0 (no crash either time) | 0 | — |
+| CLI progress output | none (silent for entire run) | heartbeat every 5s with real growing counts (verified live: `2,590,283 entries visited (655s elapsed)` etc.) | fixed |
+
+The peak-RSS fix is the one that matters: GG's own framing (2.67M-file profile scan
+extrapolating to 15-25GB on a full `C:\`) is the confirmed root cause of real OOM failures at
+true full-drive scale, and this run proves it bounded at 244MB regardless — a ~21x reduction,
+holding flat rather than climbing for the entire 672s run (see `evals/test_scanner_memory.py`
+for the structural proof at smaller, CI-tractable scale: 1.96x peak-memory growth for a 4x
+file-count increase, versus what would be close to 4x on the old code). The wall-time increase
+is real and disclosed above, traced to finding #3's stat-timeout guard specifically (not the
+batching/WAL changes) — a deliberate, asked-for correctness/operability trade against a
+theoretical hang that has not actually been observed on either real run.
+
+**Verification**: `scripts/verify.py` full pass — 748 passed, 27 skipped (775 total, +4 new:
+stat-timeout guard, 2 git-dubious-ownership log-level tests, CLI progress heartbeat), ruff/mypy
+clean, 86.94% coverage (>80% floor), all 5 safety-critical module floors held.
+`evals/test_scanner_memory.py` (new) and `evals/test_scanner_perf.py` (existing, re-run) both
+pass — perf smoke: 5,996-6,323 files/sec depending on run, still ~4-38x the CI floor.
+
+Branch `wave-1-scan-reliability`, not yet committed as of this checkpoint (commit follows this
+entry). Next: STOP before P0-B (ONNX/AI packaging) per the standing work order, pending GG's
+review of the above.
+
+### 2026-07-30 — Stat-guard wall-time regression fixed: risk-targeted routing, not blanket
+
+GG confirmed the diagnosis but pushed back on absorbing the +58% wall-time cost: an isolated
+A/B (10,696 -> 6,323 files/sec) showed it was essentially all the stat-timeout guard's per-file
+thread-hop, for a guard that has never actually fired on any real run. Directed a restructure to
+make the guard cost ~nothing in the common case while keeping a stall genuinely unable to wedge
+the scan — offered three options (out-of-band watchdog, directory/batch-granularity guarding, or
+risk-targeted fast-pathing) and asked me to pick the simplest that works.
+
+**Picked: risk-targeted fast-pathing.** Considered the watchdog approach first and rejected it —
+correctly abandoning a still-pending worker future mid-`as_completed` without either leaking a
+zombie thread that later writes through an already-dropped `scan_seen` temp table/closed
+connection, or adding real synchronization complexity, turned out to be the least simple of the
+three, not the simplest. Risk-targeting maps directly onto the spec's own original framing of
+*where* stat hangs actually come from (cloud placeholders, reparse points, network drives) rather
+than treating every local NTFS file as an equal hang risk:
+
+- `drives.py`: new `is_network_drive(path)` (reuses `list_fixed_drives`'s existing
+  `_raw_drive_type`/`GetDriveTypeW` primitive, not a duplicate) — UNC paths recognized by syntax
+  alone (no Win32 call needed), a drive-letter path needs one cheap local `GetDriveTypeW` call.
+  Checked ONCE per scan (`scan_tree` computes `force_guard = is_network_drive(root)` up front),
+  never per-entry or per-directory.
+- `scanner.py`: `_entry_is_risky(entry, force_guard)` — `force_guard=True` (network root) short-
+  circuits every entry as risky; otherwise checks the reparse-point/cloud-placeholder attribute
+  bits via `entry.stat(follow_symlinks=False)`, which on Windows reads straight from the
+  `FindNextFile` data `os.scandir` already collected (the same "free, already-cached, not a
+  second syscall" fact `count_entries_fast`'s own docstring already established and this reuses,
+  not re-derives). `build_record` only routes the real `os.stat()` call through
+  `stat_executor`/the timeout guard when `_entry_is_risky` says yes; every other entry — the
+  overwhelming majority on a normal local drive — calls `os.stat()` directly on the worker
+  thread, full speed, zero thread-hop.
+- Tests: replaced the old (now-invalid, since it used a plain local file that no longer routes
+  through the guard at all) stalled-stat test with two — `test_stalled_stat_on_risky_entry_
+  is_skipped_not_hung` (a REAL NTFS junction, per this codebase's own `mklink /J` convention, with
+  a monkeypatched slow `os.stat` on it — proves the guard still trips end-to-end on the class of
+  entry it now actually targets) and `test_local_file_stat_bypasses_the_guarded_pool` (spies on
+  every `ThreadPoolExecutor.submit` call and asserts `os.stat` never appears for a plain local
+  file — proves the fast path structurally, not just via wall-clock). Plus 3 new `is_network_drive`
+  unit tests in `test_drives.py` mirroring `list_fixed_drives`' own monkeypatch-`_raw_drive_type`
+  convention.
+
+**Measured, both requested proofs:**
+- Same isolated 4,025-file local fixture, same machine: **10,247 files/sec** with the
+  risk-targeted guard — within 4.2% of the 10,696 files/sec no-guard baseline (target was
+  "within ~10%"), up from 6,323 files/sec with the old blanket guard.
+- Same real `C:\Users\gaura` target, same direct-`python.exe`-invocation methodology:
+
+| Metric | Original (pre-Wave-1 bug) | Blanket guard | **Risk-targeted guard** |
+|---|---|---|---|
+| Peak RSS | 5,085 MB | 244 MB | **242 MB** (memory fix fully intact) |
+| Wall time | 425.23s | 672.41s (+58.1%) | **523.56s (+23.1% vs. original, -22.1% vs. blanket)** |
+| Exit code | 0 | 0 | 0 |
+
+  Entry/dir counts differ slightly across all three runs (2,672,201 / 2,624,864 / 2,569,506) —
+  real disk state changing between runs (this session's own scratch files, other concurrent
+  sessions on this shared dev machine), not a correctness signal; each run's `files_pruned=0,
+  skipped=1` stayed consistent. The residual +23% (vs. the isolated fixture's 4.2%) is plausibly
+  real-disk variance (git subprocess calls, WAL commit overhead, actual reparse
+  points/OneDrive-placeholders on this machine still correctly paying the full guard cost) rather
+  than a further optimizable gap — not chased further since the explicit target (~10% on the
+  isolated measurement) was met and the memory fix — the actually-confirmed root cause — is
+  fully intact.
+
+**Verification**: `scripts/verify.py` full pass — 752 passed, 27 skipped (779 total, +4 net new
+tests replacing/extending the prior guard tests), ruff/mypy clean, 86.91% coverage, all 5
+safety-critical module floors held.
+
+## P0-B — ONNX quality-parity report (STOP POINT 2, torch NOT yet dropped)
+
+### 2026-07-30 — CLIP + MiniLM converted, decision-grade parity measured on real fixed eval sets
+
+Per the standing work order's mandatory second stop point: report the ONNX quality-parity delta
+*before* dropping torch. This checkpoint is that report — **torch/open-clip-torch/sentence-
+transformers are still in `pyproject.toml`'s `[ai]` extras; nothing production has changed.**
+All conversion/eval work happened in a disposable scratch venv
+(`UV_PROJECT_ENVIRONMENT`-redirected `uv sync --extra ai`, plus `onnx`/`onnxruntime`/
+`onnxconverter-common`/`onnxscript` installed via `uv pip install --python <scratch-venv>` —
+**note**: `uv pip install` does NOT respect `UV_PROJECT_ENVIRONMENT` the way `uv sync` does; a
+first attempt landed `onnx`/`onnxruntime` in the real project `.venv` by mistake, caught
+immediately and reverted via `uv pip uninstall`, confirmed clean before continuing).
+
+**Method**: both models exported via `torch.onnx.export` (opset 17) directly from the
+project's own pinned, integrity-verified checkpoints (`image_embeddings._model_and_preprocess`,
+`text_embeddings._model`) — not re-derived from a different checkpoint. fp32 ONNX output
+verified against torch (max abs diff 7.6e-6 CLIP, 2.2e-7 MiniLM) before quantizing further, so
+the graph-translation step itself is confirmed lossless. int8 via
+`onnxruntime.quantization.quantize_dynamic` (QInt8, weight-only dynamic — static/calibration-
+based quantization was NOT attempted, a disclosed scope limit, not chased since fp16 already
+gave a clean answer for the one model that needed it). fp16 via `onnxconverter_common.float16.
+convert_float_to_float16`.
+
+**Eval sets — reused the project's own existing gold fixtures unchanged, not new/invented
+ones**: CLIP compared on the exact same real INRIA Copydays 40-block subset (98 images) and
+BCubed methodology `evals/test_ai_semantic_grouping_gold.py` already uses (`group_by_semantic_
+similarity` called unchanged — only the embedding backend differs, so any BCubed delta isolates
+the model backend's contribution, not a clustering-logic difference). MiniLM compared on the
+real Gutenberg realistic-tier distribution `evals/test_ai_document_gold.py`'s embedding-
+recall check uses (120 base chunks x 3 transform profiles = 360 positive pairs, plus all
+C(120,2)=7,140 distinct-chunk negative pairs — a real precision measurement, not recall-only).
+Both are this project's own PRIMARY (non-adversarial) quality measurements for these models,
+not a secondary/adversarial boundary tier like PAWS.
+
+**CLIP result — int8 REJECTED, fp16 recommended** (full report:
+`reports/ai/onnx_quality_parity/clip_torch_vs_onnx.json`). At the shipped operating threshold
+(cosine >= 0.82, ADR-0022's measured value):
+
+| | torch-fp32 | onnx-int8 | delta | onnx-fp16 | delta |
+|---|---|---|---|---|---|
+| BCubed precision | 0.7897 | 0.6791 | **-0.1107** | 0.7897 | 0.0000 |
+| BCubed recall | 0.7143 | 0.7415 | +0.0272 | 0.7143 | 0.0000 |
+| BCubed F1 | 0.7501 | 0.7089 | **-0.0412** | 0.7501 | 0.0000 |
+
+int8's -11pp precision drop at the shipped threshold is material — for a browse-tidiness
+grouping feature this isn't catastrophic (never a deletion suggestion), but it's a real,
+user-visible quality regression, and "do NOT ship it to save disk" is the right call per GG's
+own stated bar. fp16 is bit-for-bit-equivalent BCubed behavior (delta 0.0000 across all three
+metrics) — per-image cosine drift measured separately at 0.999999 (essentially lossless), so
+this isn't a coincidence of the threshold sweep, it's the model genuinely preserving fp32
+behavior. The user's suggested "int8-text-encoder-only" hedge does NOT apply here and isn't
+force-fit into the recommendation: this app never uses CLIP's text encoder at all (confirmed
+via `image_embeddings.py` — `compute_image_embedding` only ever calls `model.encode_image`),
+so there is no text-encoder component to selectively quantize.
+
+**MiniLM result — int8 ACCEPTED, quality-equivalent** (full report:
+`reports/ai/onnx_quality_parity/minilm_torch_vs_onnx.json`). At the operating threshold
+(cosine >= 0.95, `document_similarity.py`'s Stage-2 `embedding_threshold`):
+
+| | torch-fp32 | onnx-int8 | delta |
+|---|---|---|---|
+| Precision (7,140 negatives) | 1.0000 | 1.0000 | 0.0000 |
+| Recall (360 positives) | 0.8694 (313/360) | 0.8667 (312/360) | **-0.0028** |
+| Per-tier recall: mild | 1.0000 | 1.0000 | 0.0000 |
+| Per-tier recall: moderate | 0.6083 | 0.6000 | -0.0083 |
+| Per-tier recall: collab_paste | 1.0000 | 1.0000 | 0.0000 |
+
+Zero new false positives across all 7,140 negative pairs in either backend; exactly one
+additional false negative out of 360 positives under int8 (313 -> 312 true positives) — not a
+material difference. Honest note on why this looks different from a naive per-embedding cosine
+spot-check: an early sanity check on 3 arbitrary sentences showed torch-vs-onnx cosine as low
+as 0.937 (a real, measurable per-embedding quantization drift) — but that measures absolute
+drift between backends on the SAME text, not whether within-backend relative similarity
+rankings still cross the operating threshold correctly, which is what actually matters for
+near-dupe detection and is what this eval measures directly. This is exactly why GG's
+instruction to run the real decision-grade eval (not a proxy) mattered — the proxy would have
+wrongly suggested a problem that the real measurement shows isn't there.
+
+**pHash + LightGBM — confirmed unaffected, not re-measured** (per GG's explicit instruction):
+`phash.py` imports only `imagehash`/`PIL.Image`; `clutter_ranker.py` imports only `lightgbm`/
+`numpy`/`blake3` — grep-confirmed zero torch/onnx presence in either module. Neither has any
+embedding-model dependency for quantization to touch.
+
+**Payload sizes measured** (full detail: `reports/ai/onnx_quality_parity/payload_sizes.json`):
+
+| Component | fp32 | int8 | fp16 |
+|---|---|---|---|
+| CLIP vision encoder | 351.5MB | 88.5MB | 175.8MB |
+| MiniLM (full pipeline: transformer+pooling+normalize) | 91.4MB | 23.6MB | 46.2MB* |
+
+*MiniLM fp16 export has an unresolved ONNX Runtime load error (`onnxconverter_common`'s
+float16 conversion produces a type-mismatched internal cast node, `disable_shape_infer=True`
+didn't resolve it) — not chased further since MiniLM int8 already passed with no need for a
+fp16 fallback. Flagged honestly as a known gap, not silently worked around, in case a future
+reason to want MiniLM-fp16 specifically comes up.
+
+**Recommended bundle: CLIP fp16 + MiniLM int8 = 199.4MB new payload** (vs the spec's <250MB
+target — comfortably under, with ~50MB of headroom). Plus onnxruntime's CPU Python bindings
+(~40MB installed) — **not a new/additive cost**: `rapidocr-onnxruntime` (Feature 2 OCR) already
+requires onnxruntime as a transitive dependency today, so this is shared infrastructure, not a
+second payment. This compares to the CURRENT torch-based `[ai]` extras delta of ~1,028MB
+(ADR-0024's own measurement, site-packages core-only 13.6MB vs `[ai]` 1,041.8MB) — roughly an
+81% reduction in the AI payload while keeping MiniLM quality-equivalent and CLIP genuinely
+lossless (not "acceptably close," bit-identical BCubed behavior).
+
+**Alternative bundles, for completeness** (not recommended): all-int8 (CLIP 88.5 + MiniLM 23.6
+= 112.1MB, smaller but CLIP quality unacceptable per above) — all-fp16 (CLIP 175.8 + MiniLM
+46.2* = 222.0MB, both lossless but larger and MiniLM-fp16 currently doesn't load).
+
+**Honest scope limits, disclosed not hidden**:
+- Only dynamic (weight-only) int8 quantization was tried for CLIP; static/calibration-based
+  quantization might recover some of int8's lost precision and wasn't attempted — a real,
+  disclosed avenue for future size reduction if 175.8MB ever becomes a real constraint, not
+  chased here since fp16 already cleanly meets the <250MB target.
+- The Copydays 40-block eval inherits the SAME disclosed proxy-distribution limitation the
+  existing gold eval already carries (adversarial print-scan/blur/paint derivatives of one
+  photo, not genuinely different photos of the same scene/event — Track B's actual target use
+  case) — not a new gap introduced by this comparison, the same one the shipped 0.82 threshold
+  was already measured against.
+- MiniLM fp16 doesn't currently load in ONNX Runtime (see above) — irrelevant to the actual
+  recommendation (int8 passed) but noted for completeness.
+
+**Not yet done** (deliberately, per the stop point): torch/open-clip-torch/sentence-
+transformers have NOT been removed from `pyproject.toml`; `image_embeddings.py`/`text_
+embeddings.py` have NOT been rewritten to call ONNX Runtime instead of torch; no lazy-load/
+graceful-degradation wiring for a downloadable AI pack has been built yet. All of that is real
+remaining P0-B work, gated on GG's go-ahead past this stop point.
+
+### 2026-07-30 — P0-B implementation: torch dropped, ONNX shipped, bundled in the installer
+
+GG approved (CLIP fp16 + MiniLM int8, 199.4MB) and directed the full implementation: rewrite
+the modules, drop torch entirely (confirmed via grep — no `require("torch"/"open_clip"/
+"sentence_transformers")` call site remains anywhere in `src/`), lazy-load + measure cold
+start, test graceful degradation explicitly, bundle in the installer (preferred over an
+in-app download button), re-run the gold evals against the SHIPPED code (not the conversion
+scripts), full verify, commit.
+
+**Module rewrite**: `image_embeddings.py`/`text_embeddings.py` rewritten around ONNX Runtime
+sessions instead of torch models — public API (`ImageEmbedding`/`DocumentEmbedding`/
+`compute_*_embedding`/`cosine_similarity`) unchanged, so `semantic_image_grouping.py`/
+`document_similarity.py`/every downstream caller needed zero changes. New
+`reclaim.ai._optional.AIModelMissingError`/`require_bundled_model` (SHA256-verify a bundled
+file, distinct from the old "download from HF Hub" pinned-checkpoint pattern — no download path
+exists anymore since the files are bundled, so a missing/corrupted bundled file fails loud with
+"reinstall Reclaim" instead of "retry the download"). `ImageEmbeddingCache`'s `model_id` bumped
+so old torch-era cached embeddings become unreachable cache misses, never silently compared
+against new ONNX ones (the cache's own pre-existing contract). Full technical detail + the
+license/redistribution analysis for shipping a quantized derivative of an Apache-2.0 checkpoint:
+[ADR-0030](docs/architecture/adr/0030-onnx-conversion-and-bundled-ai-installer.md) (also
+formally supersedes ADR-0024 Decision 2 and ADR-0029's unbuilt "separate AI runtime" plan).
+
+**Real bug caught by actually running the new code, not just reading it**: `_preprocess_image`'s
+first draft called `pil_image.BICUBIC` where `pil_image` was the IMAGE INSTANCE, not the PIL
+module — an `AttributeError` on the very first real invocation. Fixed by threading the module
+object through separately. A second real bug: `scripts/export_ai_models.py`'s first draft
+imported `_model_and_preprocess`/`_model` FROM the now-ONNX-only production modules it was
+supposed to regenerate models FOR — those functions no longer exist there (Wave 1 P0-B removed
+them). Fixed by giving the export script its own fully self-contained pinned-checkpoint-loading
+code, since it's the one remaining place in the codebase that still needs torch/open_clip/
+sentence-transformers at all (via the new `ai-export` extras group, never installed by a normal
+`uv sync --extra ai`).
+
+**Preprocessing had to be reimplemented, and it mattered**: CLIP's image preprocessing
+(previously torchvision, sourced from open_clip's own config) has no torch-free equivalent —
+reimplemented in pure PIL + numpy. A first correctness check (single-image cosine similarity
+between the torchvision and PIL pipelines' resulting embeddings) showed real drift (0.994, not
+1.0) — not assumed harmless, actually RE-RAN the full BCubed eval with the production-shaped
+(PIL) preprocessing rather than trusting the earlier torchvision-preprocessing numbers. Result:
+a small additional real cost (fp16 F1 delta -0.008 vs the shipped threshold, still comfortably
+above Track B's 0.70 precision floor) — disclosed in the updated
+`reports/ai/onnx_quality_parity/clip_torch_vs_onnx.json`, not hidden behind the earlier,
+now-superseded torchvision-preprocessing numbers. MiniLM's tokenization has no such gap — the
+lightweight `tokenizers` package loading the model's own exported `tokenizer.json` produces
+byte-identical token ids/attention masks to the old sentence-transformers tokenizer (verified
+directly before trusting it), so no preprocessing-drift concern there.
+
+**Graceful degradation, tested at two levels, not just asserted**: (1) unit level — `_clip_
+session()`/`_session()` raise `AIModelMissingError` with an actionable message when the bundled
+file is missing or fails SHA256 verification; (2) API level — `api/ai_orchestration.py::_run_
+pipeline` now catches `AIModelMissingError` alongside the existing `AIExtraNotInstalledError`,
+verified live against a simulated missing-model-directory: the pipeline returns cleanly (empty
+clusters, `tracks_skipped` populated, structured log line), no crash, no exception propagating —
+confirmed by actually running it, not just reading the except clause. `scripts/verify.py`
+passing in the CORE-ONLY main venv (no AI extras installed at all) is the other half of "rules-
+first features work fully" — already true before this change and re-confirmed after.
+**Disclosed, not fixed**: `tracks_skipped` (the per-track skip reasons) isn't currently
+surfaced in the dashboard UI at all — a pre-existing gap (any pipeline failure, not just a
+missing AI model, hits it), out of scope for this change; only the top-level `unavailable_
+reason` (whole-`ai`-extra-missing case) is shown today, which remains the primary, most likely
+real-world case and is already handled.
+
+**Lazy loading preserved, measured before/after is honest about what changed**: module import
+(`import reclaim.ai.image_embeddings`) costs ~21ms with the session cache confirmed `None` —
+zero model loading at import time, same as the old code. First real AI use: CLIP ~2,488ms
+(~260ms of that is SHA256-verifying the 175.8MB file; the rest is ONNX Runtime's own session
+construction), MiniLM ~425ms; both then stay warm for the rest of the process (CLIP 192ms/call,
+MiniLM 5ms/call warm). Full numbers: `reports/ai/onnx_quality_parity/lazy_load_latency.json`.
+Honestly disclosed: the OLD torch-based first-use latency was NOT re-measured this session
+(would need reinstalling torch into a separate environment for a currently-unclear marginal
+benefit) — the qualitative comparison (a much lighter ONNX session vs. constructing a torch
+`nn.Module` from a safetensors checkpoint, which the old code's own docstring already called
+"the expensive part") stands without it, and the load-bearing claim — cold APP start is
+unaffected either way, since both old and new code were already lazy — doesn't need it either.
+
+**Git LFS introduced** (a real, disclosed infrastructure decision, not silently absorbed):
+`clip_vision_fp16.onnx` (175.8MB) exceeds GitHub's 100MB-per-file plain-git push limit.
+`git lfs track "src/reclaim/ai/models/*.onnx"` — standard, reversible, keeps the build
+reproducible from a bare git clone rather than requiring a separate release-asset-download step.
+
+**Re-ran the gold evals against the ACTUAL SHIPPED production code** (not the conversion
+scripts, not a scratch shim) — the specific proof GG asked for, since "the conversion passing
+doesn't prove the integration does": both reproduced their scratch-validated numbers EXACTLY
+(CLIP: precision=0.7720/recall=0.7143/F1=0.7420; MiniLM: precision=1.0/recall=0.8667,
+tp=312/fp=0/fn=48) — confirms the production module wiring (real bundled-file loading, real
+PIL preprocessing, real `tokenizers`-package tokenization) matches what was measured, not just
+the standalone conversion.
+
+**Verification**: `scripts/verify.py` full pass in the CORE-ONLY main venv (no AI extras) —
+756 passed, 27 skipped, ruff/mypy clean, 86.96% coverage, all safety-critical floors held.
+Separately, full `tests/ + evals/test_ai_safety_gate.py` re-run in a freshly-`uv sync --extra
+ai`'d scratch venv (torch-free, matching the new `[ai]` extras exactly) — 819 passed, 7 skipped,
+zero failures — proves the new torch-free `[ai]` extras profile is itself fully green, not just
+the core-only one.
+
+**Installer build**: Nuitka `--standalone` rebuilt from the torch-free `[ai]`-extras venv, with
+every AI-layer package (`onnxruntime`, `tokenizers`, `faiss`, `lightgbm`, `imagehash`, `PIL`,
+`cv2`, `numpy`, `scipy`, `datasketch`, `docx`, `pypdf`, `rapidocr_onnxruntime`) explicitly
+`--include-package`'d (Nuitka's static analysis doesn't follow this codebase's lazy
+`importlib.import_module()` calls, so each needs an explicit flag) plus
+`--include-data-dir=src/reclaim/ai/models=reclaim/ai/models` for the bundled ONNX models —
+measured results and Inno Setup packaging in the next checkpoint entry.
+
+**First attempt failed — `cc1.exe: out of memory` compiling faiss's SWIG-generated C++ wrapper
+(`module.faiss.swigfaiss.cxx`, a single translation unit that alone took 749s and still ran out
+of memory) — and, wastefully, Nuitka was ALSO compiling numpy's own bundled test suite AND
+dozens of `mypy` modules (including its `mypyc`-compiled-extension internals) neither of which
+should have been anywhere near this build. Root cause: the venv the build ran from was `uv sync
+--extra ai`'d WITHOUT `--no-dev`, so it carried the full dev toolchain (`mypy`/`pytest`/`ruff`/
+`pyarrow`/`ollama`) alongside the runtime `[ai]` extras — `uv sync` includes the default `dev`
+dependency-group unless told not to, a detail this session's earlier `ai-eval-venv` provisioning
+missed since that venv was only ever used for eval/test work, where the dev-tool bloat didn't
+matter. Fixed by building from a genuinely clean venv (`uv sync --extra ai --no-dev`, confirmed
+`mypy` unimportable in it) plus `--low-memory --jobs=2` (this is a shared dev machine — other
+sessions' own workloads were visibly running concurrently in the process list, same "don't
+assume contention-free" lesson as house rule 46a's GPU-contention guidance, applied to CPU/RAM
+here) and `--nofollow-import-to=*.tests --nofollow-import-to=*.testing` to stop bundling test
+suites that were never going to be needed.
+
 ## Gotchas discovered
 - `uv init --package` created a `reclaim = "reclaim:main"` script entry pointing at a stub
   `main()`; repointed to `reclaim.cli:main` (placeholder) since Stage 2+ will define the real
@@ -1827,3 +2351,408 @@ gate) had never run in ANY CI job at all before this — added to `eval.yml`'s `
 - pytest's `tmp_path` fixture resolves under the OS `%TEMP%` directory — any future eval/test
   that needs to distinguish "under Temp" from "not under Temp" paths must root its own fixture
   tree elsewhere (e.g. `data/_test_scratch/`), or every fixture path will spuriously match.
+
+**Second build attempt (from the clean venv) genuinely stalled from machine contention** —
+small, trivial FastAPI files took 1,300-3,000+ seconds each to compile while system-wide CPU
+sat at only ~33% utilized and free RAM fell from 16.7GB toward 9.4GB: a shared-dev-machine
+contention signature, not a Nuitka or code problem. Stopped rather than let it run for hours
+(house rule 46a's GPU-contention "don't idle-wait, escalate" guidance, applied to CPU/RAM by
+analogy), reported to GG, who directed building permanent unattended-safe tooling instead of
+blindly retrying: `packaging/build_installer.ps1` (clean-venv provisioning with a hard
+dev-toolchain-absence assertion, a pre-flight free-RAM check, and a monitored Nuitka compile
+that aborts within minutes of detected contention instead of hanging silently for hours) and
+`packaging/RELEASE_RUNBOOK.md` (documented preconditions/expected numbers). See "Build script
+hardening" below for two more real bugs this surfaced before the tooling could be trusted.
+
+**Build script hardening — two more real bugs, found by actually running the tool against a
+real build, not by reasoning about the code:**
+1. **`Start-Process -ArgumentList` argument-splitting bug.** A plain array handed to
+   `-ArgumentList` gets re-joined into a single command-line *string* before Windows ever sees
+   it — `"--company-name=Gaurav Gandhi"` (one array element containing a space) silently split
+   back into two argv tokens, so Nuitka received `Gandhi` and `packaging/entry_point.py` as two
+   stray positional arguments and refused to start ("specify only one positional argument").
+   Fixed by switching to `System.Diagnostics.ProcessStartInfo` with `.ArgumentList.Add($a)` per
+   argument (a real ordered collection, immune to re-parsing) plus async
+   `Register-ObjectEvent`-based output capture to `StreamWriter` log files.
+2. **The stall detector watched the wrong file, guaranteeing a false-positive abort on every
+   run.** Nuitka writes almost everything — inclusion warnings, plugin notices, its own
+   progress lines — to **stderr**, not stdout; `nuitka_build.log` (stdout) stayed genuinely
+   empty for the entire build. The monitor loop tracked only `$LogPath` (stdout)'s
+   `LastWriteTime` for its "seconds since last output" stall signal, so that value tracked
+   `elapsed` 1:1 from t=0 regardless of real progress — every build looked permanently stalled
+   from the first poll. This fired for real on a relaunched build: `entry_point.build` had only
+   1 file (1KB) when the monitor declared contention and killed it — Nuitka was still in its
+   legitimately slow, single-core, low-CPU module-graph-building phase, not actually stalled.
+   Fixed by tracking the newer of stdout's and stderr's `LastWriteTime` instead of stdout alone.
+   Caught by directly inspecting the live telemetry CSV and the partial build directory after a
+   real run, not by re-reading the script.
+3. **`$proc.Kill($true)` (documented to kill the whole descendant tree) did not, in practice,
+   kill Nuitka's re-exec'd worker interpreter** — after the false-positive abort above threw,
+   `Get-CimInstance Win32_Process` still showed the actual compile process alive and consuming
+   RAM. Root cause not fully isolated (plausibly the worker re-parented itself outside the
+   tracked tree); fixed defensively rather than by diagnosing further: the abort path now also
+   sweeps any `python.exe` whose command line contains the build venv's path, by name, as a
+   backstop independent of whatever `Kill($true)` actually does.
+
+All three fixes are in the same `packaging/build_installer.ps1` now being relaunched. The
+actual successful build — Nuitka compile time, dist folder size, final installer size, and the
+fresh-Windows-VM gate — is the next checkpoint entry once that run completes.
+
+**Third relaunch (after all three fixes above) reached real C compilation for the first time**
+(991s elapsed, past `Nuitka: Running C compilation via Scons.`) then aborted again at the same
+300s/60%-CPU threshold. This time confirmed as genuine contention, not another monitoring bug:
+16 logical processors (8 cores) means a single maxed *core* would only ever read as ~6% of
+`\Processor(_Total)\%`, so the observed 24-50% aggregate during the stall corresponds to
+4-7 cores actually busy — too much for one legitimately-heavy single-threaded compile to
+explain away as a false low-CPU reading. Direct process listing at the time confirmed it: 6+
+separate `claude` processes with substantial cumulative CPU time, plus Docker Desktop and
+several browser tabs, all live. No orphaned processes were left behind this time (fix #3 held).
+GG is freeing the machine (closing other CC sessions, `wsl --shutdown` for Docker Desktop,
+closing heavy tabs) before the next attempt.
+
+**Build script hardened further for the quiet-machine retry** (`packaging/build_installer.ps1`,
+not yet run): `--low-memory` (a contention-compensation flag, never actually needed once the
+machine is quiet) replaced with `--jobs=N` (auto: 6 if preflight free RAM ≥16GB else 4 — only
+sensible once contention is confirmed gone); added a Step 1 machine-state report (free RAM,
+instantaneous CPU%, processes with >30s cumulative CPU time) printed before any real work
+starts, so contention is visible up front instead of inferred after an abort; added a
+best-effort Step 4 Windows Defender exclusion for `packaging/build/` and Nuitka's own
+compiler-cache dir (`Add-MpPreference -ExclusionPath`, requires an elevated session — logs
+SKIPPED and continues if not elevated, never blocks the build; `-SkipDefenderExclusions` opts
+out explicitly). Stall-detector thresholds (300s / 60% CPU) left unchanged — on a genuinely
+quiet machine that margin is generous rather than tight, so it stays as a safety net rather
+than a tuned-tight gate.
+
+### 2026-08-05 — Installer build succeeded, function-verified; build-tooling trap catalog
+
+Fourth relaunch (quiet machine, `--jobs=1`) reached and passed real C compilation, but a
+**first** successful compile (762.7MB dist / 285.4MB installer, ~03:07 IST) turned out NOT to be
+functionally correct: the packaged binary crashed on every invocation
+(`ImportError: Module 'structlog.testing' was actively excluded`). Root cause and fix, plus every
+other build-tooling bug found by actually running the tool, not by reasoning about the code, are
+now in `packaging/build_installer.ps1`'s inline comments and `packaging/RELEASE_RUNBOOK.md`'s
+expected-numbers table. **Second** build (884.0MB dist / 309.3MB installer, ~11:24 IST) fixed the
+import crash and was verified end-to-end against the packaged binary itself (not the dev venv):
+`serve` + `/api/scan` + `/api/ai/analyze` against generated gold fixtures (seed=42), CLIP
+near-dup image clustering and MiniLM document version-chain detection both matched ground truth
+exactly. The fresh-Windows-VM install→scan→AI→vault→restore→uninstall gate (`RELEASE_RUNBOOK.md`
+step 3) is still outstanding — needs a real machine/VM, per the AUTONOMY MANDATE escalation list.
+
+**Traps a future session must not rediscover cold** (highest-priority first):
+
+1. **The bundled Nuitka's `-O3` patch is silent and re-appliable, not permanent.** Nuitka
+   hardcodes `-O3` for every gcc-backend compile on Windows (`SconsCompilerSettings.py`, no CLI
+   or env-var override actually works — `importEnvironmentVariableSettings()` reads `CFLAGS` but
+   is dead code, grep-confirmed). `-O3`'s heavier inlining is what pushed a single file (faiss's
+   SWIG-generated `swigfaiss.c`) past ~23GB peak compiler memory even with `--low-memory` and
+   `--jobs=1`. `build_installer.ps1` Step 2 now patches `-O3` → `-O2` in
+   `$BuildVenvPath\Lib\site-packages\nuitka\build\SconsCompilerSettings.py` on every run,
+   in-process, right after `uv sync`. This is NOT a one-time fix: the build venv is deleted and
+   recreated from scratch every run (Step 2's `Remove-DirectoryWithRetry` + fresh `uv sync`), so
+   an unpatched Nuitka upgrade would silently re-introduce the `cc1.exe` OOM with zero warning
+   unless the patch step itself catches it — which it's built to do: it fails loudly
+   (`PATCH_TARGET_NOT_FOUND`) if Nuitka's source no longer matches the expected `-O3` text,
+   rather than silently proceeding at `-O3`. Reapply-by-hand recipe if the automated patch ever
+   throws that error: open the failing venv's `SconsCompilerSettings.py`, find the `env.Append(
+   CCFLAGS=[...])` block choosing `-O3` for `os.name == "nt"`, change that literal to `-O2`. Also
+   note: uv installs via hardlinks from its shared package cache, not copies — an in-place
+   `open(path, "w")` on a hardlinked file would have silently patched uv's CACHE, not just this
+   venv's copy (confirmed via matching inode numbers before the fix); the patch script now writes
+   to a temp file and `os.replace()`s it in, which swaps the directory entry instead of mutating
+   the shared inode.
+2. **Do NOT reintroduce `--nofollow-import-to=*.tests` / `*.testing`.** Looks like free
+   dist-folder savings (skip numpy/scipy's own test suites) but both wildcards independently hid
+   a genuine, unconditionally-imported runtime dependency: `structlog/__init__.py` does `from
+   structlog.testing import ReturnLogger, ReturnLoggerFactory` (public API, in `__all__`);
+   `jinja2/defaults.py` does `from . import tests` (Jinja2's built-in template test functions —
+   a real language feature named "tests", not a test suite); `scipy/_lib/_array_api.py` does
+   `from scipy._external.array_api_extra.testing import lazy_xp_function` at module load, and
+   many scipy submodules import that module. Confirmed for exactly these three (`numpy.testing`
+   checked safe — only reachable via numpy's own lazy `__getattr__`, never at module-load time).
+   Verification technique if this is ever revisited: walk every `.py` file in the build venv's
+   `site-packages` with `ast.walk`, collect `Import`/`ImportFrom` nodes whose target module
+   matches `*.tests`/`*.testing`, and flag any hit where the importing file is OUTSIDE that
+   target's own package (i.e., not test code importing its own test helpers). This was run ad
+   hoc (not committed as a script) and found 10 hits, 3 genuine runtime deps — do the same scan
+   again before ever re-adding either flag, don't rely on crash-by-crash debugging to rediscover
+   the same three packages.
+3. **The stall detector needs a filesystem-progress signal; process-liveness/CPU sampling alone
+   false-kills healthy builds.** `Get-BuildProcessCpuSeconds` (poll-time process sampling) was
+   tuned against `--jobs=3+`'s shape (a few long-lived parallel compiles spanning many poll
+   intervals) and gave a false "genuinely idle" verdict at `--jobs=1`, where hundreds of small
+   files compile serially and most fully start-and-exit BETWEEN two 15s polls — their CPU is
+   invisible to a point-in-time sampler even while real `.o` files are landing every few seconds.
+   `Get-NewestObjectWriteTime` (newest `.o` mtime under `entry_point.build`) is the fix: a
+   durable, poll-timing-immune progress signal, since a written file stays written regardless of
+   whether any process happened to be alive at the instant of a poll. The abort condition now
+   requires ALL THREE signals agreeing (no compiler stdout/stderr write, low build-process CPU
+   delta, no recent `.o` write) before killing the build — any single signal alone has a known
+   false-positive mode on this codebase's build shape.
+4. **The build requires a genuinely quiet machine; this is a documented precondition, not a
+   tuning problem.** Two of the four real build attempts before the first success failed purely
+   from local machine contention (6+ concurrent `claude` processes, Docker Desktop, browser tabs
+   — confirmed via live process listing at the time of abort, not inferred). `--jobs=1` +
+   `-O2` + `--low-memory` fixes the single-file faiss OOM, which is a real per-file memory
+   ceiling independent of contention — it does NOT fix contention from other workloads on the
+   same box. Check Step 1's machine-state report (free RAM, instantaneous CPU%, processes with
+   >30s cumulative CPU time) before trusting an abort as a build-tooling bug rather than "the
+   machine wasn't actually quiet." Budget 3+ hours for a from-scratch build at `--jobs=1`; see
+   the Deferred Roadmap entry below for moving this to a dedicated CI runner instead.
+
+## Deferred roadmap (not scheduled — noted for a later wave, not built now)
+
+- **Move the release build to a GitHub Actions Windows runner** so it never competes with GG's
+  own workstation for CPU/RAM again — the root cause of two of this session's three build
+  failures was a shared local machine, not the build itself. Requirements to work out when this
+  is picked up: (1) **Git LFS on the runner** — `actions/checkout` needs `lfs: true` (or an
+  explicit `git lfs pull` step) to get the real `clip_vision_fp16.onnx` (175.8MB) rather than a
+  pointer stub, and GitHub's free-tier LFS bandwidth/storage quota (1GB/month each as of this
+  writing) is easy to exhaust with repeated full-file checkouts across CI runs — needs either a
+  paid LFS data pack, `actions/cache` keyed on the LFS object SHA to avoid re-pulling on every
+  run, or a self-hosted runner (sidesteps the quota, reintroduces "shared machine" risk if it's
+  GG's own hardware). (2) Windows Defender / AV posture on GitHub-hosted Windows runners is
+  unknown and may need its own exclusion or acceptance of slower compiles. (3) Nuitka's own
+  toolchain download (MinGW64 via `--assume-yes-for-downloads`) happens fresh per run unless
+  cached — `actions/cache` on Nuitka's cache dir would help build time significantly across
+  runs. (4) Artifact handoff: the built `reclaim-setup.exe` needs to land somewhere GG can run
+  the fresh-Windows-VM gate against it (a workflow artifact download, or a draft GitHub Release).
+
+## 2026-08-05 — Wave 1 close-out: E2E-at-scale, cold start, and visual identity + distribution
+
+Nine pieces of work, dispatched as parallel executor subagents in isolated git worktrees and
+merged back into `wave-1-scan-reliability` one at a time (each merge re-verified with `uv run
+python scripts/verify.py` before the next). **Real process gap found and fixed mid-session**:
+worktree isolation forks from `main`, not the currently-checked-out branch — four of the five
+first-wave agents started from a base missing this branch's own scanner/packaging/AI work. Caught
+by diffing `main..wave-1-scan-reliability` before trusting any agent's output; the one agent whose
+substance actually depended on the missing commits (scanner.py had 392 changed lines) was
+redirected via `SendMessage` mid-flight to rebase before finishing. Every subsequent agent was
+told to self-correct this as its first step. Worth remembering for any future multi-worktree
+dispatch on this repo.
+
+### P1-B — E2E at scale
+
+`evals/fixtures/build_scale_tree.py` (seed=42 deterministic): exact-dup sets, near-dup
+image/document sets (reused `ai_fixtures` builders, not reimplemented) with a ground-truth JSON
+manifest, a 484-char path, unicode/emoji names, a zero-byte file, a 25MB file, a genuinely
+NTFS-sparse file (verified via real allocated-vs-logical size gap, not just the flag), a junction
+cycle, best-effort cloud-placeholder and permission-denied simulations (both empirically verified,
+with honest disclosure where OS behavior didn't fully cooperate — e.g. `SetFileAttributesW` can't
+actually persist the cloud-placeholder bit on an ordinary NTFS file, matching
+`build_golden_tree.py`'s own prior finding), and a parametrized 100k+ tier (100,054 files
+generated in 132.45s).
+
+**Junction-cycle finding: not a bug.** `scanner.py`'s walk never recurses into reparse points
+(`should_recurse = is_dir_entry and not is_reparse_point`, already covered by
+`test_scan_tree_reparse_point_is_recorded_but_not_recursed_into`) — the deliberate cycle fixture
+is safe by construction, kept in as a regression tripwire.
+
+**Real bug found and fixed along the way**: `.gitattributes` didn't mark the bundled AI model's
+`minilm_tokenizer.json` as `-text`. On a fresh Windows clone with default git CRLF normalization,
+checkout corrupts the file (0 → 30,685 CRLF insertions) and breaks its SHA256 pin, making
+`AIModelMissingError` fire for every near-dup-document call — silently disabling that whole
+feature for any Windows contributor who clones fresh with default settings, not just in a
+worktree. Fixed (`src/reclaim/ai/models/*.json -text`) and will not recur for anyone who clones
+after this commit.
+
+`evals/test_e2e_scale.py` (12 tests): fast tier (3,112 entries, 0.95s) — exact-dup precision/
+recall **1.0000/1.0000**, near-dup-image **1.0000/1.0000**, near-dup-document **1.0000/1.0000**
+against the fixture's own ground truth (floors set at 0.95/0.80 respectively, well under measured,
+per rule 65b margin). Apply-batch atomicity verified via a real `os._exit()` hard-crash injection
+(reused `tests/_recovery_crash_harness.py` unmodified) with SHA-256 all-or-nothing proof. Restore
+verified bit-identical (hash before-quarantine vs after-restore, not just existence). Crash
+recovery verified via `recovery.reconcile_manifest` against real post-crash disk state.
+**Disclosed gap, not papered over**: scan cancellation has no implementation anywhere in this
+codebase (grepped `cancel|Cancel|abort|stop_scan` across `src/reclaim` — zero hits) — the
+corresponding test is an explicit `@pytest.mark.skip` naming the gap, not a weak assertion around
+nothing. "Resumed scan" is approximated via two sequential `scan_tree()` calls with the
+approximation stated plainly, since no true cancellation token exists to resume from.
+
+**100k-tier measured** (first synthetic-scale measurement of this scanner with adversarial edge
+cases baked in — distinct from the existing 10,247 files/sec isolated-clean-fixture number and
+242MB real-2.67M-file-disk number, not to be conflated with either): generation 755 files/sec,
+scan 4,057–7,255 entries/sec across runs (adversarial content — long paths, unicode, sparse files,
+real hashing — makes this a heavier workload than the clean fixture, not a regression against it).
+
+**Adversarial `SafetyValidator` proofs**: `evals/test_safety_adversarial.py`, 30 tests. Every
+built-in-deny category, path-obfuscation bypass attempt (8.3 short names, trailing
+dots/spaces, subst drives, junction-into-protected-root, symlink-to-protected-target,
+`..`-traversal, UNC-vs-local, case) stays **blocked**, each proven via the validator's actual
+return value/classification, not "no exception raised." Precedence proven directly (built-in deny
+beats a simultaneously-matching allow-list entry). `restore_batch`'s separate
+`path_is_protected_root()` code path independently proven via a real `mklink /J` junction into a
+protected root. **Real findings, not bypasses** (block still holds in every case, just via an
+earlier-checked reason code than the path's own pattern would suggest): `docker_wsl_roots`'
+`//wsl$/*` entry is always preempted by the UNC-network-path check; its `*/ProgramData/Docker/*`
+entry is always preempted by `protected_roots` on a C:-drive install; a real WSL2 `ext4.vhdx`
+image is preempted by the `vm_extensions` check before `docker_wsl_roots` ever gets a look.
+Accepted as-is (the safety property holds regardless) rather than reordering `_builtin_deny`'s
+checks for a diagnostic-message improvement in a security-critical file — a real, low-priority
+nit, not a gap, logged here for whoever next touches that function's ordering.
+
+**CI perf budgets** — first correction: the task's own framing ("scan_tree still accumulates
+every FileRecord in one list, an open gap") turned out to be **stale**. `scanner.py`'s
+`_BatchIndexWriter` already bounds peak memory at `worker_count * _WRITE_BATCH_SIZE` (5,000) —
+verified directly in code before building anything on the old premise. Real measured growth via a
+subprocess-isolated harness (`evals/_scan_peak_rss_harness.py`): file count grew 33.3x (3k→100k),
+peak RSS delta grew only **4.32x** (7.30MiB→31.53MiB) — sub-linear, neither the originally-assumed
+"flat" claim nor a naive "linear" one; `evals/test_scanner_peak_rss_budget.py` gates the growth
+*ratio* (10x ceiling) rather than an absolute number for exactly this reason. Throughput floors
+added to `evals/test_e2e_scale.py`, kept deliberately separate from the existing clean-fixture
+10,247 files/sec number (different workload, not comparable). CLI cold-start budget: 2000ms
+ceiling on the dev-venv proxy (CI can't build the Nuitka binary per-PR). Every budget assertion
+was verified to actually fire (tightened one at a time, confirmed FAILED, restored). CI wiring:
+fast-tier assertions run in `ci.yml`'s `ai-layer-with-extras` job on every PR; the 100k+ tier runs
+in a new `scale-nightly.yml` on push-to-main + a daily cron, not every PR. Also closed, found
+along the way: `evals/test_scanner_memory.py` (an existing Wave-1 memory eval) had never been
+wired into *any* CI job — same `testpaths=["tests"]`-silently-skips-`evals/` shape this whole
+session's safety-gate work already exists to guard against. **Follow-up fix after the merge**: the
+two new budget files don't need the `[ai]` extra either, so they were also missing from
+`scripts/verify.py`'s fast pre-push gate — added, but only after confirming `pyproject.toml`
+registers the `scale` marker without an `addopts` to deselect it by default, so the pytest
+invocation needed an explicit `-m "not scale"` or the "fast" gate would have started silently
+generating a 100k-file tree on every pre-push run.
+
+### P1-A — cold start
+
+CLI import chain (`config`/`dedup`/`executor`/`scanner`/etc., all eager per `cli.py`'s module-level
+imports) confirmed to NOT include `reclaim.ai` (onnxruntime/torch/PIL/faiss) for a `mode`/
+`--version`-class invocation — `python -X importtime` traced total `reclaim.cli` import cost at
+~628ms, dominated by `reclaim.config`'s `pydantic_settings`→`importlib.metadata` chain (~466ms)
+and `structlog` (~161ms), both core/architectural. Added `--version` as a fast, minimal CLI path
+(there was none before) so future cold-start measurement doesn't need an arbitrary subcommand as a
+stand-in. **Dev venv**: `--version` min 695.5ms / median 794.2ms / p95 1007.4ms (n=15). **Real
+packaged Nuitka binary** (measured directly against `packaging/build/entry_point.dist/reclaim.exe`
+from this session's earlier successful build, since a fresh worktree can't see gitignored build
+artifacts): `mode` subcommand min 594.4ms / median 722.6ms / p95 1121.8ms (n=15) — lands in the
+same ~600–900ms band as the dev venv, confirming Nuitka's standalone packaging isn't adding a
+material cold-start penalty. One 3850.9ms outlier on a separate run (plausibly a one-off Defender
+scan of a freshly-written `.exe`) reported honestly rather than rerolled away. Both numbers
+comfortably under the ~2s architectural budget — no import-deferral restructuring was needed or
+attempted.
+
+### P2 — identity + distribution
+
+**Visual identity pivoted** from v3's indigo/mint flat-rectangle mark to the newly-approved
+isometric "lifted platter" design (deep #1B6FA8 / mid #2E9BD6 / amber #F2A93B / dark #0F172A),
+geometry decomposed from a provided reference asset set (now kept at
+`docs/assets/design-reference/lifted-platter-reference.svg` for provenance). Extended
+`packaging/build_brand_assets.py`'s existing parametric-Pillow pattern (no new SVG-rasterizer
+dependency) rather than replacing it. 3 platters at 32px+, simplified to 2 (amber lifted + one
+beneath) at 16px for taskbar legibility. **Verified, not assumed**: rendered and personally
+inspected both sizes at both light and dark backgrounds (8x-scaled PNGs) — 16px reads clearly as
+an amber disk lifted over one blue disk with real separation; 32px reads as three distinct
+stacked, shaded platters. The agent additionally cross-checked the actual shipped SVGs via
+headless-Edge rasterization against the Pillow approximation. Replaced in place: `reclaim.ico`
+(16/24/32/48/64/128/256, each size reload-verified), Inno Setup wizard bitmaps, in-app
+`logo.svg`/`favicon.svg`, `docs/assets/{og-preview,logo-lockup}.png`. README banner needed no new
+wiring — it already referenced `logo-lockup.png`, which now regenerates with the new mark.
+Regenerating the renderer produces a byte-identical, empty diff (confirmed deterministic).
+
+**Code-signing** (ADR-0031, NOT purchased): live-researched 2026-08-05, not recalled from the
+earlier stale PLAN.md note. Two findings that override the old note: (1) Azure Artifact Signing
+(renamed from Trusted Signing) requires **US/Canada residency** for individual developers — GG's
+residency needs confirming before Azure is even eligible, not just a pricing comparison; (2) no
+certificate at any price removes the SmartScreen warning outright — EV and OV have been treated
+equally for reputation purposes since March 2024 per SSL.com's own pages, so EV's premium buys
+nothing here. **Recommended**: Certum Standard OV (~€209/yr), individual-eligible with no
+registered entity, no "Open Source Developer" subject restriction, no commercial-distribution
+revocation clause (unlike Certum's cheaper Open Source tier, rejected for exactly that clause).
+Runner-up named: SSL.com IV + eSigner (~$309/yr), better only on headless CI signing, which isn't
+relevant while the release build is a manual local job. Three questions recorded as needing GG's
+answer before any spend: residency, budget approval, Certum's actual willingness to validate an
+India-resident individual (no restriction found on the pages checked, which is not the same as
+confirmed). `RELEASE_RUNBOOK.md` now documents the SmartScreen warning flow and SHA-256 checksum
+verification for end users; confirmed the `.sha256` sidecar is currently produced BY HAND for each
+release, not automated in `build_installer.ps1` — a real, disclosed follow-up gap.
+
+**In-app update check**: `src/reclaim/update_check.py`, best-effort GitHub release comparison via
+`httpx` (short timeout, no retries, 24h in-memory cache — deliberately not persisted to `data/`,
+to avoid a new on-disk "when did Reclaim last phone home" artifact for a background nicety),
+wired to `GET /api/update-check` and a footer badge. **Default OFF, opt-in**: `PRIVACY.md` already
+promised "no phone-home, not even a version ping" before this change — a default-on background
+call would have silently broken a documented product commitment, so `config.toml`'s
+`[update_check] enabled` defaults to `false` and zero `httpx.Client` is constructed when disabled
+(verified in tests). `PRIVACY.md`'s now-stale "no HTTP client anywhere in src/reclaim" claim was
+rewritten to disclose the real, narrow new behavior rather than left quietly false. Real gap
+closed along the way: `httpx` was declared as a dependency but was dev-only, never actually
+shipped in a production install before this — promoted to a real `[project]` dependency.
+
+**Accessibility/DPI pass**, live-browser verified (Playwright/Chromium, since the chrome-devtools
+MCP tools specified in the task weren't actually present in that agent's tool schema — flagged
+honestly rather than the agent fabricating their use). DPI: 125/150/200% effective scaling on both
+Simple and Advanced modes, 12 screenshots reviewed — `styles.css` has zero media queries and holds
+up via `flex-wrap`/grid `auto-fit` alone, no clipping or unwanted scroll at any level. **Two real
+bugs found and fixed**: all 5 modal dialogs had `role="dialog" aria-modal="true"` with zero actual
+focus-trap/Escape-close behind the ARIA attributes (Tab could walk into controls hidden behind the
+backdrop) — fixed with a shared `initDialogKeyboardBehavior()`; the skip-link changed
+`location.hash` without ever moving DOM focus (`<main>` wasn't focusable) — fixed with the
+standard `tabindex="-1"` pattern. Confirmed already-fine: focus-visible styling present globally
+with zero `outline:none` overrides, no unlabeled icon-only buttons, live regions correctly scoped
+including the new update-check badge. First-run safety trio confirmed: dry-run is the real
+default (`ApplyRequest.dry_run: bool = True`), the real-apply confirmation names item count and
+method plainly (live-captured: *"This will really quarantine 1 item(s) via vault. Continue?"*),
+restore is genuinely one click with no confirm dialog in that code path. **One honest gap**: a
+fully successful restore wasn't literally observed end-to-end in the live session (3 attempts each
+landed on a no-vault-retention category or a stale index entry — a test-methodology miss, not a
+reproduced app bug) — code-level proof plus two correctly-explained negative cases were reported
+instead of rounding up to "confirmed."
+
+**Not done this session** (real, disclosed gaps for a future pass): the fresh-Windows-VM
+install→scan→AI→vault→restore→uninstall gate (still needs a real machine, per the standing
+escalation list); `.sha256` sidecar automation in `build_installer.ps1`; code-signing purchase
+(blocked on GG's residency/budget answers); a literal end-to-end observed restore in the
+accessibility pass's live session.
+
+### 2026-08-05 (cont'd) — Two follow-ups: scan cancellation, checksum automation
+
+Both dispatched from the two gaps the previous checkpoint disclosed rather than papered over.
+
+**Scan cancellation** — real, cooperative cancellation via a `threading.Event`
+(`AppState.cancel_scan_event`), checked at directory AND entry granularity inside
+`count_entries_fast`/`scan_tree`/`_walk_subtree` (not just once per root), so a single large
+directory can't delay interruption. New `POST /api/scan/cancel` (200/no-op if nothing is running,
+by design — safe to call speculatively). Consistency comes from `_BatchIndexWriter`'s existing
+batch-flush cadence: a cancelled scan's already-flushed rows are durable, nothing half-written is
+left behind. `prune_unseen_under_root` is skipped entirely on a cancelled run — a partial
+`scan_seen` set would otherwise wrongly delete every real entry the walk never reached; a new
+`"cancelled"` status (`error` stays `None`) keeps this distinct from `"failed"` in both API and UI.
+One subtle correctness call worth remembering: the cancel event is cleared by the ROUTE HANDLER,
+not inside `run_scan` itself — `run_scan` executes as a `BackgroundTask` AFTER the HTTP response is
+already sent, so clearing it inside `run_scan` would race an immediate cancel call and silently
+drop it. UI: a Cancel control on both Advanced and Simple-mode scan surfaces, reusing this
+session's `aria-live`/tone conventions (never rendered as an error).
+
+**Proven, not just asserted**: `evals/test_e2e_scale.py::test_cancel_mid_scan_leaves_a_consistent_
+index` is un-skipped and real (deterministic via the existing `_HEARTBEAT_INTERVAL_SECONDS=0.0`
+monkeypatch convention + an entry-count threshold, not a wall-clock race — zero flakiness across
+repeated local runs). A one-off manual demonstration against the REAL 100k+ tier: cancelled 1.0s
+into a real walk at 14,987/100,306 entries indexed, `files_pruned=0`, index inventory count
+matched exactly; a resumed incremental pass completed the remaining 85,319 entries in 7.66s to a
+fully consistent 100,306-row final index — this is the actual UX claim ("stop a long full-drive
+scan, keep what it found, finish later") demonstrated end-to-end, not inferred from unit tests
+alone.
+
+**`.sha256` checksum automation**: `build_installer.ps1` now generates the sidecar automatically
+right after Inno Setup packaging succeeds (guarded by the script's existing `$ErrorActionPreference
+= "Stop"` plus its prior throw-on-failure checks, so a failed package step correctly skips it).
+Reused the exact byte-format already verified against real published sidecars in
+`RELEASE_RUNBOOK.md` (lowercase hex, two spaces, bare filename via `Split-Path -Leaf` rather than
+hardcoded, single trailing LF, no BOM) — re-verified byte-by-byte against a synthetic file rather
+than trusting the recipe: first 4 bytes are the hash's ASCII hex (no `EF BB BF` BOM), zero `0x0D`
+bytes anywhere, last byte `0x0A`. `RELEASE_RUNBOOK.md` and ADR-0031 updated — both previously
+described this as a manual step. The "upload both files, then re-download the published asset and
+re-hash it" round-trip check remains explicitly manual (can't run until the artifact is actually
+on GitHub) and is documented as such, not implied to be automated too.
+
+**Full verification, all lanes, this session's actual commands** (not the theoretical CI
+definitions — literally run locally against the merged tip): `scripts/verify.py` (core, no `[ai]`
+extra) — 913 tests ran, all green, all 5 safety-critical coverage floors held. `ai-layer-with-
+extras` lane (`pytest tests/ evals/test_ai_safety_gate.py`) — 851 passed, 7 skipped. Its perf-
+budget step (`evals/test_e2e_scale.py evals/test_scanner_peak_rss_budget.py evals/test_scanner_
+memory.py evals/test_cli_cold_start_budget.py -m "not scale"`) — 14 passed, 2 correctly deselected,
+including the now-real `test_cancel_mid_scan_leaves_a_consistent_index`. `eval.yml`'s safety-gate
+lane — 77 passed. `frontend-xss-regression` (`tests/frontend`, `npm test`) — 20/20 passed.
+`pip-audit --desc` against a freshly-exported `requirements-audit.txt` — no known vulnerabilities.
+`scale-nightly.yml`'s own lane (`-m scale`) — 2 passed (170.18s), including the 100k+-tier full-
+scan-completes test. Working tree clean after every merge.

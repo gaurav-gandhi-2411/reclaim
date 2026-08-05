@@ -18,6 +18,7 @@ from reclaim.config import (
     SafetyConfig,
 )
 from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
+from reclaim.index import ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 from reclaim.models import Tier
 
@@ -174,7 +175,7 @@ def test_notices_route_serves_third_party_notices(tmp_path: Path) -> None:
     response = client.get("/NOTICES")
     assert response.status_code == 200
     assert "Third-party notices" in response.text
-    assert "open-clip-torch" in response.text
+    assert "onnxruntime" in response.text
 
 
 # --- Error paths -------------------------------------------------------------------------------
@@ -200,6 +201,103 @@ def test_scan_already_running_returns_409(tmp_path: Path) -> None:
     response = client.post("/api/scan", json={"path": str(target)})
     assert response.status_code == 409
     assert "already running" in response.json()["detail"]
+
+
+# --- scan cancellation ---------------------------------------------------------------------
+
+
+def test_scan_cancel_endpoint_is_a_no_op_when_nothing_is_running(tmp_path: Path) -> None:
+    """Safe to call speculatively (e.g. a UI racing its own poll loop) -- never a 409, always
+    the current (unchanged) status."""
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "idle"
+
+
+def test_scan_cancel_endpoint_stops_a_running_scan_with_a_consistent_partial_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real cancellation, end to end through the actual route: `service.run_scan` is run in a
+    real background `threading.Thread` (matching `test_run_apply_completes_and_leaves_a_durable_
+    manifest_with_zero_status_polls`'s own established pattern -- TestClient runs BackgroundTasks
+    SYNCHRONOUSLY as part of the request/response cycle, so driving the scan through
+    `client.post("/api/scan", ...)` itself would block until the whole scan finished and leave no
+    way to interleave a genuinely concurrent cancel), while the test's own thread issues a real
+    `POST /api/scan/cancel` once the scan has demonstrably made progress -- not before it starts,
+    not after it's already finished."""
+    import threading
+
+    import reclaim.scanner as scanner_module
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    # Deterministic, not a wall-clock race: fires on nearly every entry (this file's own
+    # `test_full_drive_scan_completes_correctly_with_maximal_progress_callback_frequency` already
+    # establishes this convention for exercising the live progress-republishing wiring).
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+
+    root = tmp_path / "tree"
+    num_dirs, files_per_dir = 8, 300
+    for d in range(num_dirs):
+        subdir = root / f"dir_{d}"
+        subdir.mkdir(parents=True)
+        for f in range(files_per_dir):
+            (subdir / f"f_{f}.txt").write_text("x", encoding="utf-8")
+    total_entries = num_dirs + num_dirs * files_per_dir
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "other"))
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+
+    started_at = time.time()
+    with state.lock:
+        # Mirrors exactly what `POST /api/scan`'s route handler does before scheduling
+        # `run_scan` -- see `AppState.cancel_scan_event`'s docstring for why the clear happens
+        # here, synchronously, rather than inside `run_scan` itself.
+        state.cancel_scan_event.clear()
+        state.scan_status = ScanStatus(
+            status="running",
+            root=root,
+            started_at=started_at,
+            phase="estimating",
+            current_drive=root.as_posix(),
+            drives_total=1,
+            drives_done=0,
+        )
+
+    thread = threading.Thread(target=service.run_scan, args=(state, [root], started_at))
+    thread.start()
+
+    deadline = time.monotonic() + 10.0
+    made_progress = False
+    while time.monotonic() < deadline:
+        with state.lock:
+            processed = state.scan_status.entries_processed or 0
+            still_running = state.scan_status.status == "running"
+        if not still_running:
+            break
+        if processed >= 20:
+            made_progress = True
+            break
+        time.sleep(0.005)
+    assert made_progress, "scan never reached the progress threshold before finishing/timing out"
+
+    response = client.post("/api/scan/cancel")
+    assert response.status_code == 200
+
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "run_scan did not stop within 30s of being cancelled"
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "cancelled"
+    assert status["error"] is None
+    assert status["entries_total"] is not None and status["entries_total"] < total_entries
+    assert status["files_pruned"] == 0
+
+    with ScanIndex(state.db_path) as index:
+        inventory = index.full_inventory(under=root)
+    # No torn state: the index is consistent with exactly what the (cancelled) scan reported.
+    assert len(inventory) == status["entries_total"]
 
 
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
@@ -1253,3 +1351,72 @@ def test_diagnostics_log_tail_placeholder_when_log_file_missing(tmp_path: Path) 
     missing_path = tmp_path / "never-written.log"
     expected = "(no log file yet — nothing has been logged this install)"
     assert _read_log_tail(missing_path) == expected
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------
+
+
+def test_update_check_endpoint_disabled_by_default_makes_no_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`UpdateCheckConfig.enabled` defaults to `False` (see `config.py` / PRIVACY.md) -- the
+    endpoint must report `enabled=False`, `status="disabled"`, and never even attempt to build an
+    `httpx.Client`. Patches `httpx.Client` to raise if called at all, so this test would fail
+    loudly (not silently pass) if that guarantee ever regressed."""
+    from reclaim import update_check as update_check_module
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("httpx.Client must never be constructed when update_check is disabled")
+
+    monkeypatch.setattr(update_check_module.httpx, "Client", _fail_if_called)
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/update-check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is False
+    assert body["status"] == "disabled"
+    assert body["update_available"] is False
+    assert body["latest_version"] is None
+    assert isinstance(body["current_version"], str) and body["current_version"]
+
+
+def test_update_check_endpoint_reports_available_update_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When `[update_check] enabled = true`, the endpoint delegates to
+    `reclaim.update_check.check_for_update` -- this test injects a `MockTransport`-backed client
+    (via monkeypatching `httpx.Client` itself) so it never reaches the real network, matching this
+    project's zero-live-API-calls-in-CI convention."""
+    import httpx
+
+    from reclaim import update_check as update_check_module
+    from reclaim.config import UpdateCheckConfig
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"tag_name": "v99.0.0", "html_url": "https://example.test/r"}
+        )
+
+    real_client_cls = httpx.Client
+    monkeypatch.setattr(
+        update_check_module.httpx,
+        "Client",
+        lambda **kwargs: real_client_cls(transport=httpx.MockTransport(handler)),
+    )
+    update_check_module._cache.clear()
+
+    config = _config(tmp_path / "tree")
+    config = config.model_copy(update={"update_check": UpdateCheckConfig(enabled=True)})
+    client = _make_app(tmp_path, config=config)
+
+    response = client.get("/api/update-check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["status"] == "ok"
+    assert body["update_available"] is True
+    assert body["latest_version"] == "v99.0.0"
+    assert body["release_url"] == "https://example.test/r"

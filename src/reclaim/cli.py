@@ -47,6 +47,14 @@ _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
 
+# Hardcoded rather than read via `importlib.metadata.version("reclaim")`: the Nuitka standalone
+# build (packaging/build_installer.ps1) never bundles a dist-info directory, so that lookup
+# would raise `PackageNotFoundError` in the shipped binary specifically -- the one place this
+# flag matters most (a user can't `pip show` an installed .exe). Checked against
+# pyproject.toml's version by tests/test_version_consistency.py, the same pattern already used
+# for packaging/reclaim.iss and packaging/build_installer.ps1's own version strings.
+_VERSION = "1.3.0"
+
 # Literal loopback IPs only — deliberately excludes the hostname "localhost", since that's a
 # DNS/hosts-file lookup (uvicorn/the socket layer resolves it, not this code) and a tampered
 # hosts file could in principle point it somewhere non-loopback. This tool moves and deletes
@@ -70,6 +78,12 @@ def _loopback_host(value: str) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="reclaim")
+    # `action="version"` short-circuits during parsing (prints and calls `parser.exit()`
+    # immediately when the flag is seen) -- it runs before the `required=True` subparsers check
+    # below, so `reclaim --version` alone works with no subcommand. This is also the only
+    # currently-available way to isolate pure interpreter+import overhead from a real
+    # subcommand's own work for cold-start measurement (see packaging/RELEASE_RUNBOOK.md).
+    parser.add_argument("--version", action="version", version=f"reclaim {_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser(
@@ -423,6 +437,20 @@ def _load_config_or_none(
         return None
 
 
+def _on_scan_progress_printer(processed: int, _estimated_total: int | None, elapsed: float) -> None:
+    """Wave 1 finding #2 (2026-07-30 real-disk diagnosis): the raw `reclaim scan` CLI command
+    used to call `scan_tree` with no `on_progress` at all -- a real 2.67M-file scan sat silent
+    on the terminal for 7+ minutes, indistinguishable from a hang. `scan_tree`'s own
+    `_ProgressTracker` already interval-gates calls to this (every `_HEARTBEAT_INTERVAL_SECONDS`
+    -- never per-entry), so this only needs to print, not throttle. Deliberately does NOT run
+    `count_entries_fast`'s pre-pass first the way the dashboard's live-ETA view does (see
+    `api.service.run_scan`) -- that pre-pass is a second full stat-free tree walk purely to
+    produce a total/ETA, and doubling I/O on every CLI invocation isn't worth it just to show a
+    growing count instead of a count-with-a-denominator; "clearly still working" is the actual
+    gap being closed here, not an ETA."""
+    print(f"reclaim scan: scanning... {processed:,} entries visited ({elapsed:.0f}s elapsed)")  # noqa: T201
+
+
 def _run_scan(args: argparse.Namespace) -> int:
     root: Path = args.path
     if not root.is_dir():
@@ -432,7 +460,13 @@ def _run_scan(args: argparse.Namespace) -> int:
     args.db.parent.mkdir(parents=True, exist_ok=True)
     try:
         with ScanIndex(args.db) as index:
-            stats = scan_tree(root, index, incremental=not args.full, max_workers=args.workers)
+            stats = scan_tree(
+                root,
+                index,
+                incremental=not args.full,
+                max_workers=args.workers,
+                on_progress=_on_scan_progress_printer,
+            )
     except ScanDiskFullError as exc:
         print(f"reclaim scan: {exc}", file=sys.stderr)  # noqa: T201
         return 1
@@ -441,7 +475,8 @@ def _run_scan(args: argparse.Namespace) -> int:
         f"reclaim scan: {stats.entries_total} entries under {stats.root} "
         f"({stats.dirs_visited} dirs visited, {stats.files_written} written, "
         f"{stats.files_unchanged} unchanged, {stats.files_pruned} pruned, "
-        f"{stats.skipped_unreadable_count} skipped/unreadable) "
+        f"{stats.skipped_unreadable_count} skipped/unreadable, "
+        f"{stats.guarded_stat_count} guarded-path stat, {stats.fast_stat_count} fast-path stat) "
         f"in {stats.elapsed_seconds:.2f}s"
     )
     # D12: a skip is a real permission/IO failure (long-path-only failures no longer land here

@@ -13,6 +13,7 @@ pytest.importorskip("PIL")
 from PIL import Image, ImageDraw
 
 from reclaim.ai import image_embeddings as image_embeddings_module
+from reclaim.ai._optional import AIModelMissingError
 from reclaim.ai.image_embeddings import (
     ImageEmbeddingCache,
     compute_embeddings_batch,
@@ -171,113 +172,98 @@ def test_compute_embeddings_batch_skips_unreadable_files(tmp_path: Path) -> None
     assert embeddings[0].path == good
 
 
-# E17/E18 (audit findings, ADR-0028): pinned-revision checkpoint download + sha256 integrity
-# verification for the CLIP checkpoint. Real download/inference is exercised by the other
-# tests in this file when the `ai` extra + network are available; these tests instead mock
-# `require()`'s return value so the pinning/verification wiring is provable without a real
-# download, per the task's own guidance.
+# Wave 1 P0-B (2026-07-30): CLIP now loads a bundled, pinned, SHA256-verified ONNX file
+# (`reclaim/ai/models/clip_vision_fp16.onnx`) via ONNX Runtime instead of downloading a torch
+# checkpoint from HF Hub at first use. These tests cover the new loading/integrity-check
+# wiring; real inference against the bundled file is exercised by the tests above whenever the
+# `ai` extra is installed (same "mock the wiring, exercise the real thing separately" split the
+# old torch-based tests used).
 
 
 @pytest.fixture
-def _reset_model_cache() -> object:
-    """Module-level `_model_cache`/`_preprocess_cache` are a process-wide lazy singleton --
-    save/restore around tests that need `_model_and_preprocess()` to actually re-run its
-    loading logic, so this doesn't leak a mocked model into (or lose a real model already
-    cached by) other tests in this file."""
-    original_model = image_embeddings_module._model_cache
-    original_preprocess = image_embeddings_module._preprocess_cache
-    image_embeddings_module._model_cache = None
-    image_embeddings_module._preprocess_cache = None
+def _reset_session_cache() -> object:
+    """Module-level `_session_cache` is a process-wide lazy singleton -- save/restore around
+    tests that need `_clip_session()` to actually re-run its loading logic, so this doesn't
+    leak a mocked session into (or lose a real one already cached by) other tests in this
+    file."""
+    original = image_embeddings_module._session_cache
+    image_embeddings_module._session_cache = None
     yield object()
-    image_embeddings_module._model_cache = original_model
-    image_embeddings_module._preprocess_cache = original_preprocess
+    image_embeddings_module._session_cache = original
 
 
-def test_model_and_preprocess_downloads_pinned_revision_and_verifies_checksum(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _reset_model_cache: object
+def test_clip_session_loads_the_bundled_model_and_verifies_checksum(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _reset_session_cache: object
 ) -> None:
-    fake_checkpoint = tmp_path / "checkpoint.safetensors"
-    fake_checkpoint.write_bytes(b"fake-clip-weights")
+    fake_model = tmp_path / "clip_vision_fp16.onnx"
+    fake_model.write_bytes(b"fake-onnx-bytes")
+    monkeypatch.setattr(image_embeddings_module, "_MODELS_DIR", tmp_path)
     monkeypatch.setattr(
         image_embeddings_module,
-        "_OPEN_CLIP_HF_WEIGHTS_SHA256",
-        hashlib.sha256(b"fake-clip-weights").hexdigest(),
+        "_CLIP_ONNX_SHA256",
+        hashlib.sha256(b"fake-onnx-bytes").hexdigest(),
     )
 
-    hf_hub_download_calls: list[dict[str, object]] = []
+    session_calls: list[tuple[str, list[str]]] = []
 
-    class _FakeHfHub:
-        @staticmethod
-        def hf_hub_download(**kwargs: object) -> str:
-            hf_hub_download_calls.append(kwargs)
-            return str(fake_checkpoint)
+    class _FakeSession:
+        def __init__(self, path: str, providers: list[str]) -> None:
+            session_calls.append((path, providers))
 
-    create_model_calls: list[dict[str, object]] = []
-
-    class _FakeModel:
-        def eval(self) -> None:
-            pass
-
-    class _FakeOpenClip:
-        @staticmethod
-        def get_pretrained_cfg(model_name: str, tag: str) -> dict[str, object]:
-            assert model_name == image_embeddings_module._OPEN_CLIP_MODEL_NAME
-            assert tag == "openai"
-            return {
-                "quick_gelu": True,
-                "mean": (0.48145466, 0.4578275, 0.40821073),
-                "std": (0.26862954, 0.26130258, 0.27577711),
-                "interpolation": "bicubic",
-                "resize_mode": "shortest",
-            }
-
-        @staticmethod
-        def create_model_and_transforms(*args: object, **kwargs: object) -> tuple[object, ...]:
-            create_model_calls.append(kwargs)
-            return _FakeModel(), object(), object()
+    class _FakeOnnxRuntime:
+        InferenceSession = _FakeSession
 
     def _fake_require(module_name: str, *, feature: str) -> object:
-        if module_name == "huggingface_hub":
-            return _FakeHfHub()
-        if module_name == "open_clip":
-            return _FakeOpenClip()
-        raise AssertionError(f"unexpected require() call: {module_name}")
+        assert module_name == "onnxruntime"
+        return _FakeOnnxRuntime()
 
     monkeypatch.setattr(image_embeddings_module, "require", _fake_require)
 
-    model, _ = image_embeddings_module._model_and_preprocess()
+    session = image_embeddings_module._clip_session()
 
-    assert isinstance(model, _FakeModel)
-    assert hf_hub_download_calls == [
-        {
-            "repo_id": image_embeddings_module._OPEN_CLIP_HF_REPO,
-            "filename": image_embeddings_module._OPEN_CLIP_HF_WEIGHTS_FILENAME,
-            "revision": image_embeddings_module._OPEN_CLIP_HF_REVISION,
-        }
-    ]
-    assert len(create_model_calls) == 1
-    assert create_model_calls[0]["pretrained"] == str(fake_checkpoint)
-    assert create_model_calls[0]["force_quick_gelu"] is True
-    assert create_model_calls[0]["image_mean"] == (0.48145466, 0.4578275, 0.40821073)
+    assert isinstance(session, _FakeSession)
+    assert session_calls == [(str(fake_model), ["CPUExecutionProvider"])]
+
+    # Second call reuses the cached session -- no second require()/InferenceSession call.
+    session_again = image_embeddings_module._clip_session()
+    assert session_again is session
+    assert len(session_calls) == 1
 
 
-def test_pinned_checkpoint_sha256_mismatch_quarantines_the_bad_file_and_raises(
-    tmp_path: Path,
+class _FakeOnnxRuntimeModule:
+    """Stands in for a real `onnxruntime` import -- these tests exercise the bundled-model
+    existence/integrity check, which must be provable independent of whether `onnxruntime`
+    happens to be installed in whatever environment runs the test (core-only `scripts/
+    verify.py` included)."""
+
+    class InferenceSession:
+        def __init__(self, path: str, providers: list[str]) -> None:
+            self.path = path
+            self.providers = providers
+
+
+def test_clip_session_raises_actionable_error_when_bundled_model_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _reset_session_cache: object
 ) -> None:
-    bad_checkpoint = tmp_path / "bad.safetensors"
-    bad_checkpoint.write_bytes(b"tampered content")
+    monkeypatch.setattr(image_embeddings_module, "_MODELS_DIR", tmp_path / "nonexistent")
+    monkeypatch.setattr(
+        image_embeddings_module, "require", lambda module_name, *, feature: _FakeOnnxRuntimeModule()
+    )
 
-    with pytest.raises(RuntimeError, match="integrity check failed"):
-        image_embeddings_module._verify_checkpoint_sha256_or_quarantine(bad_checkpoint, "0" * 64)
-
-    assert not bad_checkpoint.exists()  # quarantined, never left for a caller to load
+    with pytest.raises(AIModelMissingError, match="bundled AI model file"):
+        image_embeddings_module._clip_session()
 
 
-def test_pinned_checkpoint_sha256_match_leaves_the_file_in_place(tmp_path: Path) -> None:
-    good_checkpoint = tmp_path / "good.safetensors"
-    good_checkpoint.write_bytes(b"real content")
-    expected = hashlib.sha256(b"real content").hexdigest()
+def test_clip_session_raises_on_sha256_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _reset_session_cache: object
+) -> None:
+    tampered_model = tmp_path / "clip_vision_fp16.onnx"
+    tampered_model.write_bytes(b"tampered-bytes")
+    monkeypatch.setattr(image_embeddings_module, "_MODELS_DIR", tmp_path)
+    monkeypatch.setattr(image_embeddings_module, "_CLIP_ONNX_SHA256", "0" * 64)
+    monkeypatch.setattr(
+        image_embeddings_module, "require", lambda module_name, *, feature: _FakeOnnxRuntimeModule()
+    )
 
-    image_embeddings_module._verify_checkpoint_sha256_or_quarantine(good_checkpoint, expected)
-
-    assert good_checkpoint.exists()
+    with pytest.raises(AIModelMissingError, match="integrity verification"):
+        image_embeddings_module._clip_session()

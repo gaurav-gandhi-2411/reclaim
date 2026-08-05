@@ -4,7 +4,10 @@ import ctypes
 import os
 import shutil
 import subprocess
+import threading
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -705,3 +708,310 @@ def test_build_record_for_path_matches_nfd_disk_entry_against_nfc_lookup_path(
     # equality check itself is normalization-scoped, so the record still reports the on-disk NFD
     # form, not the NFC lookup form.
     assert record.path.name == nfd_name
+
+
+# --- Wave 1 finding #3: per-entry stat() timeout guard (2026-07-30 real-disk diagnosis) --------
+
+
+def test_stalled_stat_on_risky_entry_is_skipped_not_hung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single stalled `os.stat()` call on a RISKY entry -- a reparse point, the class of entry
+    the risk-targeted guard (`_entry_is_risky`) actually routes through the timeout-guarded pool
+    -- must be skipped, never hang the whole scan. A plain local file is deliberately NOT used
+    here: the risk-targeted revision no longer routes those through the guard at all (see
+    `test_local_file_stat_bypasses_the_guarded_pool` for that other half of the fix). Shortens
+    `_STAT_TIMEOUT_SECONDS` so this test itself doesn't take 30 real seconds; the sibling
+    readable file must still be scanned normally -- one bad entry never aborts the rest."""
+    monkeypatch.setattr(scanner_module, "_STAT_TIMEOUT_SECONDS", 0.3)
+    root = tmp_path / "root"
+    target = tmp_path / "junction_target"
+    target.mkdir(parents=True)
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    link_name = "slow_link"
+    link = root / link_name
+
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 -- cmd is a builtin
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
+
+    real_stat = os.stat
+
+    def slow_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if os.path.basename(str(path).rstrip("\\")).lower() == link_name:  # noqa: PTH119
+            time.sleep(2.0)
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", slow_stat)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        start = time.monotonic()
+        stats = scan_tree(root, index)
+        elapsed = time.monotonic() - start
+        inventory = index.full_inventory(under=root)
+
+    assert elapsed < 5.0, f"scan took {elapsed:.1f}s -- the stat timeout guard did not fire"
+    paths = {r.path for r in inventory}
+    assert root / "readable.txt" in paths
+    assert link not in paths
+    assert stats.skipped_unreadable_count == 1
+
+
+def test_local_file_stat_bypasses_the_guarded_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wave 1 finding #3's risk-targeted revision (the throughput fix itself): an ordinary local
+    file -- no reparse-point/cloud-placeholder attributes, no network-mapped/UNC root -- must
+    call `os.stat()` directly, never route through the timeout-guarded `stat_executor`. Proven
+    structurally (not just via a wall-clock A/B) by spying on every `ThreadPoolExecutor.submit`
+    call and asserting `os.stat` never appears among them. A flat, single-file, no-subdirectory
+    fixture keeps this isolated from `scan_tree`'s OTHER (unrelated) executor -- the
+    top-level-directory worker pool -- which never gets a submit call at all here since there's
+    nothing to recurse into."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "plain.txt").write_text("x", encoding="utf-8")
+
+    submitted_fn_names: list[str] = []
+    real_submit = ThreadPoolExecutor.submit
+
+    def spying_submit(
+        self: ThreadPoolExecutor, fn: object, *args: object, **kwargs: object
+    ) -> object:
+        submitted_fn_names.append(getattr(fn, "__name__", str(fn)))
+        return real_submit(self, fn, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", spying_submit)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(root, index)
+
+    assert "stat" not in submitted_fn_names, (
+        f"os.stat was routed through the guarded pool for a plain local file: {submitted_fn_names}"
+    )
+
+
+def test_scan_stats_reports_guarded_vs_fast_stat_counts(tmp_path: Path) -> None:
+    """2026-07-30 telemetry addendum: `ScanStats.guarded_stat_count`/`fast_stat_count` must add
+    up to `entries_total` and correctly separate a real reparse point (guarded) from plain local
+    files (fast) -- turns "how much of a real scan's wall time is legitimate guarded-path
+    volume" from a one-off diagnostic A/B into a number every real run reports."""
+    root = tmp_path / "root"
+    target = tmp_path / "junction_target"
+    target.mkdir(parents=True)
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+    (root / "b.txt").write_text("b", encoding="utf-8")
+    link = root / "link"
+
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 -- cmd is a builtin
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+
+    assert stats.guarded_stat_count == 1  # the junction
+    assert stats.fast_stat_count == 2  # a.txt, b.txt
+    assert stats.guarded_stat_count + stats.fast_stat_count == stats.entries_total
+
+
+# --- Wave 1 finding #5: quiet git "dubious ownership" noise (2026-07-30 real-disk diagnosis) ---
+
+
+class _RecordingLogger:
+    """Same hand-rolled recorder pattern as `tests/test_mode.py` -- this project's structlog
+    isn't wired to stdlib logging in tests, so `caplog` can't capture it."""
+
+    def __init__(self) -> None:
+        self.debugs: list[tuple[str, dict[str, object]]] = []
+        self.warnings: list[tuple[str, dict[str, object]]] = []
+
+    def debug(self, event: str, **kwargs: object) -> None:
+        self.debugs.append((event, kwargs))
+
+    def warning(self, event: str, **kwargs: object) -> None:
+        self.warnings.append((event, kwargs))
+
+
+def test_query_git_clean_dubious_ownership_logs_quietly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git's 'dubious ownership' safe.directory protection (CVE-2022-24765) already fails safe
+    (not-clean, same as every other `_query_git_clean` failure) -- confirmed hitting dozens of
+    real, legitimately-owned repos on the 2026-07-30 real-disk diagnosis run. The fix is purely
+    about log noise at scale (thousands of these on one real scan competing with genuinely
+    actionable warnings for the rotating log's fixed budget): this specific failure must log at
+    debug, never warning."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(scanner_module, "logger", recorder)
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "status", "--porcelain"],
+            output="",
+            stderr="fatal: detected dubious ownership in repository at 'C:/x'\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = scanner_module._query_git_clean(repo_root)
+
+    assert result is False
+    assert recorder.warnings == []
+    assert any(event == "scan.git_dubious_ownership" for event, _ in recorder.debugs)
+
+
+def test_query_git_clean_other_failure_still_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine, non-dubious-ownership git failure must still surface at warning level --
+    only the specific, already-safe, high-volume case above gets quieted."""
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(scanner_module, "logger", recorder)
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            1, ["git", "status", "--porcelain"], output="", stderr="fatal: some other error\n"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    result = scanner_module._query_git_clean(repo_root)
+
+    assert result is False
+    assert any(event == "scan.git_status_failed" for event, _ in recorder.warnings)
+
+
+# --- scan cancellation ---------------------------------------------------------------------
+
+
+def _make_fanout_tree(root: Path, *, num_dirs: int = 8, files_per_dir: int = 300) -> int:
+    """A tree wide enough (many top-level directories, each with many files) that a mid-walk
+    `cancel_event` genuinely has walk work left to interrupt across several concurrent
+    `ThreadPoolExecutor` workers, not just a handful of files any one thread could race through
+    before ever checking the event again. Returns the total entry count (dirs + files) a full,
+    uncancelled `scan_tree` would report."""
+    root.mkdir(parents=True, exist_ok=True)
+    for d in range(num_dirs):
+        subdir = root / f"dir_{d}"
+        subdir.mkdir()
+        for f in range(files_per_dir):
+            (subdir / f"f_{f}.txt").write_text("x", encoding="utf-8")
+    return num_dirs + num_dirs * files_per_dir
+
+
+def test_scan_tree_cancel_event_stops_the_walk_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `cancel_event` set partway through a real walk must actually stop it well short of the
+    full tree -- not just be accepted as a parameter and ignored. `_HEARTBEAT_INTERVAL_SECONDS`
+    monkeypatched to 0.0 (this file's own established convention, see
+    `test_scan_tree_reports_interval_gated_progress_with_estimated_total`) makes `on_progress`
+    fire on essentially every entry, so the cancellation trigger is a deterministic entry-count
+    threshold rather than a wall-clock race that could flake on a slow CI runner."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    cancel_event = threading.Event()
+    _CANCEL_AT = 50  # well under total_entries (2408), leaves plenty of walk work to interrupt
+
+    def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+        if processed >= _CANCEL_AT:
+            cancel_event.set()
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index, on_progress=on_progress, cancel_event=cancel_event)
+        inventory = index.full_inventory(under=root)
+
+    assert stats.cancelled is True
+    assert stats.entries_total >= _CANCEL_AT  # at least got to the trigger point
+    assert stats.entries_total < total_entries  # but genuinely stopped short of the full tree
+    # No torn state: every record `scan_tree` reports as written is durably readable back, no
+    # more and no fewer -- a cancelled run's aggregate counts describe exactly what's in the
+    # index, not an overcount of records that never actually landed.
+    assert len(inventory) == stats.entries_total
+    assert stats.files_pruned == 0
+
+
+def test_scan_tree_cancel_event_never_prunes_a_partial_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The most important consistency property: a cancelled rescan must NEVER delete real,
+    still-existing entries it simply didn't get back around to visiting. `prune_unseen_under_root`
+    assumes `scan_seen` reflects the WHOLE tree -- running it against a partial walk would treat
+    every not-yet-revisited entry as "gone" and wrongly delete it."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        # Seed the index with a full, uncancelled inventory first -- this is the "real,
+        # still-existing data" a cancelled rescan must not touch.
+        first = scan_tree(root, index)
+        assert first.cancelled is False
+        assert first.entries_total == total_entries
+
+        cancel_event = threading.Event()
+
+        def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+            if processed >= 50:
+                cancel_event.set()
+
+        second = scan_tree(root, index, on_progress=on_progress, cancel_event=cancel_event)
+        inventory = index.full_inventory(under=root)
+
+    assert second.cancelled is True
+    assert second.files_pruned == 0
+    # Every one of the original entries survives, even the ones the cancelled second pass never
+    # got back around to re-visiting.
+    assert len(inventory) == total_entries
+
+
+def test_scan_tree_cancel_event_none_is_the_default_and_never_cancels(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        # Every pre-existing scan_tree test in this file already calls it with no cancel_event
+        # at all -- this makes the "default None, zero behavior change, never cancelled" contract
+        # explicit, matching this file's own on_progress=None convention.
+        stats = scan_tree(root, index)
+
+    assert stats.cancelled is False
+
+
+def test_count_entries_fast_cancel_event_stops_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    total_entries = _make_fanout_tree(root)
+
+    cancel_event = threading.Event()
+
+    def on_progress(counted: int, _elapsed: float) -> None:
+        if counted >= 50:
+            cancel_event.set()
+
+    result = count_entries_fast(root, on_progress=on_progress, cancel_event=cancel_event)
+
+    assert 50 <= result < total_entries

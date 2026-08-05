@@ -10,6 +10,7 @@ from pathlib import Path
 # DRIVE_REMOVABLE=2, DRIVE_REMOTE=4, DRIVE_CDROM=5, DRIVE_RAMDISK=6) is excluded on purpose -- see
 # `list_fixed_drives`'s docstring.
 _DRIVE_FIXED = 3
+_DRIVE_REMOTE = 4
 
 
 class NoFixedDrivesFoundError(RuntimeError):
@@ -66,3 +67,25 @@ def list_fixed_drives() -> list[Path]:
             "process's Win32 GetLastError diagnostics."
         )
     return drives
+
+
+def is_network_drive(path: Path) -> bool:
+    r"""True if `path` sits on a network-mapped drive letter (`net use Z: \\server\share`) or
+    is itself a UNC path (`\\server\share\...`) -- Wave 1 finding #3 (2026-07-30 real-disk
+    diagnosis): `scanner.py::scan_tree` calls this once per scan (never per-entry) to decide
+    whether every entry under `root` needs its `os.stat()` routed through the timeout-guarded
+    pool. Network shares are a real, spec-documented stat-hang risk (an unresponsive/disconnected
+    server); a local fixed or removable drive is not, and the guard's per-file thread-hop cost
+    isn't worth paying for it there.
+
+    UNC paths are recognized without any Win32 call at all -- their own syntax already says
+    "network". A drive-letter path needs one `GetDriveTypeW` call, the same primitive
+    `list_fixed_drives` already uses (reused here, not duplicated).
+    """
+    raw = str(path)
+    if raw.startswith("\\\\"):
+        return True
+    drive = raw[:2]
+    if len(drive) != 2 or drive[1] != ":":
+        return False
+    return _raw_drive_type(f"{drive}\\") == _DRIVE_REMOTE

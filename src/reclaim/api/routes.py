@@ -27,6 +27,7 @@ from reclaim.api.schemas import (
     SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapResponse,
+    UpdateCheckResponse,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
 from reclaim.drives import NoFixedDrivesFoundError
@@ -69,6 +70,10 @@ def start_scan(
                 status_code=409,
                 detail=f"a scan is already running for {state.scan_status.root}",
             )
+        # Scan cancellation: cleared HERE (not inside `run_scan` itself) -- see
+        # `AppState.cancel_scan_event`'s docstring for why this avoids a real race against an
+        # immediate `POST /api/scan/cancel`.
+        state.cancel_scan_event.clear()
         state.scan_status = ScanStatus(
             status="running",
             root=root,
@@ -88,6 +93,24 @@ def start_scan(
 def scan_status(request: Request) -> ScanStatusOut:
     state = get_state(request)
     with state.lock:
+        return service.to_scan_status_out(state.scan_status)
+
+
+@router.post("/scan/cancel", response_model=ScanStatusOut)
+def cancel_scan(request: Request) -> ScanStatusOut:
+    """Requests a cooperative stop of whatever scan is currently running (single-path or
+    full-drive) -- `service.run_scan` observes `state.cancel_scan_event` and stops at the next
+    safe point (a batch boundary; see `scanner.scan_tree`'s own `cancel_event` docstring),
+    finishing with `scan_status.status="cancelled"` and whatever partial results were already
+    durably written, never `"failed"` (a user-requested stop is not an error).
+
+    A no-op, not an error, when nothing is running -- mirrors this API's other idempotent
+    "nothing to do" actions rather than inventing a new 409 case for a call that's inherently
+    safe to make speculatively (e.g. a UI racing its own poll loop)."""
+    state = get_state(request)
+    with state.lock:
+        if state.scan_status.status == "running":
+            state.cancel_scan_event.set()
         return service.to_scan_status_out(state.scan_status)
 
 
@@ -127,6 +150,9 @@ def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -
                 status_code=409,
                 detail=f"a scan is already running for {state.scan_status.root}",
             )
+        # Scan cancellation: see the matching comment in `start_scan` above -- same race
+        # avoided the same way.
+        state.cancel_scan_event.clear()
         state.scan_status = ScanStatus(
             status="running",
             root=roots[0],
@@ -349,6 +375,17 @@ def first_run_status(request: Request) -> FirstRunStatusResponse:
 @router.post("/first-run/acknowledge", response_model=FirstRunStatusResponse)
 def first_run_acknowledge(request: Request) -> FirstRunStatusResponse:
     return service.acknowledge_first_run_screen(get_state(request))
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------
+
+
+@router.get("/update-check", response_model=UpdateCheckResponse)
+def update_check_status(request: Request) -> UpdateCheckResponse:
+    """Read-only, best-effort — see `service.check_for_update_status` and
+    `reclaim.update_check.check_for_update` for why this can never raise, block, or make a
+    network call unless the user has opted in via `config.toml`'s `[update_check] enabled`."""
+    return service.check_for_update_status(get_state(request))
 
 
 # --- G25: bug-report diagnostics ----------------------------------------------------------------

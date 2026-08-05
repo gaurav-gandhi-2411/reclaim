@@ -1,38 +1,29 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
   <!--
-    Reclaim mark v3 (tab-icon-sized copy of logo.svg) — see that file's comment for the full
-    palette/depth rationale. Literal hex values (not CSS custom properties) because a favicon is
-    loaded as a standalone document outside the app's stylesheet cascade; these mirror
-    tokens.css's rc-mark, rc-brand, and rc-bg custom properties exactly (light mode) with a
-    prefers-color-scheme override for the dark-mode tab-bar case.
+    Reclaim mark v4 (visual identity PIVOT) — tab-icon-sized copy of logo.svg, see that file's
+    comment for the full palette/geometry rationale.
+
+    Deliberately SIMPLIFIED to 2 platters (amber lifted platter + one combined blue platter
+    beneath), not a straight shrink of logo.svg's 3-platter geometry — the explicit design-owner
+    size-behavior spec calls for this below 32px so the mark stays legible at real browser-tab /
+    taskbar pixel sizes (this is genuinely a favicon, always rendered small), matching the
+    reference SVG's own dedicated "16px" panel exactly: the combined blue platter reuses the
+    3-platter form's middle-platter colors (#1B6FA8 band / #2E9BD6 cap), and the amber platter is
+    unchanged (#C2801F band / #F2A93B cap). Verified by rendering both this geometry and
+    logo.svg's 3-platter form to real pixel grids at 16px/32px via
+    packaging/build_brand_assets.py's render_mark() (same ratios, shared source) and inspecting
+    the output — see that script's module docstring and the task report for what was checked.
 
     NOTE: no literal double-hyphen anywhere in this comment (invalid inside an XML/SVG comment;
     Chrome silently fails to render the whole file — see logo.svg's comment for why).
   -->
-  <defs>
-    <linearGradient id="rc-grad-indigo" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#6366f1" />
-      <stop offset="1" stop-color="#4338ca" />
-    </linearGradient>
-    <linearGradient id="rc-grad-mint" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#34d399" />
-      <stop offset="1" stop-color="#047857" />
-    </linearGradient>
-  </defs>
-  <style>
-    .rc-ground { fill: url(#rc-grad-indigo); }
-    .rc-reclaimed { fill: url(#rc-grad-mint); }
-    .rc-lift { fill: #6366f1; stroke: #f6f7fb; stroke-width: 2; }
-    @media (prefers-color-scheme: dark) {
-      .rc-lift { stroke: #0f1117; }
-    }
-  </style>
-  <clipPath id="rc-mark-clip">
-    <rect width="32" height="32" rx="7" />
-  </clipPath>
-  <g clip-path="url(#rc-mark-clip)">
-    <rect class="rc-ground" x="0" y="0" width="32" height="32" />
-    <rect class="rc-reclaimed" x="11" y="11" width="21" height="21" />
-    <rect class="rc-lift" x="15" y="1" width="14" height="12" />
+  <g>
+    <!-- Bottom platter (combined "still stacked" blue — middle platter's colors from the
+         3-platter form, per the reference SVG's own 16px panel). -->
+    <path d="M3.56 20.48 L3.56 24.96 A12.44 4.48 0 0 0 28.44 24.96 L28.44 20.48 A12.44 4.48 0 0 1 3.56 20.48 Z" fill="#1B6FA8" />
+    <ellipse cx="16" cy="20.48" rx="12.44" ry="4.48" fill="#2E9BD6" />
+    <!-- Top platter (amber, lifted free — the reclaimed space). -->
+    <path d="M3.56 7.04 L3.56 11.52 A12.44 4.48 0 0 0 28.44 11.52 L28.44 7.04 A12.44 4.48 0 0 1 3.56 7.04 Z" fill="#C2801F" />
+    <ellipse cx="16" cy="7.04" rx="12.44" ry="4.48" fill="#F2A93B" />
   </g>
 </svg>

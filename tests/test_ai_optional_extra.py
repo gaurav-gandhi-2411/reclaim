@@ -50,15 +50,14 @@ _ALL_GATED_MODULE_NAMES = {
     "docx",
     "pypdf",
     "datasketch",
-    "sentence_transformers",
+    "tokenizers",  # Wave 1 P0-B -- MiniLM WordPiece tokenization (replaces
+    # sentence_transformers/torch, text_embeddings.py)
     "numpy",
     "rapidocr_onnxruntime",
     "lightgbm",
-    "open_clip",
-    "torch",
+    "onnxruntime",  # Wave 1 P0-B -- CLIP + MiniLM inference (replaces torch/open_clip/
+    # sentence_transformers, image_embeddings.py/text_embeddings.py)
     "faiss",
-    "huggingface_hub",  # ADR-0028 -- pinned-revision checkpoint download + sha256 integrity
-    # verification for image_embeddings.py/text_embeddings.py (E17/E18 audit findings)
 }
 
 

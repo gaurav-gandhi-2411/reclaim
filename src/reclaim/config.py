@@ -331,11 +331,27 @@ class CategoriesConfig(BaseModel):
     duplicates: DuplicatesConfig = Field(default_factory=DuplicatesConfig)
 
 
+class UpdateCheckConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Opt-in, default OFF. PRIVACY.md states plainly that Reclaim makes no outbound network
+    # calls and does not check for updates automatically -- an unannounced background GitHub API
+    # call on every dashboard start would break that promise, so this stays off unless a user
+    # explicitly sets `enabled = true` here. When true, `reclaim.update_check.check_for_update`
+    # makes exactly one thing possible: a single best-effort GET to GitHub's public releases API
+    # for this repo's latest tag (no file/scan/user data in the request), cached in-process for
+    # ~24h, 2.5s timeout, zero retries, and never able to block or slow any real user action --
+    # see that module's docstring for the full behavior. PRIVACY.md's "Updates" section is kept
+    # in sync with this field.
+    enabled: bool = False
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
+    update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not

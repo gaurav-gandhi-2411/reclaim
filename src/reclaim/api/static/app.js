@@ -336,6 +336,23 @@ async function startManualScan(path) {
   }
 }
 
+// Scan cancellation: POST /api/scan/cancel is a safe no-op when nothing is running (see the
+// route's own docstring), so this never needs to guard against double-clicking or a stale
+// button state -- the button is disabled immediately either way to avoid a confusing double
+// request while the first one is in flight.
+async function cancelScan() {
+  const cancelBtn = document.getElementById("scan-cancel-btn");
+  cancelBtn.disabled = true;
+  try {
+    await api("/api/scan/cancel", { method: "POST" });
+  } catch {
+    // Best-effort: the next status poll (1.5s cadence, already running) reflects reality
+    // regardless of whether this particular request succeeded.
+  } finally {
+    cancelBtn.disabled = false;
+  }
+}
+
 function initScanBar() {
   const form = document.getElementById("scan-form");
   loadQuickRoots();
@@ -354,20 +371,24 @@ function initScanBar() {
     closeScanConfirmDialog();
     if (path) startManualScan(path);
   });
+  document.getElementById("scan-cancel-btn").addEventListener("click", cancelScan);
   refreshScanStatus();
 }
 
 async function refreshScanStatus() {
   const statusEl = document.getElementById("scan-status");
   const submitBtn = document.querySelector("#scan-form button[type=submit]");
+  const cancelBtn = document.getElementById("scan-cancel-btn");
   try {
     const status = await api("/api/scan/status");
     renderScanStatus(status);
     if (status.status === "running") {
       submitBtn.disabled = true;
+      cancelBtn.hidden = false;
       if (!pollHandle) pollHandle = setInterval(pollScanStatus, 1500);
     } else {
       submitBtn.disabled = false;
+      cancelBtn.hidden = true;
     }
   } catch (err) {
     statusEl.dataset.tone = "error";
@@ -392,6 +413,15 @@ function renderScanStatus(status) {
       (status.skipped_unreadable_count
         ? ` ${status.skipped_unreadable_count} path(s) skipped (unreadable).`
         : "");
+  } else if (status.status === "cancelled") {
+    // Scan cancellation: a user-requested stop, not an error -- "warning" tone (same one
+    // renderSkippedUnreadableNote already uses for a non-fatal caveat), never "error". Reports
+    // whatever was genuinely indexed before the stop, honestly labeled as partial.
+    statusEl.dataset.tone = "warning";
+    statusEl.textContent =
+      `Scan cancelled — ${status.entries_total ?? 0} entries indexed so far ` +
+      `(${status.files_written ?? 0} written, ${status.files_unchanged ?? 0} unchanged) ` +
+      `before it was stopped.`;
   } else if (status.status === "failed") {
     statusEl.dataset.tone = "error";
     statusEl.textContent = `Scan of ${status.root} failed: ${status.error}`;
@@ -403,10 +433,12 @@ async function pollScanStatus() {
   if (!status) return;
   renderScanStatus(status);
   const submitBtn = document.querySelector("#scan-form button[type=submit]");
+  const cancelBtn = document.getElementById("scan-cancel-btn");
   if (status.status !== "running") {
     clearInterval(pollHandle);
     pollHandle = null;
     submitBtn.disabled = false;
+    cancelBtn.hidden = true;
     const activeView = document.querySelector('.rc-tab[aria-selected="true"]')?.dataset.view;
     if (activeView) VIEW_LOADERS[activeView]?.();
   }
@@ -879,6 +911,19 @@ async function pollSimpleScan() {
     return;
   }
 
+  if (status.status === "cancelled") {
+    // Scan cancellation: a user-requested stop, never an error -- "empty" is this codebase's
+    // neutral (non-alarming) renderState kind, same one renderSimpleEmpty already uses for a
+    // non-error informational message, not "error"'s alert-styled panel.
+    renderState(container, "empty", {
+      title: "Scan cancelled",
+      message: `${status.entries_total ?? 0} items indexed so far before it was stopped.`,
+      actionLabel: "Scan again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+
   await loadSimpleResults();
 }
 
@@ -941,6 +986,22 @@ function renderSimpleScanning(status) {
   safety.className = "rc-progress-safety-note";
   safety.textContent = "It's safe to close this tab or stop the server at any point.";
   panel.appendChild(safety);
+
+  // Scan cancellation: same POST /api/scan/cancel every surface uses -- pollSimpleScan's next
+  // tick (already running, SIMPLE_SCAN_POLL_INTERVAL_MS cadence) picks up the resulting
+  // "cancelled" status and renders it, same "poll reflects reality" posture cancelScan() itself
+  // documents for the ADVANCED scan bar.
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "rc-btn rc-btn-secondary";
+  cancelBtn.textContent = "Cancel scan";
+  cancelBtn.addEventListener("click", () => {
+    cancelBtn.disabled = true;
+    api("/api/scan/cancel", { method: "POST" }).catch(() => {
+      cancelBtn.disabled = false;
+    });
+  });
+  panel.appendChild(cancelBtn);
 
   container.appendChild(panel);
 }
@@ -1027,6 +1088,82 @@ function renderSimpleCleanError(err) {
 
 function initSimpleMode() {
   renderSimpleIdle();
+}
+
+// --- Shared dialog behavior: focus trap + Escape-to-close ---------------------------------------
+//
+// Every `.rc-overlay[role="dialog"]` (first-run-overlay, scan-confirm-dialog, quick-clean-dialog,
+// how-it-works-dialog, power-mode-dialog) is opened/closed by its own function setting `.hidden`
+// directly rather than through a shared helper -- aria-modal="true" alone gets none of Tab-trapping,
+// initial-focus-move, or Esc-to-close for free from the browser, so this one global listener covers
+// all five by watching for whichever dialog is currently open, instead of threading the same fix
+// through every open()/close() pair above.
+function openDialogEl() {
+  return document.querySelector('.rc-overlay[role="dialog"]:not([hidden])');
+}
+
+function focusableElements(container) {
+  return Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((el) => !el.disabled && el.offsetParent !== null);
+}
+
+// first-run-overlay has no cancel action (only "I understand, continue", which also POSTs
+// /api/first-run/acknowledge) -- Escape just hides it without acknowledging, same as initFirstRun's
+// existing "worst case it reappears next launch" posture on a failed acknowledge call.
+const DIALOG_ESCAPE_CLOSE_BUTTON_IDS = {
+  "scan-confirm-dialog": "scan-confirm-cancel",
+  "quick-clean-dialog": "quick-clean-cancel",
+  "how-it-works-dialog": "how-it-works-close",
+  "power-mode-dialog": "power-mode-cancel",
+};
+
+function initDialogKeyboardBehavior() {
+  document.addEventListener("keydown", (event) => {
+    const dialog = openDialogEl();
+    if (!dialog) return;
+
+    if (event.key === "Escape") {
+      const closeBtnId = DIALOG_ESCAPE_CLOSE_BUTTON_IDS[dialog.id];
+      if (closeBtnId) {
+        document.getElementById(closeBtnId).click();
+      } else {
+        dialog.hidden = true;
+      }
+      return;
+    }
+
+    if (event.key === "Tab") {
+      const focusable = focusableElements(dialog);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+
+  // Moves focus into whichever dialog becomes visible, and back to whatever triggered it once it
+  // closes -- a MutationObserver on `hidden` (a reflected attribute, so `dialog.hidden = false`
+  // above is observable here) covers every open()/close() pair without editing each of them.
+  let lastFocusedBeforeDialog = null;
+  for (const dialog of document.querySelectorAll('.rc-overlay[role="dialog"]')) {
+    new MutationObserver(() => {
+      if (dialog.hidden) {
+        lastFocusedBeforeDialog?.focus();
+      } else {
+        lastFocusedBeforeDialog = document.activeElement;
+        focusableElements(dialog)[0]?.focus();
+      }
+    }).observe(dialog, { attributes: true, attributeFilter: ["hidden"] });
+  }
 }
 
 // --- "How this works" ----------------------------------------------------------------------------
@@ -2022,9 +2159,36 @@ async function initRecoveryBanner() {
   }
 }
 
+// --- Update check (opt-in; see PRIVACY.md's "Updates" section) --------------------------------
+//
+// GET /api/update-check never blocks initial render (called from init(), fire-and-forget, same
+// "fetch after the page is already usable" posture as initRecoveryBanner). The endpoint itself
+// makes zero network calls unless the user opted in via config.toml's [update_check] section --
+// this call always resolves fast either way (see reclaim.update_check's cache/timeout). Fails
+// silent-hidden on error, same "never trap or alarm the user over a broken status check" posture
+// as initFirstRun/initRecoveryBanner -- the existing "Check for updates" link is always there as
+// a manual fallback regardless of what this check finds.
+
+async function initUpdateCheck() {
+  const badge = document.getElementById("update-check-badge");
+  try {
+    const status = await api("/api/update-check");
+    if (!status.update_available || !status.latest_version) {
+      return;
+    }
+    badge.href = status.release_url;
+    badge.textContent = `Update available: ${status.latest_version}`;
+    badge.setAttribute("aria-label", `A newer Reclaim release, ${status.latest_version}, is available — opens the release page`);
+    badge.hidden = false;
+  } catch {
+    // Fail hidden: badge just never appears; the plain "Check for updates" link still works.
+  }
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
+  initDialogKeyboardBehavior();
   initTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   initDashboardMode();
@@ -2042,6 +2206,7 @@ function init() {
   initModeControls();
   initFirstRun();
   initRecoveryBanner();
+  initUpdateCheck();
   activateTab("overview");
 }
 

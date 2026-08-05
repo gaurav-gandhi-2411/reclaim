@@ -12,6 +12,8 @@ import re
 import tomllib
 from pathlib import Path
 
+from reclaim.cli import _VERSION
+
 _REPO_ROOT = Path(__file__).parent.parent
 
 
@@ -30,12 +32,26 @@ def test_installer_script_version_matches_pyproject() -> None:
     )
 
 
-def test_readme_documented_build_command_version_matches_pyproject() -> None:
-    readme_text = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    versions = re.findall(r"--product-version=([\w.\-]+)", readme_text)
-    assert versions, "README no longer documents a --product-version flag"
+def test_cli_version_flag_matches_pyproject() -> None:
+    # `reclaim.cli._VERSION` is hardcoded rather than read via `importlib.metadata` at runtime
+    # (see its module-level comment for why: no dist-info in the Nuitka standalone build) -- so
+    # it needs its own drift gate, same shape as the .iss/build-script checks below.
+    assert _pyproject_version() == _VERSION, (
+        f"reclaim.cli._VERSION says {_VERSION!r} but pyproject.toml says "
+        f"{_pyproject_version()!r} — 'reclaim --version' would report a stale version. Update "
+        "reclaim.cli._VERSION."
+    )
+
+
+def test_build_script_version_matches_pyproject() -> None:
+    # The Nuitka --product-version flag moved out of README.md and into build_installer.ps1
+    # (packaging/build_installer.ps1) when the manual build command became a script -- this is
+    # now the single place that flag is declared, so it's the one this gate has to watch.
+    script_text = (_REPO_ROOT / "packaging" / "build_installer.ps1").read_text(encoding="utf-8")
+    versions = re.findall(r"--product-version=([\w.\-]+)", script_text)
+    assert versions, "packaging/build_installer.ps1 no longer documents a --product-version flag"
     for found in versions:
         assert found == _pyproject_version(), (
-            f"README documents --product-version={found} but pyproject.toml says "
-            f"{_pyproject_version()!r} — a reader following the docs builds a mislabeled exe."
+            f"build_installer.ps1 declares --product-version={found} but pyproject.toml says "
+            f"{_pyproject_version()!r} — running the build script ships a mislabeled exe."
         )

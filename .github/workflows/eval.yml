@@ -58,8 +58,8 @@ jobs:
       # `testpaths = ["tests"]` means a bare `pytest` NEVER discovers anything under evals/, so
       # this 18-test file — the actual safe-mode structural gate — had never run in ANY CI job
       # before this, only ever locally if someone happened to invoke it by exact path.
-      - name: Safety gates -- deterministic, AI recommend-only, and safe-mode structural boundary
-        run: uv run pytest evals/test_safety_gate.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py -v --junitxml=pytest-results.xml
+      - name: Safety gates -- deterministic, adversarial, AI recommend-only, and safe-mode structural boundary
+        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml

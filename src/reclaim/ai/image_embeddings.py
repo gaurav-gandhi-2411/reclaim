@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from reclaim.ai._optional import require
+from reclaim.ai._optional import require, require_bundled_model
 
 # Feature 1a Track B (spec §1, ADR-0022): CLIP semantic image embeddings — the
 # whole-scene/subject similarity signal pHash (Track A) can't provide (pHash is a low-
@@ -22,29 +21,38 @@ from reclaim.ai._optional import require
 # (size/mtime changed = the file changed = the old embedding may no longer be valid) avoids
 # re-embedding a whole photo library on every run. `model_id` is part of the key so switching
 # model checkpoints never silently mixes incompatible embedding spaces.
+#
+# Wave 1 P0-B (2026-07-30): rewritten from torch/open_clip to ONNX Runtime — torch/
+# open-clip-torch dropped entirely (see ADR-0029's successor decision; the "download a
+# separate AI runtime" plan was superseded by "the model is small enough to bundle directly
+# once quantized"). The CLIP vision encoder ships as a pinned, SHA256-verified fp16 ONNX file
+# under `reclaim/ai/models/` (175.8MB) — fp16, not int8: a decision-grade BCubed comparison on
+# real INRIA Copydays blocks measured int8 at a material -11pp precision regression at the
+# shipped operating threshold, while fp16 was bit-identical BCubed behavior to the original
+# torch-fp32 model (see reports/ai/onnx_quality_parity/). Quality-parity numbers, payload
+# sizes, and the full decision rationale are documented there, not repeated here.
 
-_OPEN_CLIP_MODEL_NAME = "ViT-B-32-quickgelu"  # NOT the bare "ViT-B-32" -- the "openai"
-# checkpoint was trained with QuickGELU activation; open_clip's default "ViT-B-32" config
-# uses standard GELU and warns "QuickGELU mismatch" if paired with the "openai" pretrained
-# tag (caught during this ADR's build, not shipped with a silently-degraded embedding space —
-# see ADR-0022).
-_EMBEDDING_MODEL_ID = f"open_clip:{_OPEN_CLIP_MODEL_NAME}:openai"  # see ADR-0022
+_PACKAGE_DIR = Path(__file__).parent
+_MODELS_DIR = _PACKAGE_DIR / "models"
 
-# Supply-chain integrity (audit findings E17/E18, ADR-0028): open_clip==3.3.0 (pinned in
-# pyproject.toml/uv.lock) has NO `revision=` passthrough anywhere on the tag-based
-# `pretrained="openai"` loading path -- `create_model` always calls
-# `download_pretrained_from_hf(model_id, cache_dir=cache_dir)` with `revision=None`, i.e. HF
-# Hub's MUTABLE "main" ref (verified directly against the installed package source, not
-# assumed). The "openai" tag resolves (via `open_clip.get_pretrained_cfg`) to HF Hub repo
-# "timm/vit_base_patch32_clip_224.openai", not the more obviously-named
-# "openai/clip-vit-base-patch32". `_pinned_open_clip_checkpoint_path` below bypasses this
-# entirely: it downloads the checkpoint itself, pinned to an explicit commit hash, verifies
-# its SHA-256, and hands `create_model_and_transforms` a concrete local file path instead of
-# the "openai" tag -- the ONLY call site that ever touches HF Hub for this checkpoint.
-_OPEN_CLIP_HF_REPO = "timm/vit_base_patch32_clip_224.openai"
-_OPEN_CLIP_HF_REVISION = "a6f597a30f7b82c51704746581f9a4e41421e878"  # pinned; see ADR-0028
-_OPEN_CLIP_HF_WEIGHTS_FILENAME = "open_clip_model.safetensors"
-_OPEN_CLIP_HF_WEIGHTS_SHA256 = "e6d1bd7789aa45192b3bf90570a789b478bae1b74ebcce7eddd908e83a2b7c31"
+_CLIP_ONNX_FILENAME = "clip_vision_fp16.onnx"
+_CLIP_ONNX_SHA256 = "6ea2e813b38fc77b70b2e4930bff6c144d420c42bcb77ca1eeeaa4b0d2a2db02"
+# Bumped from the old `open_clip:ViT-B-32-quickgelu:openai` id (torch backend) — a different
+# backend/precision is, by this cache's own stated contract ("model_id is part of the key so
+# switching model checkpoints never silently mixes incompatible embedding spaces"), a
+# different embedding space, even though the underlying weights are the same CLIP checkpoint
+# just fp16-converted. Old cached torch embeddings simply become unreachable cache misses,
+# never silently compared against new ONNX ones.
+_EMBEDDING_MODEL_ID = f"onnx-fp16:clip_vision:{_CLIP_ONNX_SHA256[:12]}"
+
+# CLIP ViT-B-32/openai's own preprocessing constants (read from open_clip's built-in
+# "openai" tag config during Wave 1's conversion — see image_embeddings.py's git history
+# pre-P0-B for the torch/torchvision pipeline this replicates): Resize(shortest side to 224,
+# bicubic) -> CenterCrop(224) -> scale to [0,1] -> normalize(mean, std). Hardcoded here since
+# open_clip (the only thing that used to expose this config) is no longer a dependency.
+_CLIP_IMAGE_SIZE = 224
+_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS image_embeddings (
@@ -115,73 +123,63 @@ class ImageEmbeddingCache:
         self._conn.commit()
 
 
-_model_cache: object | None = None
-_preprocess_cache: object | None = None
+_session_cache: object | None = None
 
 
-def _verify_checkpoint_sha256_or_quarantine(checkpoint_path: Path, expected_sha256: str) -> None:
-    """Hashes `checkpoint_path` and compares it to `expected_sha256`, raising `RuntimeError`
-    (and deleting the file -- quarantine, never a silent reuse) on mismatch. HF Hub's own
-    download path is already atomic (tmp-file + rename, size-checked before the rename ever
-    happens -- a genuinely partial/interrupted download is never left where a caller could
-    read it), so this is a deliberate, independent layer on top: it catches a case the
-    size-only check inside `huggingface_hub` cannot, a server (or a compromised mirror/proxy)
-    that serves the wrong but correctly-sized bytes for the pinned revision."""
-    digest = hashlib.sha256()
-    with checkpoint_path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    actual_sha256 = digest.hexdigest()
-    if actual_sha256 != expected_sha256:
-        checkpoint_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"CLIP checkpoint integrity check failed for {checkpoint_path}: expected sha256 "
-            f"{expected_sha256}, got {actual_sha256}. The corrupted/tampered file has been "
-            "deleted; retry to re-download."
+def _clip_session() -> object:
+    """Lazily constructs the ONNX Runtime inference session once per process — loading the
+    session (reading + validating the 175.8MB model file) is the expensive part; running
+    inference against an already-loaded session is fast. Never called at import time or at
+    app startup — only the first time a caller actually needs a CLIP embedding (P1-A: lazy
+    loading, cold start must never pay this cost)."""
+    global _session_cache
+    if _session_cache is None:
+        onnxruntime = require("onnxruntime", feature="CLIP semantic image embeddings")
+        model_path = require_bundled_model(
+            _MODELS_DIR / _CLIP_ONNX_FILENAME,
+            expected_sha256=_CLIP_ONNX_SHA256,
+            feature="CLIP semantic image embeddings",
         )
-
-
-def _pinned_open_clip_checkpoint_path() -> str:
-    """Downloads (or reuses the local HF Hub cache for) the exact pinned CLIP checkpoint
-    revision and verifies its content hash (E18) before returning its path -- see the module
-    docstring comment above `_OPEN_CLIP_HF_REPO` for why this bypasses open_clip's own
-    `pretrained="openai"` tag resolution entirely."""
-    huggingface_hub = require("huggingface_hub", feature="pinned CLIP checkpoint download")
-    checkpoint_path = str(
-        huggingface_hub.hf_hub_download(
-            repo_id=_OPEN_CLIP_HF_REPO,
-            filename=_OPEN_CLIP_HF_WEIGHTS_FILENAME,
-            revision=_OPEN_CLIP_HF_REVISION,
+        _session_cache = onnxruntime.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
         )
-    )
-    _verify_checkpoint_sha256_or_quarantine(Path(checkpoint_path), _OPEN_CLIP_HF_WEIGHTS_SHA256)
-    return checkpoint_path
+    return _session_cache
 
 
-def _model_and_preprocess() -> tuple[object, object]:
-    global _model_cache, _preprocess_cache
-    if _model_cache is None:
-        open_clip = require("open_clip", feature="CLIP semantic image embeddings")
-        checkpoint_path = _pinned_open_clip_checkpoint_path()
-        # The "openai" tag's mean/std/interpolation/resize_mode/quick_gelu -- read from
-        # open_clip's own built-in config rather than duplicated as magic numbers here, so this
-        # reproduces EXACTLY what `pretrained="openai"` would have configured, just sourcing the
-        # weights file from the pinned/verified download above instead of the tag's own (mutable
-        # "main"-resolving) lookup.
-        tag_cfg = open_clip.get_pretrained_cfg(_OPEN_CLIP_MODEL_NAME, "openai")
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            _OPEN_CLIP_MODEL_NAME,
-            pretrained=checkpoint_path,
-            force_quick_gelu=tag_cfg["quick_gelu"],
-            image_mean=tag_cfg["mean"],
-            image_std=tag_cfg["std"],
-            image_interpolation=tag_cfg["interpolation"],
-            image_resize_mode=tag_cfg["resize_mode"],
-        )
-        model.eval()
-        _model_cache = model
-        _preprocess_cache = preprocess
-    return _model_cache, _preprocess_cache
+def _preprocess_image(image: object, pil_image_module: object, numpy: object) -> object:
+    r"""Reimplements CLIP ViT-B-32/openai's preprocessing without torchvision (Wave 1 P0-B —
+    torch/torchvision are no longer a dependency): resize the shortest side to 224 (bicubic),
+    center-crop to 224x224, scale to [0,1], normalize by CLIP's mean/std, transpose to CHW,
+    add a batch dimension.
+
+    `reducing_gap=3.0` on the resize: Pillow's plain BICUBIC resize is not numerically
+    identical to torchvision's antialiased bicubic resize (`antialias=True`) for a large
+    downscale ratio (a real photo down to 224px) — `reducing_gap` makes Pillow do a
+    two-step reduce-then-resize, which measurably improves the match (mean cosine similarity
+    between the two pipelines' resulting embeddings on real Copydays images: 0.994 without
+    `reducing_gap`, 0.996 with it — see reports/ai/onnx_quality_parity/ for the full,
+    disclosed measurement, including its real, small, accepted impact on BCubed grouping
+    quality: shipped-threshold F1 delta -0.008 for fp16, still comfortably above Track B's
+    own 0.70 precision floor).
+    """
+    image = image.convert("RGB")  # type: ignore[attr-defined]
+    width, height = image.size  # type: ignore[attr-defined]
+    if width < height:
+        new_width, new_height = _CLIP_IMAGE_SIZE, round(_CLIP_IMAGE_SIZE * height / width)
+    else:
+        new_width, new_height = round(_CLIP_IMAGE_SIZE * width / height), _CLIP_IMAGE_SIZE
+    bicubic = pil_image_module.BICUBIC  # type: ignore[attr-defined]
+    image = image.resize((new_width, new_height), bicubic, reducing_gap=3.0)  # type: ignore[attr-defined]
+    left = (new_width - _CLIP_IMAGE_SIZE) // 2
+    top = (new_height - _CLIP_IMAGE_SIZE) // 2
+    image = image.crop((left, top, left + _CLIP_IMAGE_SIZE, top + _CLIP_IMAGE_SIZE))  # type: ignore[attr-defined]
+
+    array = numpy.asarray(image, dtype=numpy.float32) / 255.0  # type: ignore[attr-defined]
+    mean = numpy.array(_CLIP_MEAN, dtype=numpy.float32)  # type: ignore[attr-defined]
+    std = numpy.array(_CLIP_STD, dtype=numpy.float32)  # type: ignore[attr-defined]
+    array = (array - mean) / std
+    array = array.transpose(2, 0, 1)  # HWC -> CHW
+    return array[None, ...].astype(numpy.float32)  # type: ignore[attr-defined]
 
 
 def compute_image_embedding(
@@ -199,18 +197,17 @@ def compute_image_embedding(
         if cached is not None:
             return cached
 
-    pil_image = require("PIL.Image", feature="image loading")
-    torch = require("torch", feature="CLIP inference")
+    pil_image_module = require("PIL.Image", feature="image loading")
+    numpy = require("numpy", feature="CLIP inference")
     try:
-        image = pil_image.open(path).convert("RGB")
+        image = pil_image_module.open(path)
     except Exception:
         return None
 
-    model, preprocess = _model_and_preprocess()
-    tensor = preprocess(image).unsqueeze(0)  # type: ignore[operator]
-    with torch.no_grad():
-        features = model.encode_image(tensor)  # type: ignore[attr-defined]
-    vector = tuple(float(v) for v in features[0])
+    tensor = _preprocess_image(image, pil_image_module, numpy)
+    session = _clip_session()
+    output = session.run(None, {"pixel_values": tensor})[0]  # type: ignore[attr-defined]
+    vector = tuple(float(v) for v in output[0])
     embedding = ImageEmbedding(path=path, vector=vector)
 
     if cache is not None:

@@ -160,6 +160,32 @@ _CASES: dict[str, Case] = {
         expect_index=True,
         reason="DELETE ... WHERE path = ? — primary-key point delete",
     ),
+    # --- Wave 1 (2026-07-30): streaming-safe staleness tracking (see index.py's own module
+    # comment above `begin_scan_tracking`) — replaces scan_tree's use of prune_missing above.
+    "prune_unseen_under_root": Case(
+        lambda idx: (idx.begin_scan_tracking(), idx.prune_unseen_under_root(_SCOPE))[-1],
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range, same pattern as direct_children/"
+        "load_stat_cache; the NOT IN subquery scans the small temp scan_seen table (empty "
+        "here), never the 5000-row files table",
+    ),
+    "begin_scan_tracking": Case(
+        action=None,
+        expect_index=False,
+        reason="DROP TABLE IF EXISTS + CREATE TEMP TABLE — schema DDL on a connection-scoped "
+        "temp table, not a data query; no SEARCH/SCAN plan applies",
+    ),
+    "record_seen": Case(
+        action=None,
+        expect_index=False,
+        reason="INSERT OR IGNORE ... — same statement shape as upsert_records above; "
+        "EXPLAIN QUERY PLAN produces no plan rows for this shape (verified empirically)",
+    ),
+    "end_scan_tracking": Case(
+        action=None,
+        expect_index=False,
+        reason="DROP TABLE IF EXISTS — schema DDL, not a data query; no SEARCH/SCAN plan applies",
+    ),
     "store_partial_hashes": Case(
         lambda idx: idx.store_partial_hashes(
             [(Path("C:/Data/dir1/file1.bin"), 100, 1.0, "digest")]

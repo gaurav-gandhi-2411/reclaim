@@ -14,7 +14,7 @@ from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
 from reclaim.models import Mode
 from reclaim.safety import SafetyValidator
 
-ScanStatusLiteral = Literal["idle", "running", "completed", "failed"]
+ScanStatusLiteral = Literal["idle", "running", "completed", "failed", "cancelled"]
 AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
 ApplyStatusLiteral = Literal["idle", "running", "completed", "failed"]
 RestoreStatusLiteral = Literal["idle", "running", "completed", "failed"]
@@ -157,6 +157,17 @@ class AppState:
     port: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     scan_status: ScanStatus = field(default_factory=ScanStatus)
+    # Scan cancellation: the one cooperative-cancellation signal `service.run_scan` threads
+    # through `scanner.count_entries_fast`/`scan_tree`. Cleared by the route handlers
+    # (`POST /api/scan`, `POST /api/scan/full-drive`) synchronously, under the same `lock`
+    # acquisition that flips `scan_status` to "running" -- BEFORE the background task is ever
+    # scheduled -- rather than by `run_scan` itself at the top of its own body: Starlette only
+    # runs a `BackgroundTasks` callable AFTER the HTTP response has already been sent to the
+    # client, so a client that calls `POST /api/scan/cancel` immediately after receiving that
+    # response could otherwise race an in-`run_scan` `.clear()` and have its cancel request
+    # silently wiped. Set by `POST /api/scan/cancel`. A plain `threading.Event` (not a
+    # `Lock`-guarded bool) since setting/checking it must never block a poller or the walk itself.
+    cancel_scan_event: threading.Event = field(default_factory=threading.Event)
     mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
     first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
     # G25: the persistent rotating log file this process's `configure_logging` call actually

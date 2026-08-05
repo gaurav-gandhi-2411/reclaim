@@ -122,7 +122,9 @@ class SuggestedScanRootsResponse(BaseModel):
 class ScanStatusOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: str
+    status: str  # "idle" | "running" | "completed" | "failed" | "cancelled" -- see
+    # `reclaim.api.state.ScanStatusLiteral`. "cancelled" (scan cancellation, `POST
+    # /api/scan/cancel`) is a user-requested stop, never an error -- `error` stays `None`.
     root: str | None
     started_at: float | None
     finished_at: float | None
@@ -592,6 +594,27 @@ class FirstRunStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     acknowledged: bool
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------
+
+
+class UpdateCheckResponse(BaseModel):
+    """`GET /api/update-check`'s response. `enabled=False` means the feature is off in
+    config.toml — `reclaim.update_check.check_for_update` was never called, so no network
+    request happened for this response at all (see `api.service.check_for_update_status`).
+    `status="unknown"` means the feature is on but the check itself couldn't get a usable
+    answer (offline, GitHub down, malformed response, etc.) — a normal, expected outcome that
+    must render as "couldn't check right now," never as an error."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    status: str  # "disabled" | "ok" | "unknown"
+    current_version: str
+    latest_version: str | None
+    update_available: bool
+    release_url: str
 
 
 # --- G25: bug-report diagnostics ----------------------------------------------------------------

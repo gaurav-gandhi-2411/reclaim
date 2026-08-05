@@ -10,14 +10,20 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
 
+from reclaim.drives import is_network_drive
 from reclaim.index import ScanIndex, StoredStat, is_unchanged
-from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT, FileRecord
+from reclaim.models import (
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_REPARSE_POINT,
+    FileRecord,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -129,6 +135,7 @@ def count_entries_fast(
     root: Path,
     *,
     on_progress: CountProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> int:
     r"""Fast, stat-free entry count under `root` — the "quick sample" `api.service.run_scan`'s
     live ETA is derived from (full-drive-scan-eta). The real `scan_tree` does one real
@@ -155,12 +162,22 @@ def count_entries_fast(
 
     Iterative (explicit stack), not recursive, matching `_walk_subtree`'s own convention — avoids
     Python's recursion limit on a real deep tree.
+
+    `cancel_event` (scan cancellation): checked at the top of every directory popped off the
+    stack AND on every individual entry — a single huge flat directory must not be able to delay
+    a cancellation until it's fully enumerated. `None` (the default) never checks anything, zero
+    behavior change for every existing caller. On cancellation this simply stops early and
+    returns whatever partial count was reached — this function's result only ever feeds an ETA
+    estimate, so a partial count is never treated as authoritative the way `scan_tree`'s own
+    `ScanStats.cancelled` is.
     """
     start_time = time.monotonic()
     count = 0
     last_heartbeat = start_time
     stack = [root]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         current_dir = stack.pop()
         try:
             dir_entries = list(os.scandir(long_path(current_dir)))
@@ -169,6 +186,8 @@ def count_entries_fast(
             continue
 
         for entry in dir_entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             try:
                 is_dir_entry = entry.is_dir(follow_symlinks=False)
                 is_reparse_point = bool(
@@ -308,6 +327,23 @@ class ScanStats:
     # `_SKIPPED_PATHS_SAMPLE_LIMIT`) of the actual paths, never the full list.
     skipped_unreadable_count: int
     skipped_unreadable_paths: tuple[str, ...]
+    # 2026-07-30 telemetry addendum (see `_RiskCounter`): how many entries this run's real
+    # `os.stat()` calls actually took the timeout-guarded path (reparse points, cloud
+    # placeholders, or a network-mapped/UNC root) vs the fast unguarded path. Turns "why did
+    # wall time only partly recover after risk-targeting the guard" into a measurement on every
+    # real scan, not a one-off diagnostic A/B.
+    guarded_stat_count: int
+    fast_stat_count: int
+    # Scan cancellation: `True` only when a caller-supplied `cancel_event` was actually observed
+    # SET during this walk (never inferred from anything else, e.g. "returned early for some
+    # other reason") — `False` for a normal, uncancelled completion, matching every other bool
+    # field in this codebase's "explicit, never implied" convention. Every already-flushed batch
+    # is durable regardless (see `_BatchIndexWriter`'s docstring); this field is what tells a
+    # caller "the walk stopped before covering the whole tree, don't treat the aggregate counts
+    # above as a complete inventory" — `files_pruned` is always `0` on a cancelled run, since
+    # `prune_unseen_under_root` must never run against a partial `scan_seen` set (it would wrongly
+    # delete every real, still-existing entry this run simply never got to).
+    cancelled: bool
 
 
 class GitRepoCache:
@@ -367,6 +403,18 @@ class GitRepoCache:
         return clean
 
 
+# Wave 1 finding #5 (2026-07-30 real-disk diagnosis): on a real developer machine, a large
+# fraction of directories `GitRepoCache` finds a `.git` marker under are legitimately owned but
+# still trip Git's "detected dubious ownership" safe.directory protection (CVE-2022-24765) when
+# `git status` runs with a different effective identity/context than whoever created the repo —
+# confirmed on the diagnostic run (dozens of `exit status 128` hits under real, ordinary repo
+# roots the user actually owns). This already fails SAFE (`_query_git_clean` returns `False`,
+# same conservative default as every other failure here) — the fix is purely about noise: at
+# real-disk scale this was thousands of `warning`-level lines competing for the rotating log's
+# fixed 30MB budget (`logging_config.py`) with genuinely actionable warnings.
+_GIT_DUBIOUS_OWNERSHIP_MARKER = "detected dubious ownership"
+
+
 def _query_git_clean(repo_root: Path) -> bool:
     """Runs `git status --porcelain` once for a repo root. Any failure (git missing, not a
     repo, timeout) is treated as not-clean — conservative, matching SafetyValidator's
@@ -386,10 +434,96 @@ def _query_git_clean(repo_root: Path) -> bool:
             text=True,
             timeout=30,
         )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ""
+        if _GIT_DUBIOUS_OWNERSHIP_MARKER in stderr.lower():
+            logger.debug("scan.git_dubious_ownership", repo_root=str(repo_root))
+        else:
+            logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
+        return False
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
     return result.stdout.strip() == ""
+
+
+# Wave 1 finding #3 (2026-07-30 real-disk diagnosis): `build_record`'s `os.stat()` call was the
+# only per-entry syscall anywhere in the scan walk with no timeout guard at all — `dedup.py`'s
+# hash reads have had one since real-disk validation showed a locked/pathological file must
+# never wedge the whole pipeline (`_hash_with_guard`). A stalled `os.stat()` on one top-level
+# directory couldn't previously be distinguished from a genuinely long scan; combined with the
+# old `executor.map()`-based consumption (submission-order-blocking — see `scan_tree`'s
+# `as_completed` rewrite below), it could silently stall the entire scan's visible output with
+# no error ever raised. Same "submit to a small shared pool, abandon a timed-out thread rather
+# than block the caller forever" pattern as `dedup._hash_with_guard` — Python has no
+# cross-platform way to preempt a blocked syscall, so a timed-out thread leaks rather than dies,
+# same trade-off `dedup.py` already accepts.
+#
+# First version of this guard routed EVERY entry through the timeout-guarded pool unconditionally
+# — correct, but measured (real A/B, same machine) at 10,696 files/sec unguarded vs 6,323
+# files/sec guarded, a ~41% throughput cost paid on every single local file for a guard that has
+# never actually fired on either real-disk run. Risk-targeted instead: only entries that are
+# actually plausible stat-hang candidates (a reparse point — the target could be anything, a
+# broken/circular junction, a slow network path; a cloud placeholder — hydration risk; or any
+# entry under a network-mapped/UNC root — an unresponsive server) route through the guard.
+# Everything else calls `os.stat()` directly on the worker thread, at full unguarded speed.
+_STAT_TIMEOUT_SECONDS = 30.0
+_STAT_TIMEOUT_WORKERS = 8
+_RISK_ATTRIBUTES = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+
+
+def _entry_is_risky(entry: os.DirEntry[str], *, force_guard: bool) -> bool:
+    """True if `entry` is a plausible stat-hang candidate and should route through the
+    timeout-guarded pool. `force_guard` (set once per scan by `scan_tree` via
+    `is_network_drive(root)`, never recomputed per-entry) short-circuits every entry under a
+    network-mapped/UNC root as risky without needing a per-entry check. Otherwise, checks the
+    reparse-point/cloud-placeholder attribute bits via `entry.stat(follow_symlinks=False)` — on
+    Windows this reads straight from the `FindNextFile` data `os.scandir` already collected (see
+    `count_entries_fast`'s docstring: "a free, already-cached attribute check, not a second
+    per-entry syscall"), so this check itself costs nothing extra. A `stat()` failure here (rare
+    — the entry was just listed by scandir) fails toward `True`: if the cheap check itself can't
+    tell, guard the real stat rather than assume it's safe."""
+    if force_guard:
+        return True
+    try:
+        attributes = entry.stat(follow_symlinks=False).st_file_attributes
+    except OSError:
+        return True
+    return bool(attributes & _RISK_ATTRIBUTES)
+
+
+def _guarded_stat(stat_executor: ThreadPoolExecutor | None, path: str) -> os.stat_result:
+    """`os.stat(path, follow_symlinks=False)`, optionally timeout-guarded via `stat_executor`.
+    `stat_executor=None` (the default — used by `build_record_for_path`'s one-off single-path
+    lookups, never a per-entry scan hot loop) falls back to a plain synchronous call, zero
+    behavior change for that call site. `scan_tree` passes a real shared executor so every
+    `build_record` call across its whole walk shares one bounded `_STAT_TIMEOUT_WORKERS`-sized
+    pool, not one pool per top-level-directory worker."""
+    if stat_executor is None:
+        return os.stat(path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path
+    future = stat_executor.submit(os.stat, path, follow_symlinks=False)
+    return future.result(timeout=_STAT_TIMEOUT_SECONDS)
+
+
+class _RiskCounter:
+    """Thread-safe tally of guarded-vs-fast-path stat routing (2026-07-30 telemetry addendum):
+    turns "why did wall time only partly recover after risk-targeting" from a guess into a
+    measurement on every real scan from here on, reported via `ScanStats.guarded_stat_count`/
+    `fast_stat_count` — legitimate guarded-path volume (real reparse points/cloud placeholders/
+    network roots on the scanned machine) is a different story than an unexplained residual
+    cost, and this is what tells the two apart without re-running a diagnostic A/B each time."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.guarded = 0
+        self.fast = 0
+
+    def record(self, *, guarded: bool) -> None:
+        with self._lock:
+            if guarded:
+                self.guarded += 1
+            else:
+                self.fast += 1
 
 
 def build_record(
@@ -397,16 +531,26 @@ def build_record(
     current_dir: Path,
     git_cache: GitRepoCache,
     skipped: list[SkippedPath],
+    stat_executor: ThreadPoolExecutor | None = None,
+    *,
+    force_guard: bool = False,
+    risk_counter: _RiskCounter | None = None,
 ) -> tuple[FileRecord, bool] | None:
     """Builds a FileRecord for one os.scandir entry.
 
     Returns `(record, should_recurse)`, or `None` if the entry couldn't be stat'd (permission
-    error, deleted mid-scan, etc.) — the caller skips those rather than crashing the scan, and
-    this function itself appends a `SkippedPath` to `skipped` so the miss is visible in
-    `ScanStats`, not just logged (D12). `should_recurse` is gated solely on the reparse-point
-    attribute bit, never on `entry.is_dir()` — Windows junctions carry `FILE_ATTRIBUTE_DIRECTORY`
-    alongside the reparse bit and some Python/Windows combinations still report them as
-    traversable via `is_dir()`.
+    error, deleted mid-scan, a stat that timed out, etc.) — the caller skips those rather than
+    crashing the scan, and this function itself appends a `SkippedPath` to `skipped` so the miss
+    is visible in `ScanStats`, not just logged (D12). `should_recurse` is gated solely on the
+    reparse-point attribute bit, never on `entry.is_dir()` — Windows junctions carry
+    `FILE_ATTRIBUTE_DIRECTORY` alongside the reparse bit and some Python/Windows combinations
+    still report them as traversable via `is_dir()`.
+
+    `force_guard` (Wave 1 finding #3, risk-targeted revision — see the guard's own module
+    comment): `True` for every entry under a network-mapped/UNC scan root; otherwise the
+    per-entry reparse-point/cloud-placeholder check (`_entry_is_risky`) decides. Only entries
+    classified risky pay the `stat_executor` thread-hop cost. `risk_counter`, if given, records
+    which path each entry took — see `_RiskCounter`.
     """
     entry_path = current_dir / entry.name
     try:
@@ -425,9 +569,13 @@ def build_record(
         # `executor.py`'s `_atomic_move`/`_tree_stats` already document. follow_symlinks=False so
         # a reparse point is stat'd as itself, not as whatever it points to — required to read
         # the reparse-point attribute bit correctly.
-        st = os.stat(entry.path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path
+        risky = _entry_is_risky(entry, force_guard=force_guard)
+        if risk_counter is not None:
+            risk_counter.record(guarded=risky)
+        executor_for_call = stat_executor if risky else None
+        st = _guarded_stat(executor_for_call, entry.path)
         is_dir_entry = entry.is_dir(follow_symlinks=False)
-    except OSError as exc:
+    except (OSError, FutureTimeoutError) as exc:
         logger.warning("scan.entry_unreadable", path=str(entry_path), error=str(exc))
         skipped.append(SkippedPath(path=str(entry_path), error=str(exc)))
         return None
@@ -492,14 +640,91 @@ def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | N
     return None
 
 
+# Wave 1 finding #1 (2026-07-30 real-disk diagnosis): batched-transaction size — mirrors
+# dedup.py's `_WRITE_BATCH_SIZE` cadence (that one flushes hash writes; this one flushes scan
+# writes) and the spec's own "batched transactions (e.g. 5-10k inserts)" ask.
+_WRITE_BATCH_SIZE = 5000
+
+
 @dataclass(frozen=True, slots=True)
 class _SubtreeResult:
-    records: list[FileRecord]
     dirs_visited: int
     skipped: list[SkippedPath]
 
 
-def _walk_subtree(start: Path, tracker: _ProgressTracker | None = None) -> _SubtreeResult:
+class _BatchIndexWriter:
+    """Thread-safe, size-batched wrapper around `ScanIndex` writes, shared across every worker
+    `_walk_subtree` fans out to (Wave 1 finding #1). Replaces the prior design, where every
+    `FileRecord` for an entire walk was accumulated in one Python list and written once, in a
+    single giant transaction, at the very end of `scan_tree` — measured on a real 2.67M-file
+    scan of a live home directory at 5,085MB peak RSS (PLAN.md's 2026-07-30 checkpoint), which
+    extrapolates well past typical consumer RAM on a genuine full-drive scan.
+
+    Each worker keeps its own small, thread-local pending buffer (cheap; no cross-thread
+    contention on the buffer itself) and only takes `_lock` for the actual SQLite call at flush
+    time — so peak memory is bounded by `worker_count * _WRITE_BATCH_SIZE`, a fixed ceiling
+    independent of total file count, not by the number of files under `root`. A crash mid-walk
+    now loses at most the last unflushed batch per worker, not the entire walk's progress —
+    everything flushed so far is already durable in the index.
+    """
+
+    def __init__(self, index: ScanIndex, *, scanned_at: float) -> None:
+        self._index = index
+        self._scanned_at = scanned_at
+        self._lock = threading.Lock()
+        self.written = 0
+        self.touched = 0
+
+    def flush(self, upserts: list[FileRecord], unchanged_paths: list[str]) -> None:
+        """Writes one batch: `upserts` (changed/new records, or every record when
+        `incremental=False`) via `upsert_records`, and every visited path this batch covers
+        (both `upserts` and `unchanged_paths`) into the scan's seen-tracking table, so
+        `prune_unseen_under_root` can later tell a still-present-but-unchanged file apart from
+        one that's genuinely gone — without `scan_tree` ever holding either set fully in Python
+        memory (see `index.py`'s `begin_scan_tracking`/`record_seen`/`prune_unseen_under_root`).
+        A no-op if both lists are empty (the caller's final flush after an already-flushed,
+        exactly-full last batch)."""
+        if not upserts and not unchanged_paths:
+            return
+        seen = [record.path.as_posix() for record in upserts] + unchanged_paths
+        with self._lock:
+            if upserts:
+                self.written += self._index.upsert_records(upserts, scanned_at=self._scanned_at)
+            self._index.record_seen(seen)
+            self.touched += len(unchanged_paths)
+
+
+def _classify_record(
+    record: FileRecord,
+    stat_cache: dict[str, StoredStat] | None,
+    incremental: bool,
+    pending_upserts: list[FileRecord],
+    pending_unchanged: list[str],
+) -> None:
+    """Sorts one built record into the batch it belongs to — changed/new (needs a real row
+    write) or unchanged (only needs to be marked seen, never rewritten — see
+    `_BatchIndexWriter.flush`'s docstring). `stat_cache=None` (passed whenever `incremental` is
+    False) always classifies as changed, matching the pre-batching behavior exactly."""
+    posix_path = record.path.as_posix()
+    stored = stat_cache.get(posix_path) if (incremental and stat_cache is not None) else None
+    if is_unchanged(stored, current_size=record.size_bytes, current_mtime=record.mtime):
+        pending_unchanged.append(posix_path)
+    else:
+        pending_upserts.append(record)
+
+
+def _walk_subtree(
+    start: Path,
+    *,
+    stat_cache: dict[str, StoredStat] | None,
+    incremental: bool,
+    writer: _BatchIndexWriter,
+    stat_executor: ThreadPoolExecutor | None,
+    force_guard: bool,
+    risk_counter: _RiskCounter,
+    tracker: _ProgressTracker | None = None,
+    cancel_event: threading.Event | None = None,
+) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
 
@@ -510,16 +735,30 @@ def _walk_subtree(start: Path, tracker: _ProgressTracker | None = None) -> _Subt
     code reasons about" convention.
 
     `tracker` (full-drive-scan-eta): optional, shared across every concurrent invocation of this
-    function `scan_tree`'s `ThreadPoolExecutor.map` fans out (one call per top-level directory)
-    — `None` (the default) when `scan_tree` itself was called with no `on_progress`, matching
-    every other progress-hook default in this codebase.
+    function `scan_tree` fans out (one call per top-level directory) — `None` (the default) when
+    `scan_tree` itself was called with no `on_progress`, matching every other progress-hook
+    default in this codebase. `writer`/`stat_cache`/`incremental`/`stat_executor` are likewise
+    shared across every concurrent invocation (Wave 1 finding #1/#3) — records are written in
+    `_WRITE_BATCH_SIZE`-sized batches as this walk progresses, never accumulated for the whole
+    subtree and returned.
+
+    `cancel_event` (scan cancellation): the SAME shared `threading.Event` every concurrent
+    invocation of this function gets, checked at the top of every directory popped off the stack
+    AND on every individual entry (same granularity as `count_entries_fast`) — a single huge flat
+    directory must not delay a cancellation until it's fully enumerated. On cancellation the loop
+    simply stops; the unconditional `writer.flush(...)` below still runs on the way out, so
+    whatever this worker had pending is flushed as one clean, complete batch — never abandoned
+    mid-transaction (see `_BatchIndexWriter`'s docstring).
     """
     git_cache = GitRepoCache()
-    records: list[FileRecord] = []
     skipped: list[SkippedPath] = []
     dirs_visited = 0
+    pending_upserts: list[FileRecord] = []
+    pending_unchanged: list[str] = []
     stack = [start]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         current_dir = stack.pop()
         dirs_visited += 1
         try:
@@ -530,17 +769,34 @@ def _walk_subtree(start: Path, tracker: _ProgressTracker | None = None) -> _Subt
             continue
 
         for entry in entries:
-            built = build_record(entry, current_dir, git_cache, skipped)
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            built = build_record(
+                entry,
+                current_dir,
+                git_cache,
+                skipped,
+                stat_executor,
+                force_guard=force_guard,
+                risk_counter=risk_counter,
+            )
             if built is None:
                 continue
             record, should_recurse = built
-            records.append(record)
+            _classify_record(record, stat_cache, incremental, pending_upserts, pending_unchanged)
             if tracker is not None:
                 tracker.add(1)
             if should_recurse:
                 stack.append(record.path)
+            if len(pending_upserts) >= _WRITE_BATCH_SIZE or len(pending_unchanged) >= (
+                _WRITE_BATCH_SIZE
+            ):
+                writer.flush(pending_upserts, pending_unchanged)
+                pending_upserts = []
+                pending_unchanged = []
 
-    return _SubtreeResult(records=records, dirs_visited=dirs_visited, skipped=skipped)
+    writer.flush(pending_upserts, pending_unchanged)
+    return _SubtreeResult(dirs_visited=dirs_visited, skipped=skipped)
 
 
 def scan_tree(
@@ -551,6 +807,7 @@ def scan_tree(
     max_workers: int | None = None,
     on_progress: ScanProgressCallback | None = None,
     entries_estimated_total: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ScanStats:
     """Walks `root`, populates `index` with a complete inventory, and prunes rows for entries
     that no longer exist. One `ThreadPoolExecutor` task per top-level directory under `root`
@@ -562,17 +819,49 @@ def scan_tree(
     existing caller (this test suite's scanner tests included) is unaffected.
     `entries_estimated_total` is passed straight through to every `on_progress` call unchanged
     (`scan_tree` never computes an ETA itself; see `ScanProgressCallback`).
+
+    Wave 1 (2026-07-30 real-disk diagnosis) rewrote this function's write path: records are
+    streamed into the index in `_WRITE_BATCH_SIZE`-sized transactions via `_BatchIndexWriter` as
+    the walk progresses (finding #1), never accumulated into one whole-walk list; pruning is
+    computed inside SQLite via a seen-tracking temp table (finding #4) instead of two full
+    Python collections; worker results are consumed via `as_completed` rather than
+    submission-ordered `executor.map` (finding #3), so one slow top-level directory can't delay
+    processing already-finished ones; and every `os.stat()` call on a plausible stat-hang
+    candidate (a reparse point, a cloud placeholder, or anything under a network-mapped/UNC
+    root) goes through a shared, timeout-guarded pool (finding #3, risk-targeted revision — see
+    `_entry_is_risky`'s module comment) so a single stalled syscall can't wedge the walk
+    silently, without paying a per-file thread-hop cost on the overwhelming majority of entries
+    that are never actually at risk of stalling.
+
+    `cancel_event` (scan cancellation): optional, shared `threading.Event` — checked in the
+    top-level loop below AND passed straight through to every `_walk_subtree` worker (same
+    shared instance, so setting it once stops every in-flight worker, not just the top-level
+    loop). `None` (the default) is a permanent no-op — zero behavior change for every existing
+    caller. Every already-flushed `_WRITE_BATCH_SIZE` batch (top-level and per-worker) is already
+    durable in `index` the moment cancellation is observed (see `_BatchIndexWriter`'s docstring);
+    the unconditional `writer.flush(...)` calls (here and in `_walk_subtree`) additionally flush
+    whatever partial batch was still pending, so a cancelled run never abandons a half-written
+    transaction. `ScanStats.files_pruned` is forced to `0` and `index.prune_unseen_under_root`
+    is skipped entirely on a cancelled run — pruning assumes `scan_seen` reflects the WHOLE tree,
+    and running it against a partial walk would wrongly delete every real, still-existing entry
+    this run simply never got to. `ScanStats.cancelled` reports whether this actually happened.
     """
     start_time = time.monotonic()
     scanned_at = time.time()
     tracker = _ProgressTracker(
         on_progress, entries_estimated_total=entries_estimated_total, start_time=start_time
     )
+    writer = _BatchIndexWriter(index, scanned_at=scanned_at)
 
-    # Always loaded (regardless of `incremental`): prune_missing needs the previously-indexed
-    # path set to detect deletions either way. `incremental` only controls whether it's also
-    # used below to skip writing unchanged records.
-    stat_cache: dict[str, StoredStat] = index.load_stat_cache(root)
+    # Only loaded when `incremental` — `prune_unseen_under_root` no longer needs the
+    # previously-indexed path set (it queries `files` directly), so a `--full`/forced rescan of
+    # an existing large index no longer pays for a stat_cache it would never consult anyway.
+    stat_cache: dict[str, StoredStat] | None = index.load_stat_cache(root) if incremental else None
+
+    # Checked once for the whole scan, not per-entry or per-directory — see
+    # `_entry_is_risky`/`is_network_drive`'s docstrings.
+    force_guard = is_network_drive(root)
+    risk_counter = _RiskCounter()
 
     all_skipped: list[SkippedPath] = []
     try:
@@ -583,59 +872,87 @@ def scan_tree(
         all_skipped.append(SkippedPath(path=str(root), error=str(exc)))
 
     root_git_cache = GitRepoCache()
-    top_level_records: list[FileRecord] = []
+    pending_upserts: list[FileRecord] = []
+    pending_unchanged: list[str] = []
     recurse_into: list[Path] = []
-    for entry in top_level_entries:
-        built = build_record(entry, root, root_git_cache, all_skipped)
-        if built is None:
-            continue
-        record, should_recurse = built
-        top_level_records.append(record)
-        tracker.add(1)
-        if should_recurse:
-            recurse_into.append(record.path)
-
-    dirs_visited = 1  # root itself
-    all_records: list[FileRecord] = list(top_level_records)
-    if recurse_into:
-        worker_count = max_workers or min(32, (os.cpu_count() or 4) * 4)
-        walk_subtree_with_progress = functools.partial(_walk_subtree, tracker=tracker)
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            for result in executor.map(walk_subtree_with_progress, recurse_into):
-                all_records.extend(result.records)
-                dirs_visited += result.dirs_visited
-                all_skipped.extend(result.skipped)
-
-    to_write: list[FileRecord] = []
-    unchanged_paths: list[str] = []
-    seen_paths: list[str] = []
-    for record in all_records:
-        posix_path = record.path.as_posix()
-        seen_paths.append(posix_path)
-        stored = stat_cache.get(posix_path) if incremental else None
-        if is_unchanged(stored, current_size=record.size_bytes, current_mtime=record.mtime):
-            unchanged_paths.append(posix_path)
-        else:
-            to_write.append(record)
-
+    stat_executor = ThreadPoolExecutor(max_workers=_STAT_TIMEOUT_WORKERS)
     try:
-        files_written = index.upsert_records(to_write, scanned_at=scanned_at)
-        files_pruned = index.prune_missing(stat_cache.keys(), seen_paths)
-    except (OSError, sqlite3.OperationalError) as exc:
-        if _is_disk_full(exc):
-            raise ScanDiskFullError("disk is full — free up space and try again") from exc
-        raise
+        for entry in top_level_entries:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            built = build_record(
+                entry,
+                root,
+                root_git_cache,
+                all_skipped,
+                stat_executor,
+                force_guard=force_guard,
+                risk_counter=risk_counter,
+            )
+            if built is None:
+                continue
+            record, should_recurse = built
+            _classify_record(record, stat_cache, incremental, pending_upserts, pending_unchanged)
+            tracker.add(1)
+            if should_recurse:
+                recurse_into.append(record.path)
+
+        index.begin_scan_tracking()
+        try:
+            writer.flush(pending_upserts, pending_unchanged)
+
+            dirs_visited = 1  # root itself
+            if recurse_into:
+                worker_count = max_workers or min(32, (os.cpu_count() or 4) * 4)
+                walk_subtree_with_progress = functools.partial(
+                    _walk_subtree,
+                    stat_cache=stat_cache,
+                    incremental=incremental,
+                    writer=writer,
+                    stat_executor=stat_executor,
+                    force_guard=force_guard,
+                    risk_counter=risk_counter,
+                    tracker=tracker,
+                    cancel_event=cancel_event,
+                )
+                # as_completed, not executor.map: map()'s iterator yields in SUBMISSION order,
+                # blocking on an earlier-submitted-but-still-pending directory even once every
+                # later one has already finished (Wave 1 finding #3) — as_completed consumes
+                # whichever result is ready next, so one slow top-level directory no longer
+                # holds up processing (dirs_visited/skipped accounting, progress) for the rest.
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = [executor.submit(walk_subtree_with_progress, p) for p in recurse_into]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        dirs_visited += result.dirs_visited
+                        all_skipped.extend(result.skipped)
+
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            # See `cancel_event`'s docstring above: pruning against a partial `scan_seen` set
+            # would wrongly delete every real entry this cancelled run never reached.
+            files_pruned = 0 if cancelled else index.prune_unseen_under_root(root)
+        except (OSError, sqlite3.OperationalError) as exc:
+            if _is_disk_full(exc):
+                raise ScanDiskFullError("disk is full — free up space and try again") from exc
+            raise
+        finally:
+            index.end_scan_tracking()
+    finally:
+        stat_executor.shutdown(wait=False, cancel_futures=False)
 
     return ScanStats(
         root=root,
         dirs_visited=dirs_visited,
-        entries_total=len(all_records),
-        files_written=files_written,
-        files_unchanged=len(unchanged_paths),
+        entries_total=writer.written + writer.touched,
+        files_written=writer.written,
+        files_unchanged=writer.touched,
         files_pruned=files_pruned,
         elapsed_seconds=time.monotonic() - start_time,
         skipped_unreadable_count=len(all_skipped),
         skipped_unreadable_paths=tuple(
             skipped_path.path for skipped_path in all_skipped[:_SKIPPED_PATHS_SAMPLE_LIMIT]
         ),
+        guarded_stat_count=risk_counter.guarded,
+        fast_stat_count=risk_counter.fast,
+        cancelled=cancelled,
     )

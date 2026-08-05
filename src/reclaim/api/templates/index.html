@@ -52,6 +52,10 @@
       <input id="scan-path" name="path" type="text" placeholder="C:\Users\you\Downloads" required />
     </div>
     <button type="submit" class="rc-btn rc-btn-primary">Scan</button>
+    <!-- Scan cancellation: shown only while a scan is actually running -- see
+         refreshScanStatus/pollScanStatus in app.js, which toggle `hidden` alongside the submit
+         button's own disabled state. -->
+    <button id="scan-cancel-btn" type="button" class="rc-btn rc-btn-secondary" hidden>Cancel scan</button>
     <p id="scan-status" class="rc-scan-status" role="status" aria-live="polite"></p>
   </form>
 
@@ -63,7 +67,11 @@
     <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
   </nav>
 
-  <main id="main-content" class="rc-main">
+  <!-- tabindex="-1": <main> isn't natively focusable, so activating the "Skip to main content"
+       link above only moved scroll position (location.hash) without moving DOM focus -- the next
+       Tab press restarted from the top of the header instead of continuing from here, defeating
+       the skip link's purpose for keyboard/AT users. -->
+  <main id="main-content" class="rc-main" tabindex="-1">
     <!-- SIMPLE mode: one primary "Clean My Computer" action -- no tabs, no path typing, no
          Review Queue/AI Suggestions, ever (feat/simple-advanced-mode). CSS keys visibility off
          html[data-mode] (see styles.css); app.js's SIMPLE-mode functions render every state
@@ -246,6 +254,7 @@
       <span>Reclaim v{{ reclaim_version }}</span>
       <span aria-hidden="true"> · </span>
       <a href="https://github.com/gaurav-gandhi-2411/reclaim/releases" target="_blank" rel="noopener">Check for updates</a>
+      <a id="update-check-badge" class="rc-badge" data-kind="update" role="status" aria-live="polite" target="_blank" rel="noopener" hidden></a>
       <span aria-hidden="true"> · </span>
       <a href="/NOTICES" target="_blank" rel="noopener">Third-party notices</a>
     </p>

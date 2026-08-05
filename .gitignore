@@ -62,6 +62,10 @@ dist/
 # packaging/test_packaged_safe_mode.ps1 (source/scripts) are the only tracked files here.
 packaging/build/
 packaging/dist/
+# Nuitka writes its crash report to the CURRENT WORKING DIRECTORY on a compile failure, which is
+# the repo root (build_installer.ps1 does `Set-Location $RepoRoot` before invoking it) -- not
+# under packaging/build/, so it needs its own entry here.
+nuitka-crash-report.xml
 
 # IDE / OS
 .vscode/
@@ -69,5 +73,7 @@ packaging/dist/
 Thumbs.db
 Desktop.ini
 
-# scripts/verify.py junit output
+# scripts/verify.py / CI workflow junit output
 pytest-results.xml
+pytest-perf-results.xml
+pytest-scale-results.xml

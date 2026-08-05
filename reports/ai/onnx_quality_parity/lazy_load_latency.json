@@ -1,0 +1,17 @@
+{
+  "measured_2026-07-30": {
+    "note": "Measured on the ai-eval scratch venv (onnxruntime + tokenizers installed, no torch). Confirms P1-A's lazy-loading requirement: AI modules import in milliseconds with zero model loading, and the real cost only lands on the first actual AI call, never at app/module import time.",
+    "module_import_no_model_load": {
+      "import_reclaim_ai_image_embeddings_and_text_embeddings_ms": 21.2,
+      "session_cache_is_none_after_import": true
+    },
+    "clip_first_use_session_load_plus_first_inference_ms": 2488.2,
+    "clip_sha256_verification_of_175.8mb_file_ms": 260.3,
+    "clip_onnxruntime_session_construction_ms_approx": 2227.9,
+    "clip_second_call_warm_session_ms": 191.9,
+    "minilm_first_use_session_and_tokenizer_load_plus_first_inference_ms": 424.5,
+    "minilm_second_call_warm_session_ms": 5.2
+  },
+  "interpretation": "The ~2.5s CLIP first-use cost is real and disclosed, not hidden -- it is ONNX Runtime constructing an inference session from a 175.8MB fp16 model graph (the SHA256 integrity check itself is only ~260ms of that). It happens exactly once per process lifetime (module-level session cache), never at app startup, and never again until the process restarts. This is the intended trade-off: a brief one-time delay on the FIRST AI-analysis click, not a startup-blocking cost -- matching the spec's explicit 'lazy-load models on first AI use, never at startup' requirement.",
+  "old_torch_based_comparison": "Not re-measured this session (would require reinstalling torch into a separate environment) -- the original torch-based code was ALREADY lazy-loaded on first use (module-level _model_cache, same pattern), so this change does not newly introduce lazy loading; it makes the lazily-loaded THING dramatically lighter (91.4MB torch-free ONNX session construction vs. constructing a torch nn.Module from a safetensors checkpoint plus torch's own import cost, which the old code's own docstring already characterized as 'the expensive part'). App/module import cost is unaffected by this change either way, since both old and new code deferred all heavy work behind first use."
+}

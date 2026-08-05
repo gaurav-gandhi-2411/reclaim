@@ -52,17 +52,26 @@ in the standard installer)
 | scipy | 1.18.0 | BSD-3-Clause (code) — see note below | permitted, with a disclosed carve-out |
 | pywavelets | 1.9.0 | MIT AND BSD-3-Clause | permitted |
 | datasketch | 2.0.0 | MIT | permitted |
-| sentence-transformers | 5.6.0 | Apache-2.0 | permitted |
+| tokenizers | 0.22.2 | Apache-2.0 | permitted (Wave 1 P0-B — MiniLM WordPiece tokenization, replaces sentence-transformers) |
 | python-docx | 1.2.0 | MIT | permitted |
 | pypdf | 6.14.2 | BSD-3-Clause | permitted |
 | rapidocr-onnxruntime | 1.4.4 | Apache-2.0 (code) — bundled ONNX models covered separately, see §3 | permitted |
 | lightgbm | 4.7.0 | MIT | permitted |
-| torch | 2.13.0 | Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT (component mix) | permitted |
-| open-clip-torch | 3.3.0 | MIT | permitted |
+| onnxruntime | 1.27.0 | MIT | permitted (Wave 1 P0-B — CLIP + MiniLM inference, replaces torch/open-clip-torch/sentence-transformers; also already a transitive dependency of rapidocr-onnxruntime, so this is a shared runtime, not a second payment) |
 | faiss-cpu | 1.14.3 | MIT | permitted |
-| huggingface-hub | 1.24.0 | Apache-2.0 | permitted (transitive dependency of sentence-transformers/open-clip-torch, also imported directly for pinned-checkpoint downloads — `docs/architecture/adr/0028-model-weight-revision-pinning-and-integrity.md`) |
 
 All permissive, no copyleft (GPL/AGPL) terms anywhere in this group's *own* dependency closure.
+
+**Wave 1 P0-B (2026-07-30): torch, open-clip-torch, sentence-transformers, and huggingface-hub
+were removed from this group entirely.** CLIP and MiniLM now ship as pre-converted, pinned,
+SHA256-verified ONNX files bundled directly with the app (see §3) instead of torch models
+downloaded from Hugging Face Hub on first use — see
+`reports/ai/onnx_quality_parity/` for the quality-parity measurement that justified this and
+`image_embeddings.py`/`text_embeddings.py`'s own module docstrings for the technical detail.
+`huggingface-hub` (and the torch-based packages above) still appear in the separate
+`ai-export` extras group (`scripts/export_ai_models.py`, used only to regenerate the bundled
+ONNX files from the original checkpoints — never installed by a normal `uv sync --extra ai`),
+not reflected in this table since it's not part of what ships to users.
 
 **scipy's Windows wheel bundles two additional pieces of software statically/dynamically linked
 into `scipy.libs\libscipy_openblas*.dll`**, disclosed by scipy's own installed-package `License`
@@ -88,9 +97,18 @@ source, cited below, not assumed from memory.
 
 | Model | Source (as pinned in this repo) | License | Redistribution |
 |---|---|---|---|
-| CLIP ViT-B/32 ("openai" QuickGELU checkpoint) | Hugging Face Hub `timm/vit_base_patch32_clip_224.openai`, commit `a6f597a30f7b82c51704746581f9a4e41421e878` (pinned per ADR-0028) | **Apache-2.0** | permitted |
-| all-MiniLM-L6-v2 | Hugging Face Hub `sentence-transformers/all-MiniLM-L6-v2`, commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` (pinned per ADR-0028) | **Apache-2.0** | permitted |
+| CLIP ViT-B/32 ("openai" QuickGELU checkpoint), converted to fp16 ONNX (`clip_vision_fp16.onnx`, 175.8MB, bundled under `src/reclaim/ai/models/`, Wave 1 P0-B) | Originally Hugging Face Hub `timm/vit_base_patch32_clip_224.openai`, commit `a6f597a30f7b82c51704746581f9a4e41421e878` (pinned per ADR-0028); converted via `scripts/export_ai_models.py`, weights unchanged, precision reduced fp32->fp16 | **Apache-2.0** | permitted |
+| all-MiniLM-L6-v2, converted to int8 ONNX (`minilm_int8.onnx`, 23.6MB, plus `minilm_tokenizer.json`, bundled under `src/reclaim/ai/models/`, Wave 1 P0-B) | Originally Hugging Face Hub `sentence-transformers/all-MiniLM-L6-v2`, commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` (pinned per ADR-0028); converted via `scripts/export_ai_models.py`, weights quantized fp32->int8 (dynamic) | **Apache-2.0** | permitted |
 | RapidOCR bundled OCR models (detection/classification/recognition ONNX files, ship inside the `rapidocr-onnxruntime` wheel itself — no separate download) | `RapidAI/RapidOCR` GitHub repo, converted from PaddleOCR | **Apache-2.0** | permitted |
+
+**Wave 1 P0-B (2026-07-30)**: CLIP and MiniLM's weights are unchanged from the sources cited
+below (same Apache-2.0 checkpoints) — only the file FORMAT (ONNX instead of a torch
+`.safetensors` checkpoint) and PRECISION (fp16/int8 instead of fp32) changed, and only via this
+project's own conversion (`scripts/export_ai_models.py`), not a third-party redistribution of
+already-modified weights. A quantized/format-converted model derived from a permissively
+licensed (Apache-2.0) original remains covered by that same license — Apache-2.0 explicitly
+permits creating and redistributing derivative works, which is exactly what a format/precision
+conversion is. Quality-parity measurement for the conversion: `reports/ai/onnx_quality_parity/`.
 
 **Sources cited, exactly as consulted:**
 

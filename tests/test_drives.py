@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from reclaim import drives
-from reclaim.drives import NoFixedDrivesFoundError, list_fixed_drives
+from reclaim.drives import NoFixedDrivesFoundError, is_network_drive, list_fixed_drives
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="drive enumeration is Windows-only")
 
@@ -64,3 +64,33 @@ def test_list_fixed_drives_filters_out_non_fixed_letters(monkeypatch: pytest.Mon
     found = list_fixed_drives()
 
     assert found == [Path("C:\\")]
+
+
+# --- is_network_drive (Wave 1 finding #3, risk-targeted stat guard) ----------------------------
+
+
+def test_is_network_drive_recognizes_unc_paths_without_any_win32_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_drive_root: str) -> int:
+        raise AssertionError("UNC recognition must not need a GetDriveTypeW call")
+
+    monkeypatch.setattr(drives, "_raw_drive_type", boom)
+
+    assert is_network_drive(Path("\\\\server\\share\\subdir")) is True
+
+
+def test_is_network_drive_true_for_a_mapped_network_drive_letter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(drives, "_raw_drive_type", lambda _drive_root: 4)  # DRIVE_REMOTE
+
+    assert is_network_drive(Path("Z:\\some\\path")) is True
+
+
+def test_is_network_drive_false_for_a_local_fixed_drive_letter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(drives, "_raw_drive_type", lambda _drive_root: 3)  # DRIVE_FIXED
+
+    assert is_network_drive(Path("C:\\Users\\gaura")) is False
