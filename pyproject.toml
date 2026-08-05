@@ -157,6 +157,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "scale: real-disk-scale-tier tests (evals/test_e2e_scale.py's 100k+ file tier) -- slow, not selected by default; run explicitly via `pytest -m scale`.",
+]
 
 [tool.coverage.run]
 source = ["src/reclaim"]
