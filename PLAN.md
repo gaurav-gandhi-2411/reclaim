@@ -2423,6 +2423,82 @@ out explicitly). Stall-detector thresholds (300s / 60% CPU) left unchanged — o
 quiet machine that margin is generous rather than tight, so it stays as a safety net rather
 than a tuned-tight gate.
 
+### 2026-08-05 — Installer build succeeded, function-verified; build-tooling trap catalog
+
+Fourth relaunch (quiet machine, `--jobs=1`) reached and passed real C compilation, but a
+**first** successful compile (762.7MB dist / 285.4MB installer, ~03:07 IST) turned out NOT to be
+functionally correct: the packaged binary crashed on every invocation
+(`ImportError: Module 'structlog.testing' was actively excluded`). Root cause and fix, plus every
+other build-tooling bug found by actually running the tool, not by reasoning about the code, are
+now in `packaging/build_installer.ps1`'s inline comments and `packaging/RELEASE_RUNBOOK.md`'s
+expected-numbers table. **Second** build (884.0MB dist / 309.3MB installer, ~11:24 IST) fixed the
+import crash and was verified end-to-end against the packaged binary itself (not the dev venv):
+`serve` + `/api/scan` + `/api/ai/analyze` against generated gold fixtures (seed=42), CLIP
+near-dup image clustering and MiniLM document version-chain detection both matched ground truth
+exactly. The fresh-Windows-VM install→scan→AI→vault→restore→uninstall gate (`RELEASE_RUNBOOK.md`
+step 3) is still outstanding — needs a real machine/VM, per the AUTONOMY MANDATE escalation list.
+
+**Traps a future session must not rediscover cold** (highest-priority first):
+
+1. **The bundled Nuitka's `-O3` patch is silent and re-appliable, not permanent.** Nuitka
+   hardcodes `-O3` for every gcc-backend compile on Windows (`SconsCompilerSettings.py`, no CLI
+   or env-var override actually works — `importEnvironmentVariableSettings()` reads `CFLAGS` but
+   is dead code, grep-confirmed). `-O3`'s heavier inlining is what pushed a single file (faiss's
+   SWIG-generated `swigfaiss.c`) past ~23GB peak compiler memory even with `--low-memory` and
+   `--jobs=1`. `build_installer.ps1` Step 2 now patches `-O3` → `-O2` in
+   `$BuildVenvPath\Lib\site-packages\nuitka\build\SconsCompilerSettings.py` on every run,
+   in-process, right after `uv sync`. This is NOT a one-time fix: the build venv is deleted and
+   recreated from scratch every run (Step 2's `Remove-DirectoryWithRetry` + fresh `uv sync`), so
+   an unpatched Nuitka upgrade would silently re-introduce the `cc1.exe` OOM with zero warning
+   unless the patch step itself catches it — which it's built to do: it fails loudly
+   (`PATCH_TARGET_NOT_FOUND`) if Nuitka's source no longer matches the expected `-O3` text,
+   rather than silently proceeding at `-O3`. Reapply-by-hand recipe if the automated patch ever
+   throws that error: open the failing venv's `SconsCompilerSettings.py`, find the `env.Append(
+   CCFLAGS=[...])` block choosing `-O3` for `os.name == "nt"`, change that literal to `-O2`. Also
+   note: uv installs via hardlinks from its shared package cache, not copies — an in-place
+   `open(path, "w")` on a hardlinked file would have silently patched uv's CACHE, not just this
+   venv's copy (confirmed via matching inode numbers before the fix); the patch script now writes
+   to a temp file and `os.replace()`s it in, which swaps the directory entry instead of mutating
+   the shared inode.
+2. **Do NOT reintroduce `--nofollow-import-to=*.tests` / `*.testing`.** Looks like free
+   dist-folder savings (skip numpy/scipy's own test suites) but both wildcards independently hid
+   a genuine, unconditionally-imported runtime dependency: `structlog/__init__.py` does `from
+   structlog.testing import ReturnLogger, ReturnLoggerFactory` (public API, in `__all__`);
+   `jinja2/defaults.py` does `from . import tests` (Jinja2's built-in template test functions —
+   a real language feature named "tests", not a test suite); `scipy/_lib/_array_api.py` does
+   `from scipy._external.array_api_extra.testing import lazy_xp_function` at module load, and
+   many scipy submodules import that module. Confirmed for exactly these three (`numpy.testing`
+   checked safe — only reachable via numpy's own lazy `__getattr__`, never at module-load time).
+   Verification technique if this is ever revisited: walk every `.py` file in the build venv's
+   `site-packages` with `ast.walk`, collect `Import`/`ImportFrom` nodes whose target module
+   matches `*.tests`/`*.testing`, and flag any hit where the importing file is OUTSIDE that
+   target's own package (i.e., not test code importing its own test helpers). This was run ad
+   hoc (not committed as a script) and found 10 hits, 3 genuine runtime deps — do the same scan
+   again before ever re-adding either flag, don't rely on crash-by-crash debugging to rediscover
+   the same three packages.
+3. **The stall detector needs a filesystem-progress signal; process-liveness/CPU sampling alone
+   false-kills healthy builds.** `Get-BuildProcessCpuSeconds` (poll-time process sampling) was
+   tuned against `--jobs=3+`'s shape (a few long-lived parallel compiles spanning many poll
+   intervals) and gave a false "genuinely idle" verdict at `--jobs=1`, where hundreds of small
+   files compile serially and most fully start-and-exit BETWEEN two 15s polls — their CPU is
+   invisible to a point-in-time sampler even while real `.o` files are landing every few seconds.
+   `Get-NewestObjectWriteTime` (newest `.o` mtime under `entry_point.build`) is the fix: a
+   durable, poll-timing-immune progress signal, since a written file stays written regardless of
+   whether any process happened to be alive at the instant of a poll. The abort condition now
+   requires ALL THREE signals agreeing (no compiler stdout/stderr write, low build-process CPU
+   delta, no recent `.o` write) before killing the build — any single signal alone has a known
+   false-positive mode on this codebase's build shape.
+4. **The build requires a genuinely quiet machine; this is a documented precondition, not a
+   tuning problem.** Two of the four real build attempts before the first success failed purely
+   from local machine contention (6+ concurrent `claude` processes, Docker Desktop, browser tabs
+   — confirmed via live process listing at the time of abort, not inferred). `--jobs=1` +
+   `-O2` + `--low-memory` fixes the single-file faiss OOM, which is a real per-file memory
+   ceiling independent of contention — it does NOT fix contention from other workloads on the
+   same box. Check Step 1's machine-state report (free RAM, instantaneous CPU%, processes with
+   >30s cumulative CPU time) before trusting an abort as a build-tooling bug rather than "the
+   machine wasn't actually quiet." Budget 3+ hours for a from-scratch build at `--jobs=1`; see
+   the Deferred Roadmap entry below for moving this to a dedicated CI runner instead.
+
 ## Deferred roadmap (not scheduled — noted for a later wave, not built now)
 
 - **Move the release build to a GitHub Actions Windows runner** so it never competes with GG's

@@ -73,12 +73,24 @@ a separate runtime-download mechanism solves a problem that no longer exists.
 |---|---|
 | CLIP fp16 ONNX model | 175.8 MB |
 | MiniLM int8 ONNX model + tokenizer | 23.6 MB + 0.7 MB |
-| Nuitka standalone dist folder (torch-free `[ai]` extras + models bundled) | MEASURE_DIST_SIZE |
-| Final `reclaim-setup.exe` installer size | MEASURE_INSTALLER_SIZE |
-| Previous core-only installer size (v1.3.0, for comparison) | MEASURE_PREVIOUS_INSTALLER_SIZE |
+| Nuitka standalone dist folder (torch-free `[ai]` extras + models bundled) | 884.0 MB |
+| Final `reclaim-setup.exe` installer size | 309.3 MB |
+| Previous core-only installer size (v1.3.0, for comparison) | not available -- the prior `reclaim-setup.exe` was overwritten by this build (only its `.sha256` sidecar from 2026-07-25 survives, which records a hash, not a size); no separate core-only build was run this session to produce a fresh comparison artifact |
 
-(Filled in from the actual build in this session — see PLAN.md's Wave 1 P0-B checkpoint for the
-full build log and verification steps.)
+(Measured from the actual, functionally-verified build in this session, wave-1-scan-reliability
+branch, `packaging/build_installer.ps1` run completing 2026-08-05 ~11:24 IST -- installer at
+`packaging/dist/reclaim-setup.exe`, dist folder at `packaging/build/entry_point.dist/`. An earlier
+build in this same session (762.7MB dist / 285.4MB installer, completed ~03:07 IST) passed the
+packaged safe-mode smoke test but was NOT functionally correct: it crashed on every invocation
+("ImportError: Module 'structlog.testing' was actively excluded") because
+`--nofollow-import-to=*.tests`/`*.testing` -- intended only to skip genuine numpy/scipy test
+suites -- also excluded modules that structlog, jinja2, and scipy's own internal compat shim
+import unconditionally at normal runtime. The larger 884.0MB/309.3MB numbers above are from the
+corrected build with those exclusions removed entirely; see `packaging/build_installer.ps1`'s
+inline comments and `git log` on that file for the full incident history. See PLAN.md's Wave 1
+P0-B checkpoint for the full build log and verification steps, including the AI-path end-to-end
+verification against the packaged binary (CLIP near-dup image clustering + MiniLM document
+version-chain detection, both matching known ground truth exactly).
 
 ### Bundled-model distribution: SHA256-pinned local files, not a runtime download
 

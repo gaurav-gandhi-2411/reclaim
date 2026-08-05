@@ -21,10 +21,11 @@ See PLAN.md's Wave 1 P0-B checkpoint for the full incident writeup.
 |---|---|---|
 | CLIP fp16 model | 175.8 MB | Confirmed (2026-07-30) |
 | MiniLM int8 model + tokenizer | 24.3 MB | Confirmed (2026-07-30) |
-| `[ai]` extras Python dependency closure (torch-free) | several hundred MB (onnxruntime/faiss/lightgbm/opencv/scipy) | TBD — update once a clean build completes |
-| Dist folder total | — | TBD — fill in from the first successful `build_installer.ps1` run |
-| Final `reclaim-setup.exe` | — | TBD — target: comfortably bundleable; if it lands somewhere unacceptable, the documented fallback is an in-app "Enable AI features" one-click download (progress/resume/checksum) instead of bundling |
-| Wall time, quiet machine, `--jobs=4`-`6` | Not yet measured — the three real attempts so far all hit either a build-environment bug (fixed) or genuine contention (6+ other `claude` processes plus Docker Desktop and browser tabs confirmed live via process listing at the time of the third abort) before finishing. Budget at least 20-30 minutes; update this line from the first genuinely-quiet-machine run | TBD |
+| `[ai]` extras Python dependency closure (torch-free) | several hundred MB (onnxruntime/faiss/lightgbm/opencv/scipy) | Confirmed (2026-08-05) — dist folder total below includes this closure |
+| Dist folder total | 884.0 MB | Confirmed (2026-08-05), `packaging/build_installer.ps1`. Grew from an initial 762.7MB measurement once `--nofollow-import-to=*.tests`/`*.testing` was removed entirely (see wall-time row) — the larger number is the functionally-correct one. |
+| Final `reclaim-setup.exe` | 309.3 MB | Confirmed (2026-08-05) — comfortably bundleable, no fallback download needed |
+| Wall time, quiet machine, `--jobs=1`, `-O2`-patched Nuitka | 180.4 minutes clean / ~15-100+ minutes incremental depending on what changed | Confirmed (2026-08-05). Not `--jobs=4`-`6` as originally planned: a real, reproducible `cc1.exe` OOM was found compiling faiss's SWIG-generated `swigfaiss.c` (a single ~20GB+-peak-memory translation unit) even on a fully quiet machine with 24GB+ free RAM — `--jobs` alone can't fix a single-file ceiling. Fix required `--low-memory` (drops gcc's `-pipe`) + `--jobs=1` (no other file competing for RAM while it compiles) + patching the build venv's bundled Nuitka to use `-O2` instead of `-O3` (Nuitka hardcodes `-O3` for every gcc compile on Windows with no working CLI/env override — verified by reading `SconsCompilerSettings.py`). A SECOND real bug surfaced after that first successful build: `--nofollow-import-to=*.tests`/`*.testing` (meant only to skip numpy/scipy's own test suites and save compile time) also excluded `structlog.testing`, `jinja2.tests`, and `scipy._external.array_api_extra.testing` — all three unconditionally imported by their package's normal runtime code, not test-only. The packaged CLI/server crashed on every invocation despite `test_packaged_safe_mode.ps1` passing (that test never actually starts `reclaim.exe serve`, only CLI subcommands that happened not to touch the broken import paths). Fixed by removing the test-exclusion flags entirely — verified via `ast`-scanning the whole build venv's site-packages for this exact pattern (10 hits, 3 genuine runtime deps) before committing to the fix. The `-SkipCleanBuildDirs` flag (new) lets a narrowly-scoped fix reuse Nuitka/Scons' incremental object-file cache instead of a full clean rebuild — use it for anything that doesn't change `--low-memory`/`--jobs`/compiler-flag-level settings. See `build_installer.ps1`'s inline comments for the full incident history and `git log` on that file for the sequence of fixes. Budget 3+ hours for a from-scratch build until/unless this moves to a beefier CI runner (deferred roadmap item). |
+| AI path end-to-end (packaged binary, not dev venv) | Verified (2026-08-05) | `serve` + `/api/scan` + `/api/ai/analyze` against generated gold fixtures (15 near-dup images, 14 near-dup docs, deterministic seed=42 via `evals/ai_fixtures/build_*_fixtures.py`). `tracks_run` included both `semantic_image` (CLIP) and `near_dup_document_and_version_chain` (MiniLM), `tracks_skipped` empty. Results matched ground truth exactly: 3/3 image near-dup clusters with correct membership, 3/3 document version chains with correct membership, all distractors correctly left ungrouped (except a reasonable `semantic_image` grouping of the 3 image distractors — a different, broader-similarity track, not a false positive). |
 
 **Do not treat a number in this table as validated until it's been updated with a real
 uncontended measurement and the commit SHA that produced it** (rule 65b — metric provenance).
@@ -66,7 +67,55 @@ investigate before retrying, don't just re-run.
    safe-mode-survives-packaging proof, unaffected by this change but still the right gate before
    calling a build releasable.
 3. **Run the fresh-Windows-VM gate** (a real machine/VM only GG can do, per the standing
-   AUTONOMY MANDATE's escalation list): install → first successful full scan → AI features
-   working with zero developer steps → duplicates found → vault move → restore. This is the
-   actual bar for "P0-B is done," not just a successful compile.
+   AUTONOMY MANDATE's escalation list — needs a clean Windows install with no Python, no dev
+   tools, nothing this session's own testing already touched). This is the actual bar for
+   "P0-B is done," not just a successful compile or a scripted API check. Copy
+   `packaging\dist\reclaim-setup.exe` to the VM (USB/share/whatever — not git, not this repo) and
+   walk through, in order, stopping and reporting back at the first thing that doesn't match:
+
+   a. **Install.** Double-click `reclaim-setup.exe`. No admin/UAC prompt should appear (per-user
+      install). Leave "Create a desktop shortcut" unchecked (its default) unless you want one.
+      Finish the wizard with "Launch Reclaim" checked (its default) — the app should start and
+      your default browser should open to the dashboard within a couple seconds
+      (`webbrowser.open` fires ~1s after the server starts).
+   b. **First-run overlay.** A "Before you start" modal should block the page until you click
+      "I understand, continue." It should say: starts in Simple mode, Safe mode is on by
+      default, deletes go to the Recycle Bin in Safe mode, some categories are off by default,
+      Power mode is opt-in. If this overlay is missing, garbled, or the page is blank/errors —
+      stop, that's a packaging bug (e.g. a missing static asset), not a "which button do I
+      click" question.
+   c. **First successful full scan.** Click the big "Clean My Computer" button (Simple mode,
+      no path to type). Progress should render inline and finish without an error banner.
+   d. **Switch to Advanced mode** (top-right "Switch to Advanced" link) to reach the AI/vault
+      features. You should see tabs: Overview, Storage Treemap, Review Queue, AI Suggestions,
+      Quarantine & Restore.
+   e. **AI features, zero developer knowledge.** On the "AI Suggestions" tab, click "Analyze
+      with AI." This should complete (not spin forever, not error) and list groups — near-
+      duplicate photos, possible document drafts, screenshot bursts, or similar-scene groups,
+      depending on what's actually on this machine. If it reports nothing found, that's fine IF
+      the machine genuinely has no such files; if you know it does and nothing shows up, that's
+      a real bug to report, not a "maybe it's just quiet" shrug.
+   f. **Duplicates found → vault move.** On the "Review Queue" tab (or acting on an AI
+      suggestion), pick a small, low-stakes batch of items. Note the "Quarantine method"
+      dropdown — in Safe mode (the default) it's forced to Windows Recycle Bin regardless of
+      what you pick, by design (rule: safe mode never uses the vault or a direct delete). Click
+      "1. Preview (dry-run)" first and actually read what it says it's about to do, THEN
+      "2. Confirm real apply." Verify the file(s) are actually gone from their original
+      location afterward.
+   g. **Restore.** Go to "Quarantine & Restore." You should see the batch you just created
+      (id, method, timestamp, item/byte counts). Click "Restore batch" and verify the file(s)
+      reappear at their original location, byte-identical (open one and confirm it's not
+      truncated/corrupted).
+   h. **(Optional, only if you want to exercise the vault path specifically, not just Recycle
+      Bin):** switch to Power mode via the mode badge in the top header — this requires typing
+      an exact confirmation phrase, by design, so it can't happen by accident. Repeat f–g with
+      "Vault (restorable)" selected in the Quarantine method dropdown instead of Recycle Bin.
+      Switch back to Safe mode afterward (no confirmation needed for that direction).
+   i. **Uninstall.** From the Start Menu, run "Uninstall Reclaim." It should prompt "Also delete
+      this data folder now?" — default answer is No (data under `data\` including anything
+      still in the vault survives uninstall by default, matching the "never lose data by
+      surprise" posture). Confirm the app is actually removed from Programs/Start Menu after.
+
+   Report pass/fail per step, not just an overall verdict — a step that "mostly worked but the
+   wording was a little off" is still useful signal, not a failure to hide.
 4. Update the "Expected numbers" table above with the real measurement + commit SHA.
