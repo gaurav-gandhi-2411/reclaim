@@ -1,52 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Reclaim">
   <!--
-    Reclaim mark v3: "a block lifted away from a filled square" — same geometry as v1/v2, palette
-    moved off the warm axis entirely per GG's Direction A (WS-B visual identity refresh). The
-    whole square starts indigo (occupied ground); a chunk in the bottom-right has already been
-    cleared, revealing mint underneath. The small indigo block floating top-right, outlined in
-    the surface color, is the piece mid-lift — still occupied, but on its way out.
+    Reclaim mark v4 (visual identity PIVOT): an isometric stack of disk platters, the top one
+    lifted free in amber — "reclaimed space" made literal, replacing v3's indigo/mint flat-
+    rectangle "occupied ground" metaphor entirely. Palette: deep #1B6FA8, mid #2E9BD6, amber
+    #F2A93B, decomposed directly from reclaim_lifted_platter_asset_set.svg (repo root) — each
+    platter is one <ellipse> (its top face) painted over one <path> "band" (its visible front
+    rim: a flat-sided rectangle whose bottom edge bulges into a half-ellipse arc, exactly the
+    reference SVG's own M/L/A/L/A/Z path shape). Geometry ratios (ry/rx, inter-platter gaps)
+    measured off that reference file — see packaging/build_brand_assets.py's module docstring
+    for the full derivation, since both this file and that script's raster renderer share the
+    same source geometry.
 
-    Depth: a top-lit vertical gradient on the two large regions (indigo, mint) — restrained,
-    analogous-hue (light-to-dark within the same color, not a rainbow), matching 2026 icon
-    convention of "depth without losing small-size legibility" (see PLAN.md's WS-B research
-    note). The lift block is a FLAT fill, not a nested gradient: proven empirically (see the
-    WS-B preview branch) that a second gradient inside a box this small degenerates to nothing
-    once rasterized at 16px — one flat tone plus one outline reads at every size; a nested
-    highlight inside about 7px does not. packaging/build_brand_assets.py's raster renderer
-    mirrors this: gradient at 48px+, flat below (same legibility reasoning, since PIL can't
-    rely on a resolution-independent renderer the way this SVG can).
+    This is the "larger" in-app copy (header + overlay use, 28-40px) — kept at the full
+    3-platter form. favicon.svg is the browser-tab copy, simplified to 2 platters per the
+    explicit size-behavior spec (amber lifted platter + one combined blue platter beneath,
+    matching the reference SVG's own dedicated "16px" panel) — these two files now
+    deliberately DIFFER in platter count, unlike v1-v3 where they were pixel-identical copies;
+    see favicon.svg's own comment for why.
 
     NOTE: two hyphens in a row are NOT safe inside an XML/SVG comment (invalid per the XML spec;
     Chrome silently fails to render the whole file — a real bug this project already hit once,
     see PLAN.md's 2026-07-23 late checkpoint). Use the em dash character above instead, in this
     comment and any future edit to it.
-
-    Same geometry as favicon.svg (this is the larger in-app copy).
   -->
-  <defs>
-    <linearGradient id="rc-grad-indigo" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#6366f1" />
-      <stop offset="1" stop-color="#4338ca" />
-    </linearGradient>
-    <linearGradient id="rc-grad-mint" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#34d399" />
-      <stop offset="1" stop-color="#047857" />
-    </linearGradient>
-  </defs>
-  <style>
-    .rc-ground { fill: url(#rc-grad-indigo); }
-    .rc-reclaimed { fill: url(#rc-grad-mint); }
-    .rc-lift { fill: #6366f1; stroke: #f6f7fb; stroke-width: 2; }
-    @media (prefers-color-scheme: dark) {
-      .rc-lift { stroke: #0f1117; }
-    }
-  </style>
-  <clipPath id="rc-logo-clip">
-    <rect width="32" height="32" rx="7" />
-  </clipPath>
-  <g clip-path="url(#rc-logo-clip)">
-    <rect class="rc-ground" x="0" y="0" width="32" height="32" />
-    <rect class="rc-reclaimed" x="11" y="11" width="21" height="21" />
-    <rect class="rc-lift" x="15" y="1" width="14" height="12" />
+  <g>
+    <!-- Bottom platter (darkest, base of the stack). -->
+    <path d="M5.70 22.03 L5.70 25.74 A10.30 3.71 0 0 0 26.30 25.74 L26.30 22.03 A10.30 3.71 0 0 1 5.70 22.03 Z" fill="#124C74" />
+    <ellipse cx="16" cy="22.03" rx="10.30" ry="3.71" fill="#1B6FA8" />
+    <!-- Middle platter (still stacked). -->
+    <path d="M5.70 15.54 L5.70 19.25 A10.30 3.71 0 0 0 26.30 19.25 L26.30 15.54 A10.30 3.71 0 0 1 5.70 15.54 Z" fill="#1B6FA8" />
+    <ellipse cx="16" cy="15.54" rx="10.30" ry="3.71" fill="#2E9BD6" />
+    <!-- Top platter (amber, lifted free — the reclaimed space). -->
+    <path d="M5.70 6.27 L5.70 9.98 A10.30 3.71 0 0 0 26.30 9.98 L26.30 6.27 A10.30 3.71 0 0 1 5.70 6.27 Z" fill="#C2801F" />
+    <ellipse cx="16" cy="6.27" rx="10.30" ry="3.71" fill="#F2A93B" />
   </g>
 </svg>

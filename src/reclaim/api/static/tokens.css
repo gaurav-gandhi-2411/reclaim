@@ -73,12 +73,15 @@
   --rc-warning: #b45309;
   --rc-focus-ring: #0284c7;
 
-  /* Mark colors (mirrors logo.svg/favicon.svg's gradient stops — literal hex there since SVG is
-     loaded outside this cascade). */
-  --rc-mark-ground-light: #6366f1;
-  --rc-mark-ground-dark: #4338ca;
-  --rc-mark-reclaimed-light: #34d399;
-  --rc-mark-reclaimed-dark: #047857;
+  /* Mark colors (mirrors logo.svg/favicon.svg's flat fills — literal hex there too since SVG is
+     loaded outside this cascade). v4 lifted-platter identity: no light/dark theme split needed
+     here, unlike v3's gradient stops -- the flat platter fills read cleanly against both the
+     light and dark --rc-bg (verified by rendering the mark over both, see
+     packaging/build_brand_assets.py's module docstring / the branding pivot's task report). */
+  --rc-mark-deep: #1B6FA8;
+  --rc-mark-mid: #2E9BD6;
+  --rc-mark-amber: #F2A93B;
+  --rc-mark-dark-ground: #0F172A;
 
   /* Fixed categorical palette — order matches `category_group` ids in
      src/reclaim/api/schemas.py::category_label and must never be reordered/reused. */
@@ -186,10 +189,10 @@
     --rc-warning: #fbbf24;
     --rc-focus-ring: #38bdf8;
 
-    --rc-mark-ground-light: #6366f1;
-    --rc-mark-ground-dark: #4338ca;
-    --rc-mark-reclaimed-light: #34d399;
-    --rc-mark-reclaimed-dark: #047857;
+    --rc-mark-deep: #1B6FA8;
+    --rc-mark-mid: #2E9BD6;
+    --rc-mark-amber: #F2A93B;
+    --rc-mark-dark-ground: #0F172A;
 
     --rc-cat-dev-artifacts: #d76b40;
     --rc-cat-package-caches: #b87a1f;
@@ -245,10 +248,10 @@
   --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 85%, black);
   --rc-warning: #b45309;
   --rc-focus-ring: #0284c7;
-  --rc-mark-ground-light: #6366f1;
-  --rc-mark-ground-dark: #4338ca;
-  --rc-mark-reclaimed-light: #34d399;
-  --rc-mark-reclaimed-dark: #047857;
+  --rc-mark-deep: #1B6FA8;
+  --rc-mark-mid: #2E9BD6;
+  --rc-mark-amber: #F2A93B;
+  --rc-mark-dark-ground: #0F172A;
   --rc-cat-dev-artifacts: #c1512b;
   --rc-cat-package-caches: #a6720b;
   --rc-cat-temp-browser-caches: #4f7a3a;
@@ -294,10 +297,10 @@
   --rc-danger-hover: color-mix(in oklch, var(--rc-danger) 88%, white);
   --rc-warning: #fbbf24;
   --rc-focus-ring: #38bdf8;
-  --rc-mark-ground-light: #6366f1;
-  --rc-mark-ground-dark: #4338ca;
-  --rc-mark-reclaimed-light: #34d399;
-  --rc-mark-reclaimed-dark: #047857;
+  --rc-mark-deep: #1B6FA8;
+  --rc-mark-mid: #2E9BD6;
+  --rc-mark-amber: #F2A93B;
+  --rc-mark-dark-ground: #0F172A;
   --rc-cat-dev-artifacts: #d76b40;
   --rc-cat-package-caches: #b87a1f;
   --rc-cat-temp-browser-caches: #6f9a55;
