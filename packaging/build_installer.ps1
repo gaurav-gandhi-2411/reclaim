@@ -583,8 +583,23 @@ $installerPath = "$PSScriptRoot\dist\reclaim-setup.exe"
 if (-not (Test-Path $installerPath)) { throw "Expected installer not found at $installerPath" }
 $installerSizeBytes = (Get-Item $installerPath).Length
 
+# SHA-256 checksum sidecar -- was a manual, easily-forgotten post-build step (see
+# RELEASE_RUNBOOK.md's former "Publishing: SHA-256 checksum sidecar (manual...)" section);
+# automated here so every build produces one without relying on someone remembering at publish
+# time. Byte-format matches all four real published sidecars (v1.0.0-v1.3.0), verified against
+# v1.3.0's actual 84-byte asset: lowercase hex, exactly two spaces, the bare filename with no
+# path, and a trailing LF only -- WriteAllText with a BOM-less UTF8Encoding and an explicit `n
+# (not Set-Content, not `r`n). A BOM or CRLF would make `sha256sum -c` fail for anyone verifying
+# on Linux/macOS/WSL.
+$installerFileName = Split-Path -Leaf $installerPath
+$sha256Path = "$installerPath.sha256"
+$installerHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash.ToLower()
+[System.IO.File]::WriteAllText($sha256Path, "$installerHash  $installerFileName`n", [System.Text.UTF8Encoding]::new($false))
+
 Write-Output ""
 Write-Output "==> DONE."
 Write-Output ("    Dist folder (bundled AI layer + models): {0:N1} MB" -f ($distSizeBytes / 1MB))
 Write-Output ("    Final installer: {0:N1} MB -- $installerPath" -f ($installerSizeBytes / 1MB))
+Write-Output "    SHA-256: $installerHash  $installerFileName"
+Write-Output "    Checksum sidecar: $sha256Path"
 Write-Output "    Build telemetry: $TelemetryPath"

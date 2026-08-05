@@ -46,7 +46,8 @@ preflight, else 4 — only meaningful on a verified-quiet machine, since raising
 real contention just adds more processes competing for the same starved cores); best-effort adds
 Windows Defender exclusions; runs the monitored Nuitka compile (aborts within
 `StallTimeoutSeconds` — default 5 minutes — of detected contention rather than hanging for
-hours); then packages with Inno Setup and reports the final installer size.
+hours); then packages with Inno Setup, generates the SHA-256 checksum sidecar, and reports the
+final installer size and hash.
 
 Progress/telemetry: `packaging/build/nuitka_build.log.stderr` (Nuitka writes almost everything
 here, not to stdout) and `packaging/build/nuitka_build_telemetry.csv` (elapsed time / free RAM /
@@ -122,39 +123,50 @@ investigate before retrying, don't just re-run.
    wording was a little off" is still useful signal, not a failure to hide.
 4. Update the "Expected numbers" table above with the real measurement + commit SHA.
 
-## Publishing: SHA-256 checksum sidecar (manual — the build script does NOT do this)
+## Publishing: SHA-256 checksum sidecar (automated by the build script)
 
-`build_installer.ps1` does not produce a checksum. Verified on 2026-08-05 against the 590-line
-script: it contains no `Get-FileHash`, no `sha256`, and no checksum step at all — its last action
-is to print the installer size. **If you forget this step, the release ships without a checksum
-and nobody will notice until a user asks how to verify the download.**
+`build_installer.ps1` generates the checksum sidecar automatically as the last action of Step 6,
+right after Inno Setup produces `reclaim-setup.exe`. It writes `reclaim-setup.exe.sha256` next to
+the installer in `packaging\dist\` and prints the hash to stdout as part of the build's final
+summary, so it's visible in the build log without opening the sidecar file separately. This
+replaced the manual, easily-forgotten `Get-FileHash` step every prior release used — **if you
+forget to check the sidecar exists before publishing, that's now a build-script bug to report, not
+a step to do by hand.**
 
-Every release so far has one, produced by hand at publish time. Confirmed via
+Every release so far has one. Confirmed via
 `api.github.com/repos/gaurav-gandhi-2411/reclaim/releases` on 2026-08-05: v1.0.0, v1.1.0, v1.2.0
 and v1.3.0 each carry exactly two assets, `reclaim-setup.exe` and `reclaim-setup.exe.sha256`
-(84 bytes every time).
+(84 bytes every time) — produced by hand at publish time for those releases, before this
+automation existed.
 
-Generate the sidecar in the `sha256sum`-compatible format the existing releases use — lowercase
-hex, **two** spaces, the bare filename with no path, and a trailing LF:
+The script generates the sidecar in the `sha256sum`-compatible format the existing releases use —
+lowercase hex, **two** spaces, the bare filename with no path, and a trailing LF:
 
 ```powershell
-$exe = "packaging\dist\reclaim-setup.exe"
-$h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+$installerFileName = Split-Path -Leaf $installerPath
+$sha256Path = "$installerPath.sha256"
+$installerHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash.ToLower()
 # WriteAllText with a BOM-less UTF8Encoding and an explicit `n (not `r`n, not Set-Content):
 # reproduces the published sidecars byte-for-byte at 84 bytes. A BOM or a CRLF would make
 # `sha256sum -c` fail for anyone verifying on Linux/macOS/WSL.
-[System.IO.File]::WriteAllText("$exe.sha256", "$h  reclaim-setup.exe`n", [System.Text.UTF8Encoding]::new($false))
+[System.IO.File]::WriteAllText($sha256Path, "$installerHash  $installerFileName`n", [System.Text.UTF8Encoding]::new($false))
 ```
 
 v1.3.0's published sidecar is exactly
 `7f02ab7b...d7c3` + two spaces + `reclaim-setup.exe` + `\n` = 84 bytes, no BOM (fetched and
-byte-inspected 2026-08-05); the command above was run against a dummy file on the same day and
-produced the identical 84-byte shape.
+byte-inspected 2026-08-05). The automated block above was verified against a synthetic dummy file
+standing in for the installer (2026-08-05): the resulting sidecar was 84 bytes for the
+`reclaim-setup.exe` filename length, byte-inspected to confirm no BOM (first bytes are the hash's
+own ASCII digits, not `EF BB BF`), no CR byte anywhere in the file, and a single trailing `0A`
+(LF) as the last byte — the identical shape to the real published sidecars, not just a
+coincidentally-matching byte count.
 
 Upload **both** files as release assets, named exactly `reclaim-setup.exe` and
-`reclaim-setup.exe.sha256`. Then re-download the published asset and hash it again — the point is
-to catch a corrupted or truncated upload, so hashing the local file you just built proves nothing.
-v1.3.0's published sidecar reads
+`reclaim-setup.exe.sha256` — `packaging\dist\` already has both after a successful build. Then
+re-download the published asset and hash it again — the point is to catch a corrupted or truncated
+upload, so hashing the local file you just built proves nothing, and this round-trip step is
+publish-time-only: it happens after the artifact reaches GitHub, so it cannot be done by the build
+script and remains manual. v1.3.0's published sidecar reads
 `7f02ab7b488e51212e7bde0e686c742b448d90073df103da9ce2885f6460d7c3  reclaim-setup.exe`; that
 round-trip check is what PLAN.md's "verified byte-identical after downloading the published asset
 back" notes refer to, and it is not optional.
