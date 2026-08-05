@@ -45,6 +45,28 @@ def test_bare_config_defaults_schema_version_to_current() -> None:
     assert Config().schema_version == CONFIG_SCHEMA_VERSION
 
 
+# --- Update check: opt-in, off by default (see PRIVACY.md's "Updates" section) -----------------
+
+
+def test_bare_config_defaults_update_check_to_disabled() -> None:
+    assert Config().update_check.enabled is False
+
+
+def test_config_toml_can_opt_into_update_check(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[update_check]
+enabled = true
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.update_check.enabled is True
+
+
 def test_load_config_returns_defaults_when_path_missing(tmp_path: Path) -> None:
     missing = tmp_path / "does_not_exist.toml"
     config = load_config(missing)

@@ -15,6 +15,9 @@ dependencies = [
     "send2trash>=1.8",
     "blake3>=1.0",
     "jinja2>=3.1",
+    "httpx>=0.27",  # opt-in update check only (reclaim.update_check) -- see PRIVACY.md's
+    # "Updates" section. Previously a test-only dev dependency; this is its first production
+    # use, moved here from [dependency-groups] dev below.
 ]
 
 [project.optional-dependencies]
@@ -112,7 +115,6 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",
-    "httpx>=0.27",
     "ruff>=0.7",
     "mypy>=1.13",
     "pyarrow>=17.0",  # Apache-2.0 — reads the PAWS-Wiki gold-set parquet files

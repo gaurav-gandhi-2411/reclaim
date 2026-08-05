@@ -27,6 +27,7 @@ from reclaim.api.schemas import (
     SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapResponse,
+    UpdateCheckResponse,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
 from reclaim.drives import NoFixedDrivesFoundError
@@ -349,6 +350,17 @@ def first_run_status(request: Request) -> FirstRunStatusResponse:
 @router.post("/first-run/acknowledge", response_model=FirstRunStatusResponse)
 def first_run_acknowledge(request: Request) -> FirstRunStatusResponse:
     return service.acknowledge_first_run_screen(get_state(request))
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------
+
+
+@router.get("/update-check", response_model=UpdateCheckResponse)
+def update_check_status(request: Request) -> UpdateCheckResponse:
+    """Read-only, best-effort — see `service.check_for_update_status` and
+    `reclaim.update_check.check_for_update` for why this can never raise, block, or make a
+    network call unless the user has opted in via `config.toml`'s `[update_check] enabled`."""
+    return service.check_for_update_status(get_state(request))
 
 
 # --- G25: bug-report diagnostics ----------------------------------------------------------------

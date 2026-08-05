@@ -613,6 +613,17 @@ a:active {
   font-weight: 600;
 }
 
+/* Update-available badge in the footer (see app.js::initUpdateCheck) -- hidden unless a real
+   newer release was found; the plain "Check for updates" link next to it is the manual fallback
+   this augments, not replaces. */
+.rc-badge[data-kind="update"] {
+  background: color-mix(in oklch, var(--rc-brand) 14%, transparent);
+  color: var(--rc-brand-text);
+  border-color: var(--rc-brand);
+  text-decoration: none;
+  margin-left: var(--rc-space-2);
+}
+
 /* --- Treemap ------------------------------------------------------------------------------------ */
 
 .rc-treemap-wrap {
