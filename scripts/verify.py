@@ -23,15 +23,21 @@ from collections.abc import Sequence
 
 _JUNIT_PATH = "pytest-results.xml"
 
-# Every one of these three eval files is fast and deterministic (no [ai] extra, no network, no
-# real model download -- verified: all three collect and pass with zero AI dependencies
+# Every one of these four eval files is fast and deterministic (no [ai] extra, no network, no
+# real model download -- verified: all four collect and pass with zero AI dependencies
 # installed) specifically so there is no excuse to skip them in a quick local pre-push check.
 # The rest of evals/ (gold-set/operating-point measurements) is deliberately NOT here -- those
 # need the [ai] extra and real fixture datasets, and run in CI's ai-layer-with-extras job
 # instead; bundling them into every pre-push run would make this script slow enough that people
 # stop running it, which defeats the point.
+#
+# test_safety_adversarial.py added 2026-08-05: proves the SafetyValidator hard gate resists
+# path-obfuscation bypass attempts (8.3 names, ..-traversal, subst, junctions, case) -- a
+# distinct property from test_safety_gate.py's golden-tree-fixture-match check, and exactly the
+# kind of file this script's own docstring warns gets silently skipped when it's left out.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
+    "evals/test_safety_adversarial.py",
     "evals/test_ai_safety_gate.py",
     "evals/test_safe_mode_gate.py",
 )
