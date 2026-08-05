@@ -1,0 +1,51 @@
+name: scale-nightly
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 06:00 UTC daily -- a hosted GitHub Actions runner, not a shared local dev machine, so
+    # "quiet hour" isn't load-bearing here the way it is for a local build (see
+    # packaging/RELEASE_RUNBOOK.md's contention guidance); kept at an off-hours slot anyway as a
+    # reasonable default with no downside.
+    - cron: "0 6 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scale-tier:
+    # The @pytest.mark.scale 100k+ file tier: evals/test_e2e_scale.py's real end-to-end proof at
+    # true scale (scan -> dedup -> AI near-dup -> executor -> crash-recovery, all together, at
+    # real file-count scale) plus evals/test_scanner_peak_rss_budget.py's peak-RSS growth-ratio
+    # characterization -- the tier that actually discriminates the historical
+    # whole-walk-accumulation memory bug from the current bounded-batch design (see that module's
+    # own comment for why the fast tier alone is a weak gate for that specific bug).
+    #
+    # Too slow/expensive for every PR: this session's own local measurements put the 100k-file
+    # tier's fixture generation + scan alone at 51-84s + 8-14s, before the peak-RSS harness's own
+    # separate run of the same tier on top of that -- gated to push-to-main and a nightly
+    # schedule instead of every PR, matching this repo's other workflows' conventions
+    # (concurrency cancel-in-progress, `uv sync --frozen`, a JUnit zero-test guard so a silently
+    # empty test selection can't pass by accident).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (with the ai extra)
+        run: uv sync --frozen --all-groups --extra ai
+
+      - name: Scale-tier E2E + peak-RSS growth characterization (100k+ files)
+        run: uv run pytest evals/test_e2e_scale.py evals/test_scanner_peak_rss_budget.py -m scale -v --junitxml=pytest-scale-results.xml
+
+      - name: Fail if this job collected/ran zero tests
+        run: uv run python scripts/check_junit_nonzero.py pytest-scale-results.xml
