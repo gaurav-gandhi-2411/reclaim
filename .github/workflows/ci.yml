@@ -81,6 +81,25 @@ jobs:
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
 
+      # CI-enforced performance regression budgets (this task) -- MEASURED baselines turned into
+      # pytest assertions that fail the build, not just numbers a human has to remember to check.
+      # `-m "not scale"` runs evals/test_e2e_scale.py's FAST tier only (~3k files, seconds) plus
+      # its whole non-scale-marked test suite (dedup/near-dup precision-recall, crash-recovery
+      # atomicity, restore identity, resumed-scan correctness, manifest round-trip -- none of
+      # these were wired into any CI job before this) — the real 100k+ tier is scale-gated to
+      # push-to-main/nightly only (.github/workflows/scale-nightly.yml), never per-PR, since it's
+      # meaningfully more expensive (~2-5 minutes of fixture build + scan) and its main value
+      # ("does this hang/blow up at real scale") doesn't need per-PR latency.
+      # evals/test_scanner_memory.py was ALSO never wired into any CI job before this (a real
+      # gap: `pyproject.toml`'s `testpaths = ["tests"]` means a bare `pytest` never discovers
+      # evals/ at all) despite already being the existing Wave 1 peak-memory regression proof —
+      # closed here rather than left for a future session to rediscover.
+      - name: Performance regression budgets (scan peak RSS, scale-tree throughput, CLI cold start, scan memory)
+        run: uv run pytest evals/test_e2e_scale.py evals/test_scanner_peak_rss_budget.py evals/test_scanner_memory.py evals/test_cli_cold_start_budget.py -m "not scale" -v --junitxml=pytest-perf-results.xml
+
+      - name: Fail if this job collected/ran zero tests (perf budgets)
+        run: uv run python scripts/check_junit_nonzero.py pytest-perf-results.xml
+
   frontend-xss-regression:
     runs-on: windows-latest
     steps:

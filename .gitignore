@@ -73,5 +73,7 @@ nuitka-crash-report.xml
 Thumbs.db
 Desktop.ini
 
-# scripts/verify.py junit output
+# scripts/verify.py / CI workflow junit output
 pytest-results.xml
+pytest-perf-results.xml
+pytest-scale-results.xml
