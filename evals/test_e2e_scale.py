@@ -56,6 +56,34 @@ _IMAGE_MAX_HAMMING_DISTANCE = 14
 _DOCUMENT_MINHASH_THRESHOLD = 0.1
 _DOCUMENT_EMBEDDING_THRESHOLD = 0.95
 
+# --- CI throughput regression floors for THIS fixture (scale-tree), distinct from
+# evals/test_scanner_perf.py's own 150 files/sec floor -----------------------------------------
+#
+# NOT the same measurement as evals/test_scanner_perf.py's clean ~4,025-plain-file fixture (whose
+# own floor is anchored to a 10,247 files/sec baseline, ~11x margin under that number) -- this
+# scale-tree fixture is structurally heavier per entry (long paths, unicode names, sparse files,
+# junctions, a permission-denied dir, real near-dup image/document content) and measures a
+# genuinely different, slower workload. Conflating the two numbers would either make this floor
+# meaninglessly loose (10,247-derived) or make test_scanner_perf.py's floor meaninglessly tight
+# (this fixture's own, much lower, number) -- kept separate on purpose.
+#
+# MEASURED (this session, this machine, worktree HEAD at the time of writing), 4 fresh runs of
+# the fast-tier scan alone: 6,075 / 6,321 / 6,886 / 9,777 entries/sec. Floor anchored to the
+# MINIMUM observed (6,075), not the mean/max -- matches this codebase's "conservative, not
+# just-above-measured" convention (see evals/test_scanner_perf.py's own floor-setting comment).
+# 70% tolerance on that minimum -> ~4,253 entries/sec; rounded DOWN to 4,000 for extra headroom on
+# a slower/more-contended CI runner than this dev machine.
+_FAST_TIER_MIN_ENTRIES_PER_SECOND = 4_000.0
+
+# MEASURED (this session, this machine), one fresh run (the 100k+ tier is too slow to sample
+# repeatedly in routine development -- see this test's own @pytest.mark.scale gating): 7,255
+# entries/sec. 70% tolerance -> ~5,079; rounded down to 5,000. This tier only ever runs in the
+# scale-gated nightly/main-push job (see .github/workflows/), never per-PR, so a same-session
+# re-run to build variance the way the fast tier's 4-run sample did wasn't worth the extra ~2.5
+# minutes per run -- a single real measurement plus the SAME 70%-tolerance convention already used
+# above is the honest, disclosed baseline here, not a fabricated multi-run statistic.
+_SCALE_TIER_MIN_ENTRIES_PER_SECOND = 5_000.0
+
 
 def _cleanup_tree(root: Path) -> None:
     """`shutil.rmtree` alone can fail against this fixture for two DELIBERATE reasons (both are
@@ -166,16 +194,24 @@ def test_full_scan_completes_without_raising_fast_tier(scale_root: Path) -> None
     with ScanIndex(db_path) as index:
         stats = scan_tree(manifest.root, index, incremental=False)
     elapsed = time.perf_counter() - start
+    entries_per_second = stats.entries_total / elapsed
 
     print(  # noqa: T201 -- eval numbers; run with `pytest -s` to see them
         f"\n[e2e scale, fast tier] filler={manifest.filler_file_count} "
         f"planted={manifest.total_planted_files} entries_total={stats.entries_total} "
         f"dirs_visited={stats.dirs_visited} skipped={stats.skipped_unreadable_count} "
-        f"elapsed={elapsed:.2f}s ({stats.entries_total / elapsed:.0f} entries/sec)"
+        f"elapsed={elapsed:.2f}s ({entries_per_second:.0f} entries/sec)"
     )
     assert stats.entries_total > manifest.filler_file_count
     # The junction and its cycle are recorded as leaf entries (D12 contract), never skipped.
     assert stats.skipped_unreadable_count >= 0  # always true; see the dedicated assertion below
+    # CI regression floor -- see this module's own comment above _FAST_TIER_MIN_ENTRIES_PER_SECOND
+    # for the measured baseline and tolerance. Distinct from evals/test_scanner_perf.py's
+    # 10,247-baseline floor -- this fixture is a heavier, different workload.
+    assert entries_per_second >= _FAST_TIER_MIN_ENTRIES_PER_SECOND, (
+        f"scale-tree fast-tier scan throughput ({entries_per_second:.0f} entries/sec) fell below "
+        f"the {_FAST_TIER_MIN_ENTRIES_PER_SECOND:.0f} entries/sec CI regression floor"
+    )
 
 
 def test_full_scan_records_every_special_case_leaf_entry(scale_root: Path) -> None:
@@ -228,17 +264,28 @@ def test_full_scan_completes_without_raising_100k_tier(scale_root: Path) -> None
         stats = scan_tree(manifest.root, index, incremental=False)
     scan_elapsed = time.perf_counter() - scan_start
     peak_after = _peak_working_set_bytes()
+    entries_per_second = stats.entries_total / scan_elapsed
 
     print(  # noqa: T201
         f"\n[e2e scale, 100k+ tier] filler={manifest.filler_file_count} "
         f"planted={manifest.total_planted_files} generation_elapsed={generation_elapsed:.2f}s "
         f"({manifest.total_planted_files / generation_elapsed:.0f} files/sec) "
         f"entries_total={stats.entries_total} dirs_visited={stats.dirs_visited} "
-        f"scan_elapsed={scan_elapsed:.2f}s ({stats.entries_total / scan_elapsed:.0f} entries/sec) "
+        f"scan_elapsed={scan_elapsed:.2f}s ({entries_per_second:.0f} entries/sec) "
         f"peak_working_set_before={peak_before / 1024 / 1024:.1f}MB "
-        f"peak_working_set_after={peak_after / 1024 / 1024:.1f}MB"
+        f"peak_working_set_after={peak_after / 1024 / 1024:.1f}MB "
+        "(NOTE: peak_working_set_before/after include this process's fixture-generation memory "
+        "too -- NOT a scan-isolated figure; see evals/test_scanner_peak_rss_budget.py for the "
+        "clean, subprocess-isolated peak-RSS regression budget)"
     )
     assert stats.entries_total >= LARGE_FILLER_FILE_COUNT
+    # CI regression floor (scale-gated -- this whole test only runs via `pytest -m scale`, never
+    # per-PR). See this module's own comment above _SCALE_TIER_MIN_ENTRIES_PER_SECOND for the
+    # measured baseline and tolerance.
+    assert entries_per_second >= _SCALE_TIER_MIN_ENTRIES_PER_SECOND, (
+        f"scale-tree 100k+-tier scan throughput ({entries_per_second:.0f} entries/sec) fell "
+        f"below the {_SCALE_TIER_MIN_ENTRIES_PER_SECOND:.0f} entries/sec CI regression floor"
+    )
 
 
 class _ProcessMemoryCounters(ctypes.Structure):
