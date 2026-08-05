@@ -1,1 +1,12 @@
 src/reclaim/ai/models/*.onnx filter=lfs diff=lfs merge=lfs -text
+# Bundled MiniLM tokenizer config is JSON (text-looking) but its bytes are integrity-checked
+# against a pinned SHA256 (reclaim.ai.text_embeddings._TOKENIZER_SHA256) -- git's default
+# text-file CRLF normalization (core.autocrlf=true, this repo's committed content is LF-only)
+# silently corrupts it on checkout for any contributor/CI runner with that Windows-default git
+# setting, breaking every near-dup-document AI code path with a confusing
+# `AIModelMissingError: ... failed integrity verification` far from the real cause. Discovered
+# via evals/test_e2e_scale.py (Wave 1 P0-C) failing exactly this way in a fresh worktree
+# checkout while the primary checkout (a pre-existing, not-freshly-recloned working copy) stayed
+# unaffected -- `-text` here is the same fix `*.onnx` already has, extended to this one other
+# integrity-checked bundled model file.
+src/reclaim/ai/models/*.json -text
