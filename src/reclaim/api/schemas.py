@@ -122,7 +122,9 @@ class SuggestedScanRootsResponse(BaseModel):
 class ScanStatusOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: str
+    status: str  # "idle" | "running" | "completed" | "failed" | "cancelled" -- see
+    # `reclaim.api.state.ScanStatusLiteral`. "cancelled" (scan cancellation, `POST
+    # /api/scan/cancel`) is a user-requested stop, never an error -- `error` stays `None`.
     root: str | None
     started_at: float | None
     finished_at: float | None
