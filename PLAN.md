@@ -2703,3 +2703,56 @@ install→scan→AI→vault→restore→uninstall gate (still needs a real machi
 escalation list); `.sha256` sidecar automation in `build_installer.ps1`; code-signing purchase
 (blocked on GG's residency/budget answers); a literal end-to-end observed restore in the
 accessibility pass's live session.
+
+### 2026-08-05 (cont'd) — Two follow-ups: scan cancellation, checksum automation
+
+Both dispatched from the two gaps the previous checkpoint disclosed rather than papered over.
+
+**Scan cancellation** — real, cooperative cancellation via a `threading.Event`
+(`AppState.cancel_scan_event`), checked at directory AND entry granularity inside
+`count_entries_fast`/`scan_tree`/`_walk_subtree` (not just once per root), so a single large
+directory can't delay interruption. New `POST /api/scan/cancel` (200/no-op if nothing is running,
+by design — safe to call speculatively). Consistency comes from `_BatchIndexWriter`'s existing
+batch-flush cadence: a cancelled scan's already-flushed rows are durable, nothing half-written is
+left behind. `prune_unseen_under_root` is skipped entirely on a cancelled run — a partial
+`scan_seen` set would otherwise wrongly delete every real entry the walk never reached; a new
+`"cancelled"` status (`error` stays `None`) keeps this distinct from `"failed"` in both API and UI.
+One subtle correctness call worth remembering: the cancel event is cleared by the ROUTE HANDLER,
+not inside `run_scan` itself — `run_scan` executes as a `BackgroundTask` AFTER the HTTP response is
+already sent, so clearing it inside `run_scan` would race an immediate cancel call and silently
+drop it. UI: a Cancel control on both Advanced and Simple-mode scan surfaces, reusing this
+session's `aria-live`/tone conventions (never rendered as an error).
+
+**Proven, not just asserted**: `evals/test_e2e_scale.py::test_cancel_mid_scan_leaves_a_consistent_
+index` is un-skipped and real (deterministic via the existing `_HEARTBEAT_INTERVAL_SECONDS=0.0`
+monkeypatch convention + an entry-count threshold, not a wall-clock race — zero flakiness across
+repeated local runs). A one-off manual demonstration against the REAL 100k+ tier: cancelled 1.0s
+into a real walk at 14,987/100,306 entries indexed, `files_pruned=0`, index inventory count
+matched exactly; a resumed incremental pass completed the remaining 85,319 entries in 7.66s to a
+fully consistent 100,306-row final index — this is the actual UX claim ("stop a long full-drive
+scan, keep what it found, finish later") demonstrated end-to-end, not inferred from unit tests
+alone.
+
+**`.sha256` checksum automation**: `build_installer.ps1` now generates the sidecar automatically
+right after Inno Setup packaging succeeds (guarded by the script's existing `$ErrorActionPreference
+= "Stop"` plus its prior throw-on-failure checks, so a failed package step correctly skips it).
+Reused the exact byte-format already verified against real published sidecars in
+`RELEASE_RUNBOOK.md` (lowercase hex, two spaces, bare filename via `Split-Path -Leaf` rather than
+hardcoded, single trailing LF, no BOM) — re-verified byte-by-byte against a synthetic file rather
+than trusting the recipe: first 4 bytes are the hash's ASCII hex (no `EF BB BF` BOM), zero `0x0D`
+bytes anywhere, last byte `0x0A`. `RELEASE_RUNBOOK.md` and ADR-0031 updated — both previously
+described this as a manual step. The "upload both files, then re-download the published asset and
+re-hash it" round-trip check remains explicitly manual (can't run until the artifact is actually
+on GitHub) and is documented as such, not implied to be automated too.
+
+**Full verification, all lanes, this session's actual commands** (not the theoretical CI
+definitions — literally run locally against the merged tip): `scripts/verify.py` (core, no `[ai]`
+extra) — 913 tests ran, all green, all 5 safety-critical coverage floors held. `ai-layer-with-
+extras` lane (`pytest tests/ evals/test_ai_safety_gate.py`) — 851 passed, 7 skipped. Its perf-
+budget step (`evals/test_e2e_scale.py evals/test_scanner_peak_rss_budget.py evals/test_scanner_
+memory.py evals/test_cli_cold_start_budget.py -m "not scale"`) — 14 passed, 2 correctly deselected,
+including the now-real `test_cancel_mid_scan_leaves_a_consistent_index`. `eval.yml`'s safety-gate
+lane — 77 passed. `frontend-xss-regression` (`tests/frontend`, `npm test`) — 20/20 passed.
+`pip-audit --desc` against a freshly-exported `requirements-audit.txt` — no known vulnerabilities.
+`scale-nightly.yml`'s own lane (`-m scale`) — 2 passed (170.18s), including the 100k+-tier full-
+scan-completes test. Working tree clean after every merge.
