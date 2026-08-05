@@ -2022,6 +2022,32 @@ async function initRecoveryBanner() {
   }
 }
 
+// --- Update check (opt-in; see PRIVACY.md's "Updates" section) --------------------------------
+//
+// GET /api/update-check never blocks initial render (called from init(), fire-and-forget, same
+// "fetch after the page is already usable" posture as initRecoveryBanner). The endpoint itself
+// makes zero network calls unless the user opted in via config.toml's [update_check] section --
+// this call always resolves fast either way (see reclaim.update_check's cache/timeout). Fails
+// silent-hidden on error, same "never trap or alarm the user over a broken status check" posture
+// as initFirstRun/initRecoveryBanner -- the existing "Check for updates" link is always there as
+// a manual fallback regardless of what this check finds.
+
+async function initUpdateCheck() {
+  const badge = document.getElementById("update-check-badge");
+  try {
+    const status = await api("/api/update-check");
+    if (!status.update_available || !status.latest_version) {
+      return;
+    }
+    badge.href = status.release_url;
+    badge.textContent = `Update available: ${status.latest_version}`;
+    badge.setAttribute("aria-label", `A newer Reclaim release, ${status.latest_version}, is available — opens the release page`);
+    badge.hidden = false;
+  } catch {
+    // Fail hidden: badge just never appears; the plain "Check for updates" link still works.
+  }
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
@@ -2042,6 +2068,7 @@ function init() {
   initModeControls();
   initFirstRun();
   initRecoveryBanner();
+  initUpdateCheck();
   activateTab("overview");
 }
 
