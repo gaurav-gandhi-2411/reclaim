@@ -63,7 +63,11 @@
     <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
   </nav>
 
-  <main id="main-content" class="rc-main">
+  <!-- tabindex="-1": <main> isn't natively focusable, so activating the "Skip to main content"
+       link above only moved scroll position (location.hash) without moving DOM focus -- the next
+       Tab press restarted from the top of the header instead of continuing from here, defeating
+       the skip link's purpose for keyboard/AT users. -->
+  <main id="main-content" class="rc-main" tabindex="-1">
     <!-- SIMPLE mode: one primary "Clean My Computer" action -- no tabs, no path typing, no
          Review Queue/AI Suggestions, ever (feat/simple-advanced-mode). CSS keys visibility off
          html[data-mode] (see styles.css); app.js's SIMPLE-mode functions render every state

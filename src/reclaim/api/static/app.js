@@ -1029,6 +1029,82 @@ function initSimpleMode() {
   renderSimpleIdle();
 }
 
+// --- Shared dialog behavior: focus trap + Escape-to-close ---------------------------------------
+//
+// Every `.rc-overlay[role="dialog"]` (first-run-overlay, scan-confirm-dialog, quick-clean-dialog,
+// how-it-works-dialog, power-mode-dialog) is opened/closed by its own function setting `.hidden`
+// directly rather than through a shared helper -- aria-modal="true" alone gets none of Tab-trapping,
+// initial-focus-move, or Esc-to-close for free from the browser, so this one global listener covers
+// all five by watching for whichever dialog is currently open, instead of threading the same fix
+// through every open()/close() pair above.
+function openDialogEl() {
+  return document.querySelector('.rc-overlay[role="dialog"]:not([hidden])');
+}
+
+function focusableElements(container) {
+  return Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((el) => !el.disabled && el.offsetParent !== null);
+}
+
+// first-run-overlay has no cancel action (only "I understand, continue", which also POSTs
+// /api/first-run/acknowledge) -- Escape just hides it without acknowledging, same as initFirstRun's
+// existing "worst case it reappears next launch" posture on a failed acknowledge call.
+const DIALOG_ESCAPE_CLOSE_BUTTON_IDS = {
+  "scan-confirm-dialog": "scan-confirm-cancel",
+  "quick-clean-dialog": "quick-clean-cancel",
+  "how-it-works-dialog": "how-it-works-close",
+  "power-mode-dialog": "power-mode-cancel",
+};
+
+function initDialogKeyboardBehavior() {
+  document.addEventListener("keydown", (event) => {
+    const dialog = openDialogEl();
+    if (!dialog) return;
+
+    if (event.key === "Escape") {
+      const closeBtnId = DIALOG_ESCAPE_CLOSE_BUTTON_IDS[dialog.id];
+      if (closeBtnId) {
+        document.getElementById(closeBtnId).click();
+      } else {
+        dialog.hidden = true;
+      }
+      return;
+    }
+
+    if (event.key === "Tab") {
+      const focusable = focusableElements(dialog);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  });
+
+  // Moves focus into whichever dialog becomes visible, and back to whatever triggered it once it
+  // closes -- a MutationObserver on `hidden` (a reflected attribute, so `dialog.hidden = false`
+  // above is observable here) covers every open()/close() pair without editing each of them.
+  let lastFocusedBeforeDialog = null;
+  for (const dialog of document.querySelectorAll('.rc-overlay[role="dialog"]')) {
+    new MutationObserver(() => {
+      if (dialog.hidden) {
+        lastFocusedBeforeDialog?.focus();
+      } else {
+        lastFocusedBeforeDialog = document.activeElement;
+        focusableElements(dialog)[0]?.focus();
+      }
+    }).observe(dialog, { attributes: true, attributeFilter: ["hidden"] });
+  }
+}
+
 // --- "How this works" ----------------------------------------------------------------------------
 
 function initHowItWorks() {
@@ -2051,6 +2127,7 @@ async function initUpdateCheck() {
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
+  initDialogKeyboardBehavior();
   initTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   initDashboardMode();
