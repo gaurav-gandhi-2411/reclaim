@@ -120,3 +120,110 @@ investigate before retrying, don't just re-run.
    Report pass/fail per step, not just an overall verdict — a step that "mostly worked but the
    wording was a little off" is still useful signal, not a failure to hide.
 4. Update the "Expected numbers" table above with the real measurement + commit SHA.
+
+## Publishing: SHA-256 checksum sidecar (manual — the build script does NOT do this)
+
+`build_installer.ps1` does not produce a checksum. Verified on 2026-08-05 against the 590-line
+script: it contains no `Get-FileHash`, no `sha256`, and no checksum step at all — its last action
+is to print the installer size. **If you forget this step, the release ships without a checksum
+and nobody will notice until a user asks how to verify the download.**
+
+Every release so far has one, produced by hand at publish time. Confirmed via
+`api.github.com/repos/gaurav-gandhi-2411/reclaim/releases` on 2026-08-05: v1.0.0, v1.1.0, v1.2.0
+and v1.3.0 each carry exactly two assets, `reclaim-setup.exe` and `reclaim-setup.exe.sha256`
+(84 bytes every time).
+
+Generate the sidecar in the `sha256sum`-compatible format the existing releases use — lowercase
+hex, **two** spaces, the bare filename with no path, and a trailing LF:
+
+```powershell
+$exe = "packaging\dist\reclaim-setup.exe"
+$h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+# WriteAllText with a BOM-less UTF8Encoding and an explicit `n (not `r`n, not Set-Content):
+# reproduces the published sidecars byte-for-byte at 84 bytes. A BOM or a CRLF would make
+# `sha256sum -c` fail for anyone verifying on Linux/macOS/WSL.
+[System.IO.File]::WriteAllText("$exe.sha256", "$h  reclaim-setup.exe`n", [System.Text.UTF8Encoding]::new($false))
+```
+
+v1.3.0's published sidecar is exactly
+`7f02ab7b...d7c3` + two spaces + `reclaim-setup.exe` + `\n` = 84 bytes, no BOM (fetched and
+byte-inspected 2026-08-05); the command above was run against a dummy file on the same day and
+produced the identical 84-byte shape.
+
+Upload **both** files as release assets, named exactly `reclaim-setup.exe` and
+`reclaim-setup.exe.sha256`. Then re-download the published asset and hash it again — the point is
+to catch a corrupted or truncated upload, so hashing the local file you just built proves nothing.
+v1.3.0's published sidecar reads
+`7f02ab7b488e51212e7bde0e686c742b448d90073df103da9ce2885f6460d7c3  reclaim-setup.exe`; that
+round-trip check is what PLAN.md's "verified byte-identical after downloading the published asset
+back" notes refer to, and it is not optional.
+
+### Verification instructions to give end users
+
+Put this in the release notes (and keep the README's download section pointing at it). A checksum
+nobody is told how to use is decoration, not integrity.
+
+```powershell
+# In PowerShell, in the folder you downloaded both files to:
+(Get-FileHash .\reclaim-setup.exe -Algorithm SHA256).Hash.ToLower()
+Get-Content .\reclaim-setup.exe.sha256
+# The 64-character hash printed by the first command must appear in the second command's output.
+# If it doesn't match, delete the download and do not run it.
+```
+
+Be honest in the release notes about what this does and doesn't prove: the checksum confirms the
+file arrived intact and matches what was published on this repo's releases page. It is **not** a
+publisher signature — it does not prove who built it, and a user who fetched both the installer
+and the sidecar from the same tampered mirror learns nothing. Only code signing gives that, and
+Reclaim is unsigned (see below and ADR-0031).
+
+## Publishing: what a user actually sees on an unsigned installer
+
+`reclaim-setup.exe` and the `reclaim.exe` it installs are **unsigned**. ADR-0031 records the
+current code-signing options, the recommendation, and the fact that nothing is purchased pending
+GG's go-ahead. Until that changes, every first-time user hits the flow below, and release notes,
+SUPPORT.md answers and the landing page should describe it accurately rather than paraphrase it.
+
+**1. Browser download warning (before SmartScreen ever runs).** Because the file is a rarely
+downloaded `.exe`, the browser's own reputation check fires first — in Microsoft Edge the download
+is flagged as not commonly downloaded and must be kept via the download flyout's overflow (`...`)
+menu; Chrome shows an equivalent keep/discard prompt. Wording here changes between browser
+releases, so don't quote it verbatim in user-facing docs; describe the action ("choose to keep the
+file") instead.
+
+**2. Microsoft Defender SmartScreen's unrecognised-app dialog**, when the downloaded installer is
+launched. A blue full-screen-style dialog appears, titled **"Windows protected your PC"**, with
+the body **"Microsoft Defender SmartScreen prevented an unrecognized app from starting. Running
+this app might put your PC at risk."** The only visible button is **"Don't run"** and it holds
+keyboard focus by default — there is deliberately no "run" button until the user expands the
+**"More info"** link. Doing so reveals a small details table (`App:` = `reclaim-setup.exe`,
+`Publisher:` = **`Unknown publisher`**) and *then* a **"Run anyway"** button. Two clicks, past a
+red-flag-shaped screen, before Reclaim's own installer wizard is ever seen.
+
+> Provenance for the wording above, stated precisely because it is user-facing copy. The
+> `Publisher:`/`App:` field labels, the literal default value `Unknown Publisher`, and the
+> two-button run/don't-run pattern with focus defaulting to don't-run were extracted directly on
+> 2026-08-05 from this machine's own `C:\Windows\System32\en-US\smartscreen.exe.mui`
+> (FileDescription "Windows Defender SmartScreen", version 10.0.26100.8117) — although the
+> template found there is the *"SmartScreen can't be reached right now"* offline variant, not the
+> unrecognised-app variant. A byte search for the UTF-16 strings `Windows protected your PC` and
+> `unrecognized app` across `System32`, `System32\en-US`, `SystemResources`, `SystemApps` and
+> `Program Files\WindowsApps` returned **zero** hits, so the title and body sentences above are
+> **not** sourced from a Microsoft artifact in this pass — they carry over from README.md's
+> existing SmartScreen section, which was written from observing the real prompt during earlier
+> packaging work. Treat them as observed-and-plausible rather than extracted, and re-check against
+> a live prompt on the fresh-Windows-VM gate (step 3a above) before quoting them in new
+> user-facing copy.
+
+**3. Antivirus false positives.** Independent of SmartScreen, some engines heuristically flag
+freshly compiled, unsigned Nuitka output. This project has already hit one real AV quarantine on a
+freshly built binary (PLAN.md, 2026-07-23) — treat it as a known cost of shipping unsigned, not a
+hypothetical one. README.md's "First run: SmartScreen and antivirus prompts" section carries the
+restore-from-quarantine and folder-exclusion instructions for users; keep the two in sync.
+
+**What signing would and would not fix.** Do not write release notes promising that a future
+signed build installs silently. Per ADR-0031's research, current Microsoft documentation describes
+SmartScreen as reputation-based over the file, app and certificate, and no certificate type — EV
+included — grants instant reputation any more. Signing replaces `Unknown publisher` with a
+verified name and starts a reputation clock; the warning itself clears with download volume over
+time, not at purchase.
