@@ -52,6 +52,10 @@
       <input id="scan-path" name="path" type="text" placeholder="C:\Users\you\Downloads" required />
     </div>
     <button type="submit" class="rc-btn rc-btn-primary">Scan</button>
+    <!-- Scan cancellation: shown only while a scan is actually running -- see
+         refreshScanStatus/pollScanStatus in app.js, which toggle `hidden` alongside the submit
+         button's own disabled state. -->
+    <button id="scan-cancel-btn" type="button" class="rc-btn rc-btn-secondary" hidden>Cancel scan</button>
     <p id="scan-status" class="rc-scan-status" role="status" aria-live="polite"></p>
   </form>
 

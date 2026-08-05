@@ -336,6 +336,23 @@ async function startManualScan(path) {
   }
 }
 
+// Scan cancellation: POST /api/scan/cancel is a safe no-op when nothing is running (see the
+// route's own docstring), so this never needs to guard against double-clicking or a stale
+// button state -- the button is disabled immediately either way to avoid a confusing double
+// request while the first one is in flight.
+async function cancelScan() {
+  const cancelBtn = document.getElementById("scan-cancel-btn");
+  cancelBtn.disabled = true;
+  try {
+    await api("/api/scan/cancel", { method: "POST" });
+  } catch {
+    // Best-effort: the next status poll (1.5s cadence, already running) reflects reality
+    // regardless of whether this particular request succeeded.
+  } finally {
+    cancelBtn.disabled = false;
+  }
+}
+
 function initScanBar() {
   const form = document.getElementById("scan-form");
   loadQuickRoots();
@@ -354,20 +371,24 @@ function initScanBar() {
     closeScanConfirmDialog();
     if (path) startManualScan(path);
   });
+  document.getElementById("scan-cancel-btn").addEventListener("click", cancelScan);
   refreshScanStatus();
 }
 
 async function refreshScanStatus() {
   const statusEl = document.getElementById("scan-status");
   const submitBtn = document.querySelector("#scan-form button[type=submit]");
+  const cancelBtn = document.getElementById("scan-cancel-btn");
   try {
     const status = await api("/api/scan/status");
     renderScanStatus(status);
     if (status.status === "running") {
       submitBtn.disabled = true;
+      cancelBtn.hidden = false;
       if (!pollHandle) pollHandle = setInterval(pollScanStatus, 1500);
     } else {
       submitBtn.disabled = false;
+      cancelBtn.hidden = true;
     }
   } catch (err) {
     statusEl.dataset.tone = "error";
@@ -392,6 +413,15 @@ function renderScanStatus(status) {
       (status.skipped_unreadable_count
         ? ` ${status.skipped_unreadable_count} path(s) skipped (unreadable).`
         : "");
+  } else if (status.status === "cancelled") {
+    // Scan cancellation: a user-requested stop, not an error -- "warning" tone (same one
+    // renderSkippedUnreadableNote already uses for a non-fatal caveat), never "error". Reports
+    // whatever was genuinely indexed before the stop, honestly labeled as partial.
+    statusEl.dataset.tone = "warning";
+    statusEl.textContent =
+      `Scan cancelled — ${status.entries_total ?? 0} entries indexed so far ` +
+      `(${status.files_written ?? 0} written, ${status.files_unchanged ?? 0} unchanged) ` +
+      `before it was stopped.`;
   } else if (status.status === "failed") {
     statusEl.dataset.tone = "error";
     statusEl.textContent = `Scan of ${status.root} failed: ${status.error}`;
@@ -403,10 +433,12 @@ async function pollScanStatus() {
   if (!status) return;
   renderScanStatus(status);
   const submitBtn = document.querySelector("#scan-form button[type=submit]");
+  const cancelBtn = document.getElementById("scan-cancel-btn");
   if (status.status !== "running") {
     clearInterval(pollHandle);
     pollHandle = null;
     submitBtn.disabled = false;
+    cancelBtn.hidden = true;
     const activeView = document.querySelector('.rc-tab[aria-selected="true"]')?.dataset.view;
     if (activeView) VIEW_LOADERS[activeView]?.();
   }
@@ -879,6 +911,19 @@ async function pollSimpleScan() {
     return;
   }
 
+  if (status.status === "cancelled") {
+    // Scan cancellation: a user-requested stop, never an error -- "empty" is this codebase's
+    // neutral (non-alarming) renderState kind, same one renderSimpleEmpty already uses for a
+    // non-error informational message, not "error"'s alert-styled panel.
+    renderState(container, "empty", {
+      title: "Scan cancelled",
+      message: `${status.entries_total ?? 0} items indexed so far before it was stopped.`,
+      actionLabel: "Scan again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+
   await loadSimpleResults();
 }
 
@@ -941,6 +986,22 @@ function renderSimpleScanning(status) {
   safety.className = "rc-progress-safety-note";
   safety.textContent = "It's safe to close this tab or stop the server at any point.";
   panel.appendChild(safety);
+
+  // Scan cancellation: same POST /api/scan/cancel every surface uses -- pollSimpleScan's next
+  // tick (already running, SIMPLE_SCAN_POLL_INTERVAL_MS cadence) picks up the resulting
+  // "cancelled" status and renders it, same "poll reflects reality" posture cancelScan() itself
+  // documents for the ADVANCED scan bar.
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "rc-btn rc-btn-secondary";
+  cancelBtn.textContent = "Cancel scan";
+  cancelBtn.addEventListener("click", () => {
+    cancelBtn.disabled = true;
+    api("/api/scan/cancel", { method: "POST" }).catch(() => {
+      cancelBtn.disabled = false;
+    });
+  });
+  panel.appendChild(cancelBtn);
 
   container.appendChild(panel);
 }
