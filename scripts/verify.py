@@ -35,11 +35,23 @@ _JUNIT_PATH = "pytest-results.xml"
 # path-obfuscation bypass attempts (8.3 names, ..-traversal, subst, junctions, case) -- a
 # distinct property from test_safety_gate.py's golden-tree-fixture-match check, and exactly the
 # kind of file this script's own docstring warns gets silently skipped when it's left out.
+#
+# test_scanner_peak_rss_budget.py / test_cli_cold_start_budget.py added 2026-08-05: CI-enforced
+# perf regression budgets (scan peak-RSS growth ratio, CLI cold start). Neither needs the [ai]
+# extra (confirmed: no ai-layer imports, collect and pass in a bare `uv sync`) -- same reasoning
+# as the three files above, no excuse to leave them for CI-only discovery. IMPORTANT:
+# test_scanner_peak_rss_budget.py also has a `scale`-marked 100k-file test -- pyproject.toml
+# registers that marker but does NOT set addopts to deselect it by default (verified: no
+# `-m "not scale"` anywhere in [tool.pytest.ini_options]), so the `-m "not scale"` filter below
+# on the pytest invocation itself is load-bearing, not decorative -- remove it and this "fast"
+# pre-push gate silently starts generating a 100k-file tree on every run.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
     "evals/test_ai_safety_gate.py",
     "evals/test_safe_mode_gate.py",
+    "evals/test_scanner_peak_rss_budget.py",
+    "evals/test_cli_cold_start_budget.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
@@ -56,6 +68,8 @@ _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
             "pytest",
             "tests/",
             *_SAFETY_GATE_FILES,
+            "-m",
+            "not scale",
             "--cov",
             "--cov-report=term-missing",
             f"--junitxml={_JUNIT_PATH}",
