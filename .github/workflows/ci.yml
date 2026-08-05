@@ -56,7 +56,18 @@ jobs:
     # profile directly via simulated import-blocking, so it's covered even in this job).
     runs-on: windows-latest
     steps:
+      # lfs: true is required here (and nowhere else in this file) -- actions/checkout@v4
+      # defaults to checking out Git LFS *pointer* files only, not the real binaries. This job
+      # is the only one in this file that actually loads and SHA256-verifies the bundled ONNX
+      # models (clip_vision_fp16.onnx / minilm_int8.onnx), so it's the only one a missing
+      # `lfs: true` silently breaks -- every other job here either skips the [ai] extra or never
+      # touches real model content, so they all pass regardless and gave zero signal this was
+      # missing. Found 2026-08-05 on this branch's first-ever real CI run: AIModelMissingError,
+      # integrity verification failed -- the pointer file's own bytes hash to something else
+      # entirely, not the pinned model hash.
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
