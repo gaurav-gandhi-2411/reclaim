@@ -1257,6 +1257,7 @@ source = { editable = "." }
 dependencies = [
     { name = "blake3" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -1292,7 +1293,6 @@ ai-export = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "nuitka" },
     { name = "ollama" },
@@ -1310,6 +1310,7 @@ requires-dist = [
     { name = "datasketch", marker = "extra == 'ai'", specifier = ">=1.6" },
     { name = "faiss-cpu", marker = "extra == 'ai'", specifier = ">=1.14.3" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", marker = "extra == 'ai-export'", specifier = ">=0.35" },
     { name = "imagehash", marker = "extra == 'ai'", specifier = ">=4.3" },
     { name = "jinja2", specifier = ">=3.1" },
@@ -1338,7 +1339,6 @@ provides-extras = ["ai", "ai-export"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.27" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "nuitka", specifier = ">=4.1.3" },
     { name = "ollama", specifier = ">=0.6.2" },

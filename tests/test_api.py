@@ -1253,3 +1253,72 @@ def test_diagnostics_log_tail_placeholder_when_log_file_missing(tmp_path: Path) 
     missing_path = tmp_path / "never-written.log"
     expected = "(no log file yet — nothing has been logged this install)"
     assert _read_log_tail(missing_path) == expected
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------
+
+
+def test_update_check_endpoint_disabled_by_default_makes_no_network_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`UpdateCheckConfig.enabled` defaults to `False` (see `config.py` / PRIVACY.md) -- the
+    endpoint must report `enabled=False`, `status="disabled"`, and never even attempt to build an
+    `httpx.Client`. Patches `httpx.Client` to raise if called at all, so this test would fail
+    loudly (not silently pass) if that guarantee ever regressed."""
+    from reclaim import update_check as update_check_module
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("httpx.Client must never be constructed when update_check is disabled")
+
+    monkeypatch.setattr(update_check_module.httpx, "Client", _fail_if_called)
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    response = client.get("/api/update-check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is False
+    assert body["status"] == "disabled"
+    assert body["update_available"] is False
+    assert body["latest_version"] is None
+    assert isinstance(body["current_version"], str) and body["current_version"]
+
+
+def test_update_check_endpoint_reports_available_update_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When `[update_check] enabled = true`, the endpoint delegates to
+    `reclaim.update_check.check_for_update` -- this test injects a `MockTransport`-backed client
+    (via monkeypatching `httpx.Client` itself) so it never reaches the real network, matching this
+    project's zero-live-API-calls-in-CI convention."""
+    import httpx
+
+    from reclaim import update_check as update_check_module
+    from reclaim.config import UpdateCheckConfig
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"tag_name": "v99.0.0", "html_url": "https://example.test/r"}
+        )
+
+    real_client_cls = httpx.Client
+    monkeypatch.setattr(
+        update_check_module.httpx,
+        "Client",
+        lambda **kwargs: real_client_cls(transport=httpx.MockTransport(handler)),
+    )
+    update_check_module._cache.clear()
+
+    config = _config(tmp_path / "tree")
+    config = config.model_copy(update={"update_check": UpdateCheckConfig(enabled=True)})
+    client = _make_app(tmp_path, config=config)
+
+    response = client.get("/api/update-check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["status"] == "ok"
+    assert body["update_available"] is True
+    assert body["latest_version"] == "v99.0.0"
+    assert body["release_url"] == "https://example.test/r"

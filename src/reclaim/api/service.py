@@ -11,6 +11,7 @@ from pathlib import Path
 
 import structlog
 
+from reclaim import update_check
 from reclaim.ai import presentation
 from reclaim.ai.models import AICluster
 from reclaim.api import ai_orchestration
@@ -53,6 +54,7 @@ from reclaim.api.schemas import (
     SummaryResponse,
     TreemapNodeOut,
     TreemapResponse,
+    UpdateCheckResponse,
     category_label,
     format_bytes,
     plain_language_category,
@@ -1454,6 +1456,37 @@ def first_run_status(state: AppState) -> FirstRunStatusResponse:
 def acknowledge_first_run_screen(state: AppState) -> FirstRunStatusResponse:
     acknowledge_first_run(state.first_run_state_path)
     return FirstRunStatusResponse(acknowledged=True)
+
+
+# --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------
+
+
+def check_for_update_status(state: AppState) -> UpdateCheckResponse:
+    """Backs `GET /api/update-check`. Checks `state.effective_config.update_check.enabled`
+    FIRST — when the feature is off (the default; see PRIVACY.md), returns immediately with
+    `status="disabled"` and `reclaim.update_check.check_for_update` is never called, so this
+    request makes zero network calls. When on, delegates to that module's own cache/timeout/
+    error handling (see its docstring) — this function itself never raises, matching that
+    module's own no-raise guarantee."""
+    current_version = installed_version()
+    if not state.effective_config.update_check.enabled:
+        return UpdateCheckResponse(
+            enabled=False,
+            status="disabled",
+            current_version=current_version,
+            latest_version=None,
+            update_available=False,
+            release_url=update_check.RELEASES_PAGE_URL,
+        )
+    result = update_check.check_for_update(current_version=current_version)
+    return UpdateCheckResponse(
+        enabled=True,
+        status=result.status,
+        current_version=result.current_version,
+        latest_version=result.latest_version,
+        update_available=result.update_available,
+        release_url=result.release_url,
+    )
 
 
 # --- G25: bug-report diagnostics ----------------------------------------------------------------
