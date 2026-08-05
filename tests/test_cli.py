@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from reclaim.cli import _build_parser, _run_serve, main
+from reclaim.cli import _VERSION, _build_parser, _run_serve, main
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 
 
@@ -171,6 +171,19 @@ def test_apply_include_categories_restricts_to_named_categories(
 
 
 # --- serve: hard loopback-only bind gate ------------------------------------------------------
+
+
+def test_version_flag_prints_version_and_exits_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--version` is the fast, no-op path used to isolate pure interpreter+import overhead
+    from real subcommand work for cold-start measurement (see packaging/RELEASE_RUNBOOK.md) --
+    it must short-circuit before argparse's `required=True` subparsers check (no subcommand
+    needed) and never touch any real subsystem."""
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"reclaim {_VERSION}"
 
 
 def test_serve_default_host_is_loopback() -> None:

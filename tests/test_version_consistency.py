@@ -12,6 +12,8 @@ import re
 import tomllib
 from pathlib import Path
 
+from reclaim.cli import _VERSION
+
 _REPO_ROOT = Path(__file__).parent.parent
 
 
@@ -27,6 +29,17 @@ def test_installer_script_version_matches_pyproject() -> None:
     assert match.group(1) == _pyproject_version(), (
         f"packaging/reclaim.iss says {match.group(1)!r} but pyproject.toml says "
         f"{_pyproject_version()!r} — the installer would ship mislabeled. Update the .iss."
+    )
+
+
+def test_cli_version_flag_matches_pyproject() -> None:
+    # `reclaim.cli._VERSION` is hardcoded rather than read via `importlib.metadata` at runtime
+    # (see its module-level comment for why: no dist-info in the Nuitka standalone build) -- so
+    # it needs its own drift gate, same shape as the .iss/build-script checks below.
+    assert _pyproject_version() == _VERSION, (
+        f"reclaim.cli._VERSION says {_VERSION!r} but pyproject.toml says "
+        f"{_pyproject_version()!r} — 'reclaim --version' would report a stale version. Update "
+        "reclaim.cli._VERSION."
     )
 
 

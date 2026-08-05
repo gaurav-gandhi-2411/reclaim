@@ -47,6 +47,14 @@ _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
 
+# Hardcoded rather than read via `importlib.metadata.version("reclaim")`: the Nuitka standalone
+# build (packaging/build_installer.ps1) never bundles a dist-info directory, so that lookup
+# would raise `PackageNotFoundError` in the shipped binary specifically -- the one place this
+# flag matters most (a user can't `pip show` an installed .exe). Checked against
+# pyproject.toml's version by tests/test_version_consistency.py, the same pattern already used
+# for packaging/reclaim.iss and packaging/build_installer.ps1's own version strings.
+_VERSION = "1.3.0"
+
 # Literal loopback IPs only — deliberately excludes the hostname "localhost", since that's a
 # DNS/hosts-file lookup (uvicorn/the socket layer resolves it, not this code) and a tampered
 # hosts file could in principle point it somewhere non-loopback. This tool moves and deletes
@@ -70,6 +78,12 @@ def _loopback_host(value: str) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="reclaim")
+    # `action="version"` short-circuits during parsing (prints and calls `parser.exit()`
+    # immediately when the flag is seen) -- it runs before the `required=True` subparsers check
+    # below, so `reclaim --version` alone works with no subcommand. This is also the only
+    # currently-available way to isolate pure interpreter+import overhead from a real
+    # subcommand's own work for cold-start measurement (see packaging/RELEASE_RUNBOOK.md).
+    parser.add_argument("--version", action="version", version=f"reclaim {_VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = subparsers.add_parser(
