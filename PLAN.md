@@ -2516,3 +2516,190 @@ step 3) is still outstanding — needs a real machine/VM, per the AUTONOMY MANDA
   cached — `actions/cache` on Nuitka's cache dir would help build time significantly across
   runs. (4) Artifact handoff: the built `reclaim-setup.exe` needs to land somewhere GG can run
   the fresh-Windows-VM gate against it (a workflow artifact download, or a draft GitHub Release).
+
+## 2026-08-05 — Wave 1 close-out: E2E-at-scale, cold start, and visual identity + distribution
+
+Nine pieces of work, dispatched as parallel executor subagents in isolated git worktrees and
+merged back into `wave-1-scan-reliability` one at a time (each merge re-verified with `uv run
+python scripts/verify.py` before the next). **Real process gap found and fixed mid-session**:
+worktree isolation forks from `main`, not the currently-checked-out branch — four of the five
+first-wave agents started from a base missing this branch's own scanner/packaging/AI work. Caught
+by diffing `main..wave-1-scan-reliability` before trusting any agent's output; the one agent whose
+substance actually depended on the missing commits (scanner.py had 392 changed lines) was
+redirected via `SendMessage` mid-flight to rebase before finishing. Every subsequent agent was
+told to self-correct this as its first step. Worth remembering for any future multi-worktree
+dispatch on this repo.
+
+### P1-B — E2E at scale
+
+`evals/fixtures/build_scale_tree.py` (seed=42 deterministic): exact-dup sets, near-dup
+image/document sets (reused `ai_fixtures` builders, not reimplemented) with a ground-truth JSON
+manifest, a 484-char path, unicode/emoji names, a zero-byte file, a 25MB file, a genuinely
+NTFS-sparse file (verified via real allocated-vs-logical size gap, not just the flag), a junction
+cycle, best-effort cloud-placeholder and permission-denied simulations (both empirically verified,
+with honest disclosure where OS behavior didn't fully cooperate — e.g. `SetFileAttributesW` can't
+actually persist the cloud-placeholder bit on an ordinary NTFS file, matching
+`build_golden_tree.py`'s own prior finding), and a parametrized 100k+ tier (100,054 files
+generated in 132.45s).
+
+**Junction-cycle finding: not a bug.** `scanner.py`'s walk never recurses into reparse points
+(`should_recurse = is_dir_entry and not is_reparse_point`, already covered by
+`test_scan_tree_reparse_point_is_recorded_but_not_recursed_into`) — the deliberate cycle fixture
+is safe by construction, kept in as a regression tripwire.
+
+**Real bug found and fixed along the way**: `.gitattributes` didn't mark the bundled AI model's
+`minilm_tokenizer.json` as `-text`. On a fresh Windows clone with default git CRLF normalization,
+checkout corrupts the file (0 → 30,685 CRLF insertions) and breaks its SHA256 pin, making
+`AIModelMissingError` fire for every near-dup-document call — silently disabling that whole
+feature for any Windows contributor who clones fresh with default settings, not just in a
+worktree. Fixed (`src/reclaim/ai/models/*.json -text`) and will not recur for anyone who clones
+after this commit.
+
+`evals/test_e2e_scale.py` (12 tests): fast tier (3,112 entries, 0.95s) — exact-dup precision/
+recall **1.0000/1.0000**, near-dup-image **1.0000/1.0000**, near-dup-document **1.0000/1.0000**
+against the fixture's own ground truth (floors set at 0.95/0.80 respectively, well under measured,
+per rule 65b margin). Apply-batch atomicity verified via a real `os._exit()` hard-crash injection
+(reused `tests/_recovery_crash_harness.py` unmodified) with SHA-256 all-or-nothing proof. Restore
+verified bit-identical (hash before-quarantine vs after-restore, not just existence). Crash
+recovery verified via `recovery.reconcile_manifest` against real post-crash disk state.
+**Disclosed gap, not papered over**: scan cancellation has no implementation anywhere in this
+codebase (grepped `cancel|Cancel|abort|stop_scan` across `src/reclaim` — zero hits) — the
+corresponding test is an explicit `@pytest.mark.skip` naming the gap, not a weak assertion around
+nothing. "Resumed scan" is approximated via two sequential `scan_tree()` calls with the
+approximation stated plainly, since no true cancellation token exists to resume from.
+
+**100k-tier measured** (first synthetic-scale measurement of this scanner with adversarial edge
+cases baked in — distinct from the existing 10,247 files/sec isolated-clean-fixture number and
+242MB real-2.67M-file-disk number, not to be conflated with either): generation 755 files/sec,
+scan 4,057–7,255 entries/sec across runs (adversarial content — long paths, unicode, sparse files,
+real hashing — makes this a heavier workload than the clean fixture, not a regression against it).
+
+**Adversarial `SafetyValidator` proofs**: `evals/test_safety_adversarial.py`, 30 tests. Every
+built-in-deny category, path-obfuscation bypass attempt (8.3 short names, trailing
+dots/spaces, subst drives, junction-into-protected-root, symlink-to-protected-target,
+`..`-traversal, UNC-vs-local, case) stays **blocked**, each proven via the validator's actual
+return value/classification, not "no exception raised." Precedence proven directly (built-in deny
+beats a simultaneously-matching allow-list entry). `restore_batch`'s separate
+`path_is_protected_root()` code path independently proven via a real `mklink /J` junction into a
+protected root. **Real findings, not bypasses** (block still holds in every case, just via an
+earlier-checked reason code than the path's own pattern would suggest): `docker_wsl_roots`'
+`//wsl$/*` entry is always preempted by the UNC-network-path check; its `*/ProgramData/Docker/*`
+entry is always preempted by `protected_roots` on a C:-drive install; a real WSL2 `ext4.vhdx`
+image is preempted by the `vm_extensions` check before `docker_wsl_roots` ever gets a look.
+Accepted as-is (the safety property holds regardless) rather than reordering `_builtin_deny`'s
+checks for a diagnostic-message improvement in a security-critical file — a real, low-priority
+nit, not a gap, logged here for whoever next touches that function's ordering.
+
+**CI perf budgets** — first correction: the task's own framing ("scan_tree still accumulates
+every FileRecord in one list, an open gap") turned out to be **stale**. `scanner.py`'s
+`_BatchIndexWriter` already bounds peak memory at `worker_count * _WRITE_BATCH_SIZE` (5,000) —
+verified directly in code before building anything on the old premise. Real measured growth via a
+subprocess-isolated harness (`evals/_scan_peak_rss_harness.py`): file count grew 33.3x (3k→100k),
+peak RSS delta grew only **4.32x** (7.30MiB→31.53MiB) — sub-linear, neither the originally-assumed
+"flat" claim nor a naive "linear" one; `evals/test_scanner_peak_rss_budget.py` gates the growth
+*ratio* (10x ceiling) rather than an absolute number for exactly this reason. Throughput floors
+added to `evals/test_e2e_scale.py`, kept deliberately separate from the existing clean-fixture
+10,247 files/sec number (different workload, not comparable). CLI cold-start budget: 2000ms
+ceiling on the dev-venv proxy (CI can't build the Nuitka binary per-PR). Every budget assertion
+was verified to actually fire (tightened one at a time, confirmed FAILED, restored). CI wiring:
+fast-tier assertions run in `ci.yml`'s `ai-layer-with-extras` job on every PR; the 100k+ tier runs
+in a new `scale-nightly.yml` on push-to-main + a daily cron, not every PR. Also closed, found
+along the way: `evals/test_scanner_memory.py` (an existing Wave-1 memory eval) had never been
+wired into *any* CI job — same `testpaths=["tests"]`-silently-skips-`evals/` shape this whole
+session's safety-gate work already exists to guard against. **Follow-up fix after the merge**: the
+two new budget files don't need the `[ai]` extra either, so they were also missing from
+`scripts/verify.py`'s fast pre-push gate — added, but only after confirming `pyproject.toml`
+registers the `scale` marker without an `addopts` to deselect it by default, so the pytest
+invocation needed an explicit `-m "not scale"` or the "fast" gate would have started silently
+generating a 100k-file tree on every pre-push run.
+
+### P1-A — cold start
+
+CLI import chain (`config`/`dedup`/`executor`/`scanner`/etc., all eager per `cli.py`'s module-level
+imports) confirmed to NOT include `reclaim.ai` (onnxruntime/torch/PIL/faiss) for a `mode`/
+`--version`-class invocation — `python -X importtime` traced total `reclaim.cli` import cost at
+~628ms, dominated by `reclaim.config`'s `pydantic_settings`→`importlib.metadata` chain (~466ms)
+and `structlog` (~161ms), both core/architectural. Added `--version` as a fast, minimal CLI path
+(there was none before) so future cold-start measurement doesn't need an arbitrary subcommand as a
+stand-in. **Dev venv**: `--version` min 695.5ms / median 794.2ms / p95 1007.4ms (n=15). **Real
+packaged Nuitka binary** (measured directly against `packaging/build/entry_point.dist/reclaim.exe`
+from this session's earlier successful build, since a fresh worktree can't see gitignored build
+artifacts): `mode` subcommand min 594.4ms / median 722.6ms / p95 1121.8ms (n=15) — lands in the
+same ~600–900ms band as the dev venv, confirming Nuitka's standalone packaging isn't adding a
+material cold-start penalty. One 3850.9ms outlier on a separate run (plausibly a one-off Defender
+scan of a freshly-written `.exe`) reported honestly rather than rerolled away. Both numbers
+comfortably under the ~2s architectural budget — no import-deferral restructuring was needed or
+attempted.
+
+### P2 — identity + distribution
+
+**Visual identity pivoted** from v3's indigo/mint flat-rectangle mark to the newly-approved
+isometric "lifted platter" design (deep #1B6FA8 / mid #2E9BD6 / amber #F2A93B / dark #0F172A),
+geometry decomposed from a provided reference asset set (now kept at
+`docs/assets/design-reference/lifted-platter-reference.svg` for provenance). Extended
+`packaging/build_brand_assets.py`'s existing parametric-Pillow pattern (no new SVG-rasterizer
+dependency) rather than replacing it. 3 platters at 32px+, simplified to 2 (amber lifted + one
+beneath) at 16px for taskbar legibility. **Verified, not assumed**: rendered and personally
+inspected both sizes at both light and dark backgrounds (8x-scaled PNGs) — 16px reads clearly as
+an amber disk lifted over one blue disk with real separation; 32px reads as three distinct
+stacked, shaded platters. The agent additionally cross-checked the actual shipped SVGs via
+headless-Edge rasterization against the Pillow approximation. Replaced in place: `reclaim.ico`
+(16/24/32/48/64/128/256, each size reload-verified), Inno Setup wizard bitmaps, in-app
+`logo.svg`/`favicon.svg`, `docs/assets/{og-preview,logo-lockup}.png`. README banner needed no new
+wiring — it already referenced `logo-lockup.png`, which now regenerates with the new mark.
+Regenerating the renderer produces a byte-identical, empty diff (confirmed deterministic).
+
+**Code-signing** (ADR-0031, NOT purchased): live-researched 2026-08-05, not recalled from the
+earlier stale PLAN.md note. Two findings that override the old note: (1) Azure Artifact Signing
+(renamed from Trusted Signing) requires **US/Canada residency** for individual developers — GG's
+residency needs confirming before Azure is even eligible, not just a pricing comparison; (2) no
+certificate at any price removes the SmartScreen warning outright — EV and OV have been treated
+equally for reputation purposes since March 2024 per SSL.com's own pages, so EV's premium buys
+nothing here. **Recommended**: Certum Standard OV (~€209/yr), individual-eligible with no
+registered entity, no "Open Source Developer" subject restriction, no commercial-distribution
+revocation clause (unlike Certum's cheaper Open Source tier, rejected for exactly that clause).
+Runner-up named: SSL.com IV + eSigner (~$309/yr), better only on headless CI signing, which isn't
+relevant while the release build is a manual local job. Three questions recorded as needing GG's
+answer before any spend: residency, budget approval, Certum's actual willingness to validate an
+India-resident individual (no restriction found on the pages checked, which is not the same as
+confirmed). `RELEASE_RUNBOOK.md` now documents the SmartScreen warning flow and SHA-256 checksum
+verification for end users; confirmed the `.sha256` sidecar is currently produced BY HAND for each
+release, not automated in `build_installer.ps1` — a real, disclosed follow-up gap.
+
+**In-app update check**: `src/reclaim/update_check.py`, best-effort GitHub release comparison via
+`httpx` (short timeout, no retries, 24h in-memory cache — deliberately not persisted to `data/`,
+to avoid a new on-disk "when did Reclaim last phone home" artifact for a background nicety),
+wired to `GET /api/update-check` and a footer badge. **Default OFF, opt-in**: `PRIVACY.md` already
+promised "no phone-home, not even a version ping" before this change — a default-on background
+call would have silently broken a documented product commitment, so `config.toml`'s
+`[update_check] enabled` defaults to `false` and zero `httpx.Client` is constructed when disabled
+(verified in tests). `PRIVACY.md`'s now-stale "no HTTP client anywhere in src/reclaim" claim was
+rewritten to disclose the real, narrow new behavior rather than left quietly false. Real gap
+closed along the way: `httpx` was declared as a dependency but was dev-only, never actually
+shipped in a production install before this — promoted to a real `[project]` dependency.
+
+**Accessibility/DPI pass**, live-browser verified (Playwright/Chromium, since the chrome-devtools
+MCP tools specified in the task weren't actually present in that agent's tool schema — flagged
+honestly rather than the agent fabricating their use). DPI: 125/150/200% effective scaling on both
+Simple and Advanced modes, 12 screenshots reviewed — `styles.css` has zero media queries and holds
+up via `flex-wrap`/grid `auto-fit` alone, no clipping or unwanted scroll at any level. **Two real
+bugs found and fixed**: all 5 modal dialogs had `role="dialog" aria-modal="true"` with zero actual
+focus-trap/Escape-close behind the ARIA attributes (Tab could walk into controls hidden behind the
+backdrop) — fixed with a shared `initDialogKeyboardBehavior()`; the skip-link changed
+`location.hash` without ever moving DOM focus (`<main>` wasn't focusable) — fixed with the
+standard `tabindex="-1"` pattern. Confirmed already-fine: focus-visible styling present globally
+with zero `outline:none` overrides, no unlabeled icon-only buttons, live regions correctly scoped
+including the new update-check badge. First-run safety trio confirmed: dry-run is the real
+default (`ApplyRequest.dry_run: bool = True`), the real-apply confirmation names item count and
+method plainly (live-captured: *"This will really quarantine 1 item(s) via vault. Continue?"*),
+restore is genuinely one click with no confirm dialog in that code path. **One honest gap**: a
+fully successful restore wasn't literally observed end-to-end in the live session (3 attempts each
+landed on a no-vault-retention category or a stale index entry — a test-methodology miss, not a
+reproduced app bug) — code-level proof plus two correctly-explained negative cases were reported
+instead of rounding up to "confirmed."
+
+**Not done this session** (real, disclosed gaps for a future pass): the fresh-Windows-VM
+install→scan→AI→vault→restore→uninstall gate (still needs a real machine, per the standing
+escalation list); `.sha256` sidecar automation in `build_installer.ps1`; code-signing purchase
+(blocked on GG's residency/budget answers); a literal end-to-end observed restore in the
+accessibility pass's live session.
