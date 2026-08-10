@@ -367,18 +367,20 @@ def test_apply_selection_scoped_to_explicit_paths_skips_whole_index_dedup_scan(
 
     state = AppState(
         db_path=db_path,
-        config=Config(categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0))),
+        config=Config(
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0))
+        ),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
         safety=SafetyValidator(Config()),
-        csrf_token="test-token",
+        csrf_token="test-token",  # noqa: S106 -- test fixture value, not a real secret
         host="127.0.0.1",
         port=8420,
     )
     request = ApplyRequest(tier="both", paths=[target.as_posix()], method="vault", dry_run=True)
 
     start = time.monotonic()
-    selected, method, apply_flag = service.resolve_apply_selection(state, request)
+    selected, _method, apply_flag = service.resolve_apply_selection(state, request)
     elapsed = time.monotonic() - start
     print(  # noqa: T201 -- perf smoke number; run with `pytest -s` to see it
         f"\n[apply-scoped-to-paths perf smoke] index_rows={_APPLY_SCOPE_ROW_COUNT} "
