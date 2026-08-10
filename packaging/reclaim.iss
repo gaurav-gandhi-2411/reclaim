@@ -65,6 +65,61 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent unchecked
 
 [Code]
+// fix/uninstaller-terminate-running-process: a Reclaim server process (the dashboard, or a
+// background scan/apply/AI-analysis worker it spawned) holds an OS-level lock on reclaim.exe
+// and its loaded DLLs for as long as it's running. Inno's own [Files] removal pass can't clear
+// that lock, and used to fail SILENTLY on each locked file rather than aborting the uninstall
+// -- Add/Remove Programs correctly reported the app gone (registry entry + shortcuts removed)
+// while ~30 program files, still holding real locks, survived on disk. Observed for real: a
+// scan-worker process outlived a killed parent and kept writing to data\logs\reclaim.log for
+// a full minute after the uninstaller's file-removal pass had already run past it.
+//
+// InitializeUninstall is the very first thing Inno calls, before any removal begins -- killing
+// the process tree here, not at usUninstall's start, means the removal pass itself never has to
+// contend with a live process at all.
+function InitializeUninstall(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  // /T also kills child processes of the tree (a scan/AI worker spawned via multiprocessing)
+  // -- killing only the top-level dashboard process and leaving a worker running is exactly
+  // the incident above. /F force-terminates; taskkill exits 0 (killed) or 128 (nothing was
+  // running, not an error) -- neither is worth surfacing, and this never needs admin rights to
+  // kill a process the current non-elevated user already owns (this installer is always
+  // per-user/non-elevated -- see PrivilegesRequired=lowest above).
+  Exec('taskkill.exe', '/F /T /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Windows releases a terminated process's file handles as part of process teardown, which is
+  // prompt but not guaranteed synchronous with taskkill.exe's own exit -- and a freshly-freed
+  // reclaim.exe is exactly the kind of file Defender's real-time scanner re-locks transiently
+  // right after a process release it (see packaging/RELEASE_RUNBOOK.md's cold-start scan note).
+  // A short wait here is cheap insurance against exactly that race.
+  Sleep(500);
+end;
+
+// Directory enumeration helper for the leftover-file check in CurUninstallStepChanged below --
+// True if {app} contains anything other than `data\` (which the [Files] section never lists,
+// so Inno's own removal pass never touches it -- see the data-folder-preservation comment
+// further down). A non-empty result here means InitializeUninstall's taskkill above didn't
+// fully do its job.
+function AppDirHasLeftoverFiles(AppDir: String): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if FindFirst(AppDir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') and (FindRec.Name <> 'data') then
+          Result := True;
+      until (not FindNext(FindRec)) or Result;
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 // Reclaim's data (scan index, quarantine vault, mode/apply logs — see the [Icons] comment above
 // for why these are relative paths under {app}\data) survives a normal uninstall by default: the
 // [Files] section above only ever lists the Nuitka --standalone build output, never {app}\data,
@@ -75,10 +130,30 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}";
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: String;
+  AppDir: String;
   Response: Integer;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    // Defensive verification, not the primary fix (InitializeUninstall's taskkill above is):
+    // confirm the removal pass this step follows actually left {app} clean. One retry after a
+    // short wait covers a transient re-lock (e.g. Defender); if it's STILL not clean after
+    // that, say so plainly instead of leaving silent orphans with no signal at all -- the
+    // original bug this whole change fixes.
+    AppDir := ExpandConstant('{app}');
+    if AppDirHasLeftoverFiles(AppDir) then
+    begin
+      Sleep(1000);
+      if AppDirHasLeftoverFiles(AppDir) and (not UninstallSilent) then
+        MsgBox(
+          'Reclaim removed most of its program files, but some are still in use by another ' +
+          'process and could not be deleted:' + #13#10 + #13#10 + AppDir + #13#10#13#10 +
+          'Close any other program using Reclaim (or restart your PC), then delete this ' +
+          'folder by hand if it still exists.',
+          mbInformation, MB_OK
+        );
+    end;
+
     // A silent uninstall (/VERYSILENT or /SILENT) has no one to answer a MsgBox — asking would
     // either hang or auto-answer unpredictably, so silent runs always preserve data/ instead,
     // matching this installer's "leave data behind by default" posture end to end.
