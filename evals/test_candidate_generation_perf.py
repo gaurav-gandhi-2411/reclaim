@@ -291,3 +291,114 @@ def test_drop_nested_candidates_scales_with_candidates_not_kept_dirs_squared() -
         "set-based lookup; a regression back to the list-based O(candidates * kept_dirs * "
         "depth) scan would show up here as many seconds to minutes, not a fraction of one"
     )
+
+
+# --- The fourth real-disk finding: POST /api/apply scaled with total index size, not the ---------
+# --- size of the request -------------------------------------------------------------------------
+#
+# `resolve_apply_selection` (the synchronous, request-shape-validation half of `POST /api/apply`
+# — see its docstring) used to call `_all_candidates()` unconditionally, even when the request
+# already carries an explicit `paths` list (the normal shape for both the Review Queue and every
+# AI-suggestion apply/dry-run-preview). `_all_candidates()` includes
+# `generate_duplicate_candidates()` -> `find_duplicate_clusters()`, which BLAKE3-hashes every
+# size-duplicate candidate across the WHOLE persisted index. Measured on a real 3.15M-row index
+# (inherited via "data survives uninstall" from an earlier full-machine scan): a dry-run preview
+# of ONE explicitly-selected file held `state.lock` for 6+ minutes of continuous multi-core work
+# — indistinguishable from a hang from the caller's side, and specifically what an AI-suggestion
+# apply/preview does on every single click. Fixed by skipping the duplicate-cluster computation
+# entirely when `request.paths` is provided — see `resolve_apply_selection`'s own perf comment.
+
+_APPLY_SCOPE_ROW_COUNT = 300_000
+_APPLY_SCOPE_TIME_CEILING_SECONDS = 5.0
+
+
+def _synthetic_records_with_real_duplicates(
+    count: int, *, dup_a: Path, dup_b: Path, target: Path
+) -> Iterator[FileRecord]:
+    """`target` is the one file the test actually applies — deliberately NOT part of the
+    `dup_a`/`dup_b` duplicate pair, so a correct scoped resolution never needs to know the
+    duplicate pair exists at all. Every other row shares a size with thousands of others (the
+    representative real-disk shape from the bucket-streaming test above) so the OLD, unscoped
+    code path would have real duplicate-size buckets to hash, not a fast no-op."""
+    yield _mk(str(target), size_bytes=777)
+    yield _mk(str(dup_a), size_bytes=123_456)
+    yield _mk(str(dup_b), size_bytes=123_456)
+    common_sizes = (111, 222, 333, 444, 555)
+    for i in range(count - 3):
+        size = common_sizes[i % len(common_sizes)]
+        yield _mk(f"C:/Bulk/dir{i % 5000}/file_{i}.dat", size_bytes=size)
+
+
+def test_apply_selection_scoped_to_explicit_paths_skips_whole_index_dedup_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.api.schemas import ApplyRequest
+    from reclaim.api.state import AppState
+
+    dup_a = tmp_path / "dup_a.bin"
+    dup_b = tmp_path / "dup_b.bin"
+    dup_a.write_bytes(b"x" * 123_456)
+    dup_b.write_bytes(b"x" * 123_456)
+    target = tmp_path / "ai_suggested_photo.jpg"
+    target.write_bytes(b"not a real jpeg, just fixture bytes")
+
+    db_path = tmp_path / "large_index.sqlite3"
+    with ScanIndex(db_path) as index:
+        batch: list[FileRecord] = []
+        for record in _synthetic_records_with_real_duplicates(
+            _APPLY_SCOPE_ROW_COUNT, dup_a=dup_a, dup_b=dup_b, target=target
+        ):
+            batch.append(record)
+            if len(batch) >= _BATCH_SIZE:
+                index.upsert_records(batch, scanned_at=1000.0)
+                batch.clear()
+        if batch:
+            index.upsert_records(batch, scanned_at=1000.0)
+
+    def _fail_if_called(*args: object, **kwargs: object) -> list[object]:
+        raise AssertionError(
+            "find_duplicate_clusters was called while resolving an explicit-paths apply "
+            "request — this is exactly the regression this test guards against: it means "
+            "the whole index is being hashed again for a request that only names one file"
+        )
+
+    monkeypatch.setattr(dedup_module, "find_duplicate_clusters", _fail_if_called)
+
+    state = AppState(
+        db_path=db_path,
+        config=Config(
+            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0))
+        ),
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        safety=SafetyValidator(Config()),
+        csrf_token="test-token",  # noqa: S106 -- test fixture value, not a real secret
+        host="127.0.0.1",
+        port=8420,
+    )
+    request = ApplyRequest(tier="both", paths=[target.as_posix()], method="vault", dry_run=True)
+
+    start = time.monotonic()
+    selected, _method, apply_flag = service.resolve_apply_selection(state, request)
+    elapsed = time.monotonic() - start
+    print(  # noqa: T201 -- perf smoke number; run with `pytest -s` to see it
+        f"\n[apply-scoped-to-paths perf smoke] index_rows={_APPLY_SCOPE_ROW_COUNT} "
+        f"elapsed={elapsed:.3f}s"
+    )
+
+    # Correctness: the explicitly-requested file resolved to exactly one candidate, via the
+    # user-selected fallback (it's an ordinary file, never detector- or dedup-flagged) —
+    # the fix must not silently drop a requested path while making it fast.
+    assert len(selected) == 1
+    assert selected[0].path == target
+    assert selected[0].category == "user_selected_file"
+    assert not apply_flag  # dry_run=True in the request above
+
+    assert elapsed < _APPLY_SCOPE_TIME_CEILING_SECONDS, (
+        f"resolve_apply_selection took {elapsed:.3f}s for a single explicit path against a "
+        f"{_APPLY_SCOPE_ROW_COUNT}-row index — expected well under "
+        f"{_APPLY_SCOPE_TIME_CEILING_SECONDS}s; a regression back to computing the full "
+        "candidate universe (including whole-index duplicate hashing) on every apply request "
+        "would show up here as minutes, not a fraction of one, on a real large index"
+    )
