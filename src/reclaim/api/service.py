@@ -939,8 +939,28 @@ def resolve_apply_selection(
             "items to apply."
         )
 
-    with ScanIndex(state.db_path) as index:
-        candidates = _all_candidates(index, state)
+    # perf/apply-scoped-to-paths: an explicit `request.paths` list means we only need to
+    # know about THOSE files, not every duplicate cluster in the whole index. Computing
+    # the full `_all_candidates` unconditionally here used to call
+    # `generate_duplicate_candidates` -> `find_duplicate_clusters`, which BLAKE3-hashes
+    # every size-duplicate candidate across the ENTIRE persisted index -- real, unavoidable
+    # disk I/O and CPU that scales with total rows scanned, ever, not with this request.
+    # Measured on a 3.15M-row index (a machine that had scanned its whole drive over time):
+    # a dry-run preview of ONE explicitly-selected AI-suggested file held `state.lock` for
+    # 6+ minutes of continuous multi-core work before this fix -- indistinguishable from a
+    # hang from the caller's side. `generate_candidates` (rule-based detectors: dev
+    # artifacts, temp files, etc.) stays in the scoped path below -- it's cheap per-row
+    # metadata matching, no hashing, and a requested path that a rule already flagged still
+    # needs its real category/tier, not a generic "user_selected_file" fallback label.
+    # Only a genuinely blanket apply (`request.paths is None` -- power mode only; safe mode
+    # already refuses this above) still needs the full duplicate-cluster universe, since
+    # there's no explicit path list to build fallback candidates from.
+    if request.paths is None:
+        with ScanIndex(state.db_path) as index:
+            candidates = _all_candidates(index, state)
+    else:
+        with ScanIndex(state.db_path) as index:
+            candidates = generate_candidates(index, state.effective_config, state.safety)
 
     tiers = _TIER_SELECTIONS[request.tier]
     selected = [c for c in candidates if c.tier in tiers]
@@ -951,10 +971,16 @@ def resolve_apply_selection(
         selected = [c for c in selected if c.path.as_posix() in wanted]
 
         # ADR-0025 decision 6: a requested path NOT already a deterministic candidate (the
-        # common case for an AI-suggestion apply) still gets a real, independent safety pass
-        # here and, if eligible, joins the batch at Tier B -- "acting on an AI suggestion flows
-        # through the exact same apply path as if hand-picked," not silently dropped just
-        # because no rule detector happened to flag it.
+        # common case for an AI-suggestion apply, and now also every exact-duplicate applied
+        # by explicit path -- see the perf note above) still gets a real, independent safety
+        # pass here and, if eligible, joins the batch at Tier B -- "acting on an AI suggestion
+        # flows through the exact same apply path as if hand-picked," not silently dropped
+        # just because no rule detector happened to flag it. Trade-off, disclosed rather than
+        # hidden: an exact-duplicate file applied this way now reports
+        # category="user_selected_file" instead of "duplicates" in the batch breakdown --
+        # cosmetic (the safety evaluation, quarantine method, and restore path are all
+        # identical either way), traded deliberately for not hashing the whole index on
+        # every apply request.
         already_matched = {c.path.as_posix() for c in selected}
         unmatched_paths = wanted - already_matched
         if unmatched_paths:
