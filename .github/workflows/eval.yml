@@ -42,24 +42,34 @@ jobs:
           uv run python scripts/git_guard.py config --global user.email "fixture@reclaim.test"
           uv run python scripts/git_guard.py config --global user.name "Reclaim Fixture Builder"
 
-      # Scoped explicitly to these three safety-gate files, not the whole evals/ directory: every
+      # Scoped explicitly to these six safety-gate files, not the whole evals/ directory: every
       # other evals/*.py file is a gold-set/operating-point measurement that needs the [ai]
       # extra (torch/PIL/numpy/datasketch/...) to even collect, and this job deliberately does
       # NOT install it — those measurements run in ci.yml's ai-layer-with-extras job instead
       # (`pytest tests/ evals/test_ai_safety_gate.py -v`, extras installed there). None of the
-      # three needs the ai extra: test_safety_gate.py tests the deterministic engine's
+      # six needs the ai extra: test_safety_gate.py tests the deterministic engine's
       # SafetyValidator hard gate directly; test_ai_safety_gate.py constructs
       # AICluster/AIClusterMember objects with hardcoded scores to prove the structural
       # recommend-only guarantee (never runs a real model); test_safe_mode_gate.py tests the
-      # Stage 2 safe/power mode structural boundary via config.py alone. Verified: all three
+      # Stage 2 safe/power mode structural boundary via config.py alone; test_apply_safety_preflight.py
+      # exercises the real live-process-lock/hardlink-shared-environment pre-flight probes against
+      # real fixtures (no model, no mocks); test_apply_batch_call_graph_gate.py is an AST-based
+      # static-analysis proof (not a behavioral test) that every filesystem-mutation primitive in
+      # executor.py/purge.py is confined to its allowed-home function and that apply_batch's
+      # pre-flight guard structurally precedes any mutation it can reach. Verified: all six
       # collect and pass with zero ai deps installed.
       #
       # test_safe_mode_gate.py was added here after a real gap was found: `pyproject.toml`'s
       # `testpaths = ["tests"]` means a bare `pytest` NEVER discovers anything under evals/, so
       # this 18-test file — the actual safe-mode structural gate — had never run in ANY CI job
       # before this, only ever locally if someone happened to invoke it by exact path.
-      - name: Safety gates -- deterministic, adversarial, AI recommend-only, and safe-mode structural boundary
-        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py -v --junitxml=pytest-results.xml
+      #
+      # test_apply_safety_preflight.py and test_apply_batch_call_graph_gate.py were added here
+      # after the identical gap recurred: both were wired into scripts/verify.py's local safety
+      # gate list but never into this workflow file, so neither ran in any remote CI job despite
+      # being exactly the kind of safety-critical structural gate this job exists to enforce.
+      - name: Safety gates -- deterministic, adversarial, AI recommend-only, safe-mode structural boundary, apply-time pre-flight probes, and mutation call-graph confinement
+        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
