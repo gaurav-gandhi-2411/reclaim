@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict
 
-from reclaim.executor import QuarantineMethod
+from reclaim.executor import PreflightSkipReason, QuarantineMethod
 from reclaim.models import Mode, Tier, Verdict
 
 # --- Shared formatting -----------------------------------------------------------------------
@@ -352,6 +352,14 @@ class ItemApplyResultOut(BaseModel):
     succeeded: bool
     error: str | None
     vault_path: str | None
+    # Audit P0-1 (docs/AUDIT-2026-08.md), API-boundary follow-up: `None` for every existing
+    # outcome (a genuine success, or a failure where `error` carries the real exception message
+    # from an ATTEMPTED mutation) -- set only when `apply_batch`'s pre-flight probe skipped this
+    # item WITHOUT ever attempting the move/delete. Mirrors `executor.ItemApplyResult.skip_reason`
+    # exactly; without this field a caller of `POST /api/apply` sees `succeeded=False, error=None`
+    # for a locked file and a hardlink-shared file with no way to tell them apart -- the reason
+    # was previously only visible in structlog, never in the response body.
+    skip_reason: PreflightSkipReason | None = None
 
 
 class CategoryBreakdownOut(BaseModel):

@@ -16,11 +16,11 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.models import Candidate, Mode, Tier, Verdict
-from reclaim.preflight import (
-    PreflightSkipReason,
-    check_file_in_use,
-    check_hardlink_shared_active_install,
-)
+from reclaim.preflight import PreflightSkipReason as PreflightSkipReason  # re-exported; api/
+
+# schemas.py imports this type from here rather than reaching into `reclaim.preflight` directly,
+# same convention as this module's own `long_path` re-export below.
+from reclaim.preflight import check_file_in_use, check_hardlink_shared_active_install
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below

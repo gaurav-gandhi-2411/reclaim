@@ -1031,6 +1031,50 @@ def test_apply_with_dry_run_false_really_quarantines_and_restore_round_trips(
     assert all(item["already_restored"] for item in second_restore["items"])
 
 
+def test_apply_response_surfaces_skip_reason_for_a_preflight_skipped_item(
+    tmp_path: Path,
+) -> None:
+    """Audit P0-1, API-boundary follow-up: `ItemApplyResult.skip_reason` must reach the real
+    HTTP response body, not just structlog -- a caller of `POST /api/apply` (dashboard, CLI, a
+    future MCP tool) needs to tell "file was locked" apart from "hardlink-shared into another
+    active install" without reading server logs. Locks `old_log` for real (a plain Python
+    `open()` held in this test process, across the actual `POST /api/apply` call) -- not a mock
+    of the internal `ItemApplyResult` object -- and asserts the skip reason round-trips through
+    the full HTTP response, while the OTHER Tier A candidate in the same batch still succeeds
+    (the skip must not abort the rest of the batch)."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
+    assert paths["old_log"].as_posix() in tier_a_paths
+    assert paths["node_modules_dir"].as_posix() in tier_a_paths
+
+    handle = open(paths["old_log"], "r+b")  # noqa: SIM115, PTH123 -- held across the real HTTP call
+    try:
+        report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
+    finally:
+        handle.close()
+
+    items_by_path = {item["path"]: item for item in report["items"]}
+
+    locked_item = items_by_path[paths["old_log"].as_posix()]
+    assert locked_item["succeeded"] is False
+    assert locked_item["skip_reason"] == "file_in_use"
+    assert locked_item["error"] is None  # never attempted -- not an OS error
+    assert paths["old_log"].exists()  # untouched at its original location
+
+    unlocked_item = items_by_path[paths["node_modules_dir"].as_posix()]
+    assert unlocked_item["succeeded"] is True
+    assert unlocked_item["skip_reason"] is None
+    assert not paths["node_modules_dir"].exists()  # the skip did not abort the rest of the batch
+
+    assert report["files_processed"] == len(tier_a_paths)
+    assert report["files_failed"] == 1
+    assert report["files_succeeded"] == len(tier_a_paths) - 1
+
+
 def test_restore_status_items_total_reflects_only_restorable_entries_in_mixed_batch(
     tmp_path: Path,
 ) -> None:
