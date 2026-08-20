@@ -11,7 +11,7 @@ from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
-from reclaim.models import Mode
+from reclaim.models import Candidate, Mode
 from reclaim.safety import SafetyValidator
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed", "cancelled"]
@@ -190,6 +190,22 @@ class AppState:
     # `scan_status`/`ai_status` already have.
     apply_status: ApplyStatus = field(default_factory=ApplyStatus)
     restore_status: RestoreStatus = field(default_factory=RestoreStatus)
+    # perf/dedup-cache (docs/AUDIT-2026-08.md P0-3): `api.service._all_candidates` re-runs the
+    # full detector + exact-duplicate-cluster pass (a whole-index BLAKE3 hash of every
+    # size-duplicate candidate) on every call -- before this cache, 5 independent call sites in
+    # `service.py` each triggered that pass independently, live-reproduced as 60+ second page
+    # loads and two concurrent hash passes firing 12 seconds apart for a single page load. Cached
+    # per `scan_generation` above (same staleness key ADR-0025 already uses for `ai_clusters`) --
+    # a fresh COMPLETED scan invalidates it. `candidates_cache_lock` is a DEDICATED lock (not
+    # `lock` above, which guards small/fast status-dataclass reads elsewhere) held across the
+    # entire compute-or-fetch critical section in `service._cached_all_candidates` -- a second
+    # caller racing the first for the same generation blocks on this lock rather than starting
+    # its own redundant hash pass, and sees the first caller's now-cached result once it
+    # acquires the lock. In-memory only, like every other piece of this process's session state
+    # (ADR-0025 decision 2): lost on restart, rebuilt on the next call.
+    candidates_cache: list[Candidate] | None = None
+    candidates_cache_generation: int | None = None
+    candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def live_mode(self) -> Mode:

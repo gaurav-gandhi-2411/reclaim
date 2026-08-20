@@ -105,11 +105,39 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
 
     Uses `state.effective_config` (mode-resolved fresh on every call), never `state.config`
-    directly — see `AppState.effective_config`'s docstring."""
+    directly — see `AppState.effective_config`'s docstring.
+
+    UNCACHED — this is the expensive pass `_cached_all_candidates` below memoizes per scan
+    generation. Call sites that need every candidate for the CURRENT scan should go through that
+    wrapper instead; call this directly only when scoping to a smaller universe already avoids
+    the cost (see `resolve_apply_selection`'s `request.paths is not None` branch)."""
     config = state.effective_config
     candidates = generate_candidates(index, config, state.safety)
     candidates += generate_duplicate_candidates(index, config, state.safety)
     return candidates
+
+
+def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
+    """Cached, concurrency-guarded wrapper around `_all_candidates` (perf/dedup-cache,
+    docs/AUDIT-2026-08.md P0-3) — every call site that needs the full candidate universe for the
+    CURRENT scan (`build_summary`, `build_treemap`, `list_candidates`,
+    `build_one_click_summary`, and `resolve_apply_selection`'s blanket-apply path) should call
+    this instead of `_all_candidates` directly.
+
+    `state.candidates_cache_lock` is held across the ENTIRE compute-or-fetch critical section,
+    deliberately — a second caller racing the first for the same `scan_generation` blocks on the
+    lock rather than starting its own redundant whole-index BLAKE3 hash pass, and sees the first
+    caller's now-cached result the moment it acquires the lock. See `AppState.candidates_cache`'s
+    docstring for why this is a dedicated lock rather than `state.lock`.
+    """
+    with state.candidates_cache_lock:
+        generation = state.scan_generation
+        if state.candidates_cache is not None and state.candidates_cache_generation == generation:
+            return state.candidates_cache
+        candidates = _all_candidates(index, state)
+        state.candidates_cache = candidates
+        state.candidates_cache_generation = generation
+        return candidates
 
 
 # --- Scan --------------------------------------------------------------------------------
@@ -503,7 +531,7 @@ def build_summary(state: AppState) -> SummaryResponse:
                 skipped_unreadable_paths=skipped_unreadable_paths,
             )
         total_indexed_bytes = physical_size_bytes(index.full_inventory())
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
 
     tier_a = [c for c in candidates if c.tier == Tier.A]
     tier_b = [c for c in candidates if c.tier == Tier.B]
@@ -549,7 +577,7 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
 
         children = index.direct_children(root)
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
         candidate_by_path = {c.path: c for c in candidates}
 
         nodes: list[TreemapNodeOut] = []
@@ -654,7 +682,7 @@ def list_candidates(
                 total_bytes_human=format_bytes(0),
             )
 
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
         needs_cluster_info = category_group in (None, "duplicates") and any(
             c.category_group == "duplicates" for c in candidates
         )
@@ -722,7 +750,7 @@ def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
                 total_bytes_human=format_bytes(0),
                 total_file_count=0,
             )
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
 
     grouped: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
@@ -954,10 +982,12 @@ def resolve_apply_selection(
     # needs its real category/tier, not a generic "user_selected_file" fallback label.
     # Only a genuinely blanket apply (`request.paths is None` -- power mode only; safe mode
     # already refuses this above) still needs the full duplicate-cluster universe, since
-    # there's no explicit path list to build fallback candidates from.
+    # there's no explicit path list to build fallback candidates from. Goes through
+    # `_cached_all_candidates` (perf/dedup-cache, docs/AUDIT-2026-08.md P0-3) rather than
+    # `_all_candidates` directly -- this was one of the 5 uncached call sites that fix covers.
     if request.paths is None:
         with ScanIndex(state.db_path) as index:
-            candidates = _all_candidates(index, state)
+            candidates = _cached_all_candidates(index, state)
     else:
         with ScanIndex(state.db_path) as index:
             candidates = generate_candidates(index, state.effective_config, state.safety)
