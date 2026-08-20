@@ -466,6 +466,7 @@ async function loadOverview() {
     contentEl.hidden = false;
     renderSummaryStats(summary);
     renderSkippedUnreadableNote(summary);
+    renderInaccessibleNote(summary);
     renderCategoryCards(summary.categories);
     loadQuickClean();
   } catch (err) {
@@ -525,6 +526,35 @@ function renderSkippedUnreadableNote(summary) {
     `${summary.skipped_unreadable_count} path(s) could not be read during the last scan ` +
     "(permission denied or a real I/O error) and were skipped" +
     (sample ? `: ${sample}${more}` : ".");
+}
+
+// P0-5: persisted (survives an app restart, unlike the last-scan-only note above) accounting of
+// inaccessible directories, plus -- when the last completed scan covered a whole drive -- how
+// that compares against the OS's own real used-bytes figure for that drive.
+function renderInaccessibleNote(summary) {
+  const note = document.getElementById("inaccessible-note");
+  if (!summary.inaccessible_path_count) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  note.dataset.tone = "warning";
+  let text =
+    `${formatFromBytes(summary.inaccessible_known_bytes)} across ` +
+    `${summary.inaccessible_path_count} path(s) were inaccessible and not counted in the totals above` +
+    (summary.inaccessible_unknown_count
+      ? ` (${summary.inaccessible_unknown_count} of those have no size estimate at all, so the ` +
+        "true gap is larger than the bytes shown here)."
+      : ".");
+  if (summary.reconciliation_volume && summary.reconciliation_delta_bytes != null) {
+    text +=
+      ` Reconciliation against ${summary.reconciliation_volume}: ` +
+      `${formatFromBytes(Math.abs(summary.reconciliation_delta_bytes))} ` +
+      `(${summary.reconciliation_delta_pct.toFixed(2)}%) ` +
+      `${summary.reconciliation_delta_bytes >= 0 ? "unaccounted for" : "over-counted"} vs. real disk usage.`;
+  }
+  note.textContent = text;
 }
 
 function formatFromBytes(bytes) {

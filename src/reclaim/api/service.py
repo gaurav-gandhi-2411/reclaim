@@ -83,7 +83,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
-from reclaim.index import ScanIndex, physical_size_bytes
+from reclaim.index import InaccessibleSummary, ScanIndex, physical_size_bytes
 from reclaim.mode import (
     REQUIRED_POWER_MODE_CONFIRMATION,
     switch_to_power_mode,
@@ -98,6 +98,7 @@ from reclaim.models import (
     Tier,
     Verdict,
 )
+from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
@@ -535,6 +536,31 @@ def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
     return cards
 
 
+def _reconciliation_fields(
+    index: ScanIndex, state: AppState
+) -> tuple[str | None, int | None, float | None]:
+    """`(volume, delta_bytes, delta_pct)` for `SummaryResponse`'s volume-level reconciliation
+    (P0-5) -- `(None, None, None)` whenever the most recently completed scan wasn't a genuine
+    whole-single-drive scan, since `compute_disk_reconciliation` has no way to distinguish a
+    real inaccessible-directory undercount from "this index just never covered the whole
+    volume", and this function never guesses. `OSError` (a real `shutil.disk_usage` failure --
+    e.g. the volume was unmounted since the scan) is likewise treated as "not available" rather
+    than surfaced as a 500 on an otherwise-working summary endpoint.
+    """
+    with state.lock:
+        root = state.scan_status.root
+        drives_total = state.scan_status.drives_total
+        status = state.scan_status.status
+    if status != "completed" or root is None or drives_total != 1 or not is_volume_root(root):
+        return None, None, None
+    try:
+        report = compute_disk_reconciliation(index, root)
+    except (NotAVolumeRootError, OSError) as exc:
+        logger.warning("api.reconciliation_unavailable", volume=str(root), error=str(exc))
+        return None, None, None
+    return report.volume, report.delta_bytes, report.delta_pct
+
+
 def build_summary(state: AppState) -> SummaryResponse:
     # D12: the most recent COMPLETED scan's skipped/unreadable accounting -- in-memory,
     # process-session state like `scan_status` itself (read under `state.lock`, same pattern
@@ -545,6 +571,15 @@ def build_summary(state: AppState) -> SummaryResponse:
         skipped_unreadable_paths = list(state.scan_status.skipped_unreadable_paths or ())
 
     with ScanIndex(state.db_path) as index:
+        # P0-5: persisted (index-wide, survives an app restart) accounting -- unlike
+        # `skipped_unreadable_*` above, computed even when `has_any_records()` is False (a scan
+        # whose very root was itself unreadable can produce an inaccessible-path row with zero
+        # real `files` rows to show for it).
+        inaccessible = index.inaccessible_summary()
+        reconciliation_volume, reconciliation_delta_bytes, reconciliation_delta_pct = (
+            _reconciliation_fields(index, state)
+        )
+
         if not index.has_any_records():
             return SummaryResponse(
                 has_scan=False,
@@ -557,6 +592,12 @@ def build_summary(state: AppState) -> SummaryResponse:
                 categories=[],
                 skipped_unreadable_count=skipped_unreadable_count,
                 skipped_unreadable_paths=skipped_unreadable_paths,
+                inaccessible_path_count=inaccessible.path_count,
+                inaccessible_known_bytes=inaccessible.known_bytes,
+                inaccessible_unknown_count=inaccessible.unknown_count,
+                reconciliation_volume=reconciliation_volume,
+                reconciliation_delta_bytes=reconciliation_delta_bytes,
+                reconciliation_delta_pct=reconciliation_delta_pct,
             )
         total_indexed_bytes = physical_size_bytes(index.full_inventory())
         candidates = _cached_all_candidates(index, state)
@@ -574,10 +615,60 @@ def build_summary(state: AppState) -> SummaryResponse:
         categories=_category_cards(candidates),
         skipped_unreadable_count=skipped_unreadable_count,
         skipped_unreadable_paths=skipped_unreadable_paths,
+        inaccessible_path_count=inaccessible.path_count,
+        inaccessible_known_bytes=inaccessible.known_bytes,
+        inaccessible_unknown_count=inaccessible.unknown_count,
+        reconciliation_volume=reconciliation_volume,
+        reconciliation_delta_bytes=reconciliation_delta_bytes,
+        reconciliation_delta_pct=reconciliation_delta_pct,
     )
 
 
 # --- Treemap -------------------------------------------------------------------------------
+
+# P0-5 treemap follow-up: the synthetic category_group `_inaccessible_treemap_node` emits --
+# see `schemas.category_label`'s "inaccessible" entry and `TreemapNodeOut.is_inaccessible`'s
+# docstring for why this can never collide with a real detector's category_group.
+_INACCESSIBLE_CATEGORY_GROUP = "inaccessible"
+
+
+def _inaccessible_explanation(summary: InaccessibleSummary) -> str:
+    """One-line, human-readable reason string for the synthetic inaccessible-bucket treemap
+    node -- rendered by `treemap.js`'s tooltip so the WHY is visible in the treemap itself, not
+    only in the separate `/api/summary` banner (`app.js::renderInaccessibleNote`). Mirrors that
+    function's own wording (same "best-effort estimate, not a claim of completeness" framing)
+    rather than inventing a second copy voice for the same underlying fact."""
+    text = (
+        f"{summary.path_count} path(s) could not be read due to permissions or a real I/O "
+        "error -- size shown is a best-effort estimate, not an exact figure."
+    )
+    if summary.unknown_count:
+        text += (
+            f" {summary.unknown_count} of those have no size estimate at all, so the true "
+            "total is larger than the bytes shown here."
+        )
+    return text
+
+
+def _inaccessible_treemap_node(summary: InaccessibleSummary) -> TreemapNodeOut:
+    """The single synthetic node representing `ScanIndex.inaccessible_summary`'s bucket inside
+    the treemap itself (P0-5 follow-up) -- `is_candidate=False`/`is_inaccessible=True` mark it
+    as informational-only so nothing that later grows a "click a node to select it" flow can
+    ever mistake this for a real, actionable path: the underlying paths are, by definition,
+    ones Reclaim could not read, so there is nothing real behind this node to select or delete.
+    `path` is a synthetic marker (never a real filesystem path) for the same reason."""
+    return TreemapNodeOut(
+        path="__inaccessible__",
+        label="Inaccessible / unreadable",
+        size_bytes=summary.known_bytes,
+        size_human=format_bytes(summary.known_bytes),
+        category_group=_INACCESSIBLE_CATEGORY_GROUP,
+        category_label=category_label(_INACCESSIBLE_CATEGORY_GROUP),
+        is_dir=False,
+        is_candidate=False,
+        is_inaccessible=True,
+        explanation=_inaccessible_explanation(summary),
+    )
 
 
 def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
@@ -629,6 +720,15 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
         nodes.sort(key=lambda n: n.size_bytes, reverse=True)
         nodes = nodes[:max_nodes]
+
+        # P0-5 treemap follow-up: the inaccessible bucket is a real, always-visible node in the
+        # treemap itself (not just the `/api/summary` banner), scoped to THIS root the same way
+        # `total_bytes` below is -- appended after the size-based `max_nodes` truncation above so
+        # it's never silently dropped for being small relative to the biggest real directories,
+        # and never counts against that cap.
+        inaccessible = index.inaccessible_summary(under=root)
+        if inaccessible.path_count > 0:
+            nodes.append(_inaccessible_treemap_node(inaccessible))
 
         total_bytes = index.subtree_size_bytes(root)
 

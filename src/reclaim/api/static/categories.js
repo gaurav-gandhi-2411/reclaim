@@ -21,6 +21,10 @@ const CATEGORY_VARS = {
   archive_pairs: "--rc-cat-archive-pairs",
   large_logs: "--rc-cat-large-logs",
   duplicates: "--rc-cat-duplicates",
+  // P0-5 treemap follow-up: the synthetic, non-deletable "inaccessible" bucket node
+  // (build_treemap) — its own distinct token rather than falling through to --rc-cat-other, so
+  // it never visually collides with a real "other"-grouped directory in the same treemap.
+  inaccessible: "--rc-cat-inaccessible",
 };
 
 /** CSS `var(--rc-cat-...)` reference for a category_group id; falls back to the "other" /
