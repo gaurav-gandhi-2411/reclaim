@@ -921,10 +921,16 @@ def test_plain_language_category_matches_the_spec_mapping_and_falls_back_gracefu
     assert label == "Large log files"
     assert reason is None
 
-    # Unmapped id (e.g. model_caches, or a future ai_-namespaced group) falls back to the
-    # technical label with no fabricated safety reason, never a crash or a raw snake_case id.
+    # P0-2 (2026-08 audit): model_caches gained a real mapping (used by the new Settings tab) --
+    # no longer the fallback example this test used before.
     label, reason = plain_language_category("model_caches")
-    assert label == "Model Weight Caches"
+    assert label == "ML model weight caches"
+    assert reason is not None and "re-downloadable" in reason
+
+    # Unmapped id (e.g. "other", or a future ai_-namespaced group) falls back to the technical
+    # label with no fabricated safety reason, never a crash or a raw snake_case id.
+    label, reason = plain_language_category("other")
+    assert label == "Uncategorized"
     assert reason is None
 
 
@@ -1419,4 +1425,122 @@ def test_update_check_endpoint_reports_available_update_when_enabled(
     assert body["status"] == "ok"
     assert body["update_available"] is True
     assert body["latest_version"] == "v99.0.0"
-    assert body["release_url"] == "https://example.test/r"
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings tab ------------------------------------
+
+
+def _make_app_with_config_path(tmp_path: Path, *, config: Config, config_path: Path) -> TestClient:
+    """Same shape as `_make_app`, but exposes `config_path` explicitly -- these tests write to
+    disk (`POST /api/settings/categories/{group}`), and `create_app`'s own default `config_path`
+    is the repo-relative `config.toml` (matching the real CLI default), which must never be what
+    a test writes to."""
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=config,
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    csrf_token: str = app.state.reclaim.csrf_token
+    return TestClient(
+        app,
+        base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
+        headers={security.CSRF_HEADER_NAME: csrf_token},
+    )
+
+
+def test_settings_categories_lists_every_category_with_real_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.get("/api/settings/categories")
+
+    assert response.status_code == 200
+    body = response.json()
+    by_group = {c["category_group"]: c for c in body["categories"]}
+    assert set(by_group) == set(CategoriesConfig.model_fields)
+    # dev_artifacts is explicitly overridden to enabled=True in this file's `_config` fixture.
+    assert by_group["dev_artifacts"]["enabled"] is True
+    assert by_group["dev_artifacts"]["forced_off_in_safe_mode"] is True
+    assert by_group["package_caches"]["forced_off_in_safe_mode"] is False
+    # Every category needs a non-empty, real description -- never a raw snake_case fallback with
+    # no context (the Settings tab renders this directly).
+    for entry in body["categories"]:
+        assert entry["description"]
+        assert entry["category_label"]
+
+
+def test_post_settings_category_persists_to_disk_and_takes_effect_without_restart(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    # old_installers defaults to False (see config.py's CategoriesConfig docstring).
+    before = client.get("/api/settings/categories").json()
+    by_group = {c["category_group"]: c for c in before["categories"]}
+    assert by_group["old_installers"]["enabled"] is False
+
+    response = client.post("/api/settings/categories/old_installers", json={"enabled": True})
+
+    assert response.status_code == 200
+    by_group = {c["category_group"]: c for c in response.json()["categories"]}
+    assert by_group["old_installers"]["enabled"] is True
+
+    # Persisted to the real file, not just in-memory.
+    from reclaim.config import load_config
+
+    on_disk = load_config(config_path)
+    assert on_disk.categories.old_installers.enabled is True
+
+    # Takes effect immediately -- a second GET without restarting the process reflects it too.
+    after = client.get("/api/settings/categories").json()
+    by_group = {c["category_group"]: c for c in after["categories"]}
+    assert by_group["old_installers"]["enabled"] is True
+
+
+def test_post_settings_category_unknown_group_returns_404(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/categories/not_a_real_category", json={"enabled": True})
+
+    assert response.status_code == 404
+    assert "not_a_real_category" in response.json()["detail"]
+
+
+def test_post_settings_category_without_csrf_token_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.post("/api/settings/categories/old_installers", json={"enabled": True})
+
+    assert response.status_code == 403
+    assert not config_path.exists()

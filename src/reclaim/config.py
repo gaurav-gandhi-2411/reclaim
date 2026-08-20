@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -597,3 +598,65 @@ def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Con
         else config.categories
     )
     return config.model_copy(update={"mode": resolved_mode, "categories": categories})
+
+
+# --- P0-2 fix (2026-08 audit): persisting a category toggle from the in-app Settings tab -------
+#
+# This project has no TOML *writer* dependency -- only `tomllib` (stdlib, read-only). Rather than
+# adding one (out of scope for this fix; see the PR description) or hand-rolling a full
+# parse-mutate-reserialize round trip (real risk of losing a user's own comments/formatting
+# elsewhere in the file), `_set_category_enabled_in_toml_text` is a narrow, targeted text patch:
+# find-or-create the `[categories.<category>]` section, find-or-insert its `enabled = ...` line,
+# touch nothing else. Every other section/comment/blank line in the file passes through verbatim.
+
+_ENABLED_LINE_RE = re.compile(r"^[ \t]*enabled[ \t]*=[ \t]*(?:true|false)[ \t]*(#.*)?$")
+
+
+def _set_category_enabled_in_toml_text(text: str, category: str, *, enabled: bool) -> str:
+    """Pure text transform -- no file I/O, no schema validation (callers validate `category`
+    against `CategoriesConfig.model_fields` themselves; see `set_category_enabled` below) -- so
+    this is trivially unit-testable against hand-written TOML fixtures."""
+    section_header = f"[categories.{category}]"
+    value_literal = "true" if enabled else "false"
+    enabled_line = f"enabled = {value_literal}\n"
+
+    lines = text.splitlines(keepends=True)
+    start_idx = next(
+        (i for i, line in enumerate(lines) if line.strip() == section_header), None
+    )
+
+    if start_idx is None:
+        # Section doesn't exist yet -- append a fresh one at EOF, on its own blank-line-separated
+        # block so it never gets visually merged with whatever was already there.
+        if not text:
+            return f"{section_header}\n{enabled_line}"
+        prefix = text if text.endswith("\n") else text + "\n"
+        return f"{prefix}\n{section_header}\n{enabled_line}"
+
+    # Section exists -- its body runs until the next top-level/nested `[...]` header or EOF.
+    end_idx = next(
+        (i for i in range(start_idx + 1, len(lines)) if lines[i].strip().startswith("[")),
+        len(lines),
+    )
+    for i in range(start_idx + 1, end_idx):
+        if _ENABLED_LINE_RE.match(lines[i]):
+            lines[i] = enabled_line
+            return "".join(lines)
+
+    # Section exists but has no `enabled = ...` line of its own yet (relying on the built-in
+    # default) -- insert one immediately after the header.
+    lines.insert(start_idx + 1, enabled_line)
+    return "".join(lines)
+
+
+def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> None:
+    """Persists one category's `enabled` flag to `config_path`'s on-disk TOML text, creating the
+    file (and its parent directory) if it doesn't exist yet. Raises `ValueError` for a `category`
+    that isn't a real `CategoriesConfig` field — the same hard-reject `_check_unknown_config_keys`
+    gives a hand-edited config.toml, applied here at the write boundary instead of the read one."""
+    if category not in CategoriesConfig.model_fields:
+        raise ValueError(f"unknown category {category!r}")
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _set_category_enabled_in_toml_text(text, category, enabled=enabled)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_text, encoding="utf-8")

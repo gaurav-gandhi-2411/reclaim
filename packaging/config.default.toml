@@ -1,4 +1,11 @@
-# Reclaim runtime config. Copy to `config.toml` (gitignored) and edit.
+# Reclaim's default config.toml, installed into {app}\config.toml on a fresh install (see
+# reclaim.iss's [Files] section) -- P0-2 fix (2026-08 audit): shipping this is what actually
+# turns "0 results forever" into "real results on first scan" for a fresh install, since
+# src/reclaim/config.py's own defaults are otherwise only reached when config.toml is entirely
+# absent. Kept in lockstep with the built-in defaults in config.py / config.example.toml
+# (repo-root, for a from-source dev checkout) -- this file exists so a packaged install also
+# gets a real, editable, on-disk config.toml rather than relying solely on in-code defaults.
+#
 # Anything left out here falls back to the built-in defaults in src/reclaim/config.py.
 
 [safety]
@@ -39,7 +46,8 @@ allow = []
 # P0-2 (2026-08 audit): dev_artifacts/package_caches/temp_and_browser_caches/crash_dumps below
 # default to enabled = true -- the four categories in models.REBUILDABLE_CATEGORY_GROUPS,
 # deterministically rebuildable with no vault needed (see config.py's CategoriesConfig
-# docstring for the full reasoning). Set enabled = false below to opt back out of any one.
+# docstring for the full reasoning). Set enabled = false below to opt back out of any one, or
+# use the in-app Settings tab.
 
 # node_modules inside a clean git repo is only exempted from the blanket in-repo block when
 # this category is enabled. Also gates Tier A vs Tier B for every dev-artifact candidate
