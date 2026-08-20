@@ -74,6 +74,41 @@ def test_load_config_returns_defaults_when_path_missing(tmp_path: Path) -> None:
     assert config == Config()
 
 
+# --- Notifications (R5, 80%-threshold disk-space alert): opt-in, off by default ----------------
+
+
+def test_bare_config_defaults_notifications_to_disabled() -> None:
+    assert Config().notifications.enabled is False
+
+
+def test_bare_config_notifications_defaults() -> None:
+    notifications = Config().notifications
+    assert notifications.disk_threshold_percent == 80.0
+    assert notifications.renotify_after_hours == 24.0
+    assert notifications.snooze_days == 7
+
+
+def test_config_toml_can_opt_into_notifications(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[notifications]
+enabled = true
+disk_threshold_percent = 90.0
+renotify_after_hours = 12.0
+snooze_days = 3
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.notifications.enabled is True
+    assert config.notifications.disk_threshold_percent == 90.0
+    assert config.notifications.renotify_after_hours == 12.0
+    assert config.notifications.snooze_days == 3
+
+
 def test_load_config_returns_defaults_when_path_is_none() -> None:
     assert load_config(None) == Config()
 
