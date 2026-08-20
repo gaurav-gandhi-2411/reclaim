@@ -87,6 +87,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
     "evals/test_ai_safety_gate.py",
+    "evals/test_mcp_safety_gate.py",
     "evals/test_safe_mode_gate.py",
     "evals/test_scanner_peak_rss_budget.py",
     "evals/test_cli_cold_start_budget.py",
