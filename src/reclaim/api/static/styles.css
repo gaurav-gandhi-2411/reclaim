@@ -656,6 +656,19 @@ a:active {
   stroke-width: 3;
 }
 
+/* P0-5 treemap follow-up: the single synthetic "inaccessible" bucket node -- a dashed stroke on
+   top of its own distinct `--rc-cat-inaccessible` fill (categories.js) so it reads as
+   informational/estimated at a glance, never mistaken for an ordinary, selectable directory --
+   `cursor: help` (not the default pointer) reinforces the same "look, don't click" affordance a
+   sighted user gets from the dashed edge; is_candidate=false already keeps it out of any future
+   selection wiring at the data layer (see TreemapNodeOut's docstring), this is the visual half. */
+.rc-treemap-node--inaccessible rect {
+  stroke: var(--rc-text-muted);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+  cursor: help;
+}
+
 .rc-treemap-legend {
   display: flex;
   flex-wrap: wrap;

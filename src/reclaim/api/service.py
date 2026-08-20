@@ -80,7 +80,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
-from reclaim.index import ScanIndex, physical_size_bytes
+from reclaim.index import InaccessibleSummary, ScanIndex, physical_size_bytes
 from reclaim.mode import (
     REQUIRED_POWER_MODE_CONFIRMATION,
     switch_to_power_mode,
@@ -570,6 +570,50 @@ def build_summary(state: AppState) -> SummaryResponse:
 
 # --- Treemap -------------------------------------------------------------------------------
 
+# P0-5 treemap follow-up: the synthetic category_group `_inaccessible_treemap_node` emits --
+# see `schemas.category_label`'s "inaccessible" entry and `TreemapNodeOut.is_inaccessible`'s
+# docstring for why this can never collide with a real detector's category_group.
+_INACCESSIBLE_CATEGORY_GROUP = "inaccessible"
+
+
+def _inaccessible_explanation(summary: InaccessibleSummary) -> str:
+    """One-line, human-readable reason string for the synthetic inaccessible-bucket treemap
+    node -- rendered by `treemap.js`'s tooltip so the WHY is visible in the treemap itself, not
+    only in the separate `/api/summary` banner (`app.js::renderInaccessibleNote`). Mirrors that
+    function's own wording (same "best-effort estimate, not a claim of completeness" framing)
+    rather than inventing a second copy voice for the same underlying fact."""
+    text = (
+        f"{summary.path_count} path(s) could not be read due to permissions or a real I/O "
+        "error -- size shown is a best-effort estimate, not an exact figure."
+    )
+    if summary.unknown_count:
+        text += (
+            f" {summary.unknown_count} of those have no size estimate at all, so the true "
+            "total is larger than the bytes shown here."
+        )
+    return text
+
+
+def _inaccessible_treemap_node(summary: InaccessibleSummary) -> TreemapNodeOut:
+    """The single synthetic node representing `ScanIndex.inaccessible_summary`'s bucket inside
+    the treemap itself (P0-5 follow-up) -- `is_candidate=False`/`is_inaccessible=True` mark it
+    as informational-only so nothing that later grows a "click a node to select it" flow can
+    ever mistake this for a real, actionable path: the underlying paths are, by definition,
+    ones Reclaim could not read, so there is nothing real behind this node to select or delete.
+    `path` is a synthetic marker (never a real filesystem path) for the same reason."""
+    return TreemapNodeOut(
+        path="__inaccessible__",
+        label="Inaccessible / unreadable",
+        size_bytes=summary.known_bytes,
+        size_human=format_bytes(summary.known_bytes),
+        category_group=_INACCESSIBLE_CATEGORY_GROUP,
+        category_label=category_label(_INACCESSIBLE_CATEGORY_GROUP),
+        is_dir=False,
+        is_candidate=False,
+        is_inaccessible=True,
+        explanation=_inaccessible_explanation(summary),
+    )
+
 
 def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
     with ScanIndex(state.db_path) as index:
@@ -620,6 +664,15 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
         nodes.sort(key=lambda n: n.size_bytes, reverse=True)
         nodes = nodes[:max_nodes]
+
+        # P0-5 treemap follow-up: the inaccessible bucket is a real, always-visible node in the
+        # treemap itself (not just the `/api/summary` banner), scoped to THIS root the same way
+        # `total_bytes` below is -- appended after the size-based `max_nodes` truncation above so
+        # it's never silently dropped for being small relative to the biggest real directories,
+        # and never counts against that cap.
+        inaccessible = index.inaccessible_summary(under=root)
+        if inaccessible.path_count > 0:
+            nodes.append(_inaccessible_treemap_node(inaccessible))
 
         total_bytes = index.subtree_size_bytes(root)
 

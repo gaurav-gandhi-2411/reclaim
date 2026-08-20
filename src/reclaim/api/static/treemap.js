@@ -93,10 +93,26 @@ function el(name, attrs) {
 
 /**
  * Renders `nodes` (treemap API response nodes: `{ path, label, size_bytes, size_human,
- * category_group, category_label, is_dir, is_candidate }`) into `svgEl`, wiring up
- * `tooltipEl` (hover/focus) to show the real path and formatted byte size — never a rounded
- * figure standing in for the exact one, since `size_human` already carries the honest
- * formatting from the API and the tooltip never recomputes its own.
+ * category_group, category_label, is_dir, is_candidate, is_inaccessible, explanation }`) into
+ * `svgEl`, wiring up `tooltipEl` (hover/focus) to show the real path and formatted byte size —
+ * never a rounded figure standing in for the exact one, since `size_human` already carries the
+ * honest formatting from the API and the tooltip never recomputes its own.
+ *
+ * P0-5 treemap follow-up: a node with `is_inaccessible: true` (the single synthetic
+ * "inaccessible" bucket `build_treemap` appends) gets the `rc-treemap-node--inaccessible` class
+ * — a hatched fill plus dashed stroke (see styles.css) so it reads as informational/estimated
+ * rather than a real, selectable directory even before a user hovers it — and its tooltip
+ * appends `node.explanation`, the one-line reason string the API provides for exactly this node
+ * (`null` for every ordinary node). That node is deliberately NOT fed into `squarify` alongside
+ * the real, size-proportional nodes: its best-effort byte estimate can be many orders of
+ * magnitude smaller than a real scan's biggest directories (or, per `InaccessibleSummary`,
+ * entirely absent — every inaccessible path can have an unknown size, `known_bytes == 0`), and
+ * squarify's row-packing can degenerate under an extreme size disparity (a single dominant item
+ * can compute a row "thickness" taller than the whole remaining rectangle, which zeroes out the
+ * rectangle and drops every remaining item — reproduced directly against a 500MB-vs-12KB pair
+ * in tests/frontend/treemap-inaccessible.test.mjs before this fix). Reserved instead as a fixed-
+ * height strip along the bottom of the canvas — always visible regardless of its relative size,
+ * which nothing here claims is proportionally accurate anyway (see its explanation string).
  */
 export function renderTreemap(svgEl, tooltipEl, nodes) {
   svgEl.innerHTML = "";
@@ -107,47 +123,68 @@ export function renderTreemap(svgEl, tooltipEl, nodes) {
   const height = bbox.height || svgEl.clientHeight || 520;
   svgEl.setAttribute("viewBox", `0 0 ${width} ${height}`);
 
-  const items = nodes.map((node) => ({ value: Math.max(node.size_bytes, 1), node }));
-  const rects = squarify(items, 0, 0, width, height);
+  const inaccessibleNode = nodes.find((node) => node.is_inaccessible);
+  const ordinaryNodes = nodes.filter((node) => !node.is_inaccessible);
+
+  const stripHeight = inaccessibleNode ? Math.min(32, height * 0.15) : 0;
+  const mapHeight = height - stripHeight;
+
+  const items = ordinaryNodes.map((node) => ({ value: Math.max(node.size_bytes, 1), node }));
+  const rects = squarify(items, 0, 0, width, mapHeight);
 
   for (const rect of rects) {
-    const node = rect.item.node;
-    const group = el("g", {
-      class: "rc-treemap-node",
-      tabindex: "0",
-      role: "img",
-      "aria-label": `${node.label}, ${node.category_label}, ${node.size_human}`,
-    });
-    group.appendChild(
-      el("rect", {
-        x: rect.x.toFixed(2),
-        y: rect.y.toFixed(2),
-        width: Math.max(rect.w, 0).toFixed(2),
-        height: Math.max(rect.h, 0).toFixed(2),
-        fill: categoryColorVar(node.category_group),
-      })
-    );
-    if (rect.w > 46 && rect.h > 18) {
-      const text = el("text", { x: (rect.x + 6).toFixed(2), y: (rect.y + 16).toFixed(2) });
-      text.textContent = node.label;
-      group.appendChild(text);
-    }
+    drawNode(svgEl, tooltipEl, rect.item.node, rect);
+  }
 
-    const show = () => showTooltip(tooltipEl, node, rect, svgEl);
-    const hide = () => {
-      tooltipEl.style.visibility = "hidden";
-    };
-    group.addEventListener("mouseenter", show);
-    group.addEventListener("mousemove", show);
-    group.addEventListener("mouseleave", hide);
-    group.addEventListener("focus", show);
-    group.addEventListener("blur", hide);
-    svgEl.appendChild(group);
+  if (inaccessibleNode) {
+    drawNode(svgEl, tooltipEl, inaccessibleNode, { x: 0, y: mapHeight, w: width, h: stripHeight });
   }
 }
 
+function drawNode(svgEl, tooltipEl, node, rect) {
+  const groupClass = node.is_inaccessible
+    ? "rc-treemap-node rc-treemap-node--inaccessible"
+    : "rc-treemap-node";
+  const ariaLabel = node.is_inaccessible
+    ? `${node.label}, ${node.category_label}, ${node.size_human} (estimated). ${node.explanation}`
+    : `${node.label}, ${node.category_label}, ${node.size_human}`;
+  const group = el("g", {
+    class: groupClass,
+    tabindex: "0",
+    role: "img",
+    "aria-label": ariaLabel,
+  });
+  group.appendChild(
+    el("rect", {
+      x: rect.x.toFixed(2),
+      y: rect.y.toFixed(2),
+      width: Math.max(rect.w, 0).toFixed(2),
+      height: Math.max(rect.h, 0).toFixed(2),
+      fill: categoryColorVar(node.category_group),
+    })
+  );
+  if (rect.w > 46 && rect.h > 18) {
+    const text = el("text", { x: (rect.x + 6).toFixed(2), y: (rect.y + 16).toFixed(2) });
+    text.textContent = node.label;
+    group.appendChild(text);
+  }
+
+  const show = () => showTooltip(tooltipEl, node, rect, svgEl);
+  const hide = () => {
+    tooltipEl.style.visibility = "hidden";
+  };
+  group.addEventListener("mouseenter", show);
+  group.addEventListener("mousemove", show);
+  group.addEventListener("mouseleave", hide);
+  group.addEventListener("focus", show);
+  group.addEventListener("blur", hide);
+  svgEl.appendChild(group);
+}
+
 function showTooltip(tooltipEl, node, rect, svgEl) {
-  tooltipEl.textContent = `${node.path} — ${node.size_human} (${node.category_label})`;
+  tooltipEl.textContent = node.is_inaccessible
+    ? `${node.category_label} — ${node.size_human} (estimated). ${node.explanation}`
+    : `${node.path} — ${node.size_human} (${node.category_label})`;
   const svgRect = svgEl.getBoundingClientRect();
   const scaleX = svgRect.width / (svgEl.viewBox.baseVal.width || svgRect.width);
   const scaleY = svgRect.height / (svgEl.viewBox.baseVal.height || svgRect.height);

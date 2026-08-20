@@ -40,6 +40,10 @@ _CATEGORY_LABELS: dict[str, str] = {
     # wasn't already a deterministic candidate (the common case for an AI-suggestion apply) --
     # never emitted by `reclaim.detectors`, only by `api/service.py`'s apply-time safety check.
     "user_selected": "Individually Selected Items",
+    # P0-5 treemap follow-up: the synthetic, non-deletable bucket `build_treemap` appends for
+    # `ScanIndex.inaccessible_summary` -- never emitted by any detector, so it can never collide
+    # with a real category_group a candidate might carry.
+    "inaccessible": "Inaccessible (permission denied)",
 }
 
 
@@ -228,6 +232,14 @@ class TreemapNodeOut(BaseModel):
     category_label: str
     is_dir: bool
     is_candidate: bool
+    # P0-5 treemap follow-up: `True` only for the single synthetic `inaccessible` bucket node
+    # `build_treemap` appends -- never a real scanned path, never selectable/deletable (always
+    # paired with `is_candidate=False`). `explanation` is a one-line, non-empty reason string
+    # for that same node (`None` for every ordinary node) so the treemap itself -- not just the
+    # `/api/summary` banner -- says WHY this bucket's size is a best-effort estimate rather than
+    # an exact figure.
+    is_inaccessible: bool = False
+    explanation: str | None = None
 
 
 class TreemapResponse(BaseModel):
