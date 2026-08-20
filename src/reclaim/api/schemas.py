@@ -730,3 +730,60 @@ class DiagnosticsResponse(BaseModel):
     os_version: str
     log_path: str
     log_tail: str
+
+
+# --- R2: Anthropic API key settings + per-category LLM explanations ----------------------------
+#
+# PRIVACY (non-negotiable, matching DiagnosticsResponse's own posture above): no response shape
+# in this section ever carries the plaintext API key — `AnthropicKeyStatusResponse` reports only
+# whether a key is configured, never the key itself, and `DiagnosticsResponse` above must never
+# gain a field from this module either (see reclaim.anthropic_key_store's module docstring).
+
+
+class AnthropicKeyStatusResponse(BaseModel):
+    """`GET /api/settings/anthropic-key`'s response, and the shape every mutating endpoint in
+    this section returns after acting — reports presence only, never the key itself."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    configured: bool
+
+
+class SetAnthropicKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str
+
+
+class TestAnthropicKeyRequest(BaseModel):
+    """`api_key` is optional — omit it to test the already-stored key (e.g. re-validating after
+    it may have been revoked on Anthropic's side); provide it to test a candidate key BEFORE
+    saving it, which is the primary "Test key" button flow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str | None = None
+
+
+class TestAnthropicKeyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    message: str
+
+
+class CategoryExplanationResponse(BaseModel):
+    """`GET /api/ai/category-explanation/{category_group}`'s response. `status="unavailable"`
+    covers both "no scan data for this category" and "no API key configured" — both are normal,
+    expected, non-error states (mirrors `AISuggestionsResponse`'s own "unavailable" convention);
+    `status="error"` covers a real Anthropic API failure (network/auth/malformed response) —
+    `message` is always a safe, pre-sanitized string (never a raw exception repr that could leak
+    request internals), and the API key itself never appears in any field here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # "ok" | "unavailable" | "error"
+    category_group: str
+    message: str | None  # unavailable_reason / error message; None only when status == "ok"
+    explanation: str | None
+    cached: bool

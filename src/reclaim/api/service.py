@@ -11,8 +11,8 @@ from pathlib import Path
 
 import structlog
 
-from reclaim import update_check
-from reclaim.ai import presentation
+from reclaim import anthropic_key_store, update_check
+from reclaim.ai import category_explainer, presentation
 from reclaim.ai.models import AICluster
 from reclaim.api import ai_orchestration
 from reclaim.api.schemas import (
@@ -21,6 +21,7 @@ from reclaim.api.schemas import (
     AISuggestionOut,
     AISuggestionsResponse,
     AITrackSkipOut,
+    AnthropicKeyStatusResponse,
     ApplyRequest,
     ApplyResponse,
     ApplyStatusOut,
@@ -28,6 +29,7 @@ from reclaim.api.schemas import (
     CandidatesResponse,
     CategoryBreakdownOut,
     CategoryCardOut,
+    CategoryExplanationResponse,
     CategorySettingOut,
     DiagnosticsResponse,
     DuplicateClusterOut,
@@ -50,10 +52,13 @@ from reclaim.api.schemas import (
     RestoreResponse,
     RestoreStatusOut,
     ScanStatusOut,
+    SetAnthropicKeyRequest,
     SettingsResponse,
     SuggestedScanRootOut,
     SuggestedScanRootsResponse,
     SummaryResponse,
+    TestAnthropicKeyRequest,
+    TestAnthropicKeyResponse,
     TreemapNodeOut,
     TreemapResponse,
     UpdateCheckResponse,
@@ -1846,4 +1851,152 @@ def build_diagnostics(state: AppState) -> DiagnosticsResponse:
         os_version=platform.platform(),
         log_path=str(state.log_path),
         log_tail=_read_log_tail(state.log_path),
+    )
+
+
+# --- R2: Anthropic API key settings + per-category LLM explanations ----------------------------
+
+
+def anthropic_key_status(state: AppState) -> AnthropicKeyStatusResponse:
+    configured = anthropic_key_store.has_key(state.anthropic_key_path)
+    return AnthropicKeyStatusResponse(configured=configured)
+
+
+def set_anthropic_key(
+    state: AppState, payload: SetAnthropicKeyRequest
+) -> AnthropicKeyStatusResponse:
+    anthropic_key_store.store_key(payload.api_key, state.anthropic_key_path)
+    return AnthropicKeyStatusResponse(configured=True)
+
+
+def delete_anthropic_key(state: AppState) -> AnthropicKeyStatusResponse:
+    anthropic_key_store.delete_key(state.anthropic_key_path)
+    return AnthropicKeyStatusResponse(configured=False)
+
+
+def check_anthropic_key(
+    state: AppState, payload: TestAnthropicKeyRequest
+) -> TestAnthropicKeyResponse:
+    """Backs the Settings tab's "Test key" button. Validates `payload.api_key` when given
+    (testing a candidate key BEFORE it's saved), or re-validates the already-stored key when
+    omitted — see `TestAnthropicKeyRequest`'s docstring. Never raises out to the route: a
+    network failure degrades to `valid=False` + a friendly message, the same "never a 500 from a
+    best-effort check" posture `reclaim.update_check.check_for_update` already established."""
+    api_key = payload.api_key
+    if not api_key:
+        try:
+            api_key = anthropic_key_store.load_key(state.anthropic_key_path)
+        except anthropic_key_store.DpapiError:
+            logger.warning("ai.anthropic_key.load_failed_for_test")
+            api_key = None
+    if not api_key:
+        return TestAnthropicKeyResponse(valid=False, message="No API key configured to test.")
+
+    try:
+        valid = category_explainer.validate_api_key(api_key)
+    except category_explainer.AnthropicAPIError as exc:
+        return TestAnthropicKeyResponse(valid=False, message=f"Could not reach Anthropic: {exc}")
+
+    return TestAnthropicKeyResponse(
+        valid=valid,
+        message="Key is valid." if valid else "Anthropic rejected this key (unauthorized).",
+    )
+
+
+def _category_descriptor_for_group(
+    category_group: str, candidates: Sequence[Candidate]
+) -> category_explainer.CategoryDescriptor | None:
+    """Builds R2's aggregate-only `CategoryDescriptor` from the SAME candidate list `build_
+    summary`'s `_category_cards` already derives its cards from — never a second, independent
+    read of individual file paths. `None` when nothing in the current candidate set matches
+    `category_group` (an unrecognized id, or a category with zero items this scan)."""
+    matching = [c for c in candidates if c.category_group == category_group]
+    if not matching:
+        return None
+
+    tiers = {c.tier for c in matching}
+    if tiers == {Tier.A}:
+        tier_label = "A"
+    elif tiers == {Tier.B}:
+        tier_label = "B"
+    else:
+        tier_label = "both"
+
+    retention_values = {c.retention_days for c in matching}
+    retention_days = next(iter(retention_values)) if len(retention_values) == 1 else None
+
+    return category_explainer.CategoryDescriptor(
+        category_group=category_group,
+        display_name=category_label(category_group),
+        file_count=len(matching),
+        total_size_bytes=sum(c.size_bytes for c in matching),
+        tier=tier_label,
+        retention_days=retention_days,
+    )
+
+
+def build_category_explanation(state: AppState, category_group: str) -> CategoryExplanationResponse:
+    """`GET /api/ai/category-explanation/{category_group}`. Degrades gracefully in every
+    failure mode (no scan data, no matching category, no API key, a corrupted key file, or a
+    real Anthropic API failure) — every branch returns a typed `CategoryExplanationResponse`,
+    never a raised exception reaching the route (see that response's own docstring)."""
+    with ScanIndex(state.db_path) as index:
+        if not index.has_any_records():
+            return CategoryExplanationResponse(
+                status="unavailable",
+                category_group=category_group,
+                message="Run a scan first to see category explanations.",
+                explanation=None,
+                cached=False,
+            )
+        candidates = _all_candidates(index, state)
+
+    descriptor = _category_descriptor_for_group(category_group, candidates)
+    if descriptor is None:
+        return CategoryExplanationResponse(
+            status="unavailable",
+            category_group=category_group,
+            message="No items in this category for the current scan.",
+            explanation=None,
+            cached=False,
+        )
+
+    try:
+        api_key = anthropic_key_store.load_key(state.anthropic_key_path)
+    except anthropic_key_store.DpapiError:
+        # A corrupted/foreign-user key file degrades to "not configured" here rather than a
+        # 500 -- the Settings tab is where a user would notice and re-enter their key.
+        logger.warning(
+            "ai.anthropic_key.load_failed_for_explanation", category_group=category_group
+        )
+        api_key = None
+
+    try:
+        result = category_explainer.explain_category(
+            descriptor, api_key=api_key, cache_dir=state.ai_explanation_cache_dir
+        )
+    except category_explainer.AnthropicKeyMissingError as exc:
+        return CategoryExplanationResponse(
+            status="unavailable",
+            category_group=category_group,
+            message=str(exc),
+            explanation=None,
+            cached=False,
+        )
+    except category_explainer.AnthropicAPIError:
+        logger.warning("ai.category_explainer.request_failed", category_group=category_group)
+        return CategoryExplanationResponse(
+            status="error",
+            category_group=category_group,
+            message="Could not reach Anthropic to generate an explanation. Try again shortly.",
+            explanation=None,
+            cached=False,
+        )
+
+    return CategoryExplanationResponse(
+        status="ok",
+        category_group=category_group,
+        message=None,
+        explanation=result.explanation,
+        cached=result.cached,
     )
