@@ -1262,6 +1262,96 @@ def run_apply(
         )
 
 
+# --- MCP control surface (R7) -----------------------------------------------------------------
+#
+# The only two functions `reclaim.mcp` is allowed to call to select or execute against real
+# candidates -- everything else it needs (scan trigger/status, `list_candidates` above) already
+# exists as a public function on this module. Kept here, not in `reclaim.mcp`, so the AST-level
+# "never imports reclaim.executor/send2trash" guarantee `evals/test_mcp_safety_gate.py` proves
+# for that package (mirroring `evals/test_ai_safety_gate.py`'s guarantee for `reclaim.ai`) has
+# something to actually be true about: `reclaim.mcp` calls these, it never touches
+# `apply_batch`/`send2trash` itself.
+
+
+def scan_id_for_state(state: AppState) -> str:
+    """A stable, citable identifier for the scan currently reflected in `state`'s index --
+    `reclaim.mcp`'s `scan`/`list_candidates`/`preview_apply` tools return this so a later
+    `delete` call can prove it's still talking about the SAME scan, not a stale one. Wraps
+    `AppState.scan_generation` (an internal staleness-detection counter, ADR-0025) rather than
+    inventing a second identifier -- `scan_generation` already increments exactly once per
+    completed (or cancelled-with-partial-data, see `run_scan`) scan and never otherwise, which is
+    exactly the "changed since" semantics a citable scan id needs."""
+    return f"scan-{state.scan_generation}"
+
+
+def is_current_scan_id(state: AppState, scan_id: str) -> bool:
+    """True only if `scan_id` names the scan generation `state`'s index currently reflects.
+    `False` covers both a genuinely unknown id and a real-but-superseded one (a newer scan
+    completed since) -- `reclaim.mcp` treats both identically: refuse, never guess which one was
+    meant."""
+    return scan_id == scan_id_for_state(state)
+
+
+def select_candidates_for_selector(
+    state: AppState, *, tier: str, rule_id_or_category: str
+) -> list[Candidate]:
+    """The ONLY candidate-selection function `reclaim.mcp` ever calls -- selects from the same
+    deterministic candidate universe `_all_candidates` builds for every other read surface
+    (Overview, Candidates tab, one-click clean), filtered to `tier` and a single
+    `rule_id_or_category` value matched against EITHER `Candidate.category` (a fine-grained
+    detector rule id, e.g. "windows_temp") OR `Candidate.category_group` (a coarse grouping,
+    e.g. "temp_and_browser_caches") -- never against a path. This is the structural fix R7
+    exists for: there is no parameter here, or anywhere downstream of it, that accepts a raw
+    filesystem path (contrast `ApplyRequest.paths`, which this function deliberately has no
+    equivalent of).
+
+    Raises `ValueError` for an unrecognized `tier` -- same contract `list_candidates`'s callers
+    already get from `_TIER_SELECTIONS[tier]`, just raised explicitly here instead of relying on
+    a bare `KeyError` propagating (the caller is `reclaim.mcp`, not an HTTP route with its own
+    tier validation, so this function must be the one to fail clearly)."""
+    if tier not in _TIER_SELECTIONS:
+        raise ValueError(f"tier must be one of {sorted(_TIER_SELECTIONS)} (got {tier!r})")
+    with ScanIndex(state.db_path) as index:
+        candidates = _all_candidates(index, state)
+    tiers = _TIER_SELECTIONS[tier]
+    return [
+        c
+        for c in candidates
+        if c.tier in tiers
+        and (c.category == rule_id_or_category or c.category_group == rule_id_or_category)
+    ]
+
+
+def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyResponse:
+    """Real, disk-mutating apply for `reclaim.mcp`'s `delete` tool -- the SAME `apply_batch`
+    choke point every other real deletion in this codebase goes through (`run_apply` above,
+    `cli._run_apply`), called synchronously (an MCP tool call is a single request/response, not
+    a poll loop) rather than as a background task. `selected` must already be the fresh,
+    freshly-hash-verified result of `select_candidates_for_selector` -- this function does not
+    re-derive or re-validate a selection itself (`reclaim.mcp.server.delete` owns that sequencing
+    so the hash-check-then-execute order is visible in one place, not split across two modules).
+
+    Method is auto-resolved from the live mode exactly like `resolve_apply_selection` already
+    does for the HTTP apply path -- safe mode only ever allows the Recycle Bin (`apply_batch`
+    enforces this structurally regardless), so an MCP client never needs its own method
+    selector."""
+    method: QuarantineMethod = "recycle_bin" if state.live_mode == Mode.SAFE else "vault"
+    report = apply_batch(
+        selected,
+        safety=state.safety,
+        apply=True,
+        method=method,
+        mode=state.live_mode,
+        vault_dir=state.vault_dir,
+        manifest_path=state.manifest_path,
+        direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+        direct_delete_size_guard_retention_days=(
+            state.config.safety.direct_delete_size_guard_retention_days
+        ),
+    )
+    return _apply_response(report)
+
+
 # --- AI suggestions (recommend-only; ADR-0025) ------------------------------------------------
 
 
