@@ -196,6 +196,22 @@ class SummaryResponse(BaseModel):
     # distinguish from "zero skipped".
     skipped_unreadable_count: int
     skipped_unreadable_paths: list[str]
+    # P0-5: persisted (index-wide, survives an app restart -- unlike `skipped_unreadable_*`
+    # above, which is this process session's most-recent-scan snapshot only) accounting of
+    # directories/entries the scanner could not fully account for -- see
+    # `reclaim.index.InaccessibleSummary`. `inaccessible_known_bytes` is a best-effort estimate,
+    # never a claim of completeness; `inaccessible_unknown_count` is how many of
+    # `inaccessible_path_count` have no size estimate at all.
+    inaccessible_path_count: int
+    inaccessible_known_bytes: int
+    inaccessible_unknown_count: int
+    # Volume-level reconciliation (`reclaim.reconciliation.compute_disk_reconciliation`) is only
+    # meaningful when the most recently completed scan covered a WHOLE drive -- `None` for every
+    # other case (a subtree scan, a multi-drive full-drive scan, or no completed scan yet at
+    # all), never a fabricated number for a scan scope this can't honestly evaluate.
+    reconciliation_volume: str | None
+    reconciliation_delta_bytes: int | None
+    reconciliation_delta_pct: float | None
 
 
 # --- Treemap -------------------------------------------------------------------------------

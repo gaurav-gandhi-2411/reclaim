@@ -139,6 +139,13 @@ def test_empty_state_before_any_scan(tmp_path: Path) -> None:
     assert body["has_scan"] is False
     assert body["total_indexed_bytes"] == 0
     assert body["categories"] == []
+    # P0-5: honest defaults before any scan has ever run -- 0/None, never a fabricated number.
+    assert body["inaccessible_path_count"] == 0
+    assert body["inaccessible_known_bytes"] == 0
+    assert body["inaccessible_unknown_count"] == 0
+    assert body["reconciliation_volume"] is None
+    assert body["reconciliation_delta_bytes"] is None
+    assert body["reconciliation_delta_pct"] is None
 
     treemap = client.get("/api/treemap")
     assert treemap.status_code == 200
@@ -641,6 +648,42 @@ def _build_tree(root: Path) -> dict[str, Path]:
         "dup_copy": dup_copy,
         "kept_file": kept_file,
     }
+
+
+def test_summary_surfaces_inaccessible_paths_from_a_persisted_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-5, end to end through the real API: a directory the scan cannot list is surfaced in
+    `/api/summary` as a distinct, counted entity (not silently dropped from every total), and
+    persists there even though this field is sourced from the index -- not the in-memory,
+    last-scan-only `skipped_unreadable_*` fields."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "readable.txt").write_bytes(b"x" * 100)
+    blocked_dir = root / "blocked_dir"
+    blocked_dir.mkdir()
+    (blocked_dir / "inner.txt").write_bytes(b"y" * 500)
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "blocked_dir" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    client = _make_app(tmp_path, config=_config(root))
+
+    _scan_and_wait(client, root)
+
+    summary = client.get("/api/summary").json()
+    assert summary["has_scan"] is True
+    assert summary["inaccessible_path_count"] == 1
+    assert summary["inaccessible_known_bytes"] == 0
+    assert summary["inaccessible_unknown_count"] == 1
+    # The blocked subtree's 500 bytes never made it into the visible total -- exactly the P0-5
+    # gap this field exists to make legible instead of silent.
+    assert summary["total_indexed_bytes"] == 100
 
 
 def _scan_and_wait(client: TestClient, root: Path) -> dict[str, object]:
