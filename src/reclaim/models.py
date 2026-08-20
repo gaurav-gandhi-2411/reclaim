@@ -232,9 +232,14 @@ class Candidate:
     # ADR-0006: hardlink-aware estimate of real reclaimable bytes (`linkinfo.
     # estimate_reclaimable_bytes`), distinct from `size_bytes`'s logical size. `None` means "not
     # computed for this category" (most categories today) — a caller should treat that as
-    # "assume equal to size_bytes," not as a claim of zero. Populated today only for
-    # `duplicates` (`dedup.generate_duplicate_candidates`): a "duplicate" that's actually a
-    # hardlink to the kept copy shares the same blocks already and reclaims 0 bytes if deleted,
-    # and byte-identical content — the cluster's whole selection criterion — is exactly what a
-    # hardlink produces, so this isn't a rare edge case for this category specifically.
+    # "assume equal to size_bytes," not as a claim of zero. Populated for `duplicates` (`dedup.
+    # generate_duplicate_candidates`): a "duplicate" that's actually a hardlink to the kept copy
+    # shares the same blocks already and reclaims 0 bytes if deleted, and byte-identical
+    # content — the cluster's whole selection criterion — is exactly what a hardlink produces,
+    # so this isn't a rare edge case for this category specifically. Also populated for
+    # `package_caches`/`model_caches` (audit finding E1, `detectors._reclaimable_bytes_for_
+    # candidate`): the same class of tool (uv, pnpm, conda, HF hub, npm, pip) routinely
+    # hardlinks cache blobs out into live venvs/node_modules/install directories, so a cache
+    # root's naive logical size overclaims exactly the way ADR-0006's own uv-cache measurement
+    # first found (14.3GB logical vs 5.21GB real disk-free delta).
     reclaimable_bytes: int | None = None

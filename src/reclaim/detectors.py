@@ -10,6 +10,7 @@ import structlog
 
 from reclaim.config import Config
 from reclaim.index import ScanIndex
+from reclaim.linkinfo import estimate_reclaimable_bytes
 from reclaim.models import (
     REBUILDABLE_CATEGORY_GROUPS,
     Candidate,
@@ -752,6 +753,51 @@ def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[Raw
     return raw
 
 
+# ADR-0006 extension (audit finding E1): package/model caches are exactly the shape ADR-0006's
+# own rationale describes for `exact_duplicate` -- uv/pnpm/conda/HF-hub/npm/pip caches routinely
+# hardlink blobs OUT into live venvs, node_modules, or install directories, so a cache root's
+# naive `subtree_size_bytes` overclaims whenever any of its files still has a surviving link
+# outside the cache. Both category groups get the same hardlink-aware treatment `duplicates`
+# already has, via the same `linkinfo.estimate_reclaimable_bytes` primitive.
+_LINK_AWARE_CATEGORY_GROUPS = frozenset({_GROUP_PACKAGE_CACHES, _GROUP_MODEL_CACHES})
+
+
+def _reclaimable_bytes_for_candidate(index: ScanIndex, rc: RawCandidate, size_bytes: int) -> int:
+    """Hardlink-aware reclaimable-bytes estimate for one package/model-cache candidate.
+
+    Deliberately scoped to ONLY this candidate's own file(s) -- never batched together with
+    sibling package/model-cache candidates from the same `generate_candidates()` call. `POST
+    /api/apply` can act on an explicit, caller-chosen subset of candidate paths (fix/apply-
+    scoped-to-paths, PR #33): if this candidate's estimate credited a block shared with a
+    DIFFERENT candidate's file (crediting the pair as if both were always deleted together),
+    a real apply that only ever selects this one candidate would overclaim relative to what
+    that specific apply actually frees. Scoping the "deletion set" passed to
+    `estimate_reclaimable_bytes` to exactly this candidate's own files matches
+    `exact_duplicate`'s existing semantics (ADR-0006): there, the cluster IS the whole set of
+    paths one apply of that cluster deletes together; here, this directory (or single file) IS
+    the whole set one apply of this candidate deletes together.
+
+    For a directory candidate, walks every non-directory row in its subtree via
+    `index.candidate_inventory(under=...)` -- an indexed prefix-range query bounded by that one
+    subtree, never the whole inventory, and already excludes cloud placeholders (a placeholder's
+    indexed `size` is the full remote size, not real local bytes, so counting one toward
+    reclaimable would overclaim independent of hardlinks). For a file candidate (an individual
+    model-weight file matched by extension), evaluates that single file alone.
+    """
+    if rc.is_dir:
+        members = [
+            (record.path, record.size_bytes)
+            for record in index.candidate_inventory(under=rc.path)
+            if not record.is_dir
+        ]
+        if not members:
+            return 0
+    else:
+        members = [(rc.path, size_bytes)]
+    estimates = estimate_reclaimable_bytes(members)
+    return sum(estimate.reclaimable_bytes for estimate in estimates.values())
+
+
 def generate_candidates(
     index: ScanIndex, config: Config, safety: SafetyValidator, *, now: float | None = None
 ) -> list[Candidate]:
@@ -799,6 +845,11 @@ def generate_candidates(
             tier = rc.suggested_tier if _category_enabled(rc.category_group, config) else Tier.B
 
         size_bytes = index.subtree_size_bytes(rc.path) if rc.is_dir else record.size_bytes
+        reclaimable_bytes = (
+            _reclaimable_bytes_for_candidate(index, rc, size_bytes)
+            if rc.category_group in _LINK_AWARE_CATEGORY_GROUPS
+            else None
+        )
         candidates.append(
             Candidate(
                 path=rc.path,
@@ -815,6 +866,7 @@ def generate_candidates(
                 recovery_cost_note=rc.recovery_cost_note,
                 size_guard_exempt=_category_size_guard_exempt(rc.category_group, config),
                 rebuildable=rc.category_group in REBUILDABLE_CATEGORY_GROUPS,
+                reclaimable_bytes=reclaimable_bytes,
             )
         )
     return candidates
