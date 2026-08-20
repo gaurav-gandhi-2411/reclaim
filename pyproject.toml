@@ -18,6 +18,7 @@ dependencies = [
     "httpx>=0.27",  # opt-in update check only (reclaim.update_check) -- see PRIVACY.md's
     # "Updates" section. Previously a test-only dev dependency; this is its first production
     # use, moved here from [dependency-groups] dev below.
+    "mcp>=1.2.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
