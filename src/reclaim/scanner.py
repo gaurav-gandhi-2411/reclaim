@@ -18,7 +18,7 @@ from pathlib import Path
 import structlog
 
 from reclaim.drives import is_network_drive
-from reclaim.index import ScanIndex, StoredStat, is_unchanged
+from reclaim.index import InaccessibleEntry, ScanIndex, StoredStat, is_unchanged
 from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
@@ -91,10 +91,24 @@ class SkippedPath:
     trace anywhere in the scan's output. Every scandir/stat call in this module is now
     `\\?\`-prefixed (see `long_path`), so a `SkippedPath` means a real permission/IO problem, not
     merely "the path was long".
+
+    P0-5: D12 stopped the SILENT part (every skip is now counted and sampled), but the bytes
+    under an unlistable directory still vanished from every total the app displays — nothing
+    ever estimated them. `size_estimate_bytes`/`size_estimate_is_lower_bound` (populated by
+    `_probe_inaccessible_dir_size` at this module's two directory-listing failure sites, and
+    best-effort at the single-entry failure site in `build_record`) close that gap honestly:
+    `None` means no size information exists at all (the common case — the directory's very
+    first `os.scandir()` call was denied before yielding even one entry, so there is nothing to
+    sum), never a fabricated `0`. A non-`None` value paired with `size_estimate_is_lower_bound
+    =True` means the listing partially succeeded before failing — the sum of whatever children
+    were actually enumerated, a genuine lower bound on the true subtree size, never a claim of
+    completeness.
     """
 
     path: str
     error: str
+    size_estimate_bytes: int | None = None
+    size_estimate_is_lower_bound: bool = False
 
 
 # Cap on how many actual `SkippedPath.path` strings `ScanStats.skipped_unreadable_paths` carries —
@@ -102,6 +116,55 @@ class SkippedPath:
 # protected directory tree) could otherwise accumulate an unbounded sample list for no added value
 # past the first handful.
 _SKIPPED_PATHS_SAMPLE_LIMIT = 20
+
+
+def _probe_inaccessible_dir_size(path: Path) -> tuple[int | None, bool]:
+    r"""Best-effort size probe (P0-5) for a directory `scan_tree` could not fully list — the
+    real technique behind `SkippedPath.size_estimate_bytes`.
+
+    NTFS directories carry no cumulative-size metadata of their own — a bare `os.stat()` on the
+    directory entry itself always reports `st_size == 0` regardless of what's inside, so that
+    alone gives nothing useful. The only real signal available without elevation is whatever a
+    fresh `os.scandir()` call on `path` yields before it fails:
+
+    - `(None, False)` — the very first `os.scandir()` call raised (the common ACL-denial case;
+      e.g. `C:\\Windows\\Temp` on this exact machine, per the audit this responds to). Zero
+      entries were ever obtained, so there is nothing to sum — returning `0` here would
+      fabricate a number this code never actually measured.
+    - `(N, True)` — `os.scandir()` opened successfully and yielded at least one entry before
+      failing partway through iteration (e.g. a network hiccup mid-listing, a corrupted
+      directory entry further down). `N` is the sum of `st_size` for every entry actually
+      obtained — a genuine LOWER BOUND on the true subtree size, since whatever came after the
+      failure point is excluded.
+
+    Deliberately shallow and a second, separate `os.scandir()` attempt rather than reusing the
+    caller's own failed listing: keeps this function trivially unit-testable in isolation and
+    keeps the two call sites (`_walk_subtree`'s `scan.dir_unreadable`, `scan_tree`'s
+    `scan.root_unreadable`) from having to thread partial iterator state back out of their own
+    `except` blocks. The extra listing attempt only ever runs on an already-rare failure path,
+    never on the hot, common-case walk. Never recurses into a successfully-listed child
+    directory — each such child is walked (or itself becomes its own `SkippedPath`) by the real
+    `scan_tree`/`_walk_subtree` walk, not by this probe.
+    """
+    total = 0
+    got_any = False
+    try:
+        scan_iterator = os.scandir(long_path(path))
+    except OSError:
+        return None, False
+    try:
+        for entry in scan_iterator:
+            got_any = True
+            try:
+                total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    finally:
+        scan_iterator.close()
+    return (total, True) if got_any else (None, False)
+
 
 # --- Progress feedback (full-drive-scan-eta) ----------------------------------------------------
 #
@@ -327,6 +390,15 @@ class ScanStats:
     # `_SKIPPED_PATHS_SAMPLE_LIMIT`) of the actual paths, never the full list.
     skipped_unreadable_count: int
     skipped_unreadable_paths: tuple[str, ...]
+    # P0-5: aggregate best-effort accounting over every `SkippedPath` this run produced (not
+    # just the capped sample above) — `inaccessible_known_bytes` sums every
+    # `size_estimate_bytes` that isn't `None`; `inaccessible_unknown_count` counts how many
+    # skips have no size estimate at all. Together with `skipped_unreadable_count` these answer
+    # "how much of what's missing do we actually know the size of" without a caller needing to
+    # re-derive it from the (capped) path sample. The full, uncapped list is persisted into the
+    # index itself (see `ScanIndex.replace_inaccessible_under_root`), not carried here.
+    inaccessible_known_bytes: int
+    inaccessible_unknown_count: int
     # 2026-07-30 telemetry addendum (see `_RiskCounter`): how many entries this run's real
     # `os.stat()` calls actually took the timeout-guarded path (reparse points, cloud
     # placeholders, or a network-mapped/UNC root) vs the fast unguarded path. Turns "why did
@@ -577,7 +649,33 @@ def build_record(
         is_dir_entry = entry.is_dir(follow_symlinks=False)
     except (OSError, FutureTimeoutError) as exc:
         logger.warning("scan.entry_unreadable", path=str(entry_path), error=str(exc))
-        skipped.append(SkippedPath(path=str(entry_path), error=str(exc)))
+        # P0-5: the failed stat above means we don't know whether this entry was a file or a
+        # directory from `st`/`is_dir_entry` (neither exists at this point) — but `entry`'s own
+        # cached scandir attributes are usually still readable independently of whatever made
+        # the real stat fail (a stalled GetFileInformationByHandle call, a timeout). If it says
+        # this was a directory, the same best-effort probe the two whole-directory-listing
+        # failure sites use applies here too: an entry stat failure on a directory loses that
+        # directory's entire subtree from the walk exactly like a listing failure does (it's
+        # never pushed onto the recursion stack), so it deserves the same size estimate rather
+        # than a silent `None` by default. A directory whose cached attributes are ALSO
+        # unreadable (rare — the entry was just listed by scandir) is left with `size_estimate
+        # =None`, the honest answer when even that fallback isn't available.
+        size_estimate: int | None = None
+        is_lower_bound = False
+        try:
+            entry_is_dir = entry.is_dir(follow_symlinks=False)
+        except OSError:
+            entry_is_dir = False
+        if entry_is_dir:
+            size_estimate, is_lower_bound = _probe_inaccessible_dir_size(entry_path)
+        skipped.append(
+            SkippedPath(
+                path=str(entry_path),
+                error=str(exc),
+                size_estimate_bytes=size_estimate,
+                size_estimate_is_lower_bound=is_lower_bound,
+            )
+        )
         return None
 
     attributes = st.st_file_attributes
@@ -765,7 +863,15 @@ def _walk_subtree(
             entries = list(os.scandir(long_path(current_dir)))
         except OSError as exc:
             logger.warning("scan.dir_unreadable", path=str(current_dir), error=str(exc))
-            skipped.append(SkippedPath(path=str(current_dir), error=str(exc)))
+            size_estimate, is_lower_bound = _probe_inaccessible_dir_size(current_dir)
+            skipped.append(
+                SkippedPath(
+                    path=str(current_dir),
+                    error=str(exc),
+                    size_estimate_bytes=size_estimate,
+                    size_estimate_is_lower_bound=is_lower_bound,
+                )
+            )
             continue
 
         for entry in entries:
@@ -869,7 +975,15 @@ def scan_tree(
     except OSError as exc:
         logger.warning("scan.root_unreadable", path=str(root), error=str(exc))
         top_level_entries = []
-        all_skipped.append(SkippedPath(path=str(root), error=str(exc)))
+        size_estimate, is_lower_bound = _probe_inaccessible_dir_size(root)
+        all_skipped.append(
+            SkippedPath(
+                path=str(root),
+                error=str(exc),
+                size_estimate_bytes=size_estimate,
+                size_estimate_is_lower_bound=is_lower_bound,
+            )
+        )
 
     root_git_cache = GitRepoCache()
     pending_upserts: list[FileRecord] = []
@@ -929,8 +1043,36 @@ def scan_tree(
 
             cancelled = cancel_event is not None and cancel_event.is_set()
             # See `cancel_event`'s docstring above: pruning against a partial `scan_seen` set
-            # would wrongly delete every real entry this cancelled run never reached.
+            # would wrongly delete every real entry this cancelled run never reached. The exact
+            # same reasoning applies to `inaccessible_paths` (P0-5): a completed run's
+            # `all_skipped` list is the authoritative "everything currently inaccessible under
+            # root" set (every reachable directory was actually visited), so replacing the
+            # persisted rows under `root` with it is correct — but a cancelled run never
+            # finished visiting the tree, so its `all_skipped` list is only a PARTIAL sample and
+            # replacing would wrongly erase inaccessible entries a prior, complete scan already
+            # recorded (and this run simply never got to re-examine).
             files_pruned = 0 if cancelled else index.prune_unseen_under_root(root)
+            if not cancelled:
+                index.replace_inaccessible_under_root(
+                    root,
+                    [
+                        InaccessibleEntry(
+                            # `SkippedPath.path` is a backslash-style `str(Path)` (matching the
+                            # existing D12 display convention -- CLI/API output, and the
+                            # `skipped_unreadable_paths` field, both already expect that form).
+                            # `ScanIndex`'s prefix-range scoping (`_prefix_range`), like the
+                            # `files` table itself, works in POSIX form -- re-derived here via
+                            # `Path(...).as_posix()` rather than changing `SkippedPath.path`
+                            # itself, which would break that existing display contract.
+                            path=Path(skipped_path.path).as_posix(),
+                            error=skipped_path.error,
+                            size_estimate_bytes=skipped_path.size_estimate_bytes,
+                            size_estimate_is_lower_bound=skipped_path.size_estimate_is_lower_bound,
+                        )
+                        for skipped_path in all_skipped
+                    ],
+                    scanned_at=scanned_at,
+                )
         except (OSError, sqlite3.OperationalError) as exc:
             if _is_disk_full(exc):
                 raise ScanDiskFullError("disk is full — free up space and try again") from exc
@@ -951,6 +1093,14 @@ def scan_tree(
         skipped_unreadable_count=len(all_skipped),
         skipped_unreadable_paths=tuple(
             skipped_path.path for skipped_path in all_skipped[:_SKIPPED_PATHS_SAMPLE_LIMIT]
+        ),
+        inaccessible_known_bytes=sum(
+            skipped_path.size_estimate_bytes
+            for skipped_path in all_skipped
+            if skipped_path.size_estimate_bytes is not None
+        ),
+        inaccessible_unknown_count=sum(
+            1 for skipped_path in all_skipped if skipped_path.size_estimate_bytes is None
         ),
         guarded_stat_count=risk_counter.guarded,
         fast_stat_count=risk_counter.fast,

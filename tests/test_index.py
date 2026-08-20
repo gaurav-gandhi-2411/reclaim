@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from reclaim.index import (
+    InaccessibleEntry,
     ScanIndex,
     StoredStat,
     is_unchanged,
@@ -664,3 +665,100 @@ def test_direct_children_handles_literal_underscore_in_parent_name(index: ScanIn
         Path("C:/Data/target/_app/child2.txt"),
         Path("C:/Data/target/_app/nested"),
     }
+
+
+# --- P0-5: inaccessible-path persistence -----------------------------------------------------
+
+
+def test_replace_inaccessible_under_root_inserts_and_summarizes(index: ScanIndex) -> None:
+    """A fresh set of `InaccessibleEntry` rows is persisted, and `inaccessible_summary` sums
+    known sizes while counting entries with no size estimate separately -- never folding an
+    unknown into the known total as a fabricated 0."""
+    index.replace_inaccessible_under_root(
+        Path("C:/Data"),
+        [
+            InaccessibleEntry(
+                path="C:/Data/blocked1",
+                error="Access is denied",
+                size_estimate_bytes=None,
+                size_estimate_is_lower_bound=False,
+            ),
+            InaccessibleEntry(
+                path="C:/Data/blocked2",
+                error="Access is denied",
+                size_estimate_bytes=4096,
+                size_estimate_is_lower_bound=True,
+            ),
+        ],
+        scanned_at=1000.0,
+    )
+
+    summary = index.inaccessible_summary()
+    assert summary.path_count == 2
+    assert summary.known_bytes == 4096
+    assert summary.unknown_count == 1
+
+    sample = index.inaccessible_paths_sample(limit=10)
+    assert {e.path for e in sample} == {"C:/Data/blocked1", "C:/Data/blocked2"}
+
+
+def test_replace_inaccessible_under_root_is_authoritative_not_a_merge(index: ScanIndex) -> None:
+    """A second call for the same root REPLACES the prior set rather than accumulating -- a
+    path that's no longer reported as inaccessible must disappear, matching the docstring's
+    "authoritative set, not a merge" contract."""
+    index.replace_inaccessible_under_root(
+        Path("C:/Data"),
+        [
+            InaccessibleEntry(
+                path="C:/Data/blocked1",
+                error="denied",
+                size_estimate_bytes=None,
+                size_estimate_is_lower_bound=False,
+            ),
+        ],
+        scanned_at=1000.0,
+    )
+    assert index.inaccessible_summary().path_count == 1
+
+    index.replace_inaccessible_under_root(Path("C:/Data"), [], scanned_at=2000.0)
+
+    assert index.inaccessible_summary().path_count == 0
+
+
+def test_replace_inaccessible_under_root_scopes_to_the_given_root(index: ScanIndex) -> None:
+    """Replacing entries under one root must never touch a persisted entry under a sibling
+    root -- the same prefix-scoping guarantee `prune_unseen_under_root` already relies on for
+    `files`."""
+    index.replace_inaccessible_under_root(
+        Path("C:/Data"),
+        [
+            InaccessibleEntry(
+                path="C:/Data/blocked",
+                error="denied",
+                size_estimate_bytes=None,
+                size_estimate_is_lower_bound=False,
+            ),
+        ],
+        scanned_at=1000.0,
+    )
+    index.replace_inaccessible_under_root(
+        Path("D:/Other"),
+        [
+            InaccessibleEntry(
+                path="D:/Other/blocked",
+                error="denied",
+                size_estimate_bytes=None,
+                size_estimate_is_lower_bound=False,
+            ),
+        ],
+        scanned_at=1000.0,
+    )
+
+    assert index.inaccessible_summary(under=Path("C:/Data")).path_count == 1
+    assert index.inaccessible_summary(under=Path("D:/Other")).path_count == 1
+    assert index.inaccessible_summary().path_count == 2
+
+    # Replacing C:/Data's (now empty) set must not disturb D:/Other's entry.
+    index.replace_inaccessible_under_root(Path("C:/Data"), [], scanned_at=2000.0)
+    assert index.inaccessible_summary().path_count == 1
+    assert index.inaccessible_summary(under=Path("D:/Other")).path_count == 1

@@ -9,6 +9,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,7 @@ from reclaim.scanner import (
     _HEARTBEAT_INTERVAL_SECONDS,
     GitRepoCache,
     _due,
+    _probe_inaccessible_dir_size,
     build_record_for_path,
     count_entries_fast,
     is_cloud_sync_root,
@@ -1015,3 +1017,163 @@ def test_count_entries_fast_cancel_event_stops_early(
     result = count_entries_fast(root, on_progress=on_progress, cancel_event=cancel_event)
 
     assert 50 <= result < total_entries
+
+
+# --- P0-5: inaccessible-directory size accounting -----------------------------------------------
+
+
+def test_probe_inaccessible_dir_size_returns_none_when_denied_at_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The common real-world case (confirmed on a real machine: `C:\\Windows\\Temp`) -- the very
+    first `os.scandir()` call raises before yielding a single entry. There is nothing to sum,
+    so the honest answer is `None` (unknown), never a fabricated `0`."""
+    target = tmp_path / "denied"
+    target.mkdir()
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "denied" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return os.scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+    size_estimate, is_lower_bound = _probe_inaccessible_dir_size(target)
+
+    assert size_estimate is None
+    assert is_lower_bound is False
+
+
+def test_probe_inaccessible_dir_size_returns_lower_bound_for_partial_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rarer partial-failure case -- `os.scandir()` opens successfully and yields some
+    entries before a later `OSError` (e.g. a network hiccup mid-listing). The sum of whatever
+    was actually obtained is a genuine LOWER BOUND, distinct from the "nothing known at all"
+    case above -- this is the exact distinction the task calls for."""
+    target = tmp_path / "partial"
+    target.mkdir()
+
+    class _FakeEntry:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def stat(self, *, follow_symlinks: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(st_size=self._size)
+
+    class _FailingIterator:
+        """Yields two fake entries (sizes 100 and 250) then raises `OSError` -- simulates a
+        listing that started successfully and failed partway through."""
+
+        def __init__(self) -> None:
+            self._entries = [_FakeEntry(100), _FakeEntry(250)]
+            self._index = 0
+
+        def __iter__(self) -> _FailingIterator:
+            return self
+
+        def __next__(self) -> _FakeEntry:
+            if self._index >= len(self._entries):
+                raise OSError(5, "Access is denied")
+            entry = self._entries[self._index]
+            self._index += 1
+            return entry
+
+        def close(self) -> None:
+            pass
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "partial" in str(path):
+            return _FailingIterator()
+        return os.scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+    size_estimate, is_lower_bound = _probe_inaccessible_dir_size(target)
+
+    assert size_estimate == 350
+    assert is_lower_bound is True
+
+
+def test_scan_tree_records_inaccessible_directory_as_distinct_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core P0-5 behavior: a directory `scan_tree` cannot list is no longer just logged and
+    silently dropped from every total -- it's recorded as a distinct, persisted entity (path,
+    best-effort size estimate, and it's still counted) that survives past the scan itself, in
+    the index, not just in this run's in-memory `ScanStats`."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    blocked_dir = root / "blocked_dir"
+    blocked_dir.mkdir()
+    (blocked_dir / "inner.txt").write_text("hidden", encoding="utf-8")
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "blocked_dir" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(root, index)
+
+        # Still counted (the path itself, not silently dropped) -- and its size is honestly
+        # unknown (total ACL denial, no partial listing) rather than fabricated as 0.
+        assert stats.skipped_unreadable_count == 1
+        assert stats.inaccessible_unknown_count == 1
+        assert stats.inaccessible_known_bytes == 0
+
+        # Persisted into the index itself -- survives past this run's ScanStats, per the task's
+        # explicit "survives incremental rescans" requirement.
+        summary = index.inaccessible_summary()
+        assert summary.path_count == 1
+        assert summary.known_bytes == 0
+        assert summary.unknown_count == 1
+
+        sample = index.inaccessible_paths_sample(limit=10)
+        assert len(sample) == 1
+        # Persisted in POSIX form (matching the `files` table's own path convention/prefix-range
+        # scoping), distinct from `SkippedPath.path`'s backslash-style display form.
+        assert sample[0].path == blocked_dir.as_posix()
+        assert sample[0].size_estimate_bytes is None
+
+
+def test_scan_tree_clears_a_previously_inaccessible_path_once_it_becomes_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory recorded as inaccessible by one scan must not linger forever in the index --
+    a later, complete rescan that CAN list it (an ACL was relaxed) replaces the persisted
+    `inaccessible_paths` row, same "authoritative set, not a merge" contract
+    `replace_inaccessible_under_root`'s docstring documents."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    now_readable_dir = root / "now_readable"
+    now_readable_dir.mkdir()
+    (now_readable_dir / "inner.txt").write_text("visible", encoding="utf-8")
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "now_readable" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(root, index)
+        assert index.inaccessible_summary().path_count == 1
+
+        monkeypatch.undo()  # os.scandir now behaves normally again -- the directory is readable
+        stats = scan_tree(root, index)
+
+        assert stats.skipped_unreadable_count == 0
+        summary = index.inaccessible_summary()
+        assert summary.path_count == 0
+        inventory = index.full_inventory(under=root)
+        assert now_readable_dir / "inner.txt" in {r.path for r in inventory}

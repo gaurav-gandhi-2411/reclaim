@@ -90,6 +90,24 @@ _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_files_path_lower ON files(path_lower COLLATE NOCASE);",
 )
 
+# P0-5: directories/entries the scanner could not fully account for -- see `InaccessibleEntry`
+# and `ScanIndex.replace_inaccessible_under_root`. A brand-new, separate table (not a column on
+# `files`) because these paths were never actually indexed as filesystem entries -- there is no
+# `files` row to attach the estimate to, and a directory that becomes listable again on a later
+# scan must disappear from here entirely, which `replace_inaccessible_under_root` implements as
+# a straightforward delete-then-insert (see its docstring) rather than the `files` table's
+# streaming seen-tracking machinery -- this set is always small (a handful to a few hundred real
+# skips, never millions), so that complexity buys nothing here.
+_INACCESSIBLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS inaccessible_paths (
+    path TEXT PRIMARY KEY,
+    error TEXT NOT NULL,
+    size_estimate_bytes INTEGER,
+    size_estimate_is_lower_bound INTEGER NOT NULL,
+    last_scanned REAL NOT NULL
+);
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class StoredStat:
@@ -107,6 +125,40 @@ def is_unchanged(stored: StoredStat | None, *, current_size: int, current_mtime:
     if stored is None:
         return False
     return stored.size == current_size and stored.mtime == current_mtime
+
+
+@dataclass(frozen=True, slots=True)
+class InaccessibleEntry:
+    """One `inaccessible_paths` row (P0-5) -- the persisted form of `scanner.SkippedPath`.
+
+    Deliberately duplicated here rather than importing `SkippedPath` directly: `scanner.py`
+    already imports FROM `index.py` (`ScanIndex`, `StoredStat`, `is_unchanged`), so the reverse
+    import would be circular -- the same reasoning `scanner._due`'s own docstring documents for
+    its own small, deliberate duplication rather than a new inter-module dependency.
+    """
+
+    path: str
+    error: str
+    size_estimate_bytes: int | None
+    size_estimate_is_lower_bound: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InaccessibleSummary:
+    """Aggregate view over `inaccessible_paths` (P0-5) -- computed in SQL so
+    `SummaryResponse`/the CLI reconciliation diagnostic never need to materialize every row just
+    to total them.
+
+    `known_bytes` sums `size_estimate_bytes` for rows where it isn't `None` -- an unknown
+    estimate contributes nothing to this total by design (fabricating a number for it would be
+    exactly the dishonesty this feature exists to avoid), which is why `unknown_count` is always
+    reported alongside it: the residual gap between a reconciliation delta and zero is only
+    honestly explained by *this* number, not silently absorbed into `known_bytes`.
+    """
+
+    path_count: int
+    known_bytes: int
+    unknown_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +323,7 @@ class ScanIndex:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute(_SCHEMA)
+        self._conn.execute(_INACCESSIBLE_SCHEMA)
         self._ensure_name_and_path_lower_columns()
         for statement in _INDEXES:
             self._conn.execute(statement)
@@ -418,6 +471,106 @@ class ScanIndex:
         e.g. an early failure), since a dropped connection-scoped temp table costs nothing to
         recreate next time."""
         self._conn.execute("DROP TABLE IF EXISTS temp.scan_seen")
+
+    # --- P0-5: persisted accounting for directories/entries the scanner couldn't fully account
+    # for --------------------------------------------------------------------------------------
+
+    def replace_inaccessible_under_root(
+        self, root: Path, entries: Sequence[InaccessibleEntry], *, scanned_at: float
+    ) -> None:
+        """Replaces every `inaccessible_paths` row under `root` with `entries` -- the full,
+        authoritative set a COMPLETE `scan_tree` walk of `root` actually produced, never a
+        merge. A previously-inaccessible path that's listable again now (an ACL was relaxed, the
+        directory was deleted) must not linger in this table forever -- unlike `files`'
+        incremental skip-unchanged design, an `inaccessible_paths` set is always small (a real
+        scan skips a handful to a few hundred paths, never millions), so a full
+        delete-then-insert under `root` on every completed scan is simplest and correct, with no
+        need for `files`' streaming seen-tracking machinery (Wave 1 finding #1/#4). Callers must
+        never call this for a CANCELLED scan -- see `scan_tree`'s own docstring for why (same
+        reasoning as `prune_unseen_under_root` being skipped there).
+        """
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        self._conn.execute(
+            "DELETE FROM inaccessible_paths WHERE path = ? OR (path >= ? AND path < ?)",
+            (prefix, lower, upper),
+        )
+        if entries:
+            self._conn.executemany(
+                "INSERT INTO inaccessible_paths "
+                "(path, error, size_estimate_bytes, size_estimate_is_lower_bound, last_scanned) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(path) DO UPDATE SET error=excluded.error, "
+                "size_estimate_bytes=excluded.size_estimate_bytes, "
+                "size_estimate_is_lower_bound=excluded.size_estimate_is_lower_bound, "
+                "last_scanned=excluded.last_scanned",
+                [
+                    (
+                        entry.path,
+                        entry.error,
+                        entry.size_estimate_bytes,
+                        int(entry.size_estimate_is_lower_bound),
+                        scanned_at,
+                    )
+                    for entry in entries
+                ],
+            )
+        self._conn.commit()
+
+    def inaccessible_summary(self, under: Path | None = None) -> InaccessibleSummary:
+        """`(path_count, known_bytes, unknown_count)` over `inaccessible_paths`, optionally
+        scoped under `under` -- see `InaccessibleSummary`'s docstring for what `known_bytes`
+        deliberately excludes."""
+        where = ""
+        params: list[object] = []
+        if under is not None:
+            prefix = under.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            where = " WHERE path = ? OR (path >= ? AND path < ?)"
+            params = [prefix, lower, upper]
+        # S608: `where` is built only from the fixed literal string above -- no caller-supplied
+        # value is ever interpolated into the SQL text, only bound as a `?` parameter.
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) AS path_count, "  # noqa: S608
+            "COALESCE(SUM(size_estimate_bytes), 0) AS known_bytes, "
+            "SUM(CASE WHEN size_estimate_bytes IS NULL THEN 1 ELSE 0 END) AS unknown_count "
+            f"FROM inaccessible_paths{where}",
+            params,
+        )
+        row = cursor.fetchone()
+        return InaccessibleSummary(
+            path_count=int(row["path_count"]),
+            known_bytes=int(row["known_bytes"]),
+            unknown_count=int(row["unknown_count"] or 0),
+        )
+
+    def inaccessible_paths_sample(
+        self, *, limit: int, under: Path | None = None
+    ) -> list[InaccessibleEntry]:
+        """Up to `limit` `inaccessible_paths` rows (ordered by path, for a deterministic sample),
+        optionally scoped under `under` -- mirrors `ScanStats.skipped_unreadable_paths`' own
+        "count is exact, sample is capped" shape at the persisted-index layer."""
+        where = ""
+        params: list[object] = []
+        if under is not None:
+            prefix = under.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            where = " WHERE path = ? OR (path >= ? AND path < ?)"
+            params = [prefix, lower, upper]
+        cursor = self._conn.execute(
+            "SELECT path, error, size_estimate_bytes, size_estimate_is_lower_bound "  # noqa: S608
+            f"FROM inaccessible_paths{where} ORDER BY path LIMIT ?",
+            [*params, limit],
+        )
+        return [
+            InaccessibleEntry(
+                path=row["path"],
+                error=row["error"],
+                size_estimate_bytes=row["size_estimate_bytes"],
+                size_estimate_is_lower_bound=bool(row["size_estimate_is_lower_bound"]),
+            )
+            for row in cursor
+        ]
 
     def load_stat_cache(self, root: Path | None = None) -> dict[str, StoredStat]:
         """Loads path -> (size, mtime) for every indexed row (optionally scoped under `root`)
