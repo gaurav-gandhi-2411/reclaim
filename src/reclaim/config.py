@@ -104,11 +104,14 @@ def _default_package_cache_paths() -> list[str]:
     with vaulted (never direct-delete) retention.
     """
     local_appdata = _win_path("LOCALAPPDATA", "C:/Users/Default/AppData/Local")
-    appdata = _win_path("APPDATA", "C:/Users/Default/AppData/Roaming")
     userprofile = _win_path("USERPROFILE", "C:/Users/Default")
     return [
         f"{local_appdata}/pip/Cache",
-        f"{appdata}/npm-cache",
+        # P1 fix (2026-08 audit): npm's real cache root is %LOCALAPPDATA%\npm-cache, not
+        # %APPDATA% (Roaming) — confirmed via `npm config get cache` on a real machine. The old
+        # Roaming-based path left a real, sizable (7+ GiB observed) npm cache invisible to this
+        # detector on every default install.
+        f"{local_appdata}/npm-cache",
         f"{local_appdata}/uv/cache",
         f"{local_appdata}/Yarn/Cache",
         # Judgment call: only the user-profile conda pkgs cache is covered by default (the
@@ -131,6 +134,12 @@ def _default_model_cache_paths() -> list[str]:
     userprofile = _win_path("USERPROFILE", "C:/Users/Default")
     return [
         f"{userprofile}/.cache/huggingface/hub",
+        # P1 fix (2026-08 audit): HF's `datasets` and `xet` cache subdirectories are separate
+        # from `hub` and were previously invisible to this detector — 40.9 GiB combined observed
+        # on a real machine between the two. Same recovery-cost profile as `hub` (bandwidth,
+        # possibly gated/private), so they belong in the same vaulted category, not package_caches.
+        f"{userprofile}/.cache/huggingface/datasets",
+        f"{userprofile}/.cache/huggingface/xet",
         f"{userprofile}/.cache/torch/hub",
         f"{userprofile}/.ollama/models",
     ]
@@ -190,7 +199,12 @@ class SafetyConfig(BaseModel):
 class PackageCachesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
-    enabled: bool = False
+    # P0-2 fix (2026-08 audit): default-ON. This category is one of the four in
+    # `models.REBUILDABLE_CATEGORY_GROUPS` — the codebase's own pre-existing boundary for
+    # "deterministically rebuildable, no vault needed" — so leaving it off by default meant a
+    # fresh install could produce zero candidates forever with no discoverable fix. See the
+    # `CategoriesConfig` docstring below for the full default-ON rationale.
+    enabled: bool = True
     paths: list[str] = Field(default_factory=_default_package_cache_paths)
     # ADR-0001: `None` -> direct permanent delete on apply (no vault, no send2trash); an int ->
     # vault + manifest + restore, with `purge` eligible once that many days have passed.
@@ -209,6 +223,12 @@ class PackageCachesConfig(BaseModel):
 class ModelCachesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
+    # P0-2 (2026-08 audit): stays OFF by default, deliberately, unlike the other three vaulted
+    # rebuildable-adjacent categories. Model weights are NOT in `models.REBUILDABLE_CATEGORY_
+    # GROUPS` for a real reason (see `retention_days` below): a gated/private/fine-tuned
+    # checkpoint may not be re-downloadable at all once original access has lapsed, and this
+    # category is also one of `models.SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS` — forced off in SAFE
+    # mode regardless of this flag on every fresh install anyway. No case for default-ON here.
     enabled: bool = False
     paths: list[str] = Field(default_factory=_default_model_cache_paths)
     # ADR-0003: individual model-weight files by extension, matched under the SAME `paths` roots
@@ -226,7 +246,11 @@ class ModelCachesConfig(BaseModel):
 class TempAndBrowserCachesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
-    enabled: bool = False
+    # P0-2 fix (2026-08 audit): default-ON — see the `CategoriesConfig` docstring below for the
+    # full rationale. One of `models.REBUILDABLE_CATEGORY_GROUPS` and, unlike dev_artifacts/
+    # model_caches/duplicates, NOT forced off in SAFE mode — so this is one of the categories
+    # that actually produces real candidates on a fresh, never-configured install.
+    enabled: bool = True
     cache_paths: list[str] = Field(default_factory=_default_browser_and_thumbnail_cache_paths)
     temp_roots: list[str] = Field(default_factory=_default_temp_roots)
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
@@ -237,7 +261,10 @@ class TempAndBrowserCachesConfig(BaseModel):
 class CrashDumpsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
-    enabled: bool = False
+    # P0-2 fix (2026-08 audit): default-ON — see the `CategoriesConfig` docstring below for the
+    # full rationale. One of `models.REBUILDABLE_CATEGORY_GROUPS` and NOT forced off in SAFE
+    # mode, so this produces real candidates on a fresh, never-configured install.
+    enabled: bool = True
     paths: list[str] = Field(default_factory=_default_crash_dump_paths)
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
     # Crash dumps/WER reports are diagnostic-only, so they default to `None`.
@@ -248,6 +275,9 @@ class OldInstallersConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     # Spec: review-queue by default, auto-quarantine only if the user explicitly opts in.
+    # P0-2 (2026-08 audit): stays OFF by default — vaulted/reversible (retention_days=30 below)
+    # but not deterministically rebuildable (may need a fresh download) and not in `models.
+    # REBUILDABLE_CATEGORY_GROUPS`; see the `CategoriesConfig` docstring for the line drawn here.
     enabled: bool = False
     max_age_days: int = 90
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
@@ -259,6 +289,9 @@ class OldInstallersConfig(BaseModel):
 class LargeLogsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
+    # P0-2 (2026-08 audit): stays OFF by default — a log file may hold information a user still
+    # wants, not deterministically rebuildable, not in `models.REBUILDABLE_CATEGORY_GROUPS`. See
+    # the `CategoriesConfig` docstring for the line drawn here.
     enabled: bool = False
     min_size_bytes: int = 50 * 1024 * 1024
     stale_days: int = 30
@@ -271,10 +304,18 @@ class LargeLogsConfig(BaseModel):
 class DevArtifactsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
-    # Conservative default: the node_modules-in-clean-repo exemption requires this to be
-    # explicitly turned on (spec: "category explicitly enabled"). Stage 3 also uses this flag
-    # to decide Tier A vs Tier B for every dev-artifact candidate, not just the git exemption.
-    enabled: bool = False
+    # P0-2 fix (2026-08 audit): default-ON. One of `models.REBUILDABLE_CATEGORY_GROUPS`, every
+    # candidate is manifest-adjacency-gated (`detect_dev_artifacts` — package.json/pyproject.
+    # toml/Cargo.toml/etc. must sit in the parent directory, or nothing is proposed, not even
+    # Tier B), and the node_modules-in-repo exemption this flag also controls only ever applies
+    # to a git repo with a CLEAN working tree (`safety.py`). Note this is effectively a no-op on
+    # every fresh install regardless: `dev_artifacts` is also in `models.
+    # SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`, so `load_effective_config` forces it back off while
+    # the app is in its default SAFE mode — this default only takes effect once a user explicitly
+    # opts into POWER mode (typed-confirmation gate, `mode.switch_to_power_mode`). Kept True here
+    # anyway rather than False, so a POWER-mode user doesn't ALSO need to hand-edit config.toml
+    # for this specific category on top of already passing the typed confirmation.
+    enabled: bool = True
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
     # Dev artifacts (node_modules, .venv, target/, ...) are rebuildable from an adjacent
     # manifest, so they default to `None`.
@@ -284,6 +325,9 @@ class DevArtifactsConfig(BaseModel):
 class ArchivePairsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
+    # P0-2 (2026-08 audit): stays OFF by default — vaulted/reversible but the archive can't be
+    # reconstructed from anything else and isn't in `models.REBUILDABLE_CATEGORY_GROUPS`. See
+    # the `CategoriesConfig` docstring for the line drawn here.
     enabled: bool = False
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
     # `purge`-eligible after that many days. The archive itself isn't reconstructable from
@@ -294,6 +338,11 @@ class ArchivePairsConfig(BaseModel):
 class DuplicatesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
+    # P0-2 (2026-08 audit): stays OFF by default — deciding which copy of a duplicate to keep is
+    # a human judgment call the keep-heuristic can get wrong, not just a byte-identical delete;
+    # also in `models.SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS` (forced off in SAFE mode regardless)
+    # and not in `models.REBUILDABLE_CATEGORY_GROUPS`. See the `CategoriesConfig` docstring for
+    # the line drawn here.
     enabled: bool = False
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore,
     # `purge`-eligible after that many days. A duplicate's bytes only exist in the kept copy
@@ -312,6 +361,37 @@ class DuplicatesConfig(BaseModel):
 
 
 class CategoriesConfig(BaseModel):
+    """P0-2 fix (2026-08 audit) — default-ON decision, recorded once here rather than repeated
+    per category: every category shipped `enabled=False` with no default `config.toml` anywhere
+    (repo or installer), so a first-time user following the advertised "Clean My Computer" flow
+    got zero results, forever, with no discoverable fix short of hand-authoring TOML.
+
+    The line drawn: default-ON is reserved for exactly the four categories already named in
+    `models.REBUILDABLE_CATEGORY_GROUPS` — `dev_artifacts`, `package_caches`,
+    `temp_and_browser_caches`, `crash_dumps` — a boundary this codebase already defined and
+    already uses for `retention_days=None` (direct permanent delete, no vault/human review
+    needed) because the owning tool deterministically redownloads/regenerates them. Reusing that
+    exact boundary rather than inventing a new one means "default-ON" and "direct-delete-safe"
+    stay the same four categories, not two different lists that could drift.
+
+    Every other category stays OFF by default: `model_caches` (gated/private/fine-tuned weights
+    may not be re-downloadable at all) and `duplicates` (which copy to keep is a human judgment
+    call) are both also in `models.SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`, forced off in SAFE mode
+    regardless of this flag; `old_installers`/`archive_pairs`/`large_logs` are vaulted (30-day
+    retention, reversible) but not deterministically rebuildable and each needs a human call this
+    audit didn't judge safe to make on a user's behalf by default (an installer they might still
+    need, an archive whose extraction integrity isn't re-verified, a log that might hold
+    information they want) — vaulted-and-reversible is a real mitigation, but it's not the same
+    property as "the tool can rebuild this exact content on its own," which is what the four
+    default-ON categories can all actually claim.
+
+    Practical effect on a fresh, never-configured install (default SAFE mode): `package_caches`,
+    `temp_and_browser_caches`, and `crash_dumps` are NOT in `SAFE_MODE_FORCED_OFF_CATEGORY_
+    GROUPS`, so all three produce real candidates immediately. `dev_artifacts` IS forced back off
+    by SAFE mode regardless of its own `enabled=True` default here — its default only takes
+    effect once a user explicitly opts into POWER mode (see `DevArtifactsConfig.enabled`).
+    """
+
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     dev_artifacts: DevArtifactsConfig = Field(default_factory=DevArtifactsConfig)

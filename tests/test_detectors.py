@@ -494,9 +494,25 @@ def test_drop_nested_candidates_keeps_unrelated_siblings() -> None:
 
 
 def test_category_enabled_reflects_config_flags() -> None:
+    # P0-2 (2026-08 audit): `dev_artifacts` is now default-ON (see `config.CategoriesConfig`'s
+    # docstring), `old_installers` stays default-OFF -- assert both directions so this test keeps
+    # proving `_category_enabled` reads the real flag rather than hardcoding one fixed value.
     config = Config()
-    assert _category_enabled("dev_artifacts", config) is False
+    assert _category_enabled("dev_artifacts", config) is True
     assert _category_enabled("old_installers", config) is False
+
+    explicitly_disabled = config.model_copy(
+        update={
+            "categories": config.categories.model_copy(
+                update={
+                    "dev_artifacts": config.categories.dev_artifacts.model_copy(
+                        update={"enabled": False}
+                    )
+                }
+            )
+        }
+    )
+    assert _category_enabled("dev_artifacts", explicitly_disabled) is False
 
 
 def test_category_enabled_rejects_unknown_group() -> None:
