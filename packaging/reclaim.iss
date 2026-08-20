@@ -73,7 +73,145 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent unchecked
 
+[Registry]
+; R5 (80%-threshold disk-space notification): the toast's Snooze action button uses
+; ToastButton(launch="reclaim-notify:snooze-disk-alert"), which Windows resolves via a plain
+; ShellExecute against this registered scheme -- no COM "Notification Activator" server needed,
+; and it works even though the short-lived scheduled-task process that fired the toast has
+; already exited by the time the user clicks it (see src/reclaim/notifications.py's module
+; docstring for why protocol activation, not an in-process on_activated callback, is the right
+; mechanism here). HKCU (not HKCR/HKLM) needs no admin rights, matching
+; PrivilegesRequired=lowest above. `Flags: uninsdeletekey` on the top-level key removes this
+; entire subtree (including \shell\open\command below) automatically on uninstall -- no [Code]
+; needed for cleanup, unlike the scheduled task registered in [Code] further down.
+Root: HKCU; Subkey: "Software\Classes\reclaim-notify"; ValueType: string; ValueName: ""; ValueData: "URL:Reclaim Notification Action"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\reclaim-notify"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\reclaim-notify\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" check-disk-space --apply-snooze --config ""{app}\config.toml"" --state ""{app}\data\notification_state.json"""
+
 [Code]
+// R5 (80%-threshold disk-space notification): a per-user, non-elevated Task Scheduler entry
+// that runs `reclaim check-disk-space` a few times a day -- installed here, removed in
+// UnregisterDiskSpaceTask (called from CurUninstallStepChanged below). See
+// src/reclaim/notifications.py's module docstring for the feature's own reliability posture
+// (opt-in via config.toml, never raises, debounced/snoozable).
+const
+  DiskSpaceTaskName = 'Reclaim Disk Space Check';
+
+// Minimal escaping for the handful of XML-significant characters that could in principle appear
+// in an install path (a username containing '&', for instance) -- {app} and {#MyAppExeName} are
+// both interpolated directly into element text below, not attribute values, so only these three
+// entities are needed.
+function XmlEscape(const S: String): String;
+var
+  Escaped: String;
+begin
+  Escaped := S;
+  StringChangeEx(Escaped, '&', '&amp;', True);
+  StringChangeEx(Escaped, '<', '&lt;', True);
+  StringChangeEx(Escaped, '>', '&gt;', True);
+  Result := Escaped;
+end;
+
+procedure RegisterDiskSpaceTask();
+var
+  ResultCode: Integer;
+  ExePath, AppDir, XmlPath, XmlContent: String;
+begin
+  ExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
+  AppDir := XmlEscape(ExpandConstant('{app}'));
+  XmlPath := ExpandConstant('{tmp}\reclaim_disk_space_task.xml');
+
+  // Registered via `/xml`, not the simpler `/tr` flag: schtasks caps a plain `/tr` value at 261
+  // characters (confirmed by direct reproduction against a real install-path-length command
+  // line -- a full "<exe> check-disk-space --config <path> --state <path>" line can realistically
+  // exceed that with a typical per-user install path), and `/tr` has no equivalent to
+  // <WorkingDirectory> either. Using WorkingDirectory here means the scheduled invocation reuses
+  // reclaim's normal relative config.toml/data/ paths, exactly like the Start Menu shortcut's own
+  // "Start in {app}" (see the [Icons] section above) -- no --config/--state override needed for
+  // the periodic check itself (unlike the Snooze protocol handler in [Registry] above, which has
+  // no working-directory concept and so needs the explicit absolute paths there).
+  //
+  // A LogonType of InteractiveToken with no RunLevel element (defaults to LeastPrivilege) is a
+  // per-user task that runs only while this user is logged on, needs no stored password, and
+  // never elevates -- matching PrivilegesRequired=lowest above and this project's own
+  // never-run-elevated invariant (reclaim.elevation.assert_not_elevated).
+  //
+  // The StartBoundary below is a fixed date in the past, intentionally: confirmed by direct
+  // reproduction (schtasks /query /v against a task created with this exact XML shape) that Task
+  // Scheduler computes the next occurrence from the repetition pattern (StartBoundary + N *
+  // Interval, the smallest N at or after now), not by "catching up" on every missed interval
+  // since the literal boundary date -- so this never fires a burst of overdue runs at install
+  // time, regardless of how long ago the boundary date is.
+  XmlContent :=
+    '<?xml version="1.0" encoding="UTF-16"?>' + #13#10 +
+    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
+    '  <RegistrationInfo>' + #13#10 +
+    '    <Description>Reclaim: periodic disk-space threshold check (fires a toast if crossed; ' +
+      'see PRIVACY.md).</Description>' + #13#10 +
+    '  </RegistrationInfo>' + #13#10 +
+    '  <Triggers>' + #13#10 +
+    '    <TimeTrigger>' + #13#10 +
+    '      <Repetition>' + #13#10 +
+    '        <Interval>PT4H</Interval>' + #13#10 +
+    '        <StopAtDurationEnd>false</StopAtDurationEnd>' + #13#10 +
+    '      </Repetition>' + #13#10 +
+    '      <StartBoundary>2026-01-01T09:00:00</StartBoundary>' + #13#10 +
+    '      <Enabled>true</Enabled>' + #13#10 +
+    '    </TimeTrigger>' + #13#10 +
+    '  </Triggers>' + #13#10 +
+    '  <Principals>' + #13#10 +
+    '    <Principal id="Author">' + #13#10 +
+    '      <LogonType>InteractiveToken</LogonType>' + #13#10 +
+    '    </Principal>' + #13#10 +
+    '  </Principals>' + #13#10 +
+    '  <Settings>' + #13#10 +
+    '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + #13#10 +
+    '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
+    '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
+    '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
+    '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' + #13#10 +
+    '    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>' + #13#10 +
+    '  </Settings>' + #13#10 +
+    '  <Actions Context="Author">' + #13#10 +
+    '    <Exec>' + #13#10 +
+    '      <Command>' + ExePath + '</Command>' + #13#10 +
+    '      <Arguments>check-disk-space</Arguments>' + #13#10 +
+    '      <WorkingDirectory>' + AppDir + '</WorkingDirectory>' + #13#10 +
+    '    </Exec>' + #13#10 +
+    '  </Actions>' + #13#10 +
+    '</Task>';
+
+  SaveStringToFile(XmlPath, XmlContent, False);
+  // /F overwrites a pre-existing task from an earlier install (reinstall/upgrade must not fail
+  // or duplicate the trigger) -- same idempotent-reinstall posture InitializeUninstall's
+  // taskkill already applies to process termination. A failure here (schtasks missing/disabled,
+  // an unusual locked-down environment) is not surfaced -- this is a best-effort convenience
+  // registration, not a required install step; the dashboard/CLI work identically without it,
+  // just without the background check.
+  Exec('schtasks.exe', '/create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath + '" /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  DeleteFile(XmlPath);
+end;
+
+procedure UnregisterDiskSpaceTask();
+var
+  ResultCode: Integer;
+begin
+  // A nonzero exit (task never existed -- e.g. an install that predates this feature, or a user
+  // who manually removed it) is not surfaced -- same "don't fail the uninstall over a
+  // best-effort cleanup step" posture as the rest of this script.
+  Exec('schtasks.exe', '/delete /tn "' + DiskSpaceTaskName + '" /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // ssPostInstall fires after [Files] has finished copying, so {app}\{#MyAppExeName} already
+  // exists by the time schtasks' <Command> element is registered against it.
+  if CurStep = ssPostInstall then
+    RegisterDiskSpaceTask();
+end;
+
 // fix/uninstaller-terminate-running-process: a Reclaim server process (the dashboard, or a
 // background scan/apply/AI-analysis worker it spawned) holds an OS-level lock on reclaim.exe
 // and its loaded DLLs for as long as it's running. Inno's own [Files] removal pass can't clear
@@ -142,6 +280,16 @@ var
   AppDir: String;
   Response: Integer;
 begin
+  if CurUninstallStep = usUninstall then
+    // R5: remove the per-user scheduled task registered by RegisterDiskSpaceTask above. Run at
+    // usUninstall (before file removal / the data-folder prompt below) rather than
+    // usPostUninstall -- no ordering dependency on either, but this keeps "undo everything this
+    // installer registered outside of {app} itself" together as one step, matching
+    // InitializeUninstall's own "do the OS-level cleanup first" shape. The [Registry] protocol
+    // handler needs no equivalent call here -- Flags: uninsdeletekey in [Registry] above already
+    // removes it automatically.
+    UnregisterDiskSpaceTask();
+
   if CurUninstallStep = usPostUninstall then
   begin
     // Defensive verification, not the primary fix (InitializeUninstall's taskkill above is):
