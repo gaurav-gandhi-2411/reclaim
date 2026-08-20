@@ -58,6 +58,12 @@ _JUNIT_PATH = "pytest-results.xml"
 # apply_batch's per-candidate pre-flight guard structurally precedes every statement that can
 # reach one. No [ai] extra, no network, pure `ast` parsing of this repo's own source -- same
 # "no excuse to skip it" reasoning as every other file in this tuple.
+#
+# test_r2_llm_env_var_gate.py added alongside R2 (per-category LLM explainer): AST-based proof
+# that reclaim.ai.category_explainer/reclaim.anthropic_key_store never read ANY environment
+# variable (not just no "ANTHROPIC_API_KEY" substring -- see that file's own module docstring).
+# Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar as the
+# files above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -67,6 +73,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_cli_cold_start_budget.py",
     "evals/test_apply_safety_preflight.py",
     "evals/test_apply_batch_call_graph_gate.py",
+    "evals/test_r2_llm_env_var_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
