@@ -527,6 +527,55 @@ a:active {
   color: var(--rc-text-muted);
 }
 
+/* R2: per-category "Explain" button + its loading/result panel, appended below the existing
+   category-card fields above -- reuses .rc-btn-secondary and .rc-state-panel rather than
+   introducing new interactive-element styling. */
+.rc-category-card .rc-explain-btn {
+  margin-top: var(--rc-space-2);
+}
+
+.rc-category-explanation {
+  margin-top: var(--rc-space-2);
+  font-size: var(--rc-text-sm);
+  color: var(--rc-text);
+}
+
+.rc-category-explanation[data-tone="muted"] {
+  color: var(--rc-text-muted);
+}
+
+.rc-category-explanation[data-tone="error"] {
+  color: var(--rc-danger);
+}
+
+/* --- Settings (R2: Anthropic API key) ----------------------------------------------------------- */
+
+.rc-settings-panel {
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+  background: var(--rc-surface-alt);
+  max-width: 640px;
+}
+
+.rc-settings-panel h2 {
+  margin: 0 0 var(--rc-space-1);
+  font-size: var(--rc-text-lg);
+}
+
+.rc-settings-panel > p {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+  margin: 0 0 var(--rc-space-3);
+}
+
+.rc-settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--rc-space-3);
+}
+
 /* --- Quick Clean (one-click, categorically-safe groups only) ----------------------------------- */
 
 .rc-quick-clean {
