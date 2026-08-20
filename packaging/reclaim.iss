@@ -51,6 +51,15 @@ Source: "{#MyDistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 ; process's own working directory ({app}, per the [Icons] "Start in" note below), same pattern
 ; as the LICENSE-acceptance page's LicenseFile= above needing the repo-root LICENSE at build time.
 Source: "..\NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+; P0-2 fix (2026-08 audit): without this, a fresh install had NO config.toml anywhere and every
+; cleanup category shipped enabled=false -- "Clean My Computer" produced zero results, forever,
+; with no discoverable fix. Installed as config.toml itself (reclaim.cli's default relative
+; path -- see the [Icons] "Start in" note above) so a fresh install gets real default-ON
+; categories out of the box. destfilename= renames it on the way in since Source's own basename
+; deliberately isn't "config.toml" (that name is gitignored -- see .gitignore's "User's real
+; config" entry -- so the repo-tracked source file needs a different name). onlyifdoesntexist:
+; an upgrade over an existing install must never clobber a user's already-customized config.toml.
+Source: "config.default.toml"; DestDir: "{app}"; DestName: "config.toml"; Flags: onlyifdoesntexist
 
 [Icons]
 ; "Start in" is deliberately {app} (not {userdocs} or anything else) — reclaim's CLI defaults

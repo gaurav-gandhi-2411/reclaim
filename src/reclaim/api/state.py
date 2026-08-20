@@ -11,7 +11,7 @@ from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
-from reclaim.models import Mode
+from reclaim.models import Candidate, Mode
 from reclaim.safety import SafetyValidator
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed", "cancelled"]
@@ -168,6 +168,13 @@ class AppState:
     # silently wiped. Set by `POST /api/scan/cancel`. A plain `threading.Event` (not a
     # `Lock`-guarded bool) since setting/checking it must never block a poller or the walk itself.
     cancel_scan_event: threading.Event = field(default_factory=threading.Event)
+    # P0-2 fix (2026-08 audit): the exact path `config` above was loaded from (or would be
+    # created at, if it didn't exist) — needed so `POST /api/settings/categories/{group}` can
+    # persist a toggle to the same on-disk file the CLI/next server start will read, not just
+    # mutate the in-memory `config` field for the life of this process. `create_app`/`_run_serve`
+    # always set this to the real `--config` value; the default here only covers a caller (a
+    # test, a future embedder) that never passed one explicitly.
+    config_path: Path = field(default_factory=lambda: Path("config.toml"))
     mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
     first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
     # G25: the persistent rotating log file this process's `configure_logging` call actually
@@ -190,6 +197,22 @@ class AppState:
     # `scan_status`/`ai_status` already have.
     apply_status: ApplyStatus = field(default_factory=ApplyStatus)
     restore_status: RestoreStatus = field(default_factory=RestoreStatus)
+    # perf/dedup-cache (docs/AUDIT-2026-08.md P0-3): `api.service._all_candidates` re-runs the
+    # full detector + exact-duplicate-cluster pass (a whole-index BLAKE3 hash of every
+    # size-duplicate candidate) on every call -- before this cache, 5 independent call sites in
+    # `service.py` each triggered that pass independently, live-reproduced as 60+ second page
+    # loads and two concurrent hash passes firing 12 seconds apart for a single page load. Cached
+    # per `scan_generation` above (same staleness key ADR-0025 already uses for `ai_clusters`) --
+    # a fresh COMPLETED scan invalidates it. `candidates_cache_lock` is a DEDICATED lock (not
+    # `lock` above, which guards small/fast status-dataclass reads elsewhere) held across the
+    # entire compute-or-fetch critical section in `service._cached_all_candidates` -- a second
+    # caller racing the first for the same generation blocks on this lock rather than starting
+    # its own redundant hash pass, and sees the first caller's now-cached result once it
+    # acquires the lock. In-memory only, like every other piece of this process's session state
+    # (ADR-0025 decision 2): lost on restart, rebuilt on the next call.
+    candidates_cache: list[Candidate] | None = None
+    candidates_cache_generation: int | None = None
+    candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def live_mode(self) -> Mode:

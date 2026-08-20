@@ -1046,10 +1046,16 @@ def test_plain_language_category_matches_the_spec_mapping_and_falls_back_gracefu
     assert label == "Large log files"
     assert reason is None
 
-    # Unmapped id (e.g. model_caches, or a future ai_-namespaced group) falls back to the
-    # technical label with no fabricated safety reason, never a crash or a raw snake_case id.
+    # P0-2 (2026-08 audit): model_caches gained a real mapping (used by the new Settings tab) --
+    # no longer the fallback example this test used before.
     label, reason = plain_language_category("model_caches")
-    assert label == "Model Weight Caches"
+    assert label == "ML model weight caches"
+    assert reason is not None and "re-downloadable" in reason
+
+    # Unmapped id (e.g. "other", or a future ai_-namespaced group) falls back to the technical
+    # label with no fabricated safety reason, never a crash or a raw snake_case id.
+    label, reason = plain_language_category("other")
+    assert label == "Uncategorized"
     assert reason is None
 
 
@@ -1545,3 +1551,333 @@ def test_update_check_endpoint_reports_available_update_when_enabled(
     assert body["update_available"] is True
     assert body["latest_version"] == "v99.0.0"
     assert body["release_url"] == "https://example.test/r"
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings tab ------------------------------------
+
+
+def _make_app_with_config_path(tmp_path: Path, *, config: Config, config_path: Path) -> TestClient:
+    """Same shape as `_make_app`, but exposes `config_path` explicitly -- these tests write to
+    disk (`POST /api/settings/categories/{group}`), and `create_app`'s own default `config_path`
+    is the repo-relative `config.toml` (matching the real CLI default), which must never be what
+    a test writes to."""
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=config,
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        first_run_state_path=tmp_path / "first_run_state.json",
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    csrf_token: str = app.state.reclaim.csrf_token
+    return TestClient(
+        app,
+        base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
+        headers={security.CSRF_HEADER_NAME: csrf_token},
+    )
+
+
+def test_settings_categories_lists_every_category_with_real_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.get("/api/settings/categories")
+
+    assert response.status_code == 200
+    body = response.json()
+    by_group = {c["category_group"]: c for c in body["categories"]}
+    assert set(by_group) == set(CategoriesConfig.model_fields)
+    # dev_artifacts is explicitly overridden to enabled=True in this file's `_config` fixture.
+    assert by_group["dev_artifacts"]["enabled"] is True
+    assert by_group["dev_artifacts"]["forced_off_in_safe_mode"] is True
+    assert by_group["package_caches"]["forced_off_in_safe_mode"] is False
+    # Every category needs a non-empty, real description -- never a raw snake_case fallback with
+    # no context (the Settings tab renders this directly).
+    for entry in body["categories"]:
+        assert entry["description"]
+        assert entry["category_label"]
+
+
+def test_post_settings_category_persists_to_disk_and_takes_effect_without_restart(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    # old_installers defaults to False (see config.py's CategoriesConfig docstring).
+    before = client.get("/api/settings/categories").json()
+    by_group = {c["category_group"]: c for c in before["categories"]}
+    assert by_group["old_installers"]["enabled"] is False
+
+    response = client.post("/api/settings/categories/old_installers", json={"enabled": True})
+
+    assert response.status_code == 200
+    by_group = {c["category_group"]: c for c in response.json()["categories"]}
+    assert by_group["old_installers"]["enabled"] is True
+
+    # Persisted to the real file, not just in-memory.
+    from reclaim.config import load_config
+
+    on_disk = load_config(config_path)
+    assert on_disk.categories.old_installers.enabled is True
+
+    # Takes effect immediately -- a second GET without restarting the process reflects it too.
+    after = client.get("/api/settings/categories").json()
+    by_group = {c["category_group"]: c for c in after["categories"]}
+    assert by_group["old_installers"]["enabled"] is True
+
+
+def test_post_settings_category_unknown_group_returns_404(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/categories/not_a_real_category", json={"enabled": True})
+
+    assert response.status_code == 404
+    assert "not_a_real_category" in response.json()["detail"]
+
+
+def test_post_settings_category_without_csrf_token_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.post("/api/settings/categories/old_installers", json={"enabled": True})
+
+    assert response.status_code == 403
+    assert not config_path.exists()
+
+
+def test_post_settings_category_invalidates_a_warmed_candidates_cache(tmp_path: Path) -> None:
+    """Cross-PR regression (2026-08 audit): P0-2's `update_category_setting` (this file's
+    `test_post_settings_category_persists_to_disk_and_takes_effect_without_restart` above) and
+    perf/dedup-cache's `_cached_all_candidates` (below) ship in separate PRs and, merged
+    together, interact badly -- `_cached_all_candidates` is keyed ONLY on `scan_generation`,
+    which a category toggle never bumps. Without invalidating the cache in
+    `update_category_setting` too, a dashboard that already warmed the cache with one
+    `GET /api/candidates` call keeps serving the pre-toggle tier classification after a category
+    is toggled on, directly contradicting `update_category_setting`'s own "takes effect
+    immediately without a restart" docstring/API contract for the common real-world case (the
+    dashboard is loaded before Settings is touched). Live-reproduced with a real duplicate pair:
+    `duplicates.enabled=False` puts it at Tier B; warm the cache; toggle `duplicates` on; the
+    re-fetched candidate must now report Tier A, not the stale Tier B."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(root, duplicates_enabled=False), config_path=config_path
+    )
+    _scan_and_wait(client, root)
+    dup_copy_posix = paths["dup_copy"].as_posix()
+
+    # Warm the cache -- this is the call `_cached_all_candidates` memoizes.
+    before = client.get("/api/candidates?category=duplicates").json()
+    before_by_path = {c["path"]: c for c in before["candidates"]}
+    assert before_by_path[dup_copy_posix]["tier"] == "B"
+
+    response = client.post("/api/settings/categories/duplicates", json={"enabled": True})
+    assert response.status_code == 200
+
+    # Re-fetch without restarting the process -- must reflect the toggle immediately, not the
+    # cache's stale pre-toggle classification.
+    after = client.get("/api/candidates?category=duplicates").json()
+    after_by_path = {c["path"]: c for c in after["candidates"]}
+    assert after_by_path[dup_copy_posix]["tier"] == "A", (
+        "candidates cache was not invalidated by the category toggle -- still serving the "
+        "pre-toggle Tier B classification"
+    )
+
+
+# --- perf/dedup-cache (docs/AUDIT-2026-08.md P0-3): cached, concurrency-guarded
+# `_cached_all_candidates` -----------------------------------------------------------------------
+
+
+def test_cached_all_candidates_avoids_redundant_dedup_recompute_within_one_scan_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the cache: `generate_duplicate_candidates` (the expensive whole-index
+    BLAKE3 hash pass `_all_candidates` -> `_cached_all_candidates` wraps) must run exactly ONCE
+    for a scan generation, no matter how many of the 5 call sites (summary, treemap, candidates,
+    one-click summary, blanket apply) are hit afterward -- not once per call site, as it was
+    before this fix."""
+    from reclaim.api import service
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    call_count = 0
+    real = service.generate_duplicate_candidates
+
+    def _counting(*args: object, **kwargs: object) -> list[object]:
+        nonlocal call_count
+        call_count += 1
+        return real(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(service, "generate_duplicate_candidates", _counting)
+
+    assert client.get("/api/summary").status_code == 200
+    assert client.get("/api/treemap").status_code == 200
+    assert client.get("/api/candidates?tier=A").status_code == 200
+    assert client.get("/api/clean/one-click-summary").status_code == 200
+
+    assert call_count == 1, "each of 4 call sites recomputed dedup independently -- cache miss"
+
+
+def test_cached_all_candidates_invalidates_on_a_new_scan_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh COMPLETED scan must never leave a caller looking at stale, pre-rescan candidates
+    -- the cache is keyed to `state.scan_generation` (ADR-0025's existing staleness key, bumped
+    once per completed scan) specifically so a rescan busts it."""
+    from reclaim.api import service
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    call_count = 0
+    real = service.generate_duplicate_candidates
+
+    def _counting(*args: object, **kwargs: object) -> list[object]:
+        nonlocal call_count
+        call_count += 1
+        return real(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(service, "generate_duplicate_candidates", _counting)
+
+    assert client.get("/api/summary").status_code == 200
+    assert call_count == 1
+
+    assert client.get("/api/summary").status_code == 200
+    assert call_count == 1, "second call within the same scan generation should hit the cache"
+
+    _scan_and_wait(client, root)  # a new COMPLETED scan -- bumps state.scan_generation
+
+    assert client.get("/api/summary").status_code == 200
+    assert call_count == 2, "a new scan generation must invalidate the cache, not serve stale data"
+
+
+def test_cached_all_candidates_serializes_concurrent_recompute_for_the_same_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The concurrency guard this cache exists to add: two requests racing for the SAME scan
+    generation must never both trigger a full recompute -- exactly the "two independent
+    concurrent dedup passes fired 12 seconds apart for one page load" bug docs/AUDIT-2026-08.md's
+    P0-3 live-reproduced. Deterministic (not a timing race that could pass by luck), following
+    this file's own `test_two_serialized_batches_...` pattern in tests/test_executor.py: a
+    `threading.Event` proves the second caller only starts once the first has demonstrably begun
+    (and is holding `candidates_cache_lock`), then a real `.is_alive()` check proves the second
+    caller is genuinely blocked, not merely racing and happening to lose."""
+    import threading
+
+    from reclaim.api import service
+    from reclaim.index import ScanIndex
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+
+    call_count = 0
+    first_call_started = threading.Event()
+    first_call_may_finish = threading.Event()
+    real = service.generate_duplicate_candidates
+
+    def _blocking(*args: object, **kwargs: object) -> list[object]:
+        nonlocal call_count
+        call_count += 1
+        first_call_started.set()
+        assert first_call_may_finish.wait(timeout=30), "first caller never released"
+        return real(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(service, "generate_duplicate_candidates", _blocking)
+
+    results: list[list[object]] = []
+
+    def _run() -> None:
+        with ScanIndex(state.db_path) as index:
+            results.append(service._cached_all_candidates(index, state))
+
+    first_thread = threading.Thread(target=_run)
+    second_thread = threading.Thread(target=_run)
+
+    first_thread.start()
+    assert first_call_started.wait(timeout=10), "first caller never reached the hash pass"
+
+    second_thread.start()
+    time.sleep(0.5)  # give the second caller a real chance to attempt-and-block
+    assert second_thread.is_alive(), (
+        "second caller returned while the first still holds candidates_cache_lock -- the lock "
+        "did not actually serialize the two callers"
+    )
+
+    first_call_may_finish.set()
+    first_thread.join(timeout=30)
+    second_thread.join(timeout=30)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+
+    assert call_count == 1, "the second caller recomputed instead of reusing the first's result"
+    assert len(results) == 2
+    assert results[0] == results[1]
+
+
+def test_category_cards_use_hardlink_aware_reclaimable_bytes_not_logical_size(
+    tmp_path: Path,
+) -> None:
+    """P1 fix (docs/AUDIT-2026-08.md): `_category_cards`'s top-line total must sum
+    `reclaimable_bytes` (hardlink-aware, ADR-0006) when a candidate has it populated, never the
+    naive logical `size_bytes` -- a hardlinked 'duplicate' shares its blocks with the kept copy
+    and reclaims 0 bytes on delete, so summing `size_bytes` would overstate real reclaimable
+    space by the hardlinked file's full logical size."""
+    from reclaim.api.service import _category_cards
+    from reclaim.models import Candidate, Verdict
+
+    hardlinked_duplicate = Candidate(
+        path=tmp_path / "dup.bin",
+        is_dir=False,
+        category="exact_duplicate",
+        category_group="duplicates",
+        size_bytes=5_000,  # logical size -- what a naive sum would (wrongly) report
+        tier=Tier.B,
+        rationale="test fixture",
+        rebuild_instruction=None,
+        safety_verdict=Verdict.ELIGIBLE,
+        safety_reason_code="ok",
+        retention_days=30,
+        reclaimable_bytes=0,  # hardlink-aware: shares blocks with the kept copy, reclaims 0
+    )
+
+    cards = _category_cards([hardlinked_duplicate])
+
+    assert len(cards) == 1
+    assert cards[0].total_bytes == 0
+    assert cards[0].total_bytes_human == "0 B"
