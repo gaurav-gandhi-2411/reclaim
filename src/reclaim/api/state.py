@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from reclaim.ai.category_explainer import DEFAULT_CACHE_DIR as DEFAULT_AI_EXPLANATION_CACHE_DIR
 from reclaim.ai.models import AICluster
+from reclaim.anthropic_key_store import DEFAULT_KEY_PATH as DEFAULT_ANTHROPIC_KEY_PATH
 from reclaim.config import Config, apply_safe_mode_category_overrides
 from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
@@ -190,6 +192,11 @@ class AppState:
     # `scan_status`/`ai_status` already have.
     apply_status: ApplyStatus = field(default_factory=ApplyStatus)
     restore_status: RestoreStatus = field(default_factory=RestoreStatus)
+    # R2: where the DPAPI-encrypted Anthropic API key blob lives, and where per-category
+    # explanation cache entries are written -- overridable the same way every other path on
+    # this dataclass is (test isolation; see `create_app`'s matching constructor parameters).
+    anthropic_key_path: Path = field(default_factory=lambda: DEFAULT_ANTHROPIC_KEY_PATH)
+    ai_explanation_cache_dir: Path = field(default_factory=lambda: DEFAULT_AI_EXPLANATION_CACHE_DIR)
 
     @property
     def live_mode(self) -> Mode:
