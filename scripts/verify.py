@@ -45,6 +45,15 @@ _JUNIT_PATH = "pytest-results.xml"
 # `-m "not scale"` anywhere in [tool.pytest.ini_options]), so the `-m "not scale"` filter below
 # on the pytest invocation itself is load-bearing, not decorative -- remove it and this "fast"
 # pre-push gate silently starts generating a 100k-file tree on every run.
+#
+# test_reclaimable_bytes_link_aware_gate.py / test_cache_reclaimable_bytes_gate.py added for
+# audit finding E1 (2026-08-21): the structural AST gate proving no reclaim-labeled figure
+# (reclaimable_bytes/total_bytes/bytes_freed) is ever derived from a bare `.size_bytes` without
+# the hardlink-aware path, plus the real-`os.link()` regression fixtures per cache category
+# (uv/pnpm/conda/npm/pip/HF-hub). Same reasoning as every file above: neither needs the [ai]
+# extra or network (confirmed: pure ast/stdlib + `reclaim.detectors`/`reclaim.index`, collect and
+# pass in a bare `uv sync`) -- leaving a new safety/correctness gate out of this list is exactly
+# the silent-skip gap this script's own docstring exists to prevent.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -52,6 +61,8 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safe_mode_gate.py",
     "evals/test_scanner_peak_rss_budget.py",
     "evals/test_cli_cold_start_budget.py",
+    "evals/test_reclaimable_bytes_link_aware_gate.py",
+    "evals/test_cache_reclaimable_bytes_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
