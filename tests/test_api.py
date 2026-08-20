@@ -1547,6 +1547,46 @@ def test_post_settings_category_without_csrf_token_is_rejected(tmp_path: Path) -
     assert not config_path.exists()
 
 
+def test_post_settings_category_invalidates_a_warmed_candidates_cache(tmp_path: Path) -> None:
+    """Cross-PR regression (2026-08 audit): P0-2's `update_category_setting` (this file's
+    `test_post_settings_category_persists_to_disk_and_takes_effect_without_restart` above) and
+    perf/dedup-cache's `_cached_all_candidates` (below) ship in separate PRs and, merged
+    together, interact badly -- `_cached_all_candidates` is keyed ONLY on `scan_generation`,
+    which a category toggle never bumps. Without invalidating the cache in
+    `update_category_setting` too, a dashboard that already warmed the cache with one
+    `GET /api/candidates` call keeps serving the pre-toggle tier classification after a category
+    is toggled on, directly contradicting `update_category_setting`'s own "takes effect
+    immediately without a restart" docstring/API contract for the common real-world case (the
+    dashboard is loaded before Settings is touched). Live-reproduced with a real duplicate pair:
+    `duplicates.enabled=False` puts it at Tier B; warm the cache; toggle `duplicates` on; the
+    re-fetched candidate must now report Tier A, not the stale Tier B."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(root, duplicates_enabled=False), config_path=config_path
+    )
+    _scan_and_wait(client, root)
+    dup_copy_posix = paths["dup_copy"].as_posix()
+
+    # Warm the cache -- this is the call `_cached_all_candidates` memoizes.
+    before = client.get("/api/candidates?category=duplicates").json()
+    before_by_path = {c["path"]: c for c in before["candidates"]}
+    assert before_by_path[dup_copy_posix]["tier"] == "B"
+
+    response = client.post("/api/settings/categories/duplicates", json={"enabled": True})
+    assert response.status_code == 200
+
+    # Re-fetch without restarting the process -- must reflect the toggle immediately, not the
+    # cache's stale pre-toggle classification.
+    after = client.get("/api/candidates?category=duplicates").json()
+    after_by_path = {c["path"]: c for c in after["candidates"]}
+    assert after_by_path[dup_copy_posix]["tier"] == "A", (
+        "candidates cache was not invalidated by the category toggle -- still serving the "
+        "pre-toggle Tier B classification"
+    )
+
+
 # --- perf/dedup-cache (docs/AUDIT-2026-08.md P0-3): cached, concurrency-guarded
 # `_cached_all_candidates` -----------------------------------------------------------------------
 

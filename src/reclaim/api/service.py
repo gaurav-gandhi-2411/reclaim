@@ -1611,7 +1611,15 @@ def update_category_setting(state: AppState, category: str, *, enabled: bool) ->
     """Toggles one category's `enabled` flag, both on disk (`state.config_path`, so it survives
     past this process) and in memory (`state.config`, so it takes effect immediately without a
     restart -- the same "no restart needed" posture `POST /api/mode/power|safe` already has).
-    Raises `ValueError` for a `category` that isn't a real `CategoriesConfig` field."""
+    Raises `ValueError` for a `category` that isn't a real `CategoriesConfig` field.
+
+    Also invalidates `state.candidates_cache` (perf/dedup-cache, docs/AUDIT-2026-08.md P0-3):
+    that cache is keyed ONLY on `scan_generation`, which a category toggle never bumps, so
+    without this a warmed cache would keep serving the pre-toggle tier classification -- directly
+    contradicting the "takes effect immediately" claim above for the common case where the
+    dashboard was already loaded once before the toggle. Cleared via the dedicated
+    `candidates_cache_lock` (not `state.lock`, which only guards `state.config` here) so this
+    never blocks on, or is blocked by, an in-flight `_cached_all_candidates` recompute."""
     if category not in CategoriesConfig.model_fields:
         raise ValueError(f"unknown category {category!r}")
     set_category_enabled(state.config_path, category, enabled=enabled)
@@ -1621,6 +1629,9 @@ def update_category_setting(state: AppState, category: str, *, enabled: bool) ->
         )
         new_categories = state.config.categories.model_copy(update={category: updated_category})
         state.config = state.config.model_copy(update={"categories": new_categories})
+    with state.candidates_cache_lock:
+        state.candidates_cache = None
+        state.candidates_cache_generation = None
     return settings_categories(state)
 
 
