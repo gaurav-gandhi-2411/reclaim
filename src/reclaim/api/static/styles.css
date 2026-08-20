@@ -501,6 +501,32 @@ a:active {
   font-size: var(--rc-text-sm);
 }
 
+/* --- Settings tab: per-category enable/disable toggles (P0-2 fix, 2026-08 audit) --------------- */
+
+.rc-settings-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rc-space-2);
+  margin-bottom: var(--rc-space-1);
+}
+
+.rc-settings-card-head h3 {
+  margin: 0;
+  font-size: var(--rc-text-base);
+}
+
+.rc-settings-card .rc-badge {
+  margin-top: var(--rc-space-2);
+}
+
+.rc-settings-card-status {
+  min-height: 1.2em;
+  margin: var(--rc-space-2) 0 0;
+  font-size: var(--rc-text-sm);
+  color: var(--rc-text-muted);
+}
+
 /* --- Quick Clean (one-click, categorically-safe groups only) ----------------------------------- */
 
 .rc-quick-clean {

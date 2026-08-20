@@ -781,6 +781,7 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     app = create_app(
         db_path=args.db,
         config=config,
+        config_path=config_path,
         vault_dir=args.vault_dir,
         manifest_path=args.manifest,
         mode_log_path=mode_log,
