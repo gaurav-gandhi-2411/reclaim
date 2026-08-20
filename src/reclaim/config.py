@@ -621,9 +621,7 @@ def _set_category_enabled_in_toml_text(text: str, category: str, *, enabled: boo
     enabled_line = f"enabled = {value_literal}\n"
 
     lines = text.splitlines(keepends=True)
-    start_idx = next(
-        (i for i, line in enumerate(lines) if line.strip() == section_header), None
-    )
+    start_idx = next((i for i, line in enumerate(lines) if line.strip() == section_header), None)
 
     if start_idx is None:
         # Section doesn't exist yet -- append a fresh one at EOF, on its own blank-line-separated

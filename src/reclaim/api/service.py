@@ -1559,9 +1559,7 @@ def settings_categories(state: AppState) -> SettingsResponse:
     with state.lock:
         config = state.config.categories
     return SettingsResponse(
-        categories=[
-            _category_setting_out(group, config) for group in CategoriesConfig.model_fields
-        ]
+        categories=[_category_setting_out(group, config) for group in CategoriesConfig.model_fields]
     )
 
 
@@ -1577,9 +1575,7 @@ def update_category_setting(state: AppState, category: str, *, enabled: bool) ->
         updated_category = getattr(state.config.categories, category).model_copy(
             update={"enabled": enabled}
         )
-        new_categories = state.config.categories.model_copy(
-            update={category: updated_category}
-        )
+        new_categories = state.config.categories.model_copy(update={category: updated_category})
         state.config = state.config.model_copy(update={"categories": new_categories})
     return settings_categories(state)
 
