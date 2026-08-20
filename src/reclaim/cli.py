@@ -393,6 +393,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_serve_like_arguments(dashboard_parser)
 
+    mcp_serve_parser = subparsers.add_parser(
+        "mcp-serve",
+        help="Run the Model Context Protocol (MCP) control surface over stdio, for an AI agent "
+        "to scan/review/delete through — see reclaim.mcp's module docstring for the safety "
+        "model (selection by rule/category only, never a free-form path; every delete requires "
+        "a fresh preview_apply's selection_hash). No network transport exists for this command.",
+    )
+    _add_mcp_serve_arguments(mcp_serve_parser)
+
     return parser
 
 
@@ -410,6 +419,58 @@ def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--port", type=int, default=_DEFAULT_PORT, help=f"Bind port (default: {_DEFAULT_PORT})."
     )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing).",
+    )
+    parser.add_argument(
+        "--vault-dir",
+        type=Path,
+        default=None,
+        help="Override the vault directory (default: data/quarantine).",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Override the quarantine manifest path (default: data/quarantine/manifest.jsonl).",
+    )
+    parser.add_argument(
+        "--mode-log",
+        type=Path,
+        default=None,
+        help=f"Override the mode-change log path (default: {DEFAULT_MODE_LOG_PATH}).",
+    )
+    parser.add_argument(
+        "--first-run-state",
+        type=Path,
+        default=None,
+        help=f"Override the first-run-acknowledged marker path (default: "
+        f"{DEFAULT_FIRST_RUN_STATE_PATH}).",
+    )
+    parser.add_argument(
+        "--log-path",
+        type=Path,
+        default=None,
+        help=f"Override the persistent rotating log file path (default: "
+        f"{DEFAULT_LOG_PATH}) — see SUPPORT.md for what this file is for.",
+    )
+
+
+def _add_mcp_serve_arguments(parser: argparse.ArgumentParser) -> None:
+    """`mcp-serve`'s own storage arguments -- the same set `_add_serve_like_arguments` gives
+    `serve`/`dashboard`, minus `--host`/`--port`: `reclaim.mcp.server.run_mcp_server` always
+    speaks MCP over stdio, never binds a network socket at all, so there is no bind address for
+    this command to accept or validate (see that function's own docstring)."""
     parser.add_argument(
         "--db",
         type=Path,
@@ -974,6 +1035,55 @@ def _run_dashboard(args: argparse.Namespace) -> int:
     return _run_serve(args, open_browser=True)
 
 
+def _run_mcp_serve(args: argparse.Namespace) -> int:
+    """`reclaim mcp-serve` -- the R7 MCP control surface, an AI agent's own scan/review/delete
+    entry point (see `reclaim.mcp`'s module docstring for the safety model). Same
+    not-elevated guard `serve`/`apply`/`undo`/`purge` already enforce; unlike those,
+    `reclaim.mcp` never touches `reclaim.executor`/`send2trash` directly itself, but the
+    `AppState` it's handed is the exact one `reclaim.api.service.mcp_execute_delete` calls
+    `apply_batch` through, so the same "never run elevated" invariant applies here too.
+
+    Imports deferred to inside the function, same reasoning `_run_serve` already documents for
+    uvicorn/FastAPI: `scan`/`apply`/`undo`/`serve` (and every existing test importing this
+    module) must never pay the `mcp` package's import cost.
+    """
+    try:
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim mcp-serve: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+
+    from reclaim.mcp.server import build_state, run_mcp_server
+
+    config_path: Path = args.config
+    # Raw config, deliberately -- same reasoning `_run_serve` documents: `AppState.
+    # effective_config` resolves the live mode fresh on every tool call, not once at process
+    # startup.
+    config = _load_config_or_none("mcp-serve", config_path)
+    if config is None:
+        return 1
+    mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
+    first_run_state = (
+        args.first_run_state if args.first_run_state is not None else DEFAULT_FIRST_RUN_STATE_PATH
+    )
+    log_path = args.log_path if args.log_path is not None else DEFAULT_LOG_PATH
+    state = build_state(
+        db_path=args.db,
+        config=config,
+        vault_dir=args.vault_dir,
+        manifest_path=args.manifest,
+        mode_log_path=mode_log,
+        first_run_state_path=first_run_state,
+        log_path=log_path,
+    )
+    print(  # noqa: T201
+        "reclaim mcp-serve: MCP control surface starting over stdio (Ctrl+C to stop)",
+        file=sys.stderr,
+    )
+    run_mcp_server(state)
+    return 0
+
+
 def _run_mode(args: argparse.Namespace) -> int:
     mode_log: Path = args.mode_log if args.mode_log is not None else DEFAULT_MODE_LOG_PATH
     action = getattr(args, "mode_action", None)
@@ -1182,6 +1292,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_serve(args)
     if args.command == "dashboard":
         return _run_dashboard(args)
+    if args.command == "mcp-serve":
+        return _run_mcp_serve(args)
     parser.error(f"unknown command: {args.command}")
     return 1
 
