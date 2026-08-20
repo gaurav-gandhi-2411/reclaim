@@ -77,6 +77,12 @@ _JUNIT_PATH = "pytest-results.xml"
 # destination, and the unchanged-path regression case) plus the "still works normally" cases. No
 # [ai] extra, no network -- same "no excuse to skip it" reasoning as every other file in this
 # tuple.
+#
+# test_r2_llm_env_var_gate.py added alongside R2 (per-category LLM explainer): AST-based proof
+# that reclaim.ai.category_explainer/reclaim.anthropic_key_store never read ANY environment
+# variable (not just no "ANTHROPIC_API_KEY" substring -- see that file's own module docstring).
+# Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar as the
+# files above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -89,6 +95,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_reclaimable_bytes_link_aware_gate.py",
     "evals/test_cache_reclaimable_bytes_gate.py",
     "evals/test_apply_identity_reverify.py",
+    "evals/test_r2_llm_env_var_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
