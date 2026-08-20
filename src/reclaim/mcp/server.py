@@ -22,6 +22,7 @@ from reclaim.mcp.schemas import (
     ScanTriggerResult,
 )
 from reclaim.mcp.selection import (
+    ConcurrentDeleteError,
     SelectionMismatchError,
     StaleScanError,
     compute_selection_hash,
@@ -292,80 +293,119 @@ def build_mcp_server(state: AppState) -> FastMCP:
         tier)` -- REQUIRES a `selection_hash` from a prior `preview_apply` call for this exact
         selection. There is no path parameter: this tool can only ever act on Reclaim's own
         deterministic detector output, selected by rule id or category group. Refuses (no
-        partial execution) if `scan_id` is stale or if a fresh re-derivation of the selection no
-        longer hashes to `selection_hash` -- call preview_apply again for a current hash in
-        either case."""
+        partial execution) if `scan_id` is stale, if a fresh re-derivation of the selection no
+        longer hashes to `selection_hash`, or if another `delete` call is already in flight on
+        this server -- call preview_apply again for a current hash in the first two cases, or
+        simply retry once the in-flight call finishes for the third."""
         client_id = _client_id(ctx)
         request_id = _request_id(ctx)
 
-        if not service.is_current_scan_id(state, scan_id):
+        # Concurrency fix (docs/AUDIT-2026-08.md, adversarial re-verification of PR #39):
+        # check-and-set `mcp_delete_in_progress` atomically under `state.lock`, same idiom
+        # `POST /api/apply` already uses for `apply_status` (routes.py) -- claims the
+        # single-flight slot BEFORE any candidate re-derivation or hash work happens, so a
+        # second concurrent `delete` call for the identical selection is refused immediately
+        # rather than racing the first one to `apply_batch` (see `ConcurrentDeleteError`'s
+        # docstring for the exact race this closes). The lock is held only briefly here, not
+        # across the whole operation below -- `apply_batch` can take minutes on a large batch
+        # (ADR-0026), and holding a process-wide lock for that long would block every other
+        # AppState reader (scan status polls, mode checks) for no reason; the flag alone is
+        # what needs to be atomic, matching `POST /api/apply`'s own lock-scoping precedent.
+        with state.lock:
+            if state.mcp_delete_in_progress:
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="concurrent_delete_in_progress",
+                    scan_id=scan_id,
+                    tier=tier,
+                    rule_id_or_category=rule_id_or_category,
+                )
+                raise ConcurrentDeleteError(
+                    "another delete() call is already in progress on this server -- refusing "
+                    "this one rather than risk two concurrent deletes racing the same "
+                    "selection. Wait for the in-flight call to finish and try again."
+                )
+            state.mcp_delete_in_progress = True
+
+        try:
+            if not service.is_current_scan_id(state, scan_id):
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="stale_scan_id",
+                    scan_id=scan_id,
+                    tier=tier,
+                    rule_id_or_category=rule_id_or_category,
+                )
+                raise StaleScanError(
+                    f"scan_id {scan_id!r} does not match the current scan "
+                    f"({service.scan_id_for_state(state)}) -- the index has changed since this "
+                    "selection was previewed. Refusing to delete anything. Call scan_status() "
+                    "for the current scan_id, then preview_apply() again for a fresh "
+                    "selection_hash."
+                )
+
+            selected = service.select_candidates_for_selector(
+                state, tier=tier, rule_id_or_category=rule_id_or_category
+            )
+            paths = [c.path.as_posix() for c in selected]
+            recomputed_hash = compute_selection_hash(
+                scan_id=scan_id, tier=tier, rule_id_or_category=rule_id_or_category, paths=paths
+            )
+            if recomputed_hash != selection_hash:
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="selection_hash_mismatch",
+                    scan_id=scan_id,
+                    tier=tier,
+                    rule_id_or_category=rule_id_or_category,
+                )
+                raise SelectionMismatchError(
+                    "selection_hash does not match a fresh re-derivation of this "
+                    "(scan_id, rule_id_or_category, tier) selection -- the candidate set "
+                    "changed since preview_apply ran (a manual apply/restore, a background "
+                    "purge, or files changing on disk), or the hash was tampered with. Refusing "
+                    "to delete anything. Call preview_apply() again for a current "
+                    "selection_hash."
+                )
+
             log_mcp_action(
-                "mcp.delete_refused",
+                "mcp.delete_executing",
                 client_id=client_id,
                 request_id=request_id,
-                reason="stale_scan_id",
                 scan_id=scan_id,
                 tier=tier,
                 rule_id_or_category=rule_id_or_category,
+                item_count=len(selected),
             )
-            raise StaleScanError(
-                f"scan_id {scan_id!r} does not match the current scan "
-                f"({service.scan_id_for_state(state)}) -- the index has changed since this "
-                "selection was previewed. Refusing to delete anything. Call scan_status() for "
-                "the current scan_id, then preview_apply() again for a fresh selection_hash."
-            )
-
-        selected = service.select_candidates_for_selector(
-            state, tier=tier, rule_id_or_category=rule_id_or_category
-        )
-        paths = [c.path.as_posix() for c in selected]
-        recomputed_hash = compute_selection_hash(
-            scan_id=scan_id, tier=tier, rule_id_or_category=rule_id_or_category, paths=paths
-        )
-        if recomputed_hash != selection_hash:
+            response = service.mcp_execute_delete(state, selected)
             log_mcp_action(
-                "mcp.delete_refused",
+                "mcp.delete_executed",
                 client_id=client_id,
                 request_id=request_id,
-                reason="selection_hash_mismatch",
-                scan_id=scan_id,
-                tier=tier,
-                rule_id_or_category=rule_id_or_category,
+                batch_id=response.batch_id,
+                files_succeeded=response.files_succeeded,
+                files_failed=response.files_failed,
+                bytes_freed=response.bytes_freed,
             )
-            raise SelectionMismatchError(
-                "selection_hash does not match a fresh re-derivation of this "
-                "(scan_id, rule_id_or_category, tier) selection -- the candidate set changed "
-                "since preview_apply ran (a manual apply/restore, a background purge, or files "
-                "changing on disk), or the hash was tampered with. Refusing to delete anything. "
-                "Call preview_apply() again for a current selection_hash."
+            return DeleteResult(
+                batch_id=response.batch_id,
+                files_processed=response.files_processed,
+                files_succeeded=response.files_succeeded,
+                files_failed=response.files_failed,
+                bytes_freed=response.bytes_freed,
             )
-
-        log_mcp_action(
-            "mcp.delete_executing",
-            client_id=client_id,
-            request_id=request_id,
-            scan_id=scan_id,
-            tier=tier,
-            rule_id_or_category=rule_id_or_category,
-            item_count=len(selected),
-        )
-        response = service.mcp_execute_delete(state, selected)
-        log_mcp_action(
-            "mcp.delete_executed",
-            client_id=client_id,
-            request_id=request_id,
-            batch_id=response.batch_id,
-            files_succeeded=response.files_succeeded,
-            files_failed=response.files_failed,
-            bytes_freed=response.bytes_freed,
-        )
-        return DeleteResult(
-            batch_id=response.batch_id,
-            files_processed=response.files_processed,
-            files_succeeded=response.files_succeeded,
-            files_failed=response.files_failed,
-            bytes_freed=response.bytes_freed,
-        )
+        finally:
+            # Released unconditionally -- a refusal (stale scan, hash mismatch) or a real
+            # exception from mcp_execute_delete must never leave this slot permanently claimed,
+            # which would wedge every future delete() call on this process.
+            with state.lock:
+                state.mcp_delete_in_progress = False
 
     return mcp
 

@@ -12,6 +12,7 @@ from reclaim.api import service
 from reclaim.api.state import AppState
 from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig
 from reclaim.mcp.selection import (
+    ConcurrentDeleteError,
     SelectionMismatchError,
     StaleScanError,
     compute_selection_hash,
@@ -263,6 +264,126 @@ async def test_full_workflow_scan_list_preview_delete_actually_quarantines(
     assert not paths["node_modules_dir"].exists()
     assert paths["kept_file"].exists()  # negative control: untouched
     assert any((tmp_path / "vault").rglob("index.js"))  # landed in the real vault
+
+
+def test_concurrent_delete_calls_for_the_identical_selection_do_not_both_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for the concurrency gap found by adversarial re-verification of PR #39:
+    two `delete()` calls firing concurrently with the IDENTICAL valid `(scan_id,
+    rule_id_or_category, tier, selection_hash)` must not both pass through to `apply_batch`.
+    Before the `AppState.mcp_delete_in_progress` fix, the scan index doesn't reflect the first
+    call's real file move, so the second call's fresh re-derivation still matched the same
+    `selection_hash` and both proceeded -- the second one failed at the filesystem level (the
+    path was already gone) but the tool call itself still returned `isError=False,
+    files_succeeded=0`, a misleading "the call succeeded" shape on a call that deleted nothing.
+
+    Deliberately NOT driven through `create_connected_server_and_client_session` /
+    `asyncio.gather()`: verified directly against this project's pinned `mcp==1.29.0` that a
+    sync tool function is called with a plain, unthreaded `fn(**arguments)`
+    (`mcp.server.fastmcp.utilities.func_metadata.FuncMetadata.call_fn_with_arg_validation`) --
+    with no `await` boundary inside it, one sync tool call fully monopolizes the single asyncio
+    event loop until it returns, so two tool calls dispatched via `asyncio.gather` (over one
+    session or two) can never genuinely interleave their execution in this SDK's current
+    architecture, no matter how they're scheduled. `AppState.lock` is a real `threading.Lock`
+    (see its own docstring) built for genuine OS-thread races, so this test drives the actual
+    concern directly: two real `threading.Thread`s calling the registered `delete` tool's raw
+    function (`FastMCP._tool_manager.get_tool("delete").fn`) concurrently, with
+    `service.mcp_execute_delete` patched to sleep briefly so the first thread is guaranteed to
+    still hold `mcp_delete_in_progress=True` when the second thread's entry check runs --
+    deterministic, not dependent on real scheduling luck."""
+    import threading
+    import time as time_module
+
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    service.run_scan(state, [root], time.time())
+    scan_id = service.scan_id_for_state(state)
+
+    selected = service.select_candidates_for_selector(
+        state, tier="A", rule_id_or_category="dev_artifact_node_modules"
+    )
+    assert [c.path for c in selected] == [paths["node_modules_dir"]]
+    selection_hash = compute_selection_hash(
+        scan_id=scan_id,
+        tier="A",
+        rule_id_or_category="dev_artifact_node_modules",
+        paths=[c.path.as_posix() for c in selected],
+    )
+
+    real_mcp_execute_delete = service.mcp_execute_delete
+
+    def _slow_mcp_execute_delete(*args: object, **kwargs: object) -> object:
+        # Runs while this thread already holds `mcp_delete_in_progress=True` (set by `delete()`
+        # before it ever reaches `service.mcp_execute_delete`) -- sleeping here, not before the
+        # flag is claimed, is what guarantees the second thread's entry check observes it.
+        time_module.sleep(0.3)
+        return real_mcp_execute_delete(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(service, "mcp_execute_delete", _slow_mcp_execute_delete)
+
+    server = build_mcp_server(state)
+    tool = server._tool_manager.get_tool("delete")
+    assert tool is not None
+    delete_fn = tool.fn
+
+    class _FakeContext:
+        """Minimal stand-in for `mcp.server.fastmcp.Context` -- only `client_id`/`request_id`
+        are read (via `_client_id`/`_request_id`), and those are ordinary properties that
+        require a live request context on a real `Context`, which doesn't exist when calling
+        the raw function directly like this."""
+
+        client_id = None
+        request_id = "concurrency-test"
+
+    results: list[object] = [None, None]
+    errors: list[BaseException | None] = [None, None]
+
+    def _call_delete(slot: int) -> None:
+        try:
+            results[slot] = delete_fn(
+                scan_id=scan_id,
+                rule_id_or_category="dev_artifact_node_modules",
+                tier="A",
+                selection_hash=selection_hash,
+                ctx=_FakeContext(),
+            )
+        except BaseException as exc:
+            errors[slot] = exc
+
+    first_thread = threading.Thread(target=_call_delete, args=(0,))
+    second_thread = threading.Thread(target=_call_delete, args=(1,))
+    first_thread.start()
+    # A small head start so the first thread deterministically wins the race to claim
+    # `mcp_delete_in_progress` before the second thread's own entry check runs -- the outcome
+    # being tested (exactly one success, one clear refusal) doesn't depend on WHICH thread wins,
+    # only that they don't both proceed; a head start just removes any ambiguity about which
+    # thread this test expects to be the "first" one below.
+    time_module.sleep(0.05)
+    second_thread.start()
+    first_thread.join()
+    second_thread.join()
+
+    assert errors[0] is None, errors[0]
+    succeeded = results[0]
+    refusal = errors[1]
+
+    # The first call actually executed the delete; the second was refused outright, with a
+    # typed error naming exactly why -- never both racing into apply_batch, and never a refused
+    # call disguised as a 0-success "success".
+    assert results[1] is None, "the second call must not have returned a result at all"
+    assert refusal is not None, "the second call must have been refused, not silently allowed"
+    assert isinstance(refusal, ConcurrentDeleteError), refusal
+    assert "in progress" in str(refusal).lower()
+
+    assert succeeded is not None
+    assert succeeded.files_succeeded == 1  # type: ignore[attr-defined]
+    assert succeeded.files_failed == 0  # type: ignore[attr-defined]
+
+    # Real, disk-mutating proof: quarantined exactly once, never attempted twice.
+    assert not paths["node_modules_dir"].exists()
+    assert len(list((tmp_path / "vault").rglob("index.js"))) == 1
 
 
 async def test_delete_refuses_a_stale_scan_id(tmp_path: Path) -> None:
