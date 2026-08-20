@@ -487,22 +487,39 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
 # --- Summary / category cards -------------------------------------------------------------
 
 
+def _effective_reclaimable_bytes(candidate: Candidate) -> int:
+    """The real byte count a user gets back if `candidate` is deleted -- hardlink-aware
+    `reclaimable_bytes` (ADR-0006, populated today only for `exact_duplicate`) when set, else
+    the naive logical `size_bytes` (every other category, where the two are equal in practice
+    since only `duplicates` can share blocks with a surviving copy). Never sum `size_bytes`
+    directly over a category that can contain hardlinked duplicates -- see
+    docs/AUDIT-2026-08.md's P1 finding this fixes. Same pattern `list_duplicate_cluster_review`
+    below already used correctly one tab over; every top-line byte total in this module that can
+    include the `duplicates` category now goes through this one function instead of each
+    re-deriving the same ternary."""
+    if candidate.reclaimable_bytes is not None:
+        return candidate.reclaimable_bytes
+    return candidate.size_bytes
+
+
 def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
     grouped: dict[tuple[str, Tier], list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         grouped[(candidate.category_group, candidate.tier)].append(candidate)
 
-    cards = [
-        CategoryCardOut(
-            category_group=group,
-            category_label=category_label(group),
-            tier=tier,
-            file_count=len(items),
-            total_bytes=sum(item.size_bytes for item in items),
-            total_bytes_human=format_bytes(sum(item.size_bytes for item in items)),
+    cards = []
+    for (group, tier), items in grouped.items():
+        total_bytes = sum(_effective_reclaimable_bytes(item) for item in items)
+        cards.append(
+            CategoryCardOut(
+                category_group=group,
+                category_label=category_label(group),
+                tier=tier,
+                file_count=len(items),
+                total_bytes=total_bytes,
+                total_bytes_human=format_bytes(total_bytes),
+            )
         )
-        for (group, tier), items in grouped.items()
-    ]
     cards.sort(key=lambda c: c.total_bytes, reverse=True)
     return cards
 
@@ -539,9 +556,9 @@ def build_summary(state: AppState) -> SummaryResponse:
         has_scan=True,
         total_indexed_bytes=total_indexed_bytes,
         total_indexed_human=format_bytes(total_indexed_bytes),
-        tier_a_bytes=sum(c.size_bytes for c in tier_a),
+        tier_a_bytes=sum(_effective_reclaimable_bytes(c) for c in tier_a),
         tier_a_count=len(tier_a),
-        tier_b_bytes=sum(c.size_bytes for c in tier_b),
+        tier_b_bytes=sum(_effective_reclaimable_bytes(c) for c in tier_b),
         tier_b_count=len(tier_b),
         categories=_category_cards(candidates),
         skipped_unreadable_count=skipped_unreadable_count,
@@ -702,7 +719,7 @@ def list_candidates(
         filtered = [c for c in filtered if c.category_group == category_group]
 
     out = [_candidate_out(c, cluster_by_path.get(c.path)) for c in filtered]
-    total_bytes = sum(c.size_bytes for c in filtered)
+    total_bytes = sum(_effective_reclaimable_bytes(c) for c in filtered)
     return CandidatesResponse(
         has_scan=True,
         candidates=out,
@@ -827,10 +844,7 @@ def list_duplicate_cluster_review(
             continue
         member_candidates = [candidate_by_path[d.path] for d in surviving_duplicates]
         display_cluster = _dataclass_replace(cluster, duplicates=surviving_duplicates)
-        reclaimable_total = sum(
-            c.reclaimable_bytes if c.reclaimable_bytes is not None else c.size_bytes
-            for c in member_candidates
-        )
+        reclaimable_total = sum(_effective_reclaimable_bytes(c) for c in member_candidates)
         rows.append(
             DuplicateClusterReviewOut(
                 cluster=_duplicate_cluster_out(display_cluster),
