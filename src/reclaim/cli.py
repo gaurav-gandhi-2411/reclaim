@@ -348,6 +348,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "zip-slip-equivalent guard 'reclaim undo' already applies).",
     )
 
+    check_disk_space_parser = subparsers.add_parser(
+        "check-disk-space",
+        help="Best-effort background check: fires a native Windows toast if disk free space "
+        "has crossed the configured threshold (config.toml's [notifications] section, default "
+        "OFF). Intended to run from the low-frequency Task Scheduler entry the installer "
+        "registers (packaging/reclaim.iss), not interactively -- never raises, always prints a "
+        "one-line status and exits 0 once config itself loads.",
+    )
+    check_disk_space_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults -- "
+        "notifications disabled -- if missing).",
+    )
+    check_disk_space_parser.add_argument(
+        "--state",
+        type=Path,
+        default=None,
+        help="Override the notification debounce/snooze state path (default: "
+        "data/notification_state.json).",
+    )
+    check_disk_space_parser.add_argument(
+        "--apply-snooze",
+        action="store_true",
+        help="Apply a snooze instead of running a normal check -- invoked by the toast's "
+        "Snooze action button via the registered 'reclaim-notify:' protocol handler (see "
+        "packaging/reclaim.iss), never by a user directly. Suppresses checks for "
+        "config.toml's [notifications] snooze_days (default 7), then exits; fires no toast.",
+    )
+
     serve_parser = subparsers.add_parser(
         "serve",
         help="Run the localhost-only FastAPI dashboard (scan/review/apply/undo in a browser). "
@@ -802,6 +833,42 @@ def _run_apply(args: argparse.Namespace) -> int:
     return 0 if report.files_failed == 0 else 1
 
 
+def _run_check_disk_space(args: argparse.Namespace) -> int:
+    # Imports deferred to inside the function, same reasoning as `_run_serve`'s deferred uvicorn
+    # import: `reclaim.notifications` is only needed for this one subcommand, so `scan`/`apply`/
+    # `undo`/etc. never pay its (small, but non-zero) import cost.
+    from reclaim.notifications import (
+        DEFAULT_STATE_PATH,
+        apply_snooze,
+        check_disk_space,
+        record_notified,
+        send_disk_space_toast,
+    )
+
+    config_path: Path = args.config
+    config = _load_config_or_none("check-disk-space", config_path)
+    if config is None:
+        return 1
+    state_path = args.state if args.state is not None else DEFAULT_STATE_PATH
+
+    if args.apply_snooze:
+        apply_snooze(state_path, snooze_days=config.notifications.snooze_days)
+        print(  # noqa: T201
+            f"reclaim check-disk-space: snoozed for {config.notifications.snooze_days} day(s)"
+        )
+        return 0
+
+    result = check_disk_space(config.notifications, state_path=state_path)
+    if result.should_notify:
+        send_disk_space_toast(result)
+        record_notified(state_path)
+    print(  # noqa: T201
+        f"reclaim check-disk-space: status={result.status} reason={result.reason} "
+        f"percent_used={result.percent_used} threshold={result.threshold_percent}"
+    )
+    return 0
+
+
 def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     try:
         assert_not_elevated()
@@ -1092,6 +1159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_mode(args)
     if args.command == "recover":
         return _run_recover(args)
+    if args.command == "check-disk-space":
+        return _run_check_disk_space(args)
     if args.command == "serve":
         return _run_serve(args)
     if args.command == "dashboard":
