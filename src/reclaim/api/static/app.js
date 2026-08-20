@@ -243,6 +243,7 @@ const VIEW_LOADERS = {
   review: loadReviewQueue,
   "ai-suggestions": loadAISuggestions,
   quarantine: loadQuarantineView,
+  settings: loadSettingsView,
 };
 
 function initTabs() {
@@ -560,7 +561,53 @@ function renderCategoryCards(categories) {
       <div class="rc-meta">${card.file_count.toLocaleString()} item(s) exactly measured</div>
       <span class="rc-badge" data-tier="${card.tier}">Tier ${card.tier}</span>
     `;
+    // R2: recommend-only, never a delete action -- see reclaim.ai.category_explainer's module
+    // docstring. Rendered per-card rather than fetched eagerly for every category on page load,
+    // so a user with no Anthropic key configured (the common case) never pays an unnecessary
+    // request for something they haven't asked for.
+    const explainBtn = document.createElement("button");
+    explainBtn.type = "button";
+    explainBtn.className = "rc-btn rc-btn-secondary rc-explain-btn";
+    explainBtn.textContent = "Explain this category";
+    const resultEl = document.createElement("p");
+    resultEl.className = "rc-category-explanation";
+    resultEl.hidden = true;
+    explainBtn.addEventListener("click", () =>
+      explainCategory(card.category_group, explainBtn, resultEl)
+    );
+    el.appendChild(explainBtn);
+    el.appendChild(resultEl);
     grid.appendChild(el);
+  }
+}
+
+// R2: fetches and renders a per-category prose explanation. `resultEl.textContent` only (never
+// innerHTML) -- matches renderClusterTable/renderCategoryCards' existing path-rendering
+// discipline for anything derived from server data, even though `explanation` here is prose
+// text, not a raw filesystem path (defense in depth, same convention applied uniformly).
+async function explainCategory(categoryGroup, buttonEl, resultEl) {
+  buttonEl.disabled = true;
+  resultEl.hidden = false;
+  resultEl.dataset.tone = "muted";
+  resultEl.textContent = "Asking Anthropic…";
+  try {
+    const data = await api(`/api/ai/category-explanation/${encodeURIComponent(categoryGroup)}`);
+    if (data.status === "ok") {
+      resultEl.dataset.tone = "";
+      resultEl.textContent = data.explanation;
+      buttonEl.textContent = "Refresh explanation";
+    } else if (data.status === "unavailable") {
+      resultEl.dataset.tone = "muted";
+      resultEl.textContent = data.message;
+    } else {
+      resultEl.dataset.tone = "error";
+      resultEl.textContent = data.message ?? "Could not generate an explanation.";
+    }
+  } catch (err) {
+    resultEl.dataset.tone = "error";
+    resultEl.textContent = `Could not generate an explanation: ${err.message}`;
+  } finally {
+    buttonEl.disabled = false;
   }
 }
 
@@ -2185,6 +2232,96 @@ async function initUpdateCheck() {
   }
 }
 
+// --- Settings: R2's Anthropic API key management ------------------------------------------------
+//
+// The key never travels back from the server in any response — only a `configured: true/false`
+// boolean (see AnthropicKeyStatusResponse's docstring). `anthropic-key-input` is cleared after a
+// successful save so the plaintext key doesn't linger visible in the DOM/autofill longer than
+// necessary.
+
+async function loadSettingsView() {
+  const statusEl = document.getElementById("anthropic-key-current-status");
+  try {
+    const data = await api("/api/settings/anthropic-key");
+    renderAnthropicKeyStatus(data.configured);
+  } catch (err) {
+    statusEl.textContent = `Could not check key status: ${err.message}`;
+  }
+}
+
+function renderAnthropicKeyStatus(configured) {
+  const statusEl = document.getElementById("anthropic-key-current-status");
+  statusEl.dataset.tone = configured ? "success" : "";
+  statusEl.textContent = configured
+    ? "A key is configured. “Explain this category” is available on Overview."
+    : "No key configured yet — AI category explanations are unavailable until you add one.";
+}
+
+function initSettings() {
+  const form = document.getElementById("anthropic-key-form");
+  const input = document.getElementById("anthropic-key-input");
+  const testBtn = document.getElementById("anthropic-key-test-btn");
+  const removeBtn = document.getElementById("anthropic-key-remove-btn");
+  const testResultEl = document.getElementById("anthropic-key-test-result");
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiKey = input.value.trim();
+    if (!apiKey) return;
+    const saveBtn = document.getElementById("anthropic-key-save-btn");
+    saveBtn.disabled = true;
+    try {
+      const data = await api("/api/settings/anthropic-key", {
+        method: "POST",
+        body: JSON.stringify({ api_key: apiKey }),
+      });
+      input.value = ""; // never leave the plaintext key sitting in the input after a save
+      renderAnthropicKeyStatus(data.configured);
+      testResultEl.hidden = true;
+    } catch (err) {
+      testResultEl.hidden = false;
+      testResultEl.textContent = `Could not save key: ${err.message}`;
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+
+  testBtn.addEventListener("click", async () => {
+    testBtn.disabled = true;
+    testResultEl.hidden = false;
+    testResultEl.textContent = "Testing key…";
+    try {
+      const apiKey = input.value.trim();
+      // Empty body -> tests the already-stored key (TestAnthropicKeyRequest.api_key is
+      // optional); a non-empty input tests that candidate value before it's ever saved.
+      const body = apiKey ? { api_key: apiKey } : {};
+      const data = await api("/api/settings/anthropic-key/test", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      testResultEl.textContent = data.message;
+    } catch (err) {
+      testResultEl.textContent = `Could not test key: ${err.message}`;
+    } finally {
+      testBtn.disabled = false;
+    }
+  });
+
+  removeBtn.addEventListener("click", async () => {
+    removeBtn.disabled = true;
+    try {
+      const data = await api("/api/settings/anthropic-key", { method: "DELETE" });
+      renderAnthropicKeyStatus(data.configured);
+      testResultEl.hidden = true;
+    } catch (err) {
+      testResultEl.hidden = false;
+      testResultEl.textContent = `Could not remove key: ${err.message}`;
+    } finally {
+      removeBtn.disabled = false;
+    }
+  });
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
@@ -2207,6 +2344,7 @@ function init() {
   initFirstRun();
   initRecoveryBanner();
   initUpdateCheck();
+  initSettings();
   activateTab("overview");
 }
 
