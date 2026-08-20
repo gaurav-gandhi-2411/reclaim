@@ -71,6 +71,38 @@ def test_ai_package_never_imports_the_executor_or_send2trash() -> None:
     )
 
 
+# --- 1b. R2's Anthropic-backed explainer: covered by the same scan, plus a negative test -------
+
+
+def test_category_explainer_module_is_covered_by_the_ai_package_scan() -> None:
+    """Sanity check that `category_explainer.py` (R2's LLM explainer) is actually visited by
+    the recursive `rglob` scan in `test_ai_package_never_imports_the_executor_or_send2trash`
+    above -- that scan is already recursive so no code change was needed for coverage, but this
+    proves the file is really being scanned, not silently skipped by e.g. a pattern mismatch."""
+    py_files = {p.name for p in _AI_PACKAGE_ROOT.rglob("*.py")}
+    assert "category_explainer.py" in py_files
+
+
+def test_ai_safety_gate_scan_catches_a_deliberately_broken_category_explainer_copy() -> None:
+    """Negative test proving the AST-scan mechanism has teeth for this specific new module: a
+    hand-crafted source string shaped like `category_explainer.py`'s import block, with
+    `import reclaim.executor` deliberately injected, must be flagged by the exact same
+    `_imported_module_names` function the real scan (test 1 above) uses -- proving the guard
+    would actually catch a real regression here, not just that the file currently happens to be
+    clean (same negative-test discipline other safety-critical tracks in this repo use)."""
+    poisoned_source = (
+        "from __future__ import annotations\n"
+        "import hashlib\n"
+        "import json\n"
+        "import reclaim.executor  # deliberately injected for this negative test\n"
+        "from dataclasses import dataclass\n"
+    )
+    names = _imported_module_names(poisoned_source)
+    forbidden = {"reclaim.executor", "send2trash"}
+    hit = {name for name in names if name in forbidden or name.startswith("send2trash.")}
+    assert hit == {"reclaim.executor"}
+
+
 # --- 2. Runtime: an AI cluster member cannot be smuggled into apply_batch ---------------------
 
 
