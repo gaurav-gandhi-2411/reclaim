@@ -58,3 +58,17 @@ class SelectionMismatchError(RuntimeError):
     manual apply/restore, a background purge, or files changing on disk) or the hash itself was
     tampered with — either way, this is a hard refusal: `delete` executes nothing when this is
     raised, never a partial or best-effort selection."""
+
+
+class ConcurrentDeleteError(RuntimeError):
+    """Raised by `reclaim.mcp.server.delete` when another `delete` call is already in-flight on
+    this process (`AppState.mcp_delete_in_progress`, checked-and-set under `AppState.lock` --
+    same idiom `POST /api/apply` already uses for `apply_status`). Without this guard, two
+    concurrent `delete` calls for the identical selection can both pass hash validation and both
+    reach `apply_batch`: the scan index doesn't reflect the first call's file move, so the
+    second's fresh re-derivation still matches the same `selection_hash` -- it then fails at the
+    filesystem level (the path is already gone) with `files_succeeded=0`, but the tool call
+    itself still returns `isError=False`, an easy-to-miss "the call succeeded" shape on a call
+    that deleted nothing. This error refuses the SECOND call immediately, before it ever
+    re-derives candidates or computes a hash -- an unambiguous, impossible-to-miss refusal
+    instead of a technically-honest-but-easy-to-misread empty success."""
