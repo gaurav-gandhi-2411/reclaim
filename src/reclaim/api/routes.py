@@ -24,9 +24,11 @@ from reclaim.api.schemas import (
     RestoreStatusOut,
     ScanRequest,
     ScanStatusOut,
+    SettingsResponse,
     SuggestedScanRootsResponse,
     SummaryResponse,
     TreemapResponse,
+    UpdateCategorySettingRequest,
     UpdateCheckResponse,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
@@ -375,6 +377,26 @@ def first_run_status(request: Request) -> FirstRunStatusResponse:
 @router.post("/first-run/acknowledge", response_model=FirstRunStatusResponse)
 def first_run_acknowledge(request: Request) -> FirstRunStatusResponse:
     return service.acknowledge_first_run_screen(get_state(request))
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings -----------------------------------------
+
+
+@router.get("/settings/categories", response_model=SettingsResponse)
+def settings_categories(request: Request) -> SettingsResponse:
+    return service.settings_categories(get_state(request))
+
+
+@router.post("/settings/categories/{category}", response_model=SettingsResponse)
+def update_category_setting(
+    category: str, payload: UpdateCategorySettingRequest, request: Request
+) -> SettingsResponse:
+    try:
+        return service.update_category_setting(
+            get_state(request), category, enabled=payload.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------

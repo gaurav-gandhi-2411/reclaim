@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import msvcrt
 import os
 import shutil
@@ -180,12 +181,19 @@ class RestoreIntegrityError(RuntimeError):
 ManifestPhase = Literal["intent", "done", "aborted", "needs_review"]
 ManifestOperation = Literal["apply", "restore", "purge"]
 
-# ADR-0027 (schema versioning): the manifest shape as of introducing `schema_version` itself —
-# every field this class has today, including ADR-0026's `phase`/`intent_id`/`operation` (added
-# before versioning existed, so there was never a "version 0" of the format to distinguish from).
-# Bump this whenever a field is added/removed/changed and update `read_manifest_entries` if a
-# migration step is ever needed.
-QUARANTINE_MANIFEST_SCHEMA_VERSION = 1
+# ADR-0027 (schema versioning), corrected 2026-08-20 audit P0-4: version 1 was originally defined
+# as "every field this class has today, including ADR-0026's `phase`/`intent_id`/`operation`" —
+# which was meant to include the still-older ADR-0001 fields (`is_dir`, `rebuild_instruction`,
+# `retention_days`) too, but those three were left *required* with no default, so a manifest line
+# genuinely older than all of them (predating ADR-0001, not just ADR-0026/ADR-0027) hard-crashed
+# `read_manifest_entries` instead of parsing as "version 1" the way the ADR promised. Version 2
+# is the fix: those three fields now have real defaults (see the class body), so a pre-ADR-0001
+# line finally parses the way ADR-0027 always intended pre-versioning data to. Bump this whenever
+# a field is added/removed/changed and update `read_manifest_entries` if a migration step is ever
+# needed; the one existing fresh-construction call site (`apply_batch`'s intent-entry) passes this
+# constant explicitly rather than relying on the field's own default, precisely so the two can
+# diverge (see `QuarantineManifestEntry.schema_version`'s own comment for why).
+QUARANTINE_MANIFEST_SCHEMA_VERSION = 2
 
 
 class QuarantineManifestEntry(BaseModel):
@@ -219,6 +227,11 @@ class QuarantineManifestEntry(BaseModel):
     `extra="ignore"` would discard it right there, a real data-loss bug distinct from the crash
     this ADR primarily fixes. `read_manifest_entries` logs (never raises) when it sees a
     `schema_version` newer than `QUARANTINE_MANIFEST_SCHEMA_VERSION`.
+
+    Schema v2 (audit P0-4, 2026-08-20): the backward direction — an entry OLDER than this code,
+    missing `is_dir`/`rebuild_instruction`/`retention_days` — is handled the same way: real
+    per-field defaults (see each field's own comment for why the chosen default is safe) plus an
+    explicit, loggable migration event from `read_manifest_entries`, never a silent default alone.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -229,19 +242,45 @@ class QuarantineManifestEntry(BaseModel):
     # ADR-0001: `purge_expired` needs to know whether a purge target is a file or a directory
     # (`Path.unlink()` vs `shutil.rmtree()`) without re-stat'ing `original_path`, which by the
     # time an entry is purge-eligible no longer exists.
-    is_dir: bool
+    #
+    # Schema v2 (audit P0-4, 2026-08-20): defaulted to `False` for a manifest line written before
+    # this field existed. This is a deliberate fail-*safe*, not merely a guess: `purge_expired`
+    # (`purge.py`) branches on this bit to choose `unlink()` vs `rmtree()` on the *vault* copy. A
+    # wrong `True`-should-be-`False` default just means an already-empty rmtree call on a file,
+    # which errors loudly; a wrong `False`-should-be-`True` default means `unlink()` is attempted
+    # on a real directory, which Windows also refuses with a loud `OSError` — caught, logged as
+    # `purge.item_failed`, the entry stays un-purged for a human to look at again next run. Neither
+    # wrong-default path silently deletes the wrong thing or corrupts data; both fail loud and
+    # non-destructively, which is why a static default (rather than re-deriving it from the vault
+    # path's live `is_dir()`, itself unreliable once an entry has since been restored/purged) is
+    # an acceptable, simple choice here — see `read_manifest_entries` for the explicit, per-entry
+    # migration log this default triggers.
+    is_dir: bool = False
     category: str
     category_group: str
     rationale: str
     # ADR-0001: the only "recovery" a direct-deleted (or later-purged) item has — recorded for
     # every entry, not just direct-delete ones, so the manifest stays one uniform shape.
-    rebuild_instruction: str | None
+    #
+    # Schema v2 (audit P0-4): defaulted to `None` for a pre-existing line — this is the literal
+    # truth, not a guess: no rebuild instruction was ever recorded for this entry, and `None` is
+    # exactly what a `direct_delete` entry already uses today to mean "no instruction applies."
+    # Consumers (`cli.py`, `app.js`) already treat `None` as "nothing to show," so this default is
+    # inert, never a fabricated recovery instruction presented as if it were real.
+    rebuild_instruction: str | None = None
     tier: Tier
     method: QuarantineMethod
     vault_path: Path | None
     # ADR-0001: resolved from `Candidate.retention_days` at quarantine time. `None` for a
     # `direct_delete` entry (there is no retention window; nothing was vaulted).
-    retention_days: int | None
+    #
+    # Schema v2 (audit P0-4): defaulted to `None` for a pre-existing line. Verified this is inert,
+    # not silently wrong: no code path reads `QuarantineManifestEntry.retention_days` after
+    # quarantine time (grep-confirmed) — only `retention_until` (a separate, always-populated
+    # field even on old entries, since the pre-this-field code populated it from a project-wide
+    # 30-day default) governs purge eligibility. `retention_days` on an already-written entry is
+    # purely informational.
+    retention_days: int | None = None
     quarantined_at: float
     # ADR-0001: `None` for a `direct_delete` entry (no retention window applies) — was
     # previously always populated from a single project-wide 30-day default; now derived
@@ -260,10 +299,22 @@ class QuarantineManifestEntry(BaseModel):
     intent_id: str | None = None
     operation: ManifestOperation = "apply"
     # ADR-0027: absent (pre-versioning) entries validate with this field defaulting to `1` —
-    # the literal truth, not an approximation, since `1` is the version every existing field on
-    # this class belongs to. A future field addition bumps this default and `read_manifest_entries`
-    # warns (never raises) on any entry whose recorded version is newer than the code knows.
-    schema_version: int = Field(default=QUARANTINE_MANIFEST_SCHEMA_VERSION)
+    # the literal truth, not an approximation, since `1` is the version every field ADR-0027 knew
+    # about at the time belonged to.
+    #
+    # Schema v2 correction (audit P0-4): this default is deliberately the literal `1`, NOT
+    # `QUARANTINE_MANIFEST_SCHEMA_VERSION` (now `2`) — the two must be allowed to diverge. "No
+    # `schema_version` key in the source data" is a fact about the *data* (it predates versioning,
+    # so `1` is its honest historical version), while `QUARANTINE_MANIFEST_SCHEMA_VERSION` is a
+    # fact about *this code's* current known version. Before this correction the two constants
+    # were the same value, which accidentally made this field's default double as "current version
+    # for a freshly-constructed entry" too — that stops being safe the first time the constant
+    # is ever bumped, so `apply_batch`'s one fresh-construction call site now passes
+    # `schema_version=QUARANTINE_MANIFEST_SCHEMA_VERSION` explicitly instead of relying on this
+    # default. A future field addition bumps `QUARANTINE_MANIFEST_SCHEMA_VERSION` (not this
+    # literal) and `read_manifest_entries` warns (never raises) on any entry whose recorded
+    # version is newer than the code knows.
+    schema_version: int = Field(default=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,6 +764,19 @@ def _append_and_sync(fh: TextIO, entry: QuarantineManifestEntry) -> None:
     os.fsync(fh.fileno())
 
 
+# Schema v2 (audit P0-4): the fields that were, in practice, required-with-no-default from
+# `QuarantineManifestEntry`'s introduction until this fix — a manifest line missing any of these
+# predates all of ADR-0001/0026/0027 and is the oldest possible shape this codebase can still
+# encounter on a real machine (`packaging/reclaim.iss` preserves `data/` across upgrades). Kept as
+# a module-level tuple (not inlined in `read_manifest_entries`) so it's the one place to update if
+# a future schema bump ever adds another field to this same "backward-defaulted" category.
+_SCHEMA_V2_BACKWARD_DEFAULTED_FIELDS: tuple[str, ...] = (
+    "is_dir",
+    "rebuild_instruction",
+    "retention_days",
+)
+
+
 def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
     """Public: reused by `purge.py` (via `fold_latest_manifest_entries`) and the API layer.
 
@@ -721,17 +785,43 @@ def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
     round-trips if the entry is later re-serialized); this additionally logs a warning (once per
     call, listing every newer version actually seen) so a genuinely newer schema is visible in
     logs rather than silently absorbed.
+
+    Schema v2 (audit P0-4): the mirror-image direction — an entry OLDER than this code, missing
+    one or more of `_SCHEMA_V2_BACKWARD_DEFAULTED_FIELDS` — also never raises (the fields now have
+    real defaults; see `QuarantineManifestEntry`), but unlike the pydantic-level default alone,
+    this is explicit and loggable: each such entry gets its own `structlog.info` line naming which
+    fields were missing and what they were defaulted to, so a support/debug session can see
+    exactly which manifest lines were migrated and from what, rather than the defaulting happening
+    silently. This is deliberately `.info`, not `.warning` — a routine, expected, non-destructive
+    migration on read, not an anomaly.
     """
     if not manifest_path.exists():
         return []
     entries: list[QuarantineManifestEntry] = []
     newer_versions: set[int] = set()
+    migrated_count = 0
     with manifest_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:
                 continue
+            raw = json.loads(stripped)
+            missing_fields = [
+                field for field in _SCHEMA_V2_BACKWARD_DEFAULTED_FIELDS if field not in raw
+            ]
             entry = QuarantineManifestEntry.model_validate_json(stripped)
+            if missing_fields:
+                migrated_count += 1
+                logger.info(
+                    "executor.manifest_entry_migrated_from_older_schema",
+                    manifest_path=str(manifest_path),
+                    batch_id=entry.batch_id,
+                    original_path=str(entry.original_path),
+                    recorded_schema_version=entry.schema_version,
+                    current_schema_version=QUARANTINE_MANIFEST_SCHEMA_VERSION,
+                    missing_fields=missing_fields,
+                    defaults_applied={field: getattr(entry, field) for field in missing_fields},
+                )
             if entry.schema_version > QUARANTINE_MANIFEST_SCHEMA_VERSION:
                 newer_versions.add(entry.schema_version)
             entries.append(entry)
@@ -741,6 +831,13 @@ def read_manifest_entries(manifest_path: Path) -> list[QuarantineManifestEntry]:
             manifest_path=str(manifest_path),
             known_schema_version=QUARANTINE_MANIFEST_SCHEMA_VERSION,
             encountered_schema_versions=sorted(newer_versions),
+        )
+    if migrated_count:
+        logger.info(
+            "executor.manifest_migration_summary",
+            manifest_path=str(manifest_path),
+            migrated_entry_count=migrated_count,
+            total_entry_count=len(entries),
         )
     return entries
 
@@ -1131,6 +1228,9 @@ def apply_batch(
                 phase="intent",
                 intent_id=uuid.uuid4().hex,
                 operation="apply",
+                # Explicit, not relying on the field's own default (see the field's comment on
+                # `QuarantineManifestEntry` for why the two must never be conflated).
+                schema_version=QUARANTINE_MANIFEST_SCHEMA_VERSION,
             )
             _append_and_sync(manifest_fh, intent_entry)
 

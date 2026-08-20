@@ -243,6 +243,7 @@ const VIEW_LOADERS = {
   review: loadReviewQueue,
   "ai-suggestions": loadAISuggestions,
   quarantine: loadQuarantineView,
+  settings: loadSettingsView,
 };
 
 function initTabs() {
@@ -465,6 +466,7 @@ async function loadOverview() {
     contentEl.hidden = false;
     renderSummaryStats(summary);
     renderSkippedUnreadableNote(summary);
+    renderInaccessibleNote(summary);
     renderCategoryCards(summary.categories);
     loadQuickClean();
   } catch (err) {
@@ -524,6 +526,35 @@ function renderSkippedUnreadableNote(summary) {
     `${summary.skipped_unreadable_count} path(s) could not be read during the last scan ` +
     "(permission denied or a real I/O error) and were skipped" +
     (sample ? `: ${sample}${more}` : ".");
+}
+
+// P0-5: persisted (survives an app restart, unlike the last-scan-only note above) accounting of
+// inaccessible directories, plus -- when the last completed scan covered a whole drive -- how
+// that compares against the OS's own real used-bytes figure for that drive.
+function renderInaccessibleNote(summary) {
+  const note = document.getElementById("inaccessible-note");
+  if (!summary.inaccessible_path_count) {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  note.dataset.tone = "warning";
+  let text =
+    `${formatFromBytes(summary.inaccessible_known_bytes)} across ` +
+    `${summary.inaccessible_path_count} path(s) were inaccessible and not counted in the totals above` +
+    (summary.inaccessible_unknown_count
+      ? ` (${summary.inaccessible_unknown_count} of those have no size estimate at all, so the ` +
+        "true gap is larger than the bytes shown here)."
+      : ".");
+  if (summary.reconciliation_volume && summary.reconciliation_delta_bytes != null) {
+    text +=
+      ` Reconciliation against ${summary.reconciliation_volume}: ` +
+      `${formatFromBytes(Math.abs(summary.reconciliation_delta_bytes))} ` +
+      `(${summary.reconciliation_delta_pct.toFixed(2)}%) ` +
+      `${summary.reconciliation_delta_bytes >= 0 ? "unaccounted for" : "over-counted"} vs. real disk usage.`;
+  }
+  note.textContent = text;
 }
 
 function formatFromBytes(bytes) {
@@ -2025,6 +2056,114 @@ async function restoreBatch(batchId) {
       onAction: loadQuarantineView,
     });
     contentEl.hidden = true;
+  }
+}
+
+// --- Settings: per-category enable/disable toggles (P0-2 fix, 2026-08 audit) -------------------
+
+async function loadSettingsView() {
+  const stateEl = document.getElementById("settings-state");
+  const contentEl = document.getElementById("settings-content");
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Loading settings…" });
+
+  try {
+    const data = await api("/api/settings/categories");
+    if (data.categories.length === 0) {
+      renderState(stateEl, "empty", {
+        title: "No categories to configure",
+        message: "This build defines no cleanup categories.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    renderSettingsCategories(data.categories);
+  } catch (err) {
+    renderState(stateEl, "error", {
+      title: "Could not load settings",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadSettingsView,
+    });
+  }
+}
+
+function renderSettingsCategories(categories) {
+  const grid = document.getElementById("settings-category-grid");
+  grid.innerHTML = "";
+  for (const category of categories) {
+    grid.appendChild(renderSettingsCard(category));
+  }
+}
+
+function renderSettingsCard(category) {
+  const card = document.createElement("article");
+  card.className = "rc-category-card rc-settings-card";
+  card.style.borderLeftColor = categoryColorVar(category.category_group);
+
+  const head = document.createElement("div");
+  head.className = "rc-settings-card-head";
+  head.innerHTML = `<h3>${category.category_label}</h3>`;
+
+  const toggleLabel = document.createElement("label");
+  toggleLabel.className = "rc-checkbox-row";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = category.enabled;
+  checkbox.setAttribute("aria-label", `Turn ${category.category_label} on or off`);
+  const toggleText = document.createElement("span");
+  toggleText.textContent = category.enabled ? "On" : "Off";
+  toggleLabel.appendChild(checkbox);
+  toggleLabel.appendChild(toggleText);
+  head.appendChild(toggleLabel);
+  card.appendChild(head);
+
+  const description = document.createElement("p");
+  description.className = "rc-meta";
+  description.textContent = category.description;
+  card.appendChild(description);
+
+  if (category.forced_off_in_safe_mode) {
+    const note = document.createElement("span");
+    note.className = "rc-badge";
+    note.dataset.tier = "B";
+    note.textContent = "No effect until you switch to Power mode";
+    card.appendChild(note);
+  }
+
+  const status = document.createElement("p");
+  status.className = "rc-settings-card-status";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  card.appendChild(status);
+
+  checkbox.addEventListener("change", () => {
+    toggleText.textContent = checkbox.checked ? "On" : "Off";
+    updateCategorySetting(category.category_group, checkbox, toggleText, status);
+  });
+
+  return card;
+}
+
+async function updateCategorySetting(group, checkbox, toggleText, statusEl) {
+  const nextEnabled = checkbox.checked;
+  checkbox.disabled = true;
+  statusEl.className = "rc-settings-card-status";
+  statusEl.textContent = "Saving…";
+  try {
+    await api(`/api/settings/categories/${encodeURIComponent(group)}`, {
+      method: "POST",
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    statusEl.textContent = "";
+  } catch (err) {
+    checkbox.checked = !nextEnabled;
+    toggleText.textContent = checkbox.checked ? "On" : "Off";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not save: ${err.message}`;
+  } finally {
+    checkbox.disabled = false;
   }
 }
 

@@ -39,6 +39,7 @@ from reclaim.mode import (
 )
 from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode, Tier
 from reclaim.purge import purge_eligible_entries, purge_expired
+from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
@@ -106,6 +107,22 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Thread pool size for the per-top-level-directory walk (default: cpu-based).",
+    )
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="Compare a fully-scanned volume's indexed total against the OS's real used-bytes "
+        "figure, surfacing how much of any gap is explained by inaccessible (ACL-denied/IO-"
+        "faulted) directories the scan could not enumerate (P0-5).",
+    )
+    reconcile_parser.add_argument(
+        "volume", type=Path, help=r"Drive root that was scanned in full (e.g. C:\)."
+    )
+    reconcile_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
     )
 
     apply_parser = subparsers.add_parser(
@@ -490,6 +507,49 @@ def _run_scan(args: argparse.Namespace) -> int:
             f"reclaim scan: skipped/unreadable (first {sample_count} of "
             f"{stats.skipped_unreadable_count}): {sample}{suffix}"
         )
+    # P0-5: what fraction of the skipped bytes above is actually known vs. genuinely unknown --
+    # printed unconditionally alongside the skip count itself so "0 skipped" and "N skipped, all
+    # of unknown size" are never conflated by a reader skimming just the first line.
+    if stats.skipped_unreadable_count:
+        print(  # noqa: T201 -- CLI output, not application logging
+            f"reclaim scan: inaccessible-path size accounting: "
+            f"{stats.inaccessible_known_bytes} bytes known (best-effort estimate), "
+            f"{stats.inaccessible_unknown_count} path(s) with no size estimate at all "
+            "-- see `reclaim reconcile` for how this compares to real disk usage."
+        )
+    return 0
+
+
+def _run_reconcile(args: argparse.Namespace) -> int:
+    if not args.db.exists():
+        print(  # noqa: T201
+            f"reclaim reconcile: no index found at {args.db} -- run `reclaim scan` first.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with ScanIndex(args.db) as index:
+            report = compute_disk_reconciliation(index, args.volume)
+    except NotAVolumeRootError as exc:
+        print(f"reclaim reconcile: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+    print(  # noqa: T201 -- CLI output, not application logging
+        f"reclaim reconcile: volume={report.volume} "
+        f"indexed_bytes={report.indexed_bytes} "
+        f"inaccessible_known_bytes={report.inaccessible_known_bytes} "
+        f"({report.inaccessible_path_count} inaccessible path(s), "
+        f"{report.inaccessible_unknown_count} with no size estimate) "
+        f"reported_total_bytes={report.reported_total_bytes} "
+        f"volume_used_bytes={report.volume_used_bytes} "
+        f"delta_bytes={report.delta_bytes} delta_pct={report.delta_pct:.2f}%"
+    )
+    if report.inaccessible_unknown_count:
+        print(  # noqa: T201
+            f"reclaim reconcile: {report.inaccessible_unknown_count} inaccessible path(s) have "
+            "no size estimate at all -- they contribute an unknown share of any remaining delta "
+            "above, on top of the known inaccessible bytes already folded into "
+            "reported_total_bytes."
+        )
     return 0
 
 
@@ -781,6 +841,7 @@ def _run_serve(args: argparse.Namespace, *, open_browser: bool = False) -> int:
     app = create_app(
         db_path=args.db,
         config=config,
+        config_path=config_path,
         vault_dir=args.vault_dir,
         manifest_path=args.manifest,
         mode_log_path=mode_log,
@@ -1019,6 +1080,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "scan":
         return _run_scan(args)
+    if args.command == "reconcile":
+        return _run_reconcile(args)
     if args.command == "apply":
         return _run_apply(args)
     if args.command == "undo":

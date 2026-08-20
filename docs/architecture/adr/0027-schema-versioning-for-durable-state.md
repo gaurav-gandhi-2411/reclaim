@@ -114,6 +114,46 @@ version's own maliciously/accidentally malformed input." Two of this ADR's own t
 since `schema_version = 1` alongside an unrecognized key is exactly the ambiguous case that must
 now raise, not the forward-compat case it was meant to demonstrate.
 
+### A real backward-compat gap this ADR left open, found by the 2026-08-20 audit (P0-4), and its fix
+
+This ADR's "Backward compatibility" section claimed version 1 covers "every field this class has
+today" and is verified "with hand-written pre-this-change JSON/TOML fixtures." That was true of
+`ModeChangeEntry`/`Config`, but not, in practice, of `QuarantineManifestEntry`: `is_dir`,
+`rebuild_instruction`, and `retention_days` (all three older than this ADR — see their own
+`ADR-0001` comments) were left **required, with no default**, so a manifest line genuinely older
+than all three (the actual shape of a real July-13 `data/quarantine/manifest.jsonl` batch found on
+the auditing machine) hard-crashed `read_manifest_entries` with `pydantic_core.ValidationError`
+instead of parsing as "version 1" the way this ADR promised. Because `packaging/reclaim.iss`
+preserves `{app}/data` across uninstall/reinstall by design, this hit any real user who quarantined
+something on an older release and later upgraded — a permanently-broken Quarantine tab and
+crash-recovery banner (`GET /api/quarantine`, `GET /api/recovery/status`), both raw 500s, with no
+in-app remediation.
+
+**Fix (schema v2)**: `QUARANTINE_MANIFEST_SCHEMA_VERSION` bumped `1 → 2`. The three fields now
+have real defaults (`is_dir=False`, `rebuild_instruction=None`, `retention_days=None` — see each
+field's own comment on `QuarantineManifestEntry` for why each is a safe, non-destructive choice,
+not merely a guess). Unlike a bare pydantic default alone, `read_manifest_entries` now also logs
+an explicit `.info`-level `executor.manifest_entry_migrated_from_older_schema` event per migrated
+entry (naming exactly which fields were missing and what they were defaulted to) plus one
+`executor.manifest_migration_summary` event per read — so a support/debug session can see which
+manifest lines were migrated and from what, rather than the defaulting happening silently. This is
+the "dedicated migration/upcasting layer" alternative 2 (below) explicitly deferred at the time
+this ADR was first written, now actually needed.
+
+**A second, easy-to-miss consequence of the bump**: this field's own `default=` had, until now,
+been written as `Field(default=QUARANTINE_MANIFEST_SCHEMA_VERSION)` — safe only because the
+constant and the "no key present" literal happened to both be `1` when this ADR shipped. The first
+real bump (`1 → 2`) breaks that coincidence: a line with no `schema_version` key is a fact about
+*old data* (honestly version `1`), while `QUARANTINE_MANIFEST_SCHEMA_VERSION` is a fact about
+*this code's current version* — conflating them would silently mislabel every pre-versioning line
+as "version 2" the moment the constant first moved. Fixed by decoupling: the field's own default
+is now the literal `1`, and the one real fresh-construction call site
+(`apply_batch`'s intent entry, `executor.py`) now passes `schema_version=
+QUARANTINE_MANIFEST_SCHEMA_VERSION` explicitly rather than relying on the field default. Verified
+with a real captured pre-upgrade manifest (`tests/fixtures/quarantine_manifest_pre_p0_4_2026_07_13.jsonl`,
+copied byte-for-byte from the auditing machine's `data/quarantine/manifest.jsonl`), not just a
+synthetic fixture — see `tests/test_manifest_schema_versioning.py`'s "schema v2" section.
+
 ## Alternatives considered
 
 1. **`extra="ignore"` uniformly across all three models, accepting the round-trip data loss for

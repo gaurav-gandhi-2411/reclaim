@@ -94,6 +94,10 @@
   --rc-cat-large-logs: #1f6f9e;
   --rc-cat-duplicates: #954a80;
   --rc-cat-other: #946218;
+  /* P0-5 treemap follow-up: the synthetic, non-deletable "inaccessible" bucket node
+     (build_treemap) -- deliberately outside the 9-hue set above (never reordered/reused) so it
+     reads as "informational, not a real category" rather than an ordinary detector color. */
+  --rc-cat-inaccessible: #5b6472;
 
   /* Spacing scale */
   --rc-space-1: 4px;
@@ -203,6 +207,7 @@
     --rc-cat-large-logs: #4c90c0;
     --rc-cat-duplicates: #b56a97;
     --rc-cat-other: #b87a2f;
+    --rc-cat-inaccessible: #7b859c;
 
     /* Dark-mode elevation: pure-black shadows barely register on an already-dark surface, so
        depth reads primarily through the surface/surface-alt lightness step (--rc-surface-alt is
@@ -261,6 +266,7 @@
   --rc-cat-large-logs: #1f6f9e;
   --rc-cat-duplicates: #954a80;
   --rc-cat-other: #946218;
+  --rc-cat-inaccessible: #5b6472;
   --rc-shadow-sm: 0 1px 2px rgba(19, 21, 29, 0.06), 0 1px 1px rgba(19, 21, 29, 0.08);
   --rc-shadow-md: 0 6px 16px rgba(19, 21, 29, 0.08), 0 2px 6px rgba(19, 21, 29, 0.06);
   --rc-shadow-lg: 0 24px 48px rgba(19, 21, 29, 0.18), 0 8px 20px rgba(19, 21, 29, 0.1);
@@ -310,6 +316,7 @@
   --rc-cat-large-logs: #4c90c0;
   --rc-cat-duplicates: #b56a97;
   --rc-cat-other: #b87a2f;
+  --rc-cat-inaccessible: #7b859c;
   --rc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 1px 1px rgba(0, 0, 0, 0.3);
   --rc-shadow-md: 0 6px 16px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3);
   --rc-shadow-lg: 0 24px 48px rgba(0, 0, 0, 0.55), 0 8px 20px rgba(0, 0, 0, 0.35);

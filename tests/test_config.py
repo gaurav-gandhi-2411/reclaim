@@ -274,6 +274,107 @@ def test_load_config_logs_warning_on_newer_schema_version(
     assert kwargs["known_schema_version"] == CONFIG_SCHEMA_VERSION
 
 
+# --- P0-2 fix (2026-08 audit): persisting a category toggle from the in-app Settings tab -------
+#
+# `set_category_enabled`/`_set_category_enabled_in_toml_text` back `POST
+# /api/settings/categories/{group}` -- a narrow, targeted text patch (no TOML-writer dependency,
+# see config.py's module comment) that must round-trip through `load_config` afterward, not just
+# produce syntactically-plausible-looking text.
+
+
+def test_set_category_enabled_flips_existing_enabled_line(tmp_path: Path) -> None:
+    from reclaim.config import set_category_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[safety]
+deny = ["C:/protected/*"]
+
+[categories.dev_artifacts]
+enabled = true
+# a user comment that must survive
+retention_days = 30
+
+[categories.old_installers]
+enabled = false
+""",
+        encoding="utf-8",
+    )
+
+    set_category_enabled(config_path, "dev_artifacts", enabled=False)
+
+    text = config_path.read_text(encoding="utf-8")
+    assert "# a user comment that must survive" in text
+    assert 'deny = ["C:/protected/*"]' in text
+
+    config = load_config(config_path)
+    assert config.categories.dev_artifacts.enabled is False
+    # Untouched category/section stay exactly as they were.
+    assert config.categories.old_installers.enabled is False
+    assert config.safety.deny == ["C:/protected/*"]
+
+
+def test_set_category_enabled_inserts_missing_enabled_line(tmp_path: Path) -> None:
+    from reclaim.config import set_category_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[categories.dev_artifacts]
+retention_days = 30
+""",
+        encoding="utf-8",
+    )
+
+    set_category_enabled(config_path, "dev_artifacts", enabled=True)
+
+    config = load_config(config_path)
+    assert config.categories.dev_artifacts.enabled is True
+    assert config.categories.dev_artifacts.retention_days == 30
+
+
+def test_set_category_enabled_appends_new_section_when_absent(tmp_path: Path) -> None:
+    from reclaim.config import set_category_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[safety]
+deny = ["C:/protected/*"]
+""",
+        encoding="utf-8",
+    )
+
+    set_category_enabled(config_path, "old_installers", enabled=True)
+
+    config = load_config(config_path)
+    assert config.categories.old_installers.enabled is True
+    assert config.safety.deny == ["C:/protected/*"]
+
+
+def test_set_category_enabled_creates_file_when_missing(tmp_path: Path) -> None:
+    from reclaim.config import set_category_enabled
+
+    config_path = tmp_path / "config.toml"
+    assert not config_path.exists()
+
+    set_category_enabled(config_path, "crash_dumps", enabled=False)
+
+    assert config_path.exists()
+    config = load_config(config_path)
+    assert config.categories.crash_dumps.enabled is False
+
+
+def test_set_category_enabled_rejects_unknown_category(tmp_path: Path) -> None:
+    from reclaim.config import set_category_enabled
+
+    config_path = tmp_path / "config.toml"
+    with pytest.raises(ValueError, match="not_a_real_category"):
+        set_category_enabled(config_path, "not_a_real_category", enabled=True)
+    assert not config_path.exists()
+
+
 def test_load_config_logs_warning_on_unknown_top_level_and_category_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

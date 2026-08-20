@@ -40,6 +40,10 @@ _CATEGORY_LABELS: dict[str, str] = {
     # wasn't already a deterministic candidate (the common case for an AI-suggestion apply) --
     # never emitted by `reclaim.detectors`, only by `api/service.py`'s apply-time safety check.
     "user_selected": "Individually Selected Items",
+    # P0-5 treemap follow-up: the synthetic, non-deletable bucket `build_treemap` appends for
+    # `ScanIndex.inaccessible_summary` -- never emitted by any detector, so it can never collide
+    # with a real category_group a candidate might carry.
+    "inaccessible": "Inaccessible (permission denied)",
 }
 
 
@@ -64,6 +68,14 @@ _PLAIN_LANGUAGE_CATEGORY: dict[str, tuple[str, str | None]] = {
     "package_caches": (
         "Package manager caches",
         "Safe — re-downloaded automatically when needed.",
+    ),
+    # P0-2 (2026-08 audit): added so the new Settings tab's category descriptions
+    # (`api.service.settings_categories`) have a real, non-fallback entry for every category
+    # `CategoriesConfig` defines, not just the ones the one-click-clean summary already covered.
+    "model_caches": (
+        "ML model weight caches",
+        "Vaulted for 30 days before permanent delete — a gated/private/fine-tuned model may "
+        "not be re-downloadable at all once original access has lapsed.",
     ),
     "temp_and_browser_caches": (
         "Temporary & browser cache files",
@@ -196,6 +208,22 @@ class SummaryResponse(BaseModel):
     # distinguish from "zero skipped".
     skipped_unreadable_count: int
     skipped_unreadable_paths: list[str]
+    # P0-5: persisted (index-wide, survives an app restart -- unlike `skipped_unreadable_*`
+    # above, which is this process session's most-recent-scan snapshot only) accounting of
+    # directories/entries the scanner could not fully account for -- see
+    # `reclaim.index.InaccessibleSummary`. `inaccessible_known_bytes` is a best-effort estimate,
+    # never a claim of completeness; `inaccessible_unknown_count` is how many of
+    # `inaccessible_path_count` have no size estimate at all.
+    inaccessible_path_count: int
+    inaccessible_known_bytes: int
+    inaccessible_unknown_count: int
+    # Volume-level reconciliation (`reclaim.reconciliation.compute_disk_reconciliation`) is only
+    # meaningful when the most recently completed scan covered a WHOLE drive -- `None` for every
+    # other case (a subtree scan, a multi-drive full-drive scan, or no completed scan yet at
+    # all), never a fabricated number for a scan scope this can't honestly evaluate.
+    reconciliation_volume: str | None
+    reconciliation_delta_bytes: int | None
+    reconciliation_delta_pct: float | None
 
 
 # --- Treemap -------------------------------------------------------------------------------
@@ -212,6 +240,14 @@ class TreemapNodeOut(BaseModel):
     category_label: str
     is_dir: bool
     is_candidate: bool
+    # P0-5 treemap follow-up: `True` only for the single synthetic `inaccessible` bucket node
+    # `build_treemap` appends -- never a real scanned path, never selectable/deletable (always
+    # paired with `is_candidate=False`). `explanation` is a one-line, non-empty reason string
+    # for that same node (`None` for every ordinary node) so the treemap itself -- not just the
+    # `/api/summary` banner -- says WHY this bucket's size is a best-effort estimate rather than
+    # an exact figure.
+    is_inaccessible: bool = False
+    explanation: str | None = None
 
 
 class TreemapResponse(BaseModel):
@@ -602,6 +638,37 @@ class FirstRunStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     acknowledged: bool
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings -----------------------------------------
+
+
+class CategorySettingOut(BaseModel):
+    """One cleanup category's current enable state, for the in-app Settings tab. `enabled`
+    reflects `config.toml` (or the built-in default) exactly as written -- never the SAFE-mode-
+    resolved value -- so toggling a category off in POWER mode and switching back to SAFE doesn't
+    look like the toggle silently reverted; `forced_off_in_safe_mode` is the separate, honest
+    signal for "this category is on, but has no effect until you switch to power mode"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category_group: str
+    category_label: str
+    description: str
+    enabled: bool
+    forced_off_in_safe_mode: bool
+
+
+class SettingsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[CategorySettingOut]
+
+
+class UpdateCategorySettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------

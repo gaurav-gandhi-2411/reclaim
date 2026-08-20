@@ -240,6 +240,40 @@ _CASES: dict[str, Case] = {
         reason="PRAGMA table_info + ALTER TABLE ADD COLUMN — schema introspection/DDL, not a "
         "data query; no SEARCH/SCAN plan applies",
     ),
+    # --- P0-5: inaccessible_paths -- a deliberately small, bounded table (a real scan skips a
+    # handful to a few hundred paths, never millions -- see index.py's own module comment above
+    # `_INACCESSIBLE_SCHEMA`), so its production call sites (`api.service.build_summary`,
+    # `reconciliation.compute_disk_reconciliation`) intentionally read it UNSCOPED, same
+    # "under=None means read the whole table by design" reasoning `full_inventory` already has
+    # above -- verified empirically that a SCOPED call (`under=` given) DOES hit
+    # sqlite_autoindex_inaccessible_paths_1 identically to files' own prefix-range queries, but
+    # that isn't the representative call these methods are actually used with in production.
+    "inaccessible_summary": Case(
+        lambda idx: idx.inaccessible_summary(),
+        expect_index=False,
+        reason="under=None (the actual production call shape) means 'read the whole table' by "
+        "design -- inaccessible_paths is always small, so no index is needed to bound the cost",
+    ),
+    "inaccessible_paths_sample": Case(
+        _consume(lambda idx: idx.inaccessible_paths_sample(limit=20)),
+        expect_index=True,
+        reason="under=None still hits sqlite_autoindex_inaccessible_paths_1 -- verified "
+        "empirically the ORDER BY path clause makes SQLite satisfy it via an index-ordered scan "
+        "rather than a bare table scan + separate sort, even with no WHERE-clause scoping "
+        "(unlike inaccessible_summary's unordered aggregate, which has nothing for an index to "
+        "help with when unscoped)",
+    ),
+    "replace_inaccessible_under_root": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE (prefix-range scoped via _prefix_range) + conditional INSERT + COMMIT -- "
+        "the trace callback's last captured statement is always COMMIT itself, which produces "
+        "no EXPLAIN QUERY PLAN rows to inspect (same shape record_seen/upsert_records already "
+        "document). The DELETE's own WHERE clause is byte-identical in shape to "
+        "inaccessible_summary/inaccessible_paths_sample's scoped queries, which independently "
+        "confirm sqlite_autoindex_inaccessible_paths_1 is used when a prefix scope is given "
+        "(verified empirically, not asserted here) -- this Case just can't observe it directly.",
+    ),
 }
 
 
