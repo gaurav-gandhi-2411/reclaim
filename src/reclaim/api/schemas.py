@@ -65,6 +65,14 @@ _PLAIN_LANGUAGE_CATEGORY: dict[str, tuple[str, str | None]] = {
         "Package manager caches",
         "Safe — re-downloaded automatically when needed.",
     ),
+    # P0-2 (2026-08 audit): added so the new Settings tab's category descriptions
+    # (`api.service.settings_categories`) have a real, non-fallback entry for every category
+    # `CategoriesConfig` defines, not just the ones the one-click-clean summary already covered.
+    "model_caches": (
+        "ML model weight caches",
+        "Vaulted for 30 days before permanent delete — a gated/private/fine-tuned model may "
+        "not be re-downloadable at all once original access has lapsed.",
+    ),
     "temp_and_browser_caches": (
         "Temporary & browser cache files",
         "Safe — recreated automatically as you browse.",
@@ -594,6 +602,37 @@ class FirstRunStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     acknowledged: bool
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings -----------------------------------------
+
+
+class CategorySettingOut(BaseModel):
+    """One cleanup category's current enable state, for the in-app Settings tab. `enabled`
+    reflects `config.toml` (or the built-in default) exactly as written -- never the SAFE-mode-
+    resolved value -- so toggling a category off in POWER mode and switching back to SAFE doesn't
+    look like the toggle silently reverted; `forced_off_in_safe_mode` is the separate, honest
+    signal for "this category is on, but has no effect until you switch to power mode"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category_group: str
+    category_label: str
+    description: str
+    enabled: bool
+    forced_off_in_safe_mode: bool
+
+
+class SettingsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[CategorySettingOut]
+
+
+class UpdateCategorySettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------

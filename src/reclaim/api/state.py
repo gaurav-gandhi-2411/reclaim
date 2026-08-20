@@ -168,6 +168,13 @@ class AppState:
     # silently wiped. Set by `POST /api/scan/cancel`. A plain `threading.Event` (not a
     # `Lock`-guarded bool) since setting/checking it must never block a poller or the walk itself.
     cancel_scan_event: threading.Event = field(default_factory=threading.Event)
+    # P0-2 fix (2026-08 audit): the exact path `config` above was loaded from (or would be
+    # created at, if it didn't exist) — needed so `POST /api/settings/categories/{group}` can
+    # persist a toggle to the same on-disk file the CLI/next server start will read, not just
+    # mutate the in-memory `config` field for the life of this process. `create_app`/`_run_serve`
+    # always set this to the real `--config` value; the default here only covers a caller (a
+    # test, a future embedder) that never passed one explicitly.
+    config_path: Path = field(default_factory=lambda: Path("config.toml"))
     mode_log_path: Path = field(default_factory=lambda: DEFAULT_MODE_LOG_PATH)
     first_run_state_path: Path = field(default_factory=lambda: DEFAULT_FIRST_RUN_STATE_PATH)
     # G25: the persistent rotating log file this process's `configure_logging` call actually

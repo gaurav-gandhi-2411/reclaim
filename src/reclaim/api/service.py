@@ -28,6 +28,7 @@ from reclaim.api.schemas import (
     CandidatesResponse,
     CategoryBreakdownOut,
     CategoryCardOut,
+    CategorySettingOut,
     DiagnosticsResponse,
     DuplicateClusterOut,
     DuplicateClusterReviewOut,
@@ -49,6 +50,7 @@ from reclaim.api.schemas import (
     RestoreResponse,
     RestoreStatusOut,
     ScanStatusOut,
+    SettingsResponse,
     SuggestedScanRootOut,
     SuggestedScanRootsResponse,
     SummaryResponse,
@@ -60,6 +62,7 @@ from reclaim.api.schemas import (
     plain_language_category,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.config import CategoriesConfig, set_category_enabled
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -86,7 +89,15 @@ from reclaim.mode import (
     switch_to_power_mode,
     switch_to_safe_mode,
 )
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier, Verdict
+from reclaim.models import (
+    SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS,
+    Candidate,
+    DuplicateCluster,
+    FileRecord,
+    Mode,
+    Tier,
+    Verdict,
+)
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
@@ -1522,6 +1533,51 @@ def switch_mode_to_safe(state: AppState) -> ModeStatusResponse:
     return ModeStatusResponse(
         mode=state.live_mode, required_power_confirmation=REQUIRED_POWER_MODE_CONFIRMATION
     )
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings --------------------------------------
+
+
+def _category_setting_out(group: str, config: CategoriesConfig) -> CategorySettingOut:
+    plain_label, safety_reason = plain_language_category(group)
+    description = safety_reason if safety_reason is not None else category_label(group)
+    return CategorySettingOut(
+        category_group=group,
+        category_label=plain_label,
+        description=description,
+        enabled=getattr(config, group).enabled,
+        forced_off_in_safe_mode=group in SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS,
+    )
+
+
+def settings_categories(state: AppState) -> SettingsResponse:
+    """Every category's current on-disk `enabled` flag (from `state.config`, i.e. exactly what
+    `config.toml` says -- NOT `state.effective_config`'s SAFE-mode-resolved view) plus enough
+    plain-language context for the Settings tab to render a real description, not just a raw
+    category id. Iterates `CategoriesConfig.model_fields` (not a hand-maintained list) so a
+    future category is picked up here automatically."""
+    with state.lock:
+        config = state.config.categories
+    return SettingsResponse(
+        categories=[_category_setting_out(group, config) for group in CategoriesConfig.model_fields]
+    )
+
+
+def update_category_setting(state: AppState, category: str, *, enabled: bool) -> SettingsResponse:
+    """Toggles one category's `enabled` flag, both on disk (`state.config_path`, so it survives
+    past this process) and in memory (`state.config`, so it takes effect immediately without a
+    restart -- the same "no restart needed" posture `POST /api/mode/power|safe` already has).
+    Raises `ValueError` for a `category` that isn't a real `CategoriesConfig` field."""
+    if category not in CategoriesConfig.model_fields:
+        raise ValueError(f"unknown category {category!r}")
+    set_category_enabled(state.config_path, category, enabled=enabled)
+    with state.lock:
+        updated_category = getattr(state.config.categories, category).model_copy(
+            update={"enabled": enabled}
+        )
+        new_categories = state.config.categories.model_copy(update={category: updated_category})
+        state.config = state.config.model_copy(update={"categories": new_categories})
+    return settings_categories(state)
 
 
 def first_run_status(state: AppState) -> FirstRunStatusResponse:

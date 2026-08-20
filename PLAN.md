@@ -2756,3 +2756,49 @@ lane — 77 passed. `frontend-xss-regression` (`tests/frontend`, `npm test`) —
 `pip-audit --desc` against a freshly-exported `requirements-audit.txt` — no known vulnerabilities.
 `scale-nightly.yml`'s own lane (`-m scale`) — 2 passed (170.18s), including the 100k+-tier full-
 scan-completes test. Working tree clean after every merge.
+
+### 2026-08-20 — P0-2 fix: category defaults, config coverage gaps, in-app Settings tab
+
+Dispatched from `docs/AUDIT-2026-08.md`'s P0-2 finding: every cleanup category shipped
+`enabled=false` with no default `config.toml` shipped anywhere, so a first-time user following
+the "Clean My Computer" flow got zero results, forever. Branch `fix/p0-2-category-defaults`.
+
+**Default-ON decision**: flipped `enabled=True` for exactly the four categories already named in
+`models.REBUILDABLE_CATEGORY_GROUPS` (`dev_artifacts`, `package_caches`,
+`temp_and_browser_caches`, `crash_dumps`) — a pre-existing architectural boundary this fix reused
+rather than inventing a new default-ON list. `model_caches`/`duplicates`/`old_installers`/
+`archive_pairs`/`large_logs` stay off; full reasoning recorded in `config.CategoriesConfig`'s own
+docstring, not just here. Also fixed two real P1 config-coverage gaps found in the same audit
+(npm cache path used Roaming instead of Local; HF `datasets`/`xet` cache subdirs weren't covered).
+
+**Shipped a real default `config.toml`**: `packaging/config.default.toml`, wired into
+`reclaim.iss`'s `[Files]` section with `onlyifdoesntexist` so an upgrade never clobbers a user's
+customized config.
+
+**New in-app Settings tab**: `GET/POST /api/settings/categories[/{group}]`, backed by a new
+`config.set_category_enabled` — a narrow, targeted TOML text patch (find-or-create the
+`[categories.X]` section, find-or-insert its `enabled = ` line) rather than a full parse-mutate-
+reserialize round trip, since this project carries no TOML-writer dependency. `AppState.
+config_path` threaded through `create_app`/`_run_serve` so the write lands on the same file the
+process was started with; also updates `AppState.config` in memory so a toggle takes effect
+without a restart, matching the existing safe/power mode switch's posture.
+
+**Real proof, not just unit tests** (all dry-run — `--apply` never passed, nothing on disk
+touched): scanning this machine's real `%LOCALAPPDATA%\pip` with zero config.toml and the
+default SAFE mode produced 1 `package_cache` candidate (61,089,910 bytes) where the old defaults
+produced zero; scanning real `%LOCALAPPDATA%\CrashDumps` the same way produced 10
+`crash_dump_file` candidates (2,158,538,174 bytes). `dev_artifacts` needed a non-git fixture
+(scanning this actual repo produces zero dev-artifact candidates regardless of category enable
+state — `safety.py`'s "in-repo files are blocked from automated quarantine" rule is a separate,
+pre-existing, correct safety boundary, orthogonal to this fix) plus POWER mode (SAFE mode forces
+`dev_artifacts` off via `SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`, independent of its own `enabled`
+default) — 3 real candidates (`node_modules`, `.venv`, `__pycache__`) in that fixture.
+
+**Verification**: `scripts/verify.py` — ruff/mypy/845 pytest (tests/ + safety-gate evals)/coverage
+floors, all green (829 passed, 27 skipped, 1 deselected, 87.43% total coverage). `tests/frontend`
+jsdom suite — 20/20 passed, unaffected. Screenshots of the real running Settings tab (headless
+Edge via CDP, `websockets` — already a transitive dep, nothing new installed) committed under
+`reports/screenshots/fix-p0-2-category-defaults/`.
+
+**Not done this session** (disclosed gap): no automated screenshot-diff/visual-regression test
+added — this is a single new-feature PR, not the "UI has settled" trigger rule 15f gates on.
