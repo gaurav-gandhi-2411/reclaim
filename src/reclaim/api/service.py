@@ -28,6 +28,7 @@ from reclaim.api.schemas import (
     CandidatesResponse,
     CategoryBreakdownOut,
     CategoryCardOut,
+    CategorySettingOut,
     DiagnosticsResponse,
     DuplicateClusterOut,
     DuplicateClusterReviewOut,
@@ -49,6 +50,7 @@ from reclaim.api.schemas import (
     RestoreResponse,
     RestoreStatusOut,
     ScanStatusOut,
+    SettingsResponse,
     SuggestedScanRootOut,
     SuggestedScanRootsResponse,
     SummaryResponse,
@@ -60,6 +62,7 @@ from reclaim.api.schemas import (
     plain_language_category,
 )
 from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.config import CategoriesConfig, set_category_enabled
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -80,13 +83,22 @@ from reclaim.executor import (
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
-from reclaim.index import ScanIndex, physical_size_bytes
+from reclaim.index import InaccessibleSummary, ScanIndex, physical_size_bytes
 from reclaim.mode import (
     REQUIRED_POWER_MODE_CONFIRMATION,
     switch_to_power_mode,
     switch_to_safe_mode,
 )
-from reclaim.models import Candidate, DuplicateCluster, FileRecord, Mode, Tier, Verdict
+from reclaim.models import (
+    SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS,
+    Candidate,
+    DuplicateCluster,
+    FileRecord,
+    Mode,
+    Tier,
+    Verdict,
+)
+from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
@@ -105,11 +117,39 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
 
     Uses `state.effective_config` (mode-resolved fresh on every call), never `state.config`
-    directly — see `AppState.effective_config`'s docstring."""
+    directly — see `AppState.effective_config`'s docstring.
+
+    UNCACHED — this is the expensive pass `_cached_all_candidates` below memoizes per scan
+    generation. Call sites that need every candidate for the CURRENT scan should go through that
+    wrapper instead; call this directly only when scoping to a smaller universe already avoids
+    the cost (see `resolve_apply_selection`'s `request.paths is not None` branch)."""
     config = state.effective_config
     candidates = generate_candidates(index, config, state.safety)
     candidates += generate_duplicate_candidates(index, config, state.safety)
     return candidates
+
+
+def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
+    """Cached, concurrency-guarded wrapper around `_all_candidates` (perf/dedup-cache,
+    docs/AUDIT-2026-08.md P0-3) — every call site that needs the full candidate universe for the
+    CURRENT scan (`build_summary`, `build_treemap`, `list_candidates`,
+    `build_one_click_summary`, and `resolve_apply_selection`'s blanket-apply path) should call
+    this instead of `_all_candidates` directly.
+
+    `state.candidates_cache_lock` is held across the ENTIRE compute-or-fetch critical section,
+    deliberately — a second caller racing the first for the same `scan_generation` blocks on the
+    lock rather than starting its own redundant whole-index BLAKE3 hash pass, and sees the first
+    caller's now-cached result the moment it acquires the lock. See `AppState.candidates_cache`'s
+    docstring for why this is a dedicated lock rather than `state.lock`.
+    """
+    with state.candidates_cache_lock:
+        generation = state.scan_generation
+        if state.candidates_cache is not None and state.candidates_cache_generation == generation:
+            return state.candidates_cache
+        candidates = _all_candidates(index, state)
+        state.candidates_cache = candidates
+        state.candidates_cache_generation = generation
+        return candidates
 
 
 # --- Scan --------------------------------------------------------------------------------
@@ -459,24 +499,66 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
 # --- Summary / category cards -------------------------------------------------------------
 
 
+def _effective_reclaimable_bytes(candidate: Candidate) -> int:
+    """The real byte count a user gets back if `candidate` is deleted -- hardlink-aware
+    `reclaimable_bytes` (ADR-0006, populated today only for `exact_duplicate`) when set, else
+    the naive logical `size_bytes` (every other category, where the two are equal in practice
+    since only `duplicates` can share blocks with a surviving copy). Never sum `size_bytes`
+    directly over a category that can contain hardlinked duplicates -- see
+    docs/AUDIT-2026-08.md's P1 finding this fixes. Same pattern `list_duplicate_cluster_review`
+    below already used correctly one tab over; every top-line byte total in this module that can
+    include the `duplicates` category now goes through this one function instead of each
+    re-deriving the same ternary."""
+    if candidate.reclaimable_bytes is not None:
+        return candidate.reclaimable_bytes
+    return candidate.size_bytes
+
+
 def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
     grouped: dict[tuple[str, Tier], list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         grouped[(candidate.category_group, candidate.tier)].append(candidate)
 
-    cards = [
-        CategoryCardOut(
-            category_group=group,
-            category_label=category_label(group),
-            tier=tier,
-            file_count=len(items),
-            total_bytes=sum(item.size_bytes for item in items),
-            total_bytes_human=format_bytes(sum(item.size_bytes for item in items)),
+    cards = []
+    for (group, tier), items in grouped.items():
+        total_bytes = sum(_effective_reclaimable_bytes(item) for item in items)
+        cards.append(
+            CategoryCardOut(
+                category_group=group,
+                category_label=category_label(group),
+                tier=tier,
+                file_count=len(items),
+                total_bytes=total_bytes,
+                total_bytes_human=format_bytes(total_bytes),
+            )
         )
-        for (group, tier), items in grouped.items()
-    ]
     cards.sort(key=lambda c: c.total_bytes, reverse=True)
     return cards
+
+
+def _reconciliation_fields(
+    index: ScanIndex, state: AppState
+) -> tuple[str | None, int | None, float | None]:
+    """`(volume, delta_bytes, delta_pct)` for `SummaryResponse`'s volume-level reconciliation
+    (P0-5) -- `(None, None, None)` whenever the most recently completed scan wasn't a genuine
+    whole-single-drive scan, since `compute_disk_reconciliation` has no way to distinguish a
+    real inaccessible-directory undercount from "this index just never covered the whole
+    volume", and this function never guesses. `OSError` (a real `shutil.disk_usage` failure --
+    e.g. the volume was unmounted since the scan) is likewise treated as "not available" rather
+    than surfaced as a 500 on an otherwise-working summary endpoint.
+    """
+    with state.lock:
+        root = state.scan_status.root
+        drives_total = state.scan_status.drives_total
+        status = state.scan_status.status
+    if status != "completed" or root is None or drives_total != 1 or not is_volume_root(root):
+        return None, None, None
+    try:
+        report = compute_disk_reconciliation(index, root)
+    except (NotAVolumeRootError, OSError) as exc:
+        logger.warning("api.reconciliation_unavailable", volume=str(root), error=str(exc))
+        return None, None, None
+    return report.volume, report.delta_bytes, report.delta_pct
 
 
 def build_summary(state: AppState) -> SummaryResponse:
@@ -489,6 +571,15 @@ def build_summary(state: AppState) -> SummaryResponse:
         skipped_unreadable_paths = list(state.scan_status.skipped_unreadable_paths or ())
 
     with ScanIndex(state.db_path) as index:
+        # P0-5: persisted (index-wide, survives an app restart) accounting -- unlike
+        # `skipped_unreadable_*` above, computed even when `has_any_records()` is False (a scan
+        # whose very root was itself unreadable can produce an inaccessible-path row with zero
+        # real `files` rows to show for it).
+        inaccessible = index.inaccessible_summary()
+        reconciliation_volume, reconciliation_delta_bytes, reconciliation_delta_pct = (
+            _reconciliation_fields(index, state)
+        )
+
         if not index.has_any_records():
             return SummaryResponse(
                 has_scan=False,
@@ -501,9 +592,15 @@ def build_summary(state: AppState) -> SummaryResponse:
                 categories=[],
                 skipped_unreadable_count=skipped_unreadable_count,
                 skipped_unreadable_paths=skipped_unreadable_paths,
+                inaccessible_path_count=inaccessible.path_count,
+                inaccessible_known_bytes=inaccessible.known_bytes,
+                inaccessible_unknown_count=inaccessible.unknown_count,
+                reconciliation_volume=reconciliation_volume,
+                reconciliation_delta_bytes=reconciliation_delta_bytes,
+                reconciliation_delta_pct=reconciliation_delta_pct,
             )
         total_indexed_bytes = physical_size_bytes(index.full_inventory())
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
 
     tier_a = [c for c in candidates if c.tier == Tier.A]
     tier_b = [c for c in candidates if c.tier == Tier.B]
@@ -511,17 +608,67 @@ def build_summary(state: AppState) -> SummaryResponse:
         has_scan=True,
         total_indexed_bytes=total_indexed_bytes,
         total_indexed_human=format_bytes(total_indexed_bytes),
-        tier_a_bytes=sum(c.size_bytes for c in tier_a),
+        tier_a_bytes=sum(_effective_reclaimable_bytes(c) for c in tier_a),
         tier_a_count=len(tier_a),
-        tier_b_bytes=sum(c.size_bytes for c in tier_b),
+        tier_b_bytes=sum(_effective_reclaimable_bytes(c) for c in tier_b),
         tier_b_count=len(tier_b),
         categories=_category_cards(candidates),
         skipped_unreadable_count=skipped_unreadable_count,
         skipped_unreadable_paths=skipped_unreadable_paths,
+        inaccessible_path_count=inaccessible.path_count,
+        inaccessible_known_bytes=inaccessible.known_bytes,
+        inaccessible_unknown_count=inaccessible.unknown_count,
+        reconciliation_volume=reconciliation_volume,
+        reconciliation_delta_bytes=reconciliation_delta_bytes,
+        reconciliation_delta_pct=reconciliation_delta_pct,
     )
 
 
 # --- Treemap -------------------------------------------------------------------------------
+
+# P0-5 treemap follow-up: the synthetic category_group `_inaccessible_treemap_node` emits --
+# see `schemas.category_label`'s "inaccessible" entry and `TreemapNodeOut.is_inaccessible`'s
+# docstring for why this can never collide with a real detector's category_group.
+_INACCESSIBLE_CATEGORY_GROUP = "inaccessible"
+
+
+def _inaccessible_explanation(summary: InaccessibleSummary) -> str:
+    """One-line, human-readable reason string for the synthetic inaccessible-bucket treemap
+    node -- rendered by `treemap.js`'s tooltip so the WHY is visible in the treemap itself, not
+    only in the separate `/api/summary` banner (`app.js::renderInaccessibleNote`). Mirrors that
+    function's own wording (same "best-effort estimate, not a claim of completeness" framing)
+    rather than inventing a second copy voice for the same underlying fact."""
+    text = (
+        f"{summary.path_count} path(s) could not be read due to permissions or a real I/O "
+        "error -- size shown is a best-effort estimate, not an exact figure."
+    )
+    if summary.unknown_count:
+        text += (
+            f" {summary.unknown_count} of those have no size estimate at all, so the true "
+            "total is larger than the bytes shown here."
+        )
+    return text
+
+
+def _inaccessible_treemap_node(summary: InaccessibleSummary) -> TreemapNodeOut:
+    """The single synthetic node representing `ScanIndex.inaccessible_summary`'s bucket inside
+    the treemap itself (P0-5 follow-up) -- `is_candidate=False`/`is_inaccessible=True` mark it
+    as informational-only so nothing that later grows a "click a node to select it" flow can
+    ever mistake this for a real, actionable path: the underlying paths are, by definition,
+    ones Reclaim could not read, so there is nothing real behind this node to select or delete.
+    `path` is a synthetic marker (never a real filesystem path) for the same reason."""
+    return TreemapNodeOut(
+        path="__inaccessible__",
+        label="Inaccessible / unreadable",
+        size_bytes=summary.known_bytes,
+        size_human=format_bytes(summary.known_bytes),
+        category_group=_INACCESSIBLE_CATEGORY_GROUP,
+        category_label=category_label(_INACCESSIBLE_CATEGORY_GROUP),
+        is_dir=False,
+        is_candidate=False,
+        is_inaccessible=True,
+        explanation=_inaccessible_explanation(summary),
+    )
 
 
 def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
@@ -549,7 +696,7 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
 
         children = index.direct_children(root)
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
         candidate_by_path = {c.path: c for c in candidates}
 
         nodes: list[TreemapNodeOut] = []
@@ -573,6 +720,15 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
         nodes.sort(key=lambda n: n.size_bytes, reverse=True)
         nodes = nodes[:max_nodes]
+
+        # P0-5 treemap follow-up: the inaccessible bucket is a real, always-visible node in the
+        # treemap itself (not just the `/api/summary` banner), scoped to THIS root the same way
+        # `total_bytes` below is -- appended after the size-based `max_nodes` truncation above so
+        # it's never silently dropped for being small relative to the biggest real directories,
+        # and never counts against that cap.
+        inaccessible = index.inaccessible_summary(under=root)
+        if inaccessible.path_count > 0:
+            nodes.append(_inaccessible_treemap_node(inaccessible))
 
         total_bytes = index.subtree_size_bytes(root)
 
@@ -654,7 +810,7 @@ def list_candidates(
                 total_bytes_human=format_bytes(0),
             )
 
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
         needs_cluster_info = category_group in (None, "duplicates") and any(
             c.category_group == "duplicates" for c in candidates
         )
@@ -674,7 +830,7 @@ def list_candidates(
         filtered = [c for c in filtered if c.category_group == category_group]
 
     out = [_candidate_out(c, cluster_by_path.get(c.path)) for c in filtered]
-    total_bytes = sum(c.size_bytes for c in filtered)
+    total_bytes = sum(_effective_reclaimable_bytes(c) for c in filtered)
     return CandidatesResponse(
         has_scan=True,
         candidates=out,
@@ -722,7 +878,7 @@ def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
                 total_bytes_human=format_bytes(0),
                 total_file_count=0,
             )
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
 
     grouped: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
@@ -799,10 +955,7 @@ def list_duplicate_cluster_review(
             continue
         member_candidates = [candidate_by_path[d.path] for d in surviving_duplicates]
         display_cluster = _dataclass_replace(cluster, duplicates=surviving_duplicates)
-        reclaimable_total = sum(
-            c.reclaimable_bytes if c.reclaimable_bytes is not None else c.size_bytes
-            for c in member_candidates
-        )
+        reclaimable_total = sum(_effective_reclaimable_bytes(c) for c in member_candidates)
         rows.append(
             DuplicateClusterReviewOut(
                 cluster=_duplicate_cluster_out(display_cluster),
@@ -954,10 +1107,12 @@ def resolve_apply_selection(
     # needs its real category/tier, not a generic "user_selected_file" fallback label.
     # Only a genuinely blanket apply (`request.paths is None` -- power mode only; safe mode
     # already refuses this above) still needs the full duplicate-cluster universe, since
-    # there's no explicit path list to build fallback candidates from.
+    # there's no explicit path list to build fallback candidates from. Goes through
+    # `_cached_all_candidates` (perf/dedup-cache, docs/AUDIT-2026-08.md P0-3) rather than
+    # `_all_candidates` directly -- this was one of the 5 uncached call sites that fix covers.
     if request.paths is None:
         with ScanIndex(state.db_path) as index:
-            candidates = _all_candidates(index, state)
+            candidates = _cached_all_candidates(index, state)
     else:
         with ScanIndex(state.db_path) as index:
             candidates = generate_candidates(index, state.effective_config, state.safety)
@@ -1522,6 +1677,62 @@ def switch_mode_to_safe(state: AppState) -> ModeStatusResponse:
     return ModeStatusResponse(
         mode=state.live_mode, required_power_confirmation=REQUIRED_POWER_MODE_CONFIRMATION
     )
+
+
+# --- P0-2 fix (2026-08 audit): in-app category settings --------------------------------------
+
+
+def _category_setting_out(group: str, config: CategoriesConfig) -> CategorySettingOut:
+    plain_label, safety_reason = plain_language_category(group)
+    description = safety_reason if safety_reason is not None else category_label(group)
+    return CategorySettingOut(
+        category_group=group,
+        category_label=plain_label,
+        description=description,
+        enabled=getattr(config, group).enabled,
+        forced_off_in_safe_mode=group in SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS,
+    )
+
+
+def settings_categories(state: AppState) -> SettingsResponse:
+    """Every category's current on-disk `enabled` flag (from `state.config`, i.e. exactly what
+    `config.toml` says -- NOT `state.effective_config`'s SAFE-mode-resolved view) plus enough
+    plain-language context for the Settings tab to render a real description, not just a raw
+    category id. Iterates `CategoriesConfig.model_fields` (not a hand-maintained list) so a
+    future category is picked up here automatically."""
+    with state.lock:
+        config = state.config.categories
+    return SettingsResponse(
+        categories=[_category_setting_out(group, config) for group in CategoriesConfig.model_fields]
+    )
+
+
+def update_category_setting(state: AppState, category: str, *, enabled: bool) -> SettingsResponse:
+    """Toggles one category's `enabled` flag, both on disk (`state.config_path`, so it survives
+    past this process) and in memory (`state.config`, so it takes effect immediately without a
+    restart -- the same "no restart needed" posture `POST /api/mode/power|safe` already has).
+    Raises `ValueError` for a `category` that isn't a real `CategoriesConfig` field.
+
+    Also invalidates `state.candidates_cache` (perf/dedup-cache, docs/AUDIT-2026-08.md P0-3):
+    that cache is keyed ONLY on `scan_generation`, which a category toggle never bumps, so
+    without this a warmed cache would keep serving the pre-toggle tier classification -- directly
+    contradicting the "takes effect immediately" claim above for the common case where the
+    dashboard was already loaded once before the toggle. Cleared via the dedicated
+    `candidates_cache_lock` (not `state.lock`, which only guards `state.config` here) so this
+    never blocks on, or is blocked by, an in-flight `_cached_all_candidates` recompute."""
+    if category not in CategoriesConfig.model_fields:
+        raise ValueError(f"unknown category {category!r}")
+    set_category_enabled(state.config_path, category, enabled=enabled)
+    with state.lock:
+        updated_category = getattr(state.config.categories, category).model_copy(
+            update={"enabled": enabled}
+        )
+        new_categories = state.config.categories.model_copy(update={category: updated_category})
+        state.config = state.config.model_copy(update={"categories": new_categories})
+    with state.candidates_cache_lock:
+        state.candidates_cache = None
+        state.candidates_cache_generation = None
+    return settings_categories(state)
 
 
 def first_run_status(state: AppState) -> FirstRunStatusResponse:

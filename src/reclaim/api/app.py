@@ -31,10 +31,14 @@ _DEFAULT_PORT = 8420
 _templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 
+_DEFAULT_CONFIG_PATH = Path("config.toml")
+
+
 def create_app(
     *,
     db_path: Path,
     config: Config,
+    config_path: Path | None = None,
     vault_dir: Path | None = None,
     manifest_path: Path | None = None,
     mode_log_path: Path | None = None,
@@ -52,6 +56,11 @@ def create_app(
     a temp `config.toml` per test). The live mode (and, when SAFE, the category override) is
     resolved fresh on every request via `AppState.effective_config` — see its docstring for why
     `config` must stay raw here rather than pre-resolved once at startup.
+
+    `config_path` (P0-2 fix, 2026-08 audit) is separate from `config` itself: the on-disk file
+    `POST /api/settings/categories/{group}` persists a category toggle to, so a change survives
+    past this process's lifetime the same way `config` was originally loaded. Defaults to the
+    same `config.toml` the CLI itself defaults to when not given explicitly.
 
     `host`/`port` must be the exact loopback address this process will actually be bound to
     (`cli.py::_run_serve` passes its already-`_loopback_host`-validated `args.host`/`args.port`
@@ -77,6 +86,7 @@ def create_app(
     app.state.reclaim = AppState(
         db_path=db_path,
         config=config,
+        config_path=config_path if config_path is not None else _DEFAULT_CONFIG_PATH,
         vault_dir=vault_dir if vault_dir is not None else _DEFAULT_VAULT_DIR,
         manifest_path=manifest_path if manifest_path is not None else _DEFAULT_MANIFEST_PATH,
         safety=SafetyValidator(config),

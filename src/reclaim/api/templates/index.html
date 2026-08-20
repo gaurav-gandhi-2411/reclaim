@@ -65,6 +65,7 @@
     <button class="rc-tab" role="tab" data-view="review" id="tab-review" aria-selected="false" aria-controls="view-review">Review Queue</button>
     <button class="rc-tab" role="tab" data-view="ai-suggestions" id="tab-ai-suggestions" aria-selected="false" aria-controls="view-ai-suggestions">AI Suggestions</button>
     <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
+    <button class="rc-tab" role="tab" data-view="settings" id="tab-settings" aria-selected="false" aria-controls="view-settings">Settings</button>
   </nav>
 
   <!-- tabindex="-1": <main> isn't natively focusable, so activating the "Skip to main content"
@@ -112,6 +113,7 @@
 
         <dl id="stat-row" class="rc-stat-row"></dl>
         <p id="skipped-unreadable-note" class="rc-scan-status" hidden></p>
+        <p id="inaccessible-note" class="rc-scan-status" hidden></p>
         <h2>Categories</h2>
         <div id="category-grid" class="rc-card-grid"></div>
       </div>
@@ -244,6 +246,21 @@
       <div id="quarantine-state"></div>
       <div id="quarantine-content" hidden>
         <div id="batch-list"></div>
+      </div>
+    </section>
+
+    <!-- Settings: per-category enable/disable toggles (P0-2 fix, 2026-08 audit). Every category
+         defaulted off with no in-app way to turn any of them on -- this is that way. -->
+    <section id="view-settings" class="rc-view" role="tabpanel" aria-labelledby="tab-settings" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>Settings</h1>
+          <p>Turn cleanup categories on or off. Changes save immediately and apply to every scan from now on -- no restart needed.</p>
+        </div>
+      </div>
+      <div id="settings-state"></div>
+      <div id="settings-content" hidden>
+        <div id="settings-category-grid" class="rc-card-grid"></div>
       </div>
     </section>
   </main>

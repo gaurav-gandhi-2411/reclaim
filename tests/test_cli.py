@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import os
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
 
+import reclaim.reconciliation as reconciliation_module
 from reclaim.cli import _VERSION, _build_parser, _run_serve, main
+from reclaim.index import InaccessibleEntry, ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
+from reclaim.models import FileRecord
+
+_DiskUsage = namedtuple("_DiskUsage", ["total", "used", "free"])
 
 
 @pytest.fixture(autouse=True)
@@ -168,6 +175,135 @@ def test_apply_include_categories_restricts_to_named_categories(
     assert "1/2 tier/root-eligible candidate(s) kept" in out
     assert "dev_artifact_pycache: count=1" in out
     assert "dev_artifact_node_modules" not in out
+
+
+# --- P0-5: inaccessible-path accounting + `reclaim reconcile` --------------------------------
+
+
+def test_scan_prints_inaccessible_size_accounting_when_paths_are_skipped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reclaim scan`'s CLI output surfaces the best-effort inaccessible-path size accounting
+    (P0-5), not just the bare skip count -- and stays silent about it when nothing was skipped."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "readable.txt").write_text("ok", encoding="utf-8")
+    blocked_dir = root / "blocked_dir"
+    blocked_dir.mkdir()
+    (blocked_dir / "inner.txt").write_text("hidden", encoding="utf-8")
+
+    real_scandir = os.scandir
+
+    def fake_scandir(path: object, *args: object, **kwargs: object) -> object:
+        if "blocked_dir" in str(path):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    db = tmp_path / "index.sqlite3"
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+
+    out = capsys.readouterr().out
+    assert "inaccessible-path size accounting" in out
+    assert "0 bytes known" in out
+    assert "1 path(s) with no size estimate at all" in out
+
+
+def test_scan_omits_inaccessible_accounting_line_when_nothing_was_skipped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text("ok", encoding="utf-8")
+    db = tmp_path / "index.sqlite3"
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+
+    out = capsys.readouterr().out
+    assert "inaccessible-path size accounting" not in out
+
+
+def test_reconcile_errors_when_no_index_exists(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing_db = tmp_path / "does_not_exist.sqlite3"
+
+    exit_code = main(["reconcile", "C:\\", "--db", str(missing_db)])
+
+    assert exit_code == 1
+    assert "no index found" in capsys.readouterr().err
+
+
+def test_reconcile_rejects_a_non_volume_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "index.sqlite3"
+    with ScanIndex(db):
+        pass  # just needs to exist on disk for _run_reconcile's own existence check
+
+    exit_code = main(["reconcile", str(tmp_path), "--db", str(db)])
+
+    assert exit_code == 1
+    assert "is not a drive root" in capsys.readouterr().err
+
+
+def test_reconcile_prints_delta_bytes_and_pct_for_a_fully_scanned_volume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end through the CLI entry point: a volume with a real indexed file plus a
+    persisted inaccessible entry reconciles against a (faked, for determinism) real disk-usage
+    figure, and the residual-gap explanation is printed whenever any inaccessible path has no
+    size estimate at all."""
+    db = tmp_path / "index.sqlite3"
+    volume = Path("C:/")
+    with ScanIndex(db) as index:
+        index.upsert_records(
+            [
+                FileRecord(
+                    path=Path("C:/a.txt"),
+                    is_dir=False,
+                    size_bytes=1000,
+                    attributes=0,
+                    ext=".txt",
+                    git_repo_root=None,
+                    git_repo_clean=False,
+                    mtime=1.0,
+                    ctime=1.0,
+                    dev=1,
+                    ino=1,
+                )
+            ],
+            scanned_at=1000.0,
+        )
+        index.replace_inaccessible_under_root(
+            volume,
+            [
+                InaccessibleEntry(
+                    path="C:/blocked",
+                    error="denied",
+                    size_estimate_bytes=None,
+                    size_estimate_is_lower_bound=False,
+                )
+            ],
+            scanned_at=1000.0,
+        )
+
+    monkeypatch.setattr(
+        reconciliation_module.shutil,
+        "disk_usage",
+        lambda _path: _DiskUsage(total=10_000, used=2000, free=8000),
+    )
+
+    exit_code = main(["reconcile", "C:\\", "--db", str(db)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "indexed_bytes=1000" in out
+    assert "reported_total_bytes=1000" in out
+    assert "delta_bytes=1000" in out
+    assert "delta_pct=50.00%" in out
+    assert "1 inaccessible path(s) have no size estimate at all" in out
 
 
 # --- serve: hard loopback-only bind gate ------------------------------------------------------
