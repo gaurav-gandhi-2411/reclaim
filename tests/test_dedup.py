@@ -1114,43 +1114,9 @@ def test_generate_duplicate_candidates_excludes_env_copies_when_keep_is_pkgs_cac
     assert candidates == []  # every environment's own copy excluded, not just some of them
 
 
-@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
-def test_generate_duplicate_candidates_excludes_standalone_python_install_copy(
-    tmp_path: Path,
-) -> None:
-    """ADR-0009: the actual real-disk incident this closes. A shared, uv-managed Python
-    installation's stdlib file (`Lib/socket.py`) was byte-identical to a named conda
-    environment's own copy of the same stdlib file -- before this fix, the uv install wasn't
-    recognized as ANY kind of environment (`_environment_root` returned `None` for it, since it
-    has neither `conda-meta/` nor `pyvenv.cfg`), so it was proposed for deletion and applied for
-    real, breaking every project on the machine that referenced that shared interpreter build.
-    Recovered from the Windows Recycle Bin afterward -- this test is the regression guard so it
-    can't happen again."""
-    uv_python = _make_standalone_python_install(
-        tmp_path / "uv" / "python" / "cpython-3.12.12-windows-x86_64-none"
-    )
-    uv_socket_path = uv_python / "Lib" / "socket.py"
-    uv_socket_path.write_bytes(b"stdlib-socket-module-" * 1_000)
-
-    conda_root = tmp_path / "anaconda3"
-    named_env = _make_conda_env(conda_root / "envs" / "tes-cleanroom-080")
-    env_socket_path = named_env / "Lib" / "socket.py"
-    env_socket_path.parent.mkdir(parents=True, exist_ok=True)
-    env_socket_path.write_bytes(uv_socket_path.read_bytes())
-    size = uv_socket_path.stat().st_size
-
-    with ScanIndex(tmp_path / "index.sqlite3") as index:
-        index.upsert_records(
-            [
-                _index_record(str(env_socket_path), size_bytes=size, ctime=100.0),  # kept
-                _index_record(str(uv_socket_path), size_bytes=size, ctime=200.0),
-            ],
-            scanned_at=1000.0,
-        )
-        config = Config(
-            safety=SafetyConfig(protected_roots=[]),
-            categories=CategoriesConfig(duplicates=DuplicatesConfig(min_reclaim_bytes=0)),
-        )
-        candidates = generate_duplicate_candidates(index, config, SafetyValidator(config))
-
-    assert candidates == []  # the shared interpreter install's copy must never be proposed
+# `test_generate_duplicate_candidates_excludes_standalone_python_install_copy` (the ADR-0009
+# real-disk-incident regression guard, previously decorated
+# `@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")`) moved to
+# `evals/test_apply_safety_preflight.py` on 2026-08-20 (audit P2, docs/AUDIT-2026-08.md) -- it
+# belongs on the safety-named test surface, not filed under `test_dedup.py` where it was
+# undiscoverable from the naming convention alone.

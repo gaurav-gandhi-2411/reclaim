@@ -1032,6 +1032,7 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
             succeeded=item.succeeded,
             error=item.error,
             vault_path=item.vault_path.as_posix() if item.vault_path is not None else None,
+            skip_reason=item.skip_reason,
         )
         for item in report.items
     ]
