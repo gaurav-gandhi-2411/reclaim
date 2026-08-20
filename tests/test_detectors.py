@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -607,6 +608,43 @@ def test_generate_candidates_resolves_size_guard_exempt_for_package_cache(
     package_candidates = [c for c in candidates if c.category_group == "package_caches"]
     assert len(package_candidates) == 1
     assert package_candidates[0].size_guard_exempt is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="hardlink identity is Windows-specific")
+def test_generate_candidates_resolves_reclaimable_bytes_for_a_file_level_model_cache_candidate(
+    tmp_path: Path, index: ScanIndex
+) -> None:
+    """Audit finding E1: `_reclaimable_bytes_for_candidate`'s single-file branch (an individual
+    model-weight file matched by extension under a configured `model_caches` root -- the OTHER
+    detection surface `detect_model_caches` has besides the whole-directory sweep, see
+    `test_model_cache_matches_safetensors_file_under_configured_root` above) needs its own real
+    file + real hardlink, distinct from every other reclaimable-bytes test in this project
+    (which all exercise the whole-DIRECTORY branch, via `evals/test_cache_reclaimable_bytes_gate.
+    py`'s fixtures or the package-cache tests below)."""
+    hub_root = tmp_path / "hub"
+    external_dir = tmp_path / "external_env" / "site-packages"
+    hub_root.mkdir(parents=True)
+    external_dir.mkdir(parents=True)
+
+    model_path = hub_root / "model.safetensors"
+    model_path.write_bytes(b"m" * 4096)
+    os.link(model_path, external_dir / "model.safetensors")  # real hardlink: nlink == 2
+
+    _seed(index, _record(model_path.as_posix(), size_bytes=4096))
+    config = Config(
+        safety=SafetyConfig(protected_roots=[]),
+        categories=CategoriesConfig(
+            model_caches=ModelCachesConfig(enabled=True, paths=[hub_root.as_posix()])
+        ),
+    )
+    candidates = generate_candidates(index, config, SafetyValidator(config), now=_NOW)
+    model_candidates = [c for c in candidates if c.category_group == "model_caches"]
+    assert len(model_candidates) == 1
+    # The sole name inside `hub_root` is one of two names on this inode -- the external copy
+    # survives this candidate's own deletion, so 0 bytes are really reclaimable, exactly like
+    # `exact_duplicate`'s existing "hardlink to a surviving copy" case.
+    assert model_candidates[0].reclaimable_bytes == 0
+    assert model_candidates[0].size_bytes == 4096
 
 
 def test_generate_candidates_resolves_rebuildable_flag(tmp_path: Path, index: ScanIndex) -> None:
