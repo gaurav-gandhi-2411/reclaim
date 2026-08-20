@@ -9,6 +9,8 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
 
+from reclaim.ai.category_explainer import DEFAULT_CACHE_DIR as DEFAULT_AI_EXPLANATION_CACHE_DIR
+from reclaim.anthropic_key_store import DEFAULT_KEY_PATH as DEFAULT_ANTHROPIC_KEY_PATH
 from reclaim.api import service
 from reclaim.api.routes import router
 from reclaim.api.security import LocalOriginPolicy, generate_csrf_token, local_origin_violation
@@ -44,6 +46,8 @@ def create_app(
     mode_log_path: Path | None = None,
     first_run_state_path: Path | None = None,
     log_path: Path | None = None,
+    anthropic_key_path: Path | None = None,
+    ai_explanation_cache_dir: Path | None = None,
     host: str = _DEFAULT_HOST,
     port: int = _DEFAULT_PORT,
 ) -> FastAPI:
@@ -100,6 +104,14 @@ def create_app(
             else DEFAULT_FIRST_RUN_STATE_PATH
         ),
         log_path=resolved_log_path,
+        anthropic_key_path=(
+            anthropic_key_path if anthropic_key_path is not None else DEFAULT_ANTHROPIC_KEY_PATH
+        ),
+        ai_explanation_cache_dir=(
+            ai_explanation_cache_dir
+            if ai_explanation_cache_dir is not None
+            else DEFAULT_AI_EXPLANATION_CACHE_DIR
+        ),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     app.include_router(router)
