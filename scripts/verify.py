@@ -45,6 +45,12 @@ _JUNIT_PATH = "pytest-results.xml"
 # `-m "not scale"` anywhere in [tool.pytest.ini_options]), so the `-m "not scale"` filter below
 # on the pytest invocation itself is load-bearing, not decorative -- remove it and this "fast"
 # pre-push gate silently starts generating a 100k-file tree on every run.
+#
+# test_apply_safety_preflight.py added 2026-08-20 (audit P0-1, docs/AUDIT-2026-08.md): the two
+# R6 pre-flight safety guards on `apply_batch` ("no live process holds it", "not hardlink-backed
+# into an active install") plus the ADR-0009 real-disk-incident regression test moved here from
+# `tests/test_dedup.py` (audit P2). No [ai] extra, no network -- same "no excuse to skip it"
+# reasoning as every other file in this tuple.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -52,6 +58,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safe_mode_gate.py",
     "evals/test_scanner_peak_rss_budget.py",
     "evals/test_cli_cold_start_budget.py",
+    "evals/test_apply_safety_preflight.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
