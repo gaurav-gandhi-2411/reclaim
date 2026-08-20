@@ -51,6 +51,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # into an active install") plus the ADR-0009 real-disk-incident regression test moved here from
 # `tests/test_dedup.py` (audit P2). No [ai] extra, no network -- same "no excuse to skip it"
 # reasoning as every other file in this tuple.
+#
+# test_apply_batch_call_graph_gate.py added 2026-08-21 (same audit, promoted from a throwaway
+# scratchpad script): the AST-based structural proof that every real filesystem-mutation
+# primitive in executor.py/purge.py is confined to its expected allowed-home function, AND that
+# apply_batch's per-candidate pre-flight guard structurally precedes every statement that can
+# reach one. No [ai] extra, no network, pure `ast` parsing of this repo's own source -- same
+# "no excuse to skip it" reasoning as every other file in this tuple.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -59,6 +66,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_scanner_peak_rss_budget.py",
     "evals/test_cli_cold_start_budget.py",
     "evals/test_apply_safety_preflight.py",
+    "evals/test_apply_batch_call_graph_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
