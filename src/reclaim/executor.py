@@ -16,6 +16,11 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.models import Candidate, Mode, Tier, Verdict
+from reclaim.preflight import (
+    PreflightSkipReason,
+    check_file_in_use,
+    check_hardlink_shared_active_install,
+)
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
@@ -274,6 +279,14 @@ class ItemApplyResult:
     succeeded: bool
     error: str | None
     vault_path: Path | None
+    # Audit P0-1 (docs/AUDIT-2026-08.md): `None` for every existing outcome shape (a genuine
+    # success, or a failure where `error` carries the real exception message from an ATTEMPTED
+    # mutation). Set to a `PreflightSkipReason` only when `apply_batch`'s pre-flight probe found
+    # a reason to skip this item WITHOUT ever attempting the move/delete at all -- distinct from
+    # `error`, which always means "we tried and the OS/filesystem rejected it". `succeeded` is
+    # still `False` for a skipped item (it did not happen), but callers that need to tell "never
+    # attempted" apart from "attempted and failed" should check this field, not just `error`.
+    skip_reason: PreflightSkipReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -875,6 +888,30 @@ _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES = 1024 * 1024 * 1024
 _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS = 30
 
 
+def _preflight_skip_reason(candidate: Candidate) -> PreflightSkipReason | None:
+    """Audit P0-1 (docs/AUDIT-2026-08.md): the two R6 pre-flight safety checks, run in order,
+    against one candidate right before `apply_batch` would otherwise attempt to move/delete it.
+    Returns the first that fires -- either one alone is sufficient reason to skip the item
+    without attempting the real mutation, so there is no need to run (or report) both.
+
+    `check_hardlink_shared_active_install` is applied unconditionally here, to every apply
+    (including a human-confirmed, single-item apply from the dashboard), not gated behind any
+    "is this an unattended/scheduled run" flag -- `apply_batch` has no such notion today (R6's
+    autonomous-cleanup allowlist doesn't exist yet either; see the audit's R6/D3 sections), and
+    the check itself is genuinely defense-in-depth (deleting a hardlink-shared path is not
+    destructive to its siblings -- see `preflight.check_hardlink_shared_active_install`'s
+    docstring) rather than a hard safety violation, so applying it to every apply path is the
+    conservative choice: it costs a skip a human can investigate and re-apply after review, never
+    a silent unsafe delete. Revisit this call site (not the check itself) if/when a real
+    "attended vs. unattended" distinction is ever added to this function's signature.
+    """
+    if check_file_in_use(candidate.path, is_dir=candidate.is_dir):
+        return "file_in_use"
+    if check_hardlink_shared_active_install(candidate.path).is_shared_with_other_environment:
+        return "hardlink_shared_active_install"
+    return None
+
+
 def apply_batch(
     candidates: list[Candidate],
     *,
@@ -917,6 +954,14 @@ def apply_batch(
     permission error, ...) is caught, recorded, and does not abort the rest of the batch (house
     rule 104: errors are part of the API, not silent) — *except* for the pre-delete safety
     re-check below, which is a whole-batch abort by design.
+
+    Audit P0-1 (docs/AUDIT-2026-08.md): immediately before each item's real mutation, when
+    `apply=True`, two pre-flight checks run (`_preflight_skip_reason`, `reclaim.preflight`) — "is
+    this path currently held open by another process" and "is this path hardlink-connected into a
+    DIFFERENT live Python environment than its own". Either one skips just that item (never
+    attempted, no manifest intent written, `ItemApplyResult.skip_reason` set) and the batch
+    continues — the same "abort the item, not the run" shape every other per-item failure in this
+    loop already follows, not a new abort mode.
 
     `method` (`"vault"`/`"recycle_bin"`) only governs candidates whose category has a real
     retention window; a candidate with `retention_days is None` always direct-deletes
@@ -1036,6 +1081,34 @@ def apply_batch(
 
             if manifest_fh is None:  # unreachable: opened above whenever apply=True
                 raise RuntimeError("apply_batch: manifest file handle unexpectedly not open")
+
+            # Audit P0-1 (docs/AUDIT-2026-08.md): the two R6 pre-flight safety checks, run BEFORE
+            # anything is written to the manifest at all -- a skipped item was never attempted,
+            # so (unlike a caught mutation failure) there is no intent to record and no "aborted"
+            # phase to close out; `reclaim.recovery` never needs to know this item existed.
+            skip_reason = _preflight_skip_reason(candidate)
+            if skip_reason is not None:
+                logger.info(
+                    "executor.apply_item_skipped_preflight",
+                    path=str(candidate.path),
+                    method=item_method,
+                    skip_reason=skip_reason,
+                )
+                items.append(
+                    ItemApplyResult(
+                        path=candidate.path,
+                        category=candidate.category,
+                        category_group=candidate.category_group,
+                        size_bytes=candidate.size_bytes,
+                        tier=candidate.tier,
+                        method=item_method,
+                        succeeded=False,
+                        error=None,
+                        vault_path=None,
+                        skip_reason=skip_reason,
+                    )
+                )
+                continue
 
             # ADR-0026, phase 1: log the intent, fsynced, BEFORE any filesystem mutation. A kill
             # here leaves an intent whose source is untouched — `reclaim.recovery` reconciles it
