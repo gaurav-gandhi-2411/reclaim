@@ -1017,6 +1017,18 @@ def _build_user_selected_candidate(
         safety_verdict=result.verdict,
         safety_reason_code=result.reason_code,
         retention_days=_USER_SELECTED_RETENTION_DAYS,
+        # P0-K1a: `record` above is a FRESH `FileRecord` (just built by `build_record_for_path`
+        # a few lines up, not a stale scan-index row) -- its dev/ino/mtime are the correct
+        # scan-time-equivalent baseline for `executor._preflight_skip_reason`'s identity
+        # re-check, same as the other two `Candidate`-construction sites. Not called out by name
+        # in this fix's original design note (which only named `detectors.py`/`dedup.py`), but
+        # this is the third and only other place a `Candidate` reaching `apply_batch` is built
+        # from real data -- leaving it at the 0/0/0.0 default would silently disable the
+        # identity check for every AI-suggestion/user-selected apply, not just narrow its
+        # coverage.
+        dev=record.dev,
+        ino=record.ino,
+        mtime=record.mtime,
     )
 
 

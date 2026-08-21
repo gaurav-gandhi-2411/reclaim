@@ -243,3 +243,17 @@ class Candidate:
     # root's naive logical size overclaims exactly the way ADR-0006's own uv-cache measurement
     # first found (14.3GB logical vs 5.21GB real disk-free delta).
     reclaimable_bytes: int | None = None
+    # P0-K1a: the scan-time `(dev, ino, mtime)` baseline `executor._preflight_skip_reason` (via
+    # `preflight.check_identity_unchanged_since_scan`) re-verifies against a fresh `os.stat()`
+    # right before `apply_batch` would otherwise mutate this path -- catches a delete-and-
+    # recreate/junction-repoint swap of the content at this exact path between scan and apply.
+    # Defaulted to 0/0/0.0 (same "Stage 2 addition, pre-existing callers keep working unchanged"
+    # convention `FileRecord.dev`/`.ino`/`.mtime` already use) rather than made required: every
+    # real candidate-construction site (`detectors.generate_candidates`, `dedup.
+    # generate_duplicate_candidates`, `api.service._build_user_selected_candidate`) populates
+    # these from a `FileRecord` already read at candidate-generation time -- zero new
+    # `os.stat()` calls needed -- but a `0, 0` pair is never treated as a confirmed match NOR a
+    # confirmed mismatch by the check that reads it; see that function's own docstring for why.
+    dev: int = 0
+    ino: int = 0
+    mtime: float = 0.0
