@@ -18,8 +18,10 @@ from reclaim.models import Candidate, FileRecord, Tier, Verdict
 from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
+    enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
+from reclaim.scanner import long_path
 
 # Audit P0-1 (docs/AUDIT-2026-08.md): the safety-named home for both R6 pre-flight regression
 # guards ("no live process holds it", "not hardlink-backed into an active install") AND the
@@ -303,6 +305,93 @@ def test_check_hardlink_shared_active_install_false_for_an_unresolvable_path(
 ) -> None:
     result = check_hardlink_shared_active_install(tmp_path / "does-not-exist.bin")
     assert result.is_shared_with_other_environment is False
+
+
+# --- (d) batched directory-identity enumeration: reclaim.preflight.enumerate_directory_identity -
+#
+# P0-K1a M1 cost-budget fix: `executor._live_subtree_records` used to call `os.stat()` once per
+# entry (17-28s added to a real apply against the worst-case real fixture -- PLAN.md's 2026-08-21
+# checkpoint). `enumerate_directory_identity` replaces that with one open directory handle and a
+# batched `GetFileInformationByHandleEx`/`FileIdBothDirectoryInfo` read. This is a HARD
+# PREREQUISITE test (per this fix's own task brief): if `FileId` doesn't match `os.stat().st_ino`
+# for the same real file, this whole approach is unsound and must not be relied on anywhere.
+
+
+def test_batch_enumerated_file_id_matches_os_stat_ino_for_real_files(tmp_path: Path) -> None:
+    """Real files (not mocked) -- `enumerate_directory_identity`'s `FileId` must exactly equal
+    `os.stat(path, follow_symlinks=False).st_ino` for every one of them, and `is_dir`/attributes
+    must agree with `os.stat`'s own `st_file_attributes`. A wrong struct offset would read
+    garbage, not a plausible-looking wrong inode -- so an exact match across several real files
+    (not just one) is real evidence the `_FILE_ID_BOTH_DIR_INFO` layout is correct, not a
+    coincidence."""
+    names = ["a.txt", "b.bin", "a_much_longer_filename_to_perturb_struct_offsets.dat"]
+    for i, name in enumerate(names):
+        (tmp_path / name).write_bytes(f"content-{i}".encode() * (i + 1))
+    nested_dir = tmp_path / "nested_subdir"
+    nested_dir.mkdir()
+
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    by_name = {entry.name: entry for entry in entries}
+    assert set(by_name) == {*names, "nested_subdir"}
+
+    for name in names:
+        live_path = tmp_path / name
+        st = os.stat(live_path, follow_symlinks=False)  # noqa: PTH116 -- comparing against the
+        # exact call this fix replaces, not a Path-vs-str style choice.
+        entry = by_name[name]
+        assert entry.ino == st.st_ino, f"{name}: FileId {entry.ino} != st_ino {st.st_ino}"
+        assert entry.is_dir is False
+        assert entry.size_bytes == st.st_size
+
+    dir_entry = by_name["nested_subdir"]
+    dir_st = os.stat(nested_dir, follow_symlinks=False)  # noqa: PTH116
+    assert dir_entry.ino == dir_st.st_ino
+    assert dir_entry.is_dir is True
+
+
+def test_batch_enumerated_directory_dot_and_dotdot_are_filtered(tmp_path: Path) -> None:
+    (tmp_path / "only_child.txt").write_bytes(b"x")
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    assert "." not in {e.name for e in entries}
+    assert ".." not in {e.name for e in entries}
+
+
+def test_batch_enumerated_directory_empty_returns_empty_list(tmp_path: Path) -> None:
+    empty_dir = tmp_path / "genuinely_empty"
+    empty_dir.mkdir()
+    entries = enumerate_directory_identity(long_path(empty_dir))
+    assert entries == []  # NOT None -- the directory opened fine, it just has nothing in it
+
+
+def test_batch_enumerated_directory_missing_path_returns_none(tmp_path: Path) -> None:
+    assert enumerate_directory_identity(long_path(tmp_path / "does-not-exist")) is None
+
+
+def test_batch_enumerated_directory_many_entries_spans_multiple_buffer_reads(
+    tmp_path: Path,
+) -> None:
+    """`_DIR_ENUM_INITIAL_BUFFER_BYTES` (64KB) comfortably fits a few hundred short-named
+    entries in one `GetFileInformationByHandleEx` call -- this creates enough real files that a
+    single read cannot possibly hold them all, exercising the multi-call pagination loop for
+    real rather than only ever hitting the single-call happy path."""
+    file_count = 2000
+    for i in range(file_count):
+        (tmp_path / f"file_{i:05d}.bin").write_bytes(b"x")
+
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    assert len(entries) == file_count
+    names = {e.name for e in entries}
+    assert names == {f"file_{i:05d}.bin" for i in range(file_count)}
+    # Every entry's identity is independently real, not a byproduct of pagination miscounting --
+    # spot-check a real `os.stat` on a sample spread across the run (first, middle, last).
+    for i in (0, file_count // 2, file_count - 1):
+        target = tmp_path / f"file_{i:05d}.bin"
+        st = os.stat(target, follow_symlinks=False)  # noqa: PTH116
+        matching = next(e for e in entries if e.name == target.name)
+        assert matching.ino == st.st_ino
 
 
 # --- Integration: apply_batch skips instead of attempting the mutation -------------------------
