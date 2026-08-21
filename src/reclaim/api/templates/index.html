@@ -249,8 +249,10 @@
       </div>
     </section>
 
-    <!-- Settings: per-category enable/disable toggles (P0-2 fix, 2026-08 audit). Every category
-         defaulted off with no in-app way to turn any of them on -- this is that way. -->
+    <!-- Settings: per-category enable/disable toggles (P0-2 fix, 2026-08 audit) plus R2's
+         Anthropic API key entry. No path/candidate ever crosses the key-entry surface -- see
+         reclaim.ai.category_explainer's module docstring for the structural guarantee behind
+         the per-category "Explain" buttons in Overview, which read from this key. -->
     <section id="view-settings" class="rc-view" role="tabpanel" aria-labelledby="tab-settings" data-active="false">
       <div class="rc-view-header">
         <div>
@@ -262,6 +264,24 @@
       <div id="settings-content" hidden>
         <div id="settings-category-grid" class="rc-card-grid"></div>
       </div>
+
+      <section class="rc-settings-panel" aria-labelledby="anthropic-key-heading">
+        <h2 id="anthropic-key-heading">Anthropic API key</h2>
+        <p>Adds an optional "Explain this category" button to each category card in Overview — a plain-language summary of what a category of files generally is, the pros/cons of deleting it, and what it costs to regenerate. Recommend-only: this can never select or delete anything on its own.</p>
+        <p>Your key stays on this machine, encrypted with Windows DPAPI — never sent anywhere except directly to Anthropic, and never written to a log or a diagnostics report.</p>
+        <p id="anthropic-key-current-status" class="rc-scan-status" role="status" aria-live="polite">Checking key status…</p>
+
+        <form id="anthropic-key-form" class="rc-settings-row">
+          <div class="rc-field">
+            <label for="anthropic-key-input">API key</label>
+            <input id="anthropic-key-input" name="api_key" type="password" autocomplete="off" placeholder="sk-ant-…" />
+          </div>
+          <button id="anthropic-key-test-btn" type="button" class="rc-btn rc-btn-secondary">Test key</button>
+          <button id="anthropic-key-save-btn" type="submit" class="rc-btn rc-btn-primary">Save</button>
+          <button id="anthropic-key-remove-btn" type="button" class="rc-btn rc-btn-danger">Remove key</button>
+        </form>
+        <p id="anthropic-key-test-result" class="rc-form-error" role="status" aria-live="polite" hidden></p>
+      </section>
     </section>
   </main>
 

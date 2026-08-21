@@ -9,9 +9,11 @@ from reclaim.api import ai_orchestration, service
 from reclaim.api.schemas import (
     AIAnalysisStatusOut,
     AISuggestionsResponse,
+    AnthropicKeyStatusResponse,
     ApplyRequest,
     ApplyStatusOut,
     CandidatesResponse,
+    CategoryExplanationResponse,
     DiagnosticsResponse,
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
@@ -24,9 +26,12 @@ from reclaim.api.schemas import (
     RestoreStatusOut,
     ScanRequest,
     ScanStatusOut,
+    SetAnthropicKeyRequest,
     SettingsResponse,
     SuggestedScanRootsResponse,
     SummaryResponse,
+    TestAnthropicKeyRequest,
+    TestAnthropicKeyResponse,
     TreemapResponse,
     UpdateCategorySettingRequest,
     UpdateCheckResponse,
@@ -418,3 +423,47 @@ def diagnostics(request: Request) -> DiagnosticsResponse:
     """Backs the dashboard's "Copy diagnostics" button — paths, counts, and version/mode
     metadata only, never file content (see `DiagnosticsResponse`'s docstring and PRIVACY.md)."""
     return service.build_diagnostics(get_state(request))
+
+
+# --- R2: Anthropic API key settings + per-category LLM explanations ----------------------------
+
+
+@router.get("/settings/anthropic-key", response_model=AnthropicKeyStatusResponse)
+def anthropic_key_status(request: Request) -> AnthropicKeyStatusResponse:
+    """Whether a key is configured — never the key itself (see `AnthropicKeyStatusResponse`'s
+    docstring)."""
+    return service.anthropic_key_status(get_state(request))
+
+
+@router.post("/settings/anthropic-key", response_model=AnthropicKeyStatusResponse)
+def set_anthropic_key(
+    payload: SetAnthropicKeyRequest, request: Request
+) -> AnthropicKeyStatusResponse:
+    return service.set_anthropic_key(get_state(request), payload)
+
+
+@router.delete("/settings/anthropic-key", response_model=AnthropicKeyStatusResponse)
+def delete_anthropic_key(request: Request) -> AnthropicKeyStatusResponse:
+    """A no-op (never an error) when no key is configured — same idempotent-delete posture as
+    `cancel_scan` above."""
+    return service.delete_anthropic_key(get_state(request))
+
+
+@router.post("/settings/anthropic-key/test", response_model=TestAnthropicKeyResponse)
+def test_anthropic_key(
+    payload: TestAnthropicKeyRequest, request: Request
+) -> TestAnthropicKeyResponse:
+    """Backs the Settings tab's "Test key" button — one cheap models-list call, never a
+    completion, so testing a key before saving it costs nothing. Never raises: a network
+    failure or a rejected key both come back as a typed `valid=False` response, never a 500."""
+    return service.check_anthropic_key(get_state(request), payload)
+
+
+@router.get("/ai/category-explanation/{category_group}", response_model=CategoryExplanationResponse)
+def category_explanation(category_group: str, request: Request) -> CategoryExplanationResponse:
+    """Per-category prose explanation (R2) — recommend-only, same as everything else under
+    `reclaim.ai`: this can never influence a delete decision (see
+    `reclaim.ai.category_explainer`'s module docstring). Degrades gracefully in every failure
+    mode (no scan, no matching category, no key configured, an Anthropic API failure) — never a
+    500, see `service.build_category_explanation`'s docstring."""
+    return service.build_category_explanation(get_state(request), category_group)
