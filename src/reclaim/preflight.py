@@ -14,8 +14,17 @@ from typing import Literal
 # detection here -- `executor.apply_batch` owns the decision of what to DO with a positive
 # result (skip the item, log it, keep going) and the structlog call; this module only answers
 # the two yes/no questions.
+#
+# P0-K1a (this session, live-reproduced finding): `apply_batch` acted on stale DB-index data
+# with zero re-verification against live filesystem state at mutation time -- swapping content
+# at a candidate's path between scan and apply caused the swapped content to be permanently
+# deleted or misrouted into the vault. `check_identity_unchanged_since_scan` below is the third
+# read-only probe this module answers, same posture as the two above: it only says whether the
+# live path's identity still matches what the scan recorded, never what to do about a mismatch.
 
-PreflightSkipReason = Literal["file_in_use", "hardlink_shared_active_install"]
+PreflightSkipReason = Literal[
+    "file_in_use", "hardlink_shared_active_install", "identity_changed_since_scan"
+]
 
 # --- (a) live-process handle probe -------------------------------------------------------------
 #
@@ -263,4 +272,110 @@ def check_hardlink_shared_active_install(path: Path) -> HardlinkShareCheck:
         is_shared_with_other_environment=bool(other_roots),
         own_environment_root=own_root,
         sibling_environment_roots=tuple(other_roots),
+    )
+
+
+# --- (c) identity-since-scan probe (P0-K1a) ----------------------------------------------------
+#
+# `os.stat(path, follow_symlinks=False)`'s `(st_dev, st_ino)` pair is the file ID Windows/NTFS
+# itself uses to identify a filesystem entry independent of its name -- confirmed empirically
+# this session against a real NTFS junction (built and repointed with `mklink /J`, not mocked):
+# `follow_symlinks=False` already gives correct, reparse-point-aware, by-handle identity
+# semantics through CPython's own `os.stat` implementation, with no `ctypes`/
+# `GetFileInformationByHandle` needed to get an equivalent of `FILE_FLAG_OPEN_REPARSE_POINT`.
+#
+# Residual gaps (house rule 98a: name every control's surface explicitly) -- disclosed here,
+# verbatim, and in this PR's body, never softened:
+#   1. NTFS MFT sequence-number reuse is a real-but-practically-ignorable residual risk: the
+#      64-bit `st_ino` NTFS returns packs a 48-bit file-record number with a 16-bit sequence
+#      number that increments each time that exact MFT record is reused for a new file; a
+#      collision requires ~65,536 forced reuse cycles of the SAME MFT record inside one
+#      scan-to-apply window, which is not a practical attack surface for a tool whose apply
+#      typically runs minutes to hours after its scan.
+#   2. Same-inode in-place content edits (no rename/recreate -- e.g. a process opens the
+#      existing file and overwrites its bytes without ever unlinking it) are NOT caught by this
+#      check, by design: `(dev, ino)` is unchanged by construction for an in-place edit, and
+#      this is a different threat class (data-integrity-of-contents, not
+#      wrong-file-deleted/misrouted) than what this fix addresses. Out of scope.
+#   3. `FSCTL_SET_REPARSE_POINT`-based in-place reparse-point retargeting (rewriting an
+#      existing junction/symlink's target without deleting and recreating the reparse point
+#      itself, so the same MFT record -- and therefore the same `(dev, ino)` -- survives the
+#      retarget) is a theoretical, untested residual gap: this check would see an unchanged
+#      identity and not fire, even though the path now resolves somewhere else. Untested because
+#      constructing this exact retarget (as opposed to the delete-and-recreate junction repoint
+#      this session's real test used) needs a raw `DeviceIoControl` call this fix does not add.
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityCheck:
+    """Outcome of `check_identity_unchanged_since_scan` -- kept structured (not a bare bool) so
+    `executor.py`'s structlog call can log the recorded-vs-live values for a human to inspect,
+    not just that the check fired. `live_dev`/`live_ino`/`live_mtime`/`live_size_bytes` are
+    `None` only when `path` couldn't be stat'd at all (already vanished between scan and apply)
+    -- a different, already-handled condition (the real move/delete attempt's own `try/except`
+    reports it), not itself a reason to flag `identity_changed=True` here.
+
+    `recorded_mtime`/`live_mtime`/`recorded_size_bytes`/`live_size_bytes` are supplementary
+    DIAGNOSTIC context only, logged for a human reviewing a skip -- never part of the
+    `identity_changed` decision itself. `(dev, ino)` alone is the authoritative identity signal;
+    requiring mtime to also match would incorrectly flag a same-inode in-place content edit as
+    an "identity change", which residual-gap #2 above documents as deliberately OUT OF SCOPE for
+    this check, not something to accidentally start catching as a side effect of a stricter
+    comparison.
+    """
+
+    identity_changed: bool
+    recorded_dev: int
+    recorded_ino: int
+    live_dev: int | None
+    live_ino: int | None
+    recorded_mtime: float
+    live_mtime: float | None
+    recorded_size_bytes: int
+    live_size_bytes: int | None
+
+
+def check_identity_unchanged_since_scan(
+    path: Path,
+    *,
+    recorded_dev: int,
+    recorded_ino: int,
+    recorded_mtime: float,
+    recorded_size_bytes: int,
+) -> IdentityCheck:
+    """R6/P0-K1a pre-flight check (c): true (`identity_changed=True`) if `path`'s live
+    `(st_dev, st_ino)` no longer matches `recorded_dev`/`recorded_ino` -- the scan-time baseline
+    a caller must supply (this module has no index/DB access of its own; see
+    `executor._preflight_skip_reason` for where the baseline comes from).
+
+    Fails safe toward "not a mismatch" (returns `identity_changed=False`) when `path` can no
+    longer be stat'd at all -- a vanished path is `apply_batch`'s existing per-item
+    `try/except`'s problem to report as a failed item, not this probe's; manufacturing a
+    skip_reason for a condition that already has its own honest failure path would just make
+    that failure harder to find in the logs, not safer.
+    """
+    try:
+        st = path.stat(follow_symlinks=False)
+    except OSError:
+        return IdentityCheck(
+            identity_changed=False,
+            recorded_dev=recorded_dev,
+            recorded_ino=recorded_ino,
+            live_dev=None,
+            live_ino=None,
+            recorded_mtime=recorded_mtime,
+            live_mtime=None,
+            recorded_size_bytes=recorded_size_bytes,
+            live_size_bytes=None,
+        )
+    return IdentityCheck(
+        identity_changed=(st.st_dev != recorded_dev or st.st_ino != recorded_ino),
+        recorded_dev=recorded_dev,
+        recorded_ino=recorded_ino,
+        live_dev=st.st_dev,
+        live_ino=st.st_ino,
+        recorded_mtime=recorded_mtime,
+        live_mtime=st.st_mtime,
+        recorded_size_bytes=recorded_size_bytes,
+        live_size_bytes=st.st_size,
     )
