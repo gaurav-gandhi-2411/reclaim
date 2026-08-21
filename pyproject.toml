@@ -18,6 +18,18 @@ dependencies = [
     "httpx>=0.27",  # opt-in update check only (reclaim.update_check) -- see PRIVACY.md's
     # "Updates" section. Previously a test-only dev dependency; this is its first production
     # use, moved here from [dependency-groups] dev below.
+    "windows-toasts>=1.3.1",  # Apache-2.0 -- native Windows toast notifications for the
+    # 80%-disk-threshold alert (reclaim.notifications), opt-in via config.toml's
+    # [notifications] section (default OFF, same posture as update_check). Chosen over hand-
+    # rolled WinRT bindings: it's a thin, actively-maintained wrapper around the same
+    # `Windows.UI.Notifications` APIs (pulls in `winrt-*` packages transitively, all prebuilt
+    # wheels -- no MSVC Build Tools needed, verified via `uv add` on this machine), with a
+    # documented, tested `ToastButton(launch=...)` protocol-activation mechanism that fires an
+    # OS-level ShellExecute on a registered custom URI scheme -- exactly what the Snooze button
+    # needs, and it works without any COM "Notification Activator" server registration (which
+    # would be required for a `windows_toasts`-only in-process `on_activated` callback, since
+    # this feature's own checker process is short-lived and exits right after firing the toast
+    # -- see notifications.py's module docstring).
 ]
 
 [project.optional-dependencies]

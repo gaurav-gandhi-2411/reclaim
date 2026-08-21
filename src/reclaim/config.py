@@ -427,12 +427,37 @@ class UpdateCheckConfig(BaseModel):
     enabled: bool = False
 
 
+class NotificationsConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Opt-in, default OFF -- same reasoning as UpdateCheckConfig just above: a background
+    # Task-Scheduler-triggered toast a user never asked for would be a surprise, not a feature.
+    # When true, `reclaim check-disk-space` (invoked by the per-user scheduled task the
+    # installer registers -- see packaging/reclaim.iss) measures free space on the Windows
+    # system drive and fires a native toast once usage crosses `disk_threshold_percent`, subject
+    # to the debounce/snooze state in `reclaim.notifications` -- see that module's docstring for
+    # the full reliability posture (never raises, mirrors `update_check`).
+    enabled: bool = False
+    # Percent of the drive used (not free) at or above which a crossing is reported -- matches
+    # the audit brief's "80% threshold" framing directly, expressed as "used" (not "free") since
+    # that's the more common way disk-space alerts are phrased to end users.
+    disk_threshold_percent: float = 80.0
+    # Debounce: minimum wall-clock hours between two notifications for a threshold that stays
+    # crossed across multiple scheduled-task runs. The scheduled task itself runs a few times a
+    # day (see reclaim.iss), so without this a user gets re-notified every single run until they
+    # free up space -- this is the "don't re-fire every scheduled run" requirement (R5 spec).
+    renotify_after_hours: float = 24.0
+    # How many days a single Snooze button click suppresses further checks for.
+    snooze_days: int = 7
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
+    notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not

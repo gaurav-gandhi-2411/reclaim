@@ -750,3 +750,112 @@ def test_dashboard_refuses_to_run_elevated(
     exit_code = main(["dashboard"])
     assert exit_code == 1
     assert "simulated: process is elevated" in capsys.readouterr().err
+
+
+# --- check-disk-space (R5, 80%-threshold disk-space notification) ------------------------------
+
+
+def test_check_disk_space_disabled_by_default_prints_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No config.toml at all (built-in defaults, notifications off) must be a clean, fast no-op
+    -- exit 0, one status line, no toast attempted."""
+    missing_config = tmp_path / "config.toml"
+    state_path = tmp_path / "state.json"
+
+    exit_code = main(
+        ["check-disk-space", "--config", str(missing_config), "--state", str(state_path)]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "reason=disabled" in out
+    assert not state_path.exists()  # a disabled check never touches state
+
+
+def test_check_disk_space_reports_clean_message_for_malformed_toml(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+
+    exit_code = main(["check-disk-space", "--config", str(bad_config)])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reclaim check-disk-space:" in err
+    assert str(bad_config) in err
+
+
+def test_check_disk_space_notifies_and_records_state_when_enabled_and_crossed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[notifications]
+enabled = true
+disk_threshold_percent = 10.0
+""",
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "state.json"
+
+    # The toast call itself is a separate, best-effort concern (see test_notifications.py for
+    # its own coverage) -- stub it here so this CLI-level test only asserts the orchestration
+    # (state gets recorded, exit code, printed status), not the real WinRT call.
+    sent_results = []
+    monkeypatch.setattr(
+        "reclaim.notifications.send_disk_space_toast",
+        lambda result: sent_results.append(result) or True,  # type: ignore[func-returns-value]
+    )
+
+    exit_code = main(["check-disk-space", "--config", str(config_path), "--state", str(state_path)])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "reason=would_notify" in out
+    assert len(sent_results) == 1
+    assert state_path.exists()  # record_notified must have run
+
+
+def test_check_disk_space_apply_snooze_writes_state_without_checking(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--apply-snooze` is the entry point the toast's Snooze button's protocol handler invokes
+    (see packaging/reclaim.iss) -- it must never measure disk space or fire a toast, only write
+    the snooze state."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[notifications]
+snooze_days = 3
+""",
+        encoding="utf-8",
+    )
+    state_path = tmp_path / "state.json"
+
+    def _boom(_anchor: Path) -> None:  # pragma: no cover -- must never be called
+        raise AssertionError("--apply-snooze must never measure disk space")
+
+    monkeypatch.setattr("reclaim.notifications.shutil.disk_usage", _boom)
+
+    exit_code = main(
+        [
+            "check-disk-space",
+            "--config",
+            str(config_path),
+            "--state",
+            str(state_path),
+            "--apply-snooze",
+        ]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "snoozed for 3 day(s)" in out
+
+    from reclaim.notifications import load_state
+
+    state = load_state(state_path)
+    assert state.snoozed_until is not None
