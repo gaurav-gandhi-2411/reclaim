@@ -2885,3 +2885,77 @@ deletion-adjacent code). Blocks #37 and further merges until the M1 cost-budget 
 resolved by a human decision — accept the overhead, ship a lighter-weight identity-only re-walk
 (skip git-detection/ext computation `build_record` currently pays for), or gate M1 behind a
 size/entry-count threshold are three options surfaced, none picked unilaterally.
+
+### 2026-08-21 — P0-K1a follow-up: batched `GetFileInformationByHandleEx` re-walk (real, measured
+### improvement — cost budget still NOT reliably met; a second, distinct bottleneck disclosed)
+
+Dispatched to act on the M1 cost-budget finding above: replace `_live_subtree_records`'s
+`os.stat()`-per-entry identity read with `preflight.enumerate_directory_identity` — a single open
+directory `HANDLE` (`CreateFileW`+`FILE_FLAG_BACKUP_SEMANTICS`) per directory, then a small,
+buffer-growth-bounded number of `GetFileInformationByHandleEx`/`FileIdBothDirectoryInfo` calls
+returning every child's `FileId`, size, attributes, and timestamps in one shot — zero per-child
+`CreateFile`/open operations. `dev` (the volume-identity half of `(dev, ino)`) is read once per
+directory via a single `os.stat()` on the directory itself, not per entry — safe because every
+child of a directory shares its parent's volume unless it's a reparse point, which this walk's own
+recursion already excludes.
+
+**Prerequisite equivalence proof (hard gate, per this task's own instruction) — PASSED**:
+`evals/test_apply_safety_preflight.py::test_batch_enumerated_file_id_matches_os_stat_ino_for_real_files`
+builds real files (short names, a long name to perturb struct offsets, a nested directory) and
+asserts the batched `FileId` exactly equals `os.stat(path, follow_symlinks=False).st_ino` for
+every one of them — a wrong `_FILE_ID_BOTH_DIR_INFO` struct offset would read garbage, not a
+plausible-looking wrong inode, so an exact match is real evidence the layout (`FileId` at byte
+offset 96, 104-byte fixed header — verified via `ctypes.sizeof`/`.offset` before relying on it) is
+correct. Four more tests cover the disclosed edge cases: `.`/`..` filtering, a genuinely empty
+directory (returns `[]`, not `None`), a missing/unreadable directory (returns `None`), and 2,000
+real files forcing the multi-call buffer-growth pagination loop (not just the single-call happy
+path) — all pass.
+
+**Real measurement (disposable `robocopy /MIR` mirror of this machine's actual
+`%LOCALAPPDATA%\npm-cache`, 88,864 files / 11,205 dirs — never the live directory itself)**,
+interleaved OLD-vs-NEW repetitions (not a single reversed pair — 5 reps, alternating order every
+rep, medians reported to wash out real OS-file-metadata-cache-warming noise a single reversed pair
+didn't fully control for; see this session's own disposable `bench_m1_rewalk_v2.py`, not committed
+— throwaway measurement tooling, not shipped code):
+
+- **`_live_subtree_records` alone** (exactly what this fix touches): OLD median 11.19s → NEW
+  median 7.87s — **1.42x speedup, real and reproducible** across all 5 reps individually, not
+  just in the median.
+- **`_direct_delete_directory_mismatch` full** (the same boundary the original 17-28s/5.2355s
+  findings measured — includes the walk above PLUS an UNCHANGED third loop): OLD median 16.67s →
+  NEW median 12.30s — **1.35x speedup**, but with high per-rep variance (NEW ranged 9.30s–17.08s
+  across the 5 reps; one individual NEW rep exceeded the ~15s budget even though the median did
+  not).
+
+**Root cause of the smaller-than-hoped improvement, disclosed rather than silently absorbed**:
+`_direct_delete_directory_mismatch`'s third loop (`live_record.path.stat(follow_symlinks=False)
+.st_nlink` for every live FILE, feeding `check_hardlink_shared_active_install`) is a SEPARATE,
+UNCHANGED per-entry `os.stat()` pass this fix does not touch — `FILE_ID_BOTH_DIR_INFO` (the struct
+this task's own brief specifies) has no `nNumberOfLinks` field, and no batched Win32 directory-
+query API provides one; getting nlink for a child still requires opening that child's own real
+handle, the exact cost this fix exists to eliminate. This is a distinct, technically-necessary
+architectural boundary, not an oversight: condition (a)/(b) (identity mismatch, unexpectedly-new
+entries) and condition (c) (hardlink-into-a-different-environment) are different mechanisms, and
+only the first pair is what `GetFileInformationByHandleEx` can batch. The gap between "walk-only"
+(1.42x, my fix's true, clean improvement) and "full-check" (1.35x, diluted by the untouched third
+loop) is the direct, measured evidence of this.
+
+**Verdict on this fix's own stated success criterion ("under the ~15s absolute threshold")**:
+MEDIAN now under budget (12.30s < 15s) where OLD's median was not (16.67s > 15s) — a real,
+measured improvement — but NOT reliably/consistently under budget on a per-run basis given the
+observed variance (one of 5 NEW reps hit 17.08s). Whether this residual is acceptable, or whether
+the third loop's nlink-stat cost also needs its own fix (a genuinely different, harder problem —
+no batched Win32 API exists for it), is a human decision this PR does not make unilaterally,
+matching this fix's own original draft-status posture.
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy clean; 952 passed, 28
+skipped, 1 deselected, 87.93% total coverage; `executor.py` 92.95% (floor 90%, unchanged). All 8 of
+M4's teeth-proof tests in `evals/test_apply_identity_reverify.py` and all 8 tests in
+`evals/test_apply_batch_call_graph_gate.py` pass unmodified — same behavior, faster mechanism, no
+regression.
+
+**Status**: still DRAFT, not merged. This commit is additive to the same branch/PR
+(`fix/apply-batch-identity-reverify`) per this task's own instruction — it measurably narrows, but
+does not fully close, the M1 cost-budget finding; the human decision point from the prior
+checkpoint (accept remaining overhead / also address the third loop's nlink cost / gate M1 behind
+a size threshold) still stands, now with a tighter, better-characterized number to decide against.
