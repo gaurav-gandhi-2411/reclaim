@@ -400,6 +400,14 @@ class ItemApplyResultOut(BaseModel):
     # for a guard-downgraded, rebuildable, retention_days=0 candidate whose vault copy was ALSO
     # purged back out, synchronously, within this same apply call. See that field's docstring.
     synchronously_purged: bool = False
+    # K2a follow-up (API-boundary gap, same shape as the skip_reason follow-up above): mirrors
+    # `executor.ItemApplyResult.postcondition_verification_failed` exactly -- `True` only when
+    # apply_batch's real-filesystem post-condition check caught the OS silently no-op'ing a
+    # mutation it reported as successful (e.g. the K2b junction/reparse-point rmtree case).
+    # `error` already carries a human-readable message for this case, but without this field a
+    # caller of `POST /api/apply` can only detect "silent no-op" by string-matching `error`
+    # rather than checking a structured field. Always `False` when `succeeded` is `True`.
+    postcondition_verification_failed: bool = False
 
 
 class CategoryBreakdownOut(BaseModel):

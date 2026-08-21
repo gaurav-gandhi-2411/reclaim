@@ -1046,6 +1046,7 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
             vault_path=item.vault_path.as_posix() if item.vault_path is not None else None,
             skip_reason=item.skip_reason,
             synchronously_purged=item.synchronously_purged,
+            postcondition_verification_failed=item.postcondition_verification_failed,
         )
         for item in report.items
     ]

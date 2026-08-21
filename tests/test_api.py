@@ -1206,6 +1206,48 @@ def test_apply_response_surfaces_skip_reason_for_a_preflight_skipped_item(
     assert report["files_succeeded"] == len(tier_a_paths) - 1
 
 
+def test_apply_response_surfaces_postcondition_verification_failed_for_a_silent_noop_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2a follow-up, API-boundary gap (same shape as the `skip_reason` test above):
+    `ItemApplyResult.postcondition_verification_failed` must reach the real HTTP response body,
+    not just the internal dataclass -- a caller of `POST /api/apply` currently has no structured
+    way to tell "the OS silently no-op'd this mutation" (K2a/K2b's finding) apart from any other
+    failure without string-matching `error`. Monkeypatches `executor._atomic_move` (the real
+    move primitive the default `method="vault"` apply path calls) to a no-op that raises nothing
+    and touches neither `old_log` nor its vault destination -- reproducing K2a's failure SHAPE
+    (an operation reporting success while changing nothing) through a real `POST /api/apply`
+    `TestClient` call, not a direct `apply_batch()` call."""
+    import reclaim.executor as executor_module
+
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
+    assert paths["old_log"].as_posix() in tier_a_paths
+
+    monkeypatch.setattr(executor_module, "_atomic_move", lambda src, dst, *, is_dir: None)
+
+    report = _apply_and_wait(
+        client, {"tier": "A", "paths": [paths["old_log"].as_posix()], "dry_run": False}
+    )
+
+    items_by_path = {item["path"]: item for item in report["items"]}
+    item = items_by_path[paths["old_log"].as_posix()]
+
+    assert item["succeeded"] is False
+    assert item["postcondition_verification_failed"] is True
+    assert item["error"] is not None
+    assert "silently did not remove it" in item["error"]
+    assert paths["old_log"].exists()  # never actually touched -- the no-op is faithfully simulated
+
+    assert report["files_processed"] == 1
+    assert report["files_failed"] == 1
+    assert report["files_succeeded"] == 0
+
+
 def test_restore_status_items_total_reflects_only_restorable_entries_in_mixed_batch(
     tmp_path: Path,
 ) -> None:
