@@ -443,9 +443,11 @@ def test_apply_batch_skips_file_in_use_and_continues_the_rest_of_the_batch(
     assert report.files_failed == 1
 
 
-def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest_of_the_batch(
+def test_apply_batch_direct_delete_still_skips_hardlink_shared_active_install(
     tmp_path: Path,
 ) -> None:
+    """P0-K1a original finding: load-bearing, unconditionally, for `direct_delete` -- unchanged
+    by ADR-0032/P3 (which only ever skips this check for `method="vault"`)."""
     cache_root = tmp_path / "uv-cache"
     cache_root.mkdir()
     cache_file = cache_root / "six.py"
@@ -463,7 +465,10 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     manifest_path = tmp_path / "manifest.jsonl"
 
     report = apply_batch(
-        [_candidate(cache_file, size_bytes=26), _candidate(normal_target, size_bytes=14)],
+        [
+            _candidate(cache_file, size_bytes=26, retention_days=None),
+            _candidate(normal_target, size_bytes=14, retention_days=None),
+        ],
         safety=_safety(),
         apply=True,
         method="vault",
@@ -475,6 +480,7 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     cache_result = _result_for(report.items, cache_file)
     normal_result = _result_for(report.items, normal_target)
 
+    assert cache_result.method == "direct_delete"
     assert cache_result.succeeded is False
     assert cache_result.skip_reason == "hardlink_shared_active_install"
     assert cache_result.error is None
@@ -488,6 +494,49 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     assert report.files_processed == 2
     assert report.files_succeeded == 1
     assert report.files_failed == 1
+
+
+def test_apply_batch_vault_method_does_not_skip_hardlink_shared_active_install(
+    tmp_path: Path,
+) -> None:
+    """ADR-0032/P3: a vault move is a same-volume rename (or, cross-volume, a copy-then-delete
+    of the source) -- neither destroys the hardlink-shared sibling, and the item stays fully
+    restorable via `reclaim undo` -- so the top-level `check_hardlink_shared_active_install` gate
+    is provably unnecessary specifically for `method="vault"` and is skipped for it. Same
+    fixture shape as the direct-delete regression above, `method="vault"` instead."""
+    cache_root = tmp_path / "uv-cache"
+    cache_root.mkdir()
+    cache_file = cache_root / "six.py"
+    cache_file.write_bytes(b"stdlib-ish-module-content")
+
+    venv = _make_venv(tmp_path / "project" / ".venv")
+    site_packages = venv / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    os.link(cache_file, site_packages / "six.py")
+
+    vault_dir = tmp_path / "vault"
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(cache_file, size_bytes=26)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    cache_result = _result_for(report.items, cache_file)
+    assert cache_result.method == "vault"
+    assert cache_result.succeeded is True
+    assert cache_result.skip_reason is None
+    assert not cache_file.exists()  # moved into the vault, not skipped
+    assert cache_result.vault_path is not None
+    assert cache_result.vault_path.exists()
+    # The hardlink sibling inside the "live install" is untouched either way -- vaulting one
+    # name never affects the content or existence of the other name sharing the same inode.
+    assert (site_packages / "six.py").exists()
 
 
 def test_apply_batch_dry_run_never_probes_preflight_checks(

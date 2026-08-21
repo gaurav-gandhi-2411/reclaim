@@ -195,6 +195,15 @@ class SafetyConfig(BaseModel):
     # Retention window applied only when the guard above fires — independent of the category's
     # own `retention_days` (which is `None` by construction whenever this guard is reachable).
     direct_delete_size_guard_retention_days: int = 30
+    # ADR-0032 (P0-K1a/M1 cost-budget follow-up): a SECOND, independent guard, keyed on entry
+    # count rather than bytes — protects against a directory candidate whose live full-subtree
+    # re-verification re-walk (M1) would cost more wall-clock than a human waiting on `apply`
+    # should have to, even when the candidate is small in bytes or `size_guard_exempt`. Default
+    # 87,882: the real, measured crossing point against the ~15s absolute re-walk budget, using
+    # the WORST (not median) observed per-entry rate from a real disposable mirror of this
+    # machine's `%LOCALAPPDATA%\npm-cache` (88,864 files, 11,205 dirs) — see
+    # `executor._DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD`'s own comment for the full derivation.
+    direct_delete_entry_count_guard: int = 87_882
 
 
 class PackageCachesConfig(BaseModel):

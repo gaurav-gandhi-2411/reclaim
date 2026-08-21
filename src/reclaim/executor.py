@@ -8,7 +8,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TextIO
 
@@ -344,6 +344,14 @@ class ItemApplyResult:
     # still `False` for a skipped item (it did not happen), but callers that need to tell "never
     # attempted" apart from "attempted and failed" should check this field, not just `error`.
     skip_reason: PreflightSkipReason | None = None
+    # ADR-0032: `True` only for a guard-downgraded (entry-count or byte-size), rebuildable,
+    # `retention_days=0` candidate whose vault copy was ALSO successfully purged back out again,
+    # synchronously, within this same `apply_batch` call — see that function's docstring. `False`
+    # (the default) for every other outcome, including a `retention_days=0` item whose
+    # synchronous purge attempt itself failed (it stays validly vaulted, `succeeded` is still
+    # `True` for the underlying vault move, just not yet purged — a future `reclaim purge` run
+    # will pick it up like any other purge-eligible entry).
+    synchronously_purged: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +389,13 @@ class BatchApplyReport:
     disk_free_before_bytes: int | None
     disk_free_after_bytes: int | None
     disk_free_delta_bytes: int | None
+    # ADR-0032: subset of `files_succeeded`/`bytes_freed` that was ALSO synchronously purged
+    # back out of the vault within this same call — see `ItemApplyResult.synchronously_purged`.
+    # Reported separately, mirroring `purge.PurgeReport.stale_count`/`stale_bytes`'s pattern, so
+    # a caller never has to infer "were these bytes actually freed yet" from `disk_free_delta_
+    # bytes` alone. `0`/`0` for every existing caller/batch that never triggers a guard downgrade.
+    synchronously_purged_count: int = 0
+    bytes_synchronously_purged: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,6 +899,8 @@ def _effective_method_and_retention_days(
     mode: Mode,
     size_guard_bytes: int,
     size_guard_retention_days: int,
+    entry_count_guard: int,
+    subtree_entry_count: int | None,
 ) -> tuple[QuarantineMethod, int | None]:
     """Stage 2 safety boundary, checked FIRST, before any other branch in this function: when
     `mode` is `Mode.SAFE`, the result is unconditionally `("recycle_bin", candidate.
@@ -924,19 +941,47 @@ def _effective_method_and_retention_days(
     guard-downgraded candidate (a hypothetical misconfigured category with `retention_days=None`
     that isn't one of the four known-rebuildable groups) keeps the safer `size_guard_retention_
     days` default.
+
+    P0-K1a/M1 cost-budget follow-up (ADR-0032): a SECOND, independent guard axis, keyed on entry
+    COUNT rather than bytes. M1's full-subtree re-walk (`_direct_delete_directory_mismatch`,
+    reached only for a directory candidate whose resolved method is `"direct_delete"`) has a
+    real, measured per-entry wall-clock cost with no further batching available for its hardlink
+    pass (see PLAN.md's 2026-08-21 checkpoints) — a candidate can be small in `size_bytes` (or
+    outright `size_guard_exempt`, like `package_caches`) while still containing enough entries to
+    make that re-walk take longer than a human waiting on `apply` should ever have to (the
+    `%LOCALAPPDATA%\\npm-cache` real worst case: 88,864 files, package_caches, exempt from the
+    size guard, yet the single most expensive candidate this fix has actually measured). This
+    guard fires independently of `size_guard_exempt` — that flag only ever meant "this category's
+    RECOVERY cost doesn't scale with size," never "this category's RE-WALK cost doesn't scale
+    with entry count," and the two are unrelated axes. `subtree_entry_count` is `None` whenever
+    the caller has no `ScanIndex` to cheaply count against (mirrors M1's own `scan_index is None`
+    fallback) or the candidate isn't a directory (an entry-count guard is meaningless for a single
+    file) — this guard simply never fires in that case, same fail-open-on-this-axis-only posture
+    M1's own `scan_index is None` fallback already established (the size guard and the top-level
+    identity check still apply regardless).
     """
     if mode == Mode.SAFE:
         return "recycle_bin", candidate.retention_days
 
     if candidate.retention_days is None:
-        if candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt:
+        size_guard_hit = (
+            candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt
+        )
+        entry_count_guard_hit = (
+            subtree_entry_count is not None and subtree_entry_count >= entry_count_guard
+        )
+        if size_guard_hit or entry_count_guard_hit:
             retention_days = 0 if candidate.rebuildable else size_guard_retention_days
             logger.info(
                 "executor.retention_size_guard_downgrade",
                 path=str(candidate.path),
                 size_bytes=candidate.size_bytes,
+                subtree_entry_count=subtree_entry_count,
                 category=candidate.category,
                 size_guard_bytes=size_guard_bytes,
+                entry_count_guard=entry_count_guard,
+                size_guard_hit=size_guard_hit,
+                entry_count_guard_hit=entry_count_guard_hit,
                 retention_days=retention_days,
             )
             return "vault", retention_days
@@ -989,6 +1034,22 @@ def _reverify_direct_delete_candidates(
 
 _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES = 1024 * 1024 * 1024
 _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS = 30
+
+# P0-K1a/M1 cost-budget follow-up (ADR-0032): real, measured crossing point, not a round number
+# picked without data. Basis: PLAN.md's 2026-08-21 "batched GetFileInformationByHandleEx re-walk"
+# checkpoint measured `_direct_delete_directory_mismatch`'s full cost (walk + the unbatchable
+# per-file hardlink/nlink pass) against a disposable mirror of this machine's real
+# `%LOCALAPPDATA%\npm-cache` (88,864 files + 11,205 dirs = 100,069 entries): 5 interleaved reps,
+# NEW median 12.30s, range 9.30s-17.08s. Using the WORST observed rep (not the median) as the
+# per-entry rate basis is a deliberate safety margin, not an oversight: the median alone was
+# already flagged in that checkpoint as "NOT reliably under budget on a per-run basis" (one of
+# five reps exceeded the ~15s absolute ceiling even though the median did not) -- a human waiting
+# on `apply` cares about the run they actually get, not the average of five they didn't.
+# worst_rate = 17.08s / 100,069 entries = 170.68us/entry; threshold = 15s / worst_rate =
+# 87,882.6 entries, floored to the largest entry count whose worst-observed-rate-scaled estimate
+# still lands at or under the 15s ceiling. Recorded here, not derived at import time, so this
+# constant's value is legible from the source alone without re-running the division.
+_DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD = 87_882
 
 
 def _top_level_identity_mismatch(candidate: Candidate) -> str | None:
@@ -1170,16 +1231,33 @@ def _preflight_skip_reason(
     the item without attempting the real mutation, so there is no need to run (or report) more
     than the first hit.
 
-    `check_hardlink_shared_active_install` is applied unconditionally here, to every apply
-    (including a human-confirmed, single-item apply from the dashboard), not gated behind any
-    "is this an unattended/scheduled run" flag -- `apply_batch` has no such notion today (R6's
-    autonomous-cleanup allowlist doesn't exist yet either; see the audit's R6/D3 sections), and
-    the check itself is genuinely defense-in-depth (deleting a hardlink-shared path is not
+    `check_hardlink_shared_active_install` is applied to every DIRECT-DELETE and RECYCLE-BIN
+    apply (including a human-confirmed, single-item apply from the dashboard), not gated behind
+    any "is this an unattended/scheduled run" flag -- `apply_batch` has no such notion today
+    (R6's autonomous-cleanup allowlist doesn't exist yet either; see the audit's R6/D3 sections),
+    and the check itself is genuinely defense-in-depth (deleting a hardlink-shared path is not
     destructive to its siblings -- see `preflight.check_hardlink_shared_active_install`'s
-    docstring) rather than a hard safety violation, so applying it to every apply path is the
+    docstring) rather than a hard safety violation, so applying it to those two paths is the
     conservative choice: it costs a skip a human can investigate and re-apply after review, never
     a silent unsafe delete. Revisit this call site (not the check itself) if/when a real
     "attended vs. unattended" distinction is ever added to this function's signature.
+
+    P0-K1a/M1 cost-budget follow-up (ADR-0032, P3): SKIPPED for `item_method == "vault"`
+    specifically -- verified airtight, not assumed: a vault move is `_atomic_move`'s same-volume
+    `os.rename` in the common case (a single metadata operation, doesn't touch the target's bytes
+    or its hardlink siblings at all) and, in the rare cross-volume fallback, a copy-then-delete of
+    `src` -- and the check's own docstring already establishes that deleting `path` "is NOT
+    destructive to any hardlink sibling by construction" (an unlink only decrements the shared
+    inode's reference count; every surviving name still resolves to the identical bytes) for
+    EITHER case. Vault additionally never destroys anything at all -- the item is fully restorable
+    via `reclaim undo` right up until (and, per ADR-0032, briefly past) its retention window --
+    which is strictly weaker grounds for pausing an unattended apply than direct-delete's genuine
+    permanence. No UI/reporting path was found to depend on `hardlink_shared_active_install` firing
+    specifically for a vault-method item (grep-confirmed: the only consumer of this skip_reason
+    literal outside this module is the generic `PreflightSkipReason` display, which renders any
+    skip reason identically regardless of which one fired) -- so skipping it here costs nothing a
+    vaulted candidate's own user was relying on to see. Kept fully, unconditionally, for
+    `direct_delete` and `recycle_bin` -- it is load-bearing there, per the original P0-1 finding.
 
     P0-K1a identity checks, run last (the two checks above are cheaper and were here first):
     `_top_level_identity_mismatch` runs for every candidate; `_direct_delete_directory_mismatch`
@@ -1195,7 +1273,10 @@ def _preflight_skip_reason(
     """
     if check_file_in_use(candidate.path, is_dir=candidate.is_dir):
         return "file_in_use"
-    if check_hardlink_shared_active_install(candidate.path).is_shared_with_other_environment:
+    if (
+        item_method != "vault"
+        and check_hardlink_shared_active_install(candidate.path).is_shared_with_other_environment
+    ):
         return "hardlink_shared_active_install"
 
     top_level_detail = _top_level_identity_mismatch(candidate)
@@ -1229,6 +1310,7 @@ def apply_batch(
     now: float | None = None,
     direct_delete_size_guard_bytes: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES,
     direct_delete_size_guard_retention_days: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS,
+    direct_delete_entry_count_guard: int = _DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD,
     on_progress: ProgressCallback | None = None,
     scan_index: ScanIndex | None = None,
 ) -> BatchApplyReport:
@@ -1296,6 +1378,38 @@ def apply_batch(
     is forced to `vault` instead of `direct_delete`, with `direct_delete_size_guard_retention_days`
     as its retention window — recovery cost, not category, gates permanent deletion.
 
+    ADR-0032 (P0-K1a/M1 cost-budget follow-up): a SECOND, independent guard, keyed on entry count
+    rather than bytes — a `retention_days is None` DIRECTORY candidate whose scan-recorded subtree
+    entry count (`scan_index.subtree_entry_count`, a cheap indexed `COUNT(*)`, never a live walk)
+    is at or above `direct_delete_entry_count_guard` is force-downgraded to `vault` the same way
+    the byte-size guard is — independent of `size_guard_exempt` (that flag is about RECOVERY cost,
+    this guard is about RE-WALK cost; a `package_caches` candidate like a real `npm-cache` root can
+    be exempt from the byte guard yet still contain enough entries to make M1's full re-walk take
+    longer than a human waiting on `apply` should have to). Requires `scan_index` to be non-`None`
+    and the candidate to be a directory; otherwise this guard axis simply never fires (the size
+    guard and the top-level identity check still apply regardless) — same disclosed,
+    narrower-coverage-not-silent-skip posture `scan_index is None` already has for M1 itself. A
+    guard-downgraded candidate this way gets `retention_days=0` under the exact same ADR-0005
+    rebuildable-category rule as a byte-size-guard downgrade — and, per ADR-0032, that
+    `retention_days=0` result is what makes it eligible for the synchronous purge below.
+
+    ADR-0032, synchronous purge for guard-downgraded zero-retention items: a candidate whose
+    CATEGORY resolves to `retention_days=None` (i.e. was always going to be permanently,
+    irreversibly deleted with no review checkpoint at all) but gets force-vaulted to
+    `retention_days=0` by either guard above is, immediately after the main per-item loop below
+    (same batch, same manifest lock, same `apply_batch` call), purged right back out of the vault
+    — so `retention_days=0` means what it says: bytes are actually gone from the volume by the
+    time this call returns, not merely "eligible for a future `reclaim purge` run" (closing the
+    gap ADR-0001's own real-disk-free-delta requirement exists for). Scoped narrowly and
+    explicitly to `candidate.retention_days is None` (checked BEFORE guard resolution, not the
+    resolved `item_retention_days`) so a category a human explicitly configured with
+    `retention_days=0` in `config.toml` is never swept into this — that item never had this fix's
+    guard involved at all, so it keeps the ordinary "vault now, `reclaim purge` explicitly later"
+    checkpoint unchanged. See `ItemApplyResult.synchronously_purged` for the per-item outcome and
+    `docs/architecture/adr/0032-entry-count-guard-and-synchronous-purge.md` for the full
+    reasoning, including why this does not reopen ADR-0001's rejected "auto-purge everything on
+    every run" alternative.
+
     Defense in depth, in two layers:
     1. Raises `SafetyInvariantError` and refuses the *entire* batch if any candidate's
        `safety_verdict` is `Verdict.BLOCKED` — every candidate reaching this function should
@@ -1344,6 +1458,13 @@ def apply_batch(
     )
 
     items: list[ItemApplyResult] = []
+    # ADR-0032: `(index into items, the just-written vault "done" manifest entry)` for every
+    # succeeded item this call must synchronously purge right back out again -- see this
+    # function's own docstring section on synchronous purge. Collected during the main loop,
+    # acted on in a second pass immediately after it (still inside this `try:`, still holding the
+    # same manifest lock) so every vault "done" record is durable BEFORE any purge intent for the
+    # same item is ever written.
+    pending_synchronous_purges: list[tuple[int, QuarantineManifestEntry]] = []
     total_candidates = len(candidates)
     last_heartbeat = time.monotonic()
     # ADR-0026: one manifest file handle held open for the whole batch (not re-opened per item)
@@ -1367,12 +1488,23 @@ def apply_batch(
                     on_progress(index - 1, total_candidates, candidate.category)
                 last_heartbeat = heartbeat_now
 
+            # ADR-0032: cheap indexed COUNT, never a live walk -- only worth querying at all for
+            # the exact shape the entry-count guard can ever fire on (a directory candidate whose
+            # category would otherwise direct-delete it); every other candidate leaves this
+            # `None` and the guard axis simply never fires for it, same as `scan_index is None`.
+            subtree_entry_count = (
+                scan_index.subtree_entry_count(candidate.path)
+                if scan_index is not None and candidate.is_dir and candidate.retention_days is None
+                else None
+            )
             item_method, item_retention_days = _effective_method_and_retention_days(
                 candidate,
                 method,
                 mode=mode,
                 size_guard_bytes=direct_delete_size_guard_bytes,
                 size_guard_retention_days=direct_delete_size_guard_retention_days,
+                entry_count_guard=direct_delete_entry_count_guard,
+                subtree_entry_count=subtree_entry_count,
             )
             item_retention_until = (
                 now_ts + item_retention_days * _SECONDS_PER_DAY
@@ -1502,7 +1634,8 @@ def apply_batch(
             # ADR-0026, phase 2 (success path): the action is now real on disk; log it done,
             # fsynced. A kill between the two `_append_and_sync` calls above leaves an intent
             # whose target now exists — `reclaim.recovery` reconciles it as "completed".
-            _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "done"}))
+            done_entry = intent_entry.model_copy(update={"phase": "done"})
+            _append_and_sync(manifest_fh, done_entry)
             items.append(
                 ItemApplyResult(
                     path=candidate.path,
@@ -1516,6 +1649,72 @@ def apply_batch(
                     vault_path=vault_path,
                 )
             )
+            # ADR-0032: scoped to `candidate.retention_days is None` (the CATEGORY's own,
+            # pre-guard setting) -- never `item_retention_days == 0` alone, which a human could
+            # also reach by explicitly configuring `retention_days: 0` for some category in
+            # config.toml. Only a guard-downgrade-from-direct-delete gets synchronously purged;
+            # an explicitly-configured zero-retention category keeps the ordinary vault-now,
+            # purge-later checkpoint untouched.
+            if (
+                item_method == "vault"
+                and item_retention_days == 0
+                and candidate.retention_days is None
+            ):
+                pending_synchronous_purges.append((len(items) - 1, done_entry))
+
+        # ADR-0032: second pass, same manifest lock, same `try:` -- see docstring. Runs after
+        # every item in the batch has had its own apply intent/done pair written, so a purge
+        # intent for one item is never interleaved with another item's still-open apply intent.
+        # `manifest_fh is not None` is re-checked (not just asserted) here even though it's
+        # unreachable for `pending_synchronous_purges` to be non-empty when `manifest_fh is None`
+        # (every entry in it came from the `apply=True`-only success path above, which already
+        # requires an open handle) -- mypy can't see that invariant across the two loops, and a
+        # narrowed local name is clearer than a `# type: ignore`.
+        if manifest_fh is not None:
+            for item_index, vault_done_entry in pending_synchronous_purges:
+                purge_vault_path = vault_done_entry.vault_path
+                if purge_vault_path is None:  # unreachable: only "vault" entries were collected
+                    continue
+                purge_intent = vault_done_entry.model_copy(
+                    update={
+                        "phase": "intent",
+                        "intent_id": uuid.uuid4().hex,
+                        "operation": "purge",
+                    }
+                )
+                _append_and_sync(manifest_fh, purge_intent)
+                try:
+                    if vault_done_entry.is_dir:
+                        shutil.rmtree(long_path(purge_vault_path), onexc=rmtree_clear_readonly)
+                    else:
+                        unlink_clear_readonly(long_path(purge_vault_path))
+                except OSError as exc:
+                    # Not a failure of the apply itself -- the item is still validly vaulted and
+                    # restorable; it simply stays a normal, retention_days=0 vault entry,
+                    # eligible for the next `reclaim purge` run same as before this fix existed.
+                    logger.warning(
+                        "executor.apply_synchronous_purge_failed",
+                        path=str(vault_done_entry.original_path),
+                        vault_path=str(purge_vault_path),
+                        error=str(exc),
+                    )
+                    _append_and_sync(
+                        manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
+                    )
+                    continue
+                _append_and_sync(
+                    manifest_fh,
+                    purge_intent.model_copy(
+                        update={"phase": "done", "purged": True, "purged_at": now_ts}
+                    ),
+                )
+                items[item_index] = replace(items[item_index], synchronously_purged=True)
+                logger.info(
+                    "executor.apply_synchronous_purge_completed",
+                    path=str(vault_done_entry.original_path),
+                    vault_path=str(purge_vault_path),
+                    size_bytes=vault_done_entry.size_bytes,
+                )
     finally:
         if manifest_fh is not None:
             _close_manifest_for_sync(manifest_fh)
@@ -1531,6 +1730,7 @@ def apply_batch(
 
     succeeded_items = [item for item in items if item.succeeded]
     failed_items = [item for item in items if not item.succeeded]
+    purged_items = [item for item in succeeded_items if item.synchronously_purged]
     return BatchApplyReport(
         batch_id=batch_id,
         apply=apply,
@@ -1546,6 +1746,8 @@ def apply_batch(
         disk_free_before_bytes=disk_free_before,
         disk_free_after_bytes=disk_free_after,
         disk_free_delta_bytes=disk_free_delta,
+        synchronously_purged_count=len(purged_items),
+        bytes_synchronously_purged=sum(item.size_bytes for item in purged_items),
     )
 
 

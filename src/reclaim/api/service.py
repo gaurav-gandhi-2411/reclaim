@@ -1045,6 +1045,7 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
             error=item.error,
             vault_path=item.vault_path.as_posix() if item.vault_path is not None else None,
             skip_reason=item.skip_reason,
+            synchronously_purged=item.synchronously_purged,
         )
         for item in report.items
     ]
@@ -1072,6 +1073,8 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
         disk_free_before_bytes=report.disk_free_before_bytes,
         disk_free_after_bytes=report.disk_free_after_bytes,
         disk_free_delta_bytes=report.disk_free_delta_bytes,
+        synchronously_purged_count=report.synchronously_purged_count,
+        bytes_synchronously_purged=report.bytes_synchronously_purged,
     )
 
 
@@ -1226,6 +1229,9 @@ def run_apply(
                 direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
                 direct_delete_size_guard_retention_days=(
                     state.config.safety.direct_delete_size_guard_retention_days
+                ),
+                direct_delete_entry_count_guard=(
+                    state.config.safety.direct_delete_entry_count_guard
                 ),
                 on_progress=_on_progress,
                 scan_index=apply_scan_index,

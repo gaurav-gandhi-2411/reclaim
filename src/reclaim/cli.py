@@ -806,6 +806,7 @@ def _run_apply(args: argparse.Namespace) -> int:
                 direct_delete_size_guard_retention_days=(
                     config.safety.direct_delete_size_guard_retention_days
                 ),
+                direct_delete_entry_count_guard=config.safety.direct_delete_entry_count_guard,
                 on_progress=_cli_progress_printer("apply"),
                 scan_index=apply_scan_index,
             )
@@ -823,6 +824,16 @@ def _run_apply(args: argparse.Namespace) -> int:
         print(  # noqa: T201
             f"reclaim apply: disk free before={report.disk_free_before_bytes} "
             f"after={report.disk_free_after_bytes} delta={report.disk_free_delta_bytes}"
+        )
+    if report.synchronously_purged_count > 0:
+        # ADR-0032: an entry-count/size-guard-downgraded, rebuildable candidate was vaulted
+        # (M1's re-walk skipped, only the cheap top-level check applied) and then immediately
+        # purged back out within this same apply — "vault" in the method column above never
+        # meant "still sitting in the vault" for these specific items.
+        print(  # noqa: T201
+            f"  synchronously purged (guard-downgraded, rebuildable, freed immediately): "
+            f"count={report.synchronously_purged_count} "
+            f"bytes={report.bytes_synchronously_purged}"
         )
     for category, breakdown in sorted(report.category_breakdown.items()):
         print(  # noqa: T201

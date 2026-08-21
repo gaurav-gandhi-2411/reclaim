@@ -29,8 +29,10 @@ from reclaim.executor import (
     long_path,
     restore_batch,
 )
+from reclaim.index import ScanIndex
 from reclaim.models import Candidate, Mode, Tier, Verdict
 from reclaim.safety import SafetyValidator
+from reclaim.scanner import scan_tree
 
 _NOW = 1_700_000_000.0
 
@@ -1256,6 +1258,123 @@ def test_direct_delete_size_guard_does_not_trigger_below_threshold(tmp_path: Pat
 
     assert report.items[0].method == "direct_delete"
     assert not target.exists()
+
+
+def _flat_tree(root: Path, *, file_count: int) -> Path:
+    cache_dir = root / "cache_dir"
+    cache_dir.mkdir()
+    for i in range(file_count):
+        (cache_dir / f"file_{i}.bin").write_bytes(b"x")
+    return cache_dir
+
+
+def test_direct_delete_entry_count_guard_respects_configured_threshold(tmp_path: Path) -> None:
+    """ADR-0032 (P0-K1a/M1 cost-budget follow-up): a directory candidate whose scan-recorded
+    subtree entry count is at or above a configured (small, for test speed) threshold is
+    force-downgraded to vault, the same way the byte-size guard already is — proves the
+    threshold is actually threaded through `apply_batch`, not hardcoded."""
+    cache_dir = _flat_tree(tmp_path, file_count=5)
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        report = apply_batch(
+            [_candidate(cache_dir, is_dir=True, size_bytes=5, retention_days=None)],
+            safety=_safety(),
+            apply=True,
+            vault_dir=tmp_path / "vault",
+            manifest_path=manifest_path,
+            now=_NOW,
+            scan_index=index,
+            direct_delete_entry_count_guard=2,  # real tree has 5 files, well above this
+        )
+
+    assert report.items[0].method == "vault"
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert entries[0].method == "vault"
+
+
+def test_direct_delete_entry_count_guard_does_not_trigger_below_threshold(tmp_path: Path) -> None:
+    cache_dir = _flat_tree(tmp_path, file_count=3)
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        report = apply_batch(
+            [_candidate(cache_dir, is_dir=True, size_bytes=3, retention_days=None)],
+            safety=_safety(),
+            apply=True,
+            vault_dir=tmp_path / "vault",
+            manifest_path=manifest_path,
+            now=_NOW,
+            scan_index=index,
+            direct_delete_entry_count_guard=1000,  # real tree has 3 files, well below this
+        )
+
+    assert report.items[0].method == "direct_delete"
+    assert not cache_dir.exists()
+
+
+def test_size_guard_exempt_candidate_still_subject_to_entry_count_guard(tmp_path: Path) -> None:
+    """The key motivating interaction (ADR-0032): `size_guard_exempt=True` (package_caches'
+    real default) only ever meant "this category's RECOVERY cost doesn't scale with size" — it
+    was never a statement about RE-WALK cost, which is what the entry-count guard protects
+    against. A real `%LOCALAPPDATA%\\npm-cache`-shaped candidate (package_caches, exempt from
+    the byte-size guard, but with a large real file count) must still be caught by the
+    entry-count axis."""
+    cache_dir = _flat_tree(tmp_path, file_count=5)
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        report = apply_batch(
+            [
+                _candidate(
+                    cache_dir,
+                    is_dir=True,
+                    size_bytes=5,
+                    category="package_cache",
+                    retention_days=None,
+                    size_guard_exempt=True,
+                )
+            ],
+            safety=_safety(),
+            apply=True,
+            vault_dir=tmp_path / "vault",
+            manifest_path=manifest_path,
+            now=_NOW,
+            scan_index=index,
+            direct_delete_size_guard_bytes=1,  # would also fire on bytes if not exempt
+            direct_delete_entry_count_guard=2,
+        )
+
+    # size_guard_exempt=True means the BYTE axis never fires (proven by the sibling test above),
+    # but the entry-count axis is independent of that flag and fires anyway.
+    assert report.items[0].method == "vault"
+
+
+def test_entry_count_guard_never_fires_without_scan_index(tmp_path: Path) -> None:
+    """Disclosed fallback (mirrors M1's own `scan_index is None` posture): with no `scan_index`
+    passed, `subtree_entry_count` can never be queried, so this guard axis simply never fires —
+    the byte-size guard and the top-level identity check still apply regardless. A real 5-file
+    tree, well above the (tiny) configured threshold, still direct-deletes because there is no
+    scan index to cheaply count it against."""
+    cache_dir = _flat_tree(tmp_path, file_count=5)
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(cache_dir, is_dir=True, size_bytes=5, retention_days=None)],
+        safety=_safety(),
+        apply=True,
+        vault_dir=tmp_path / "vault",
+        manifest_path=manifest_path,
+        now=_NOW,
+        direct_delete_entry_count_guard=2,
+        # scan_index intentionally omitted
+    )
+
+    assert report.items[0].method == "direct_delete"
+    assert not cache_dir.exists()
 
 
 def test_size_guard_exempt_candidate_direct_deletes_regardless_of_size(tmp_path: Path) -> None:
