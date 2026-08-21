@@ -232,7 +232,12 @@ Every `apply` prints a `batch_id`. Most categories vault into `data/quarantine/`
 rebuildable categories (package caches, dev artifacts, browser/temp caches, crash dumps) delete
 immediately since their real recovery path was always "rebuild it," not "restore it" — see
 ADR-0001 for the full rationale and `reclaim apply --help`/the dashboard's per-item recovery note
-for which is which before you apply.
+for which is which before you apply. An unusually large member of one of these rebuildable
+categories may briefly show `method=vault` in a per-item report instead of `direct_delete` — a
+cost-budget guard (ADR-0003/ADR-0032) routes it through the vault and then purges it back out
+within the same `apply` call, rather than skipping its identity re-verification. The end result
+is identical from your perspective (bytes gone by the time `apply` returns, real, measured
+disk-free delta), just via a different internal mechanism for that one item.
 
 ```powershell
 # From the CLI:
