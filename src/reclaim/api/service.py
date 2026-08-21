@@ -1210,20 +1210,26 @@ def run_apply(
             state.apply_status.current_category = current_category
 
     try:
-        report = apply_batch(
-            selected,
-            safety=state.safety,
-            apply=apply,
-            method=method,
-            mode=state.live_mode,
-            vault_dir=state.vault_dir,
-            manifest_path=state.manifest_path,
-            direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
-            direct_delete_size_guard_retention_days=(
-                state.config.safety.direct_delete_size_guard_retention_days
-            ),
-            on_progress=_on_progress,
-        )
+        # P0-K1a/M1: a fresh `ScanIndex` opened right here so `apply_batch`'s full-subtree
+        # re-walk has the SAME persisted scan data to re-verify irreversible directory
+        # candidates against -- `selected` above was built from its own separately-scoped
+        # `with ScanIndex(...)` block that has already closed by this point.
+        with ScanIndex(state.db_path) as apply_scan_index:
+            report = apply_batch(
+                selected,
+                safety=state.safety,
+                apply=apply,
+                method=method,
+                mode=state.live_mode,
+                vault_dir=state.vault_dir,
+                manifest_path=state.manifest_path,
+                direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+                direct_delete_size_guard_retention_days=(
+                    state.config.safety.direct_delete_size_guard_retention_days
+                ),
+                on_progress=_on_progress,
+                scan_index=apply_scan_index,
+            )
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
         logger.warning("api.apply_failed", error=str(exc))

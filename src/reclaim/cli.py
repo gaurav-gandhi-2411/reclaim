@@ -789,20 +789,26 @@ def _run_apply(args: argparse.Namespace) -> int:
     if args.apply:
         _print_batch_duration_warning("apply", len(selected))
     try:
-        report = apply_batch(
-            selected,
-            safety=safety,
-            apply=args.apply,
-            method=method,
-            mode=config.mode,
-            vault_dir=args.vault_dir,
-            manifest_path=args.manifest,
-            direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
-            direct_delete_size_guard_retention_days=(
-                config.safety.direct_delete_size_guard_retention_days
-            ),
-            on_progress=_cli_progress_printer("apply"),
-        )
+        # P0-K1a/M1: a fresh `ScanIndex` opened right here (the earlier `with ScanIndex(...)`
+        # above, used for candidate generation, has already closed by this point) so
+        # `apply_batch`'s full-subtree re-walk has the SAME persisted scan data to re-verify
+        # irreversible directory candidates against.
+        with ScanIndex(args.db) as apply_scan_index:
+            report = apply_batch(
+                selected,
+                safety=safety,
+                apply=args.apply,
+                method=method,
+                mode=config.mode,
+                vault_dir=args.vault_dir,
+                manifest_path=args.manifest,
+                direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
+                direct_delete_size_guard_retention_days=(
+                    config.safety.direct_delete_size_guard_retention_days
+                ),
+                on_progress=_cli_progress_printer("apply"),
+                scan_index=apply_scan_index,
+            )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
         return 1
