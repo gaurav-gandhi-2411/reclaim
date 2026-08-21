@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reclaim.mode import current_mode
@@ -70,6 +70,17 @@ DEFAULT_PROTECTED_EXTENSIONS: tuple[str, ...] = (
 
 DEFAULT_DATABASE_EXTENSIONS: tuple[str, ...] = (".db", ".sqlite", ".mdf")
 DEFAULT_VM_EXTENSIONS: tuple[str, ...] = (".vhdx", ".vmdk", ".qcow2")
+
+# P0 fix (2026-08 audit, temp-sweep age-guard finding): hard floor for
+# `TempAndBrowserCachesConfig.min_temp_root_age_hours` -- never configurable below this,
+# regardless of what a hand-edited config.toml requests. Without a floor, a misconfigured (or
+# adversarially set) value of e.g. `0` would silently defeat the whole guard and put this back
+# to the exact unconditional-sweep behavior this fix exists to close. 24h, not 0h: a genuinely
+# fresh temp file (installer mid-extraction, active download, running app scratch state) is
+# almost always resolved (completed or abandoned) well within a day; this is the same order of
+# magnitude as `preflight.check_file_in_use`'s own protection window, just closing the gap that
+# check cannot (a file momentarily unlocked between writes at the exact instant of apply).
+MIN_TEMP_ROOT_AGE_HOURS_FLOOR = 24.0
 
 DEFAULT_FINANCE_TOKENS: tuple[str, ...] = (
     "tax",
@@ -266,6 +277,42 @@ class TempAndBrowserCachesConfig(BaseModel):
     # ADR-0001: `None` -> direct permanent delete on apply; an int -> vault + manifest + restore.
     # Browser/temp caches regenerate automatically, so they default to `None`.
     retention_days: int | None = None
+    # P0 fix (2026-08 audit, temp-sweep age-guard finding): `temp_roots`' direct children
+    # (`%TEMP%`/`C:\Windows\Temp`) previously had NO age check anywhere -- a file written seconds
+    # ago (an in-progress installer's temp extraction, an active browser download's partial
+    # file, a running application's scratch state) was exactly as eligible for direct-delete as a
+    # year-old leftover. This is a DETECTION-TIME guard, independent of (and a real gap-closer
+    # for) `preflight.check_file_in_use`'s APPLY-TIME lock probe: the lock probe only fires if
+    # another process holds a conflicting handle at the exact instant of apply, so a file that is
+    # momentarily unlocked between writes (e.g. an installer closing and reopening the same file
+    # across extraction steps) is invisible to it -- an age floor means that file is never even
+    # proposed as a candidate in the first place, closing the race window at its source rather
+    # than trying to catch it at apply time. `detect_temp_and_browser_caches` is the only detector
+    # this applies to (whole-directory browser/thumbnail cache matches under `cache_paths` are
+    # unaffected, matching the scope of the original finding). Default 7 days: matches the manual
+    # mtime filter this project's own Track A cleanup used on this exact directory -- the shipped
+    # default had drifted more aggressive than what was manually judged safe. See
+    # `MIN_TEMP_ROOT_AGE_HOURS_FLOOR` for the hard minimum this can never be configured below.
+    min_temp_root_age_hours: float = 24.0 * 7
+
+    @field_validator("min_temp_root_age_hours")
+    @classmethod
+    def _enforce_min_temp_root_age_floor(cls, value: float) -> float:
+        """Hard reject (not a silent clamp) for a value below `MIN_TEMP_ROOT_AGE_HOURS_FLOOR` --
+        same hard-reject posture `_check_unknown_config_keys` already uses elsewhere in this
+        module for a config value that would otherwise silently defeat a safety guard. Clamping
+        instead would let a user believe they'd configured e.g. `0.1` and get quiet, different-
+        than-requested behavior with no signal anything was overridden; raising surfaces the
+        misconfiguration immediately, at config-load time, rather than as a later data-loss
+        incident."""
+        if value < MIN_TEMP_ROOT_AGE_HOURS_FLOOR:
+            raise ValueError(
+                f"categories.temp_and_browser_caches.min_temp_root_age_hours must be >= "
+                f"{MIN_TEMP_ROOT_AGE_HOURS_FLOOR} (got {value}) -- a lower value would defeat "
+                "the guard against sweeping just-written temp files (in-progress installers, "
+                "active downloads, running application scratch state)"
+            )
+        return value
 
 
 class CrashDumpsConfig(BaseModel):
