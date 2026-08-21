@@ -11,12 +11,24 @@ import pytest
 # with Python's `ast` module -- never string/regex matching, which a comment or a docstring
 # mentioning "shutil.rmtree" could trivially fool either direction:
 #
-# 1. Every DIRECT call to a real filesystem-mutation primitive (`shutil.rmtree`,
+# 1. Every DIRECT call to a real filesystem-mutation primitive (`shutil.rmtree`, `os.rmdir`,
 #    `send2trash.send2trash`, `os.rename`, `os.unlink`) anywhere in these two files is lexically
-#    confined to one of four functions: `_atomic_move` / `unlink_clear_readonly` (executor.py's
-#    two crash-safe move/delete primitives, ADR-0004) or `apply_batch` (executor.py) /
-#    `purge_expired` (purge.py) themselves (the two batch entry points that call those
-#    primitives directly for their recycle-bin/direct-delete/permanent-purge branches).
+#    confined to one of five functions: `_atomic_move` / `unlink_clear_readonly` /
+#    `rmtree_reparse_point_safe` (executor.py's three crash-safe/reparse-point-safe move/delete
+#    primitives, ADR-0004 and K2b) or `apply_batch` (executor.py) / `purge_expired` (purge.py)
+#    themselves (the two batch entry points that call those primitives directly, or through one
+#    of the three wrapper homes, for their recycle-bin/direct-delete/permanent-purge branches).
+#    K2b (audit finding, this session): `os.rmdir` joined the forbidden-primitive set and
+#    `rmtree_reparse_point_safe` joined the allowed-homes set together, as one pair -- `os.rmdir`
+#    is the correct, safe removal call for a top-level path that turns out to be a reparse point
+#    (a junction/symlink), used INSIDE `rmtree_reparse_point_safe` precisely to avoid the silent
+#    no-op `shutil.rmtree` suffers when handed one directly (see that function's own module
+#    comment in executor.py) -- both the primitive and its one legitimate home had to be added
+#    together, or this gate would have flagged K2b's own fix as a violation.
+#    `purge.py` no longer calls `shutil.rmtree`/`os.rmdir` directly at all (K2b) -- both go
+#    through the SAME imported `rmtree_reparse_point_safe` wrapper `unlink_clear_readonly` was
+#    already the precedent for (purge.py's `os.unlink` has never been a direct call in this file
+#    either); see section 1's purge-specific tests below for how this is proven with teeth.
 # 2. Inside `apply_batch`'s per-candidate loop, Audit P0-1's pre-flight-check guard
 #    (`_preflight_skip_reason` + its `if skip_reason is not None: continue`) structurally
 #    precedes the first statement that can reach a mutation primitive -- sufficient to prove by
@@ -34,21 +46,37 @@ _PURGE_PATH = _SRC_ROOT / "purge.py"
 
 _FORBIDDEN_MUTATION_PRIMITIVES = {
     "shutil.rmtree",
+    "os.rmdir",
     "send2trash.send2trash",
     "os.rename",
     "os.unlink",
 }
 
-_ALLOWED_HOMES_EXECUTOR = {"_atomic_move", "unlink_clear_readonly", "apply_batch"}
+_ALLOWED_HOMES_EXECUTOR = {
+    "_atomic_move",
+    "unlink_clear_readonly",
+    "rmtree_reparse_point_safe",
+    "apply_batch",
+}
 _ALLOWED_HOMES_PURGE = {"purge_expired"}
 
-# apply_batch's own preflight guard call, and the two allowed-home wrapper functions a mutation
-# can additionally reach through (rather than only ever via a bare primitive call) -- see
+# Wrapper functions (defined in executor.py) purge.py imports and calls INSTEAD of ever calling a
+# forbidden primitive directly -- the same "audited wrapper, not a bare primitive" pattern
+# `_ALLOWED_HOMES_EXECUTOR` already establishes for executor.py itself. Used by section 1's
+# purge-specific "guard the guard" test to prove purge.py's real mutations genuinely still
+# happen, confined to `purge_expired`, now that neither `shutil.rmtree`/`os.rmdir` nor `os.unlink`
+# is ever called bare in this file (K2b made this uniformly true for all three; `os.unlink` via
+# `unlink_clear_readonly` was already this shape before K2b).
+_PURGE_WRAPPER_NAMES = {"rmtree_reparse_point_safe", "unlink_clear_readonly"}
+
+# apply_batch's own preflight guard call, and the allowed-home wrapper functions a mutation can
+# additionally reach through (rather than only ever via a bare primitive call) -- see
 # `_MUTATION_REACHING_NAMES` below, used only for the loop-order proof in section 2.
 _PREFLIGHT_GUARD_CALL_NAME = "_preflight_skip_reason"
 _MUTATION_REACHING_NAMES = _FORBIDDEN_MUTATION_PRIMITIVES | {
     "_atomic_move",
     "unlink_clear_readonly",
+    "rmtree_reparse_point_safe",
 }
 
 # Audit-traced real call sites into `apply_batch` (section 4): `cli.py::_run_apply` (the CLI
@@ -209,9 +237,14 @@ def test_executor_mutation_primitives_confined_to_allowed_homes() -> None:
 
 def test_executor_scan_actually_found_every_real_mutation_primitive() -> None:
     """Guards the guard (house rule 85a): a scan that found zero calls anywhere would trivially
-    "pass" the test above without proving anything. Confirms all four primitives are genuinely
-    present in executor.py today (shutil.rmtree x3, os.rename x1, os.unlink x2, send2trash x1),
-    each already confined to an allowed home."""
+    "pass" the test above without proving anything. Confirms all five primitives are genuinely
+    present in executor.py today (shutil.rmtree x2, os.rmdir x3, os.rename x1, os.unlink x2,
+    send2trash x1), each already confined to an allowed home. `shutil.rmtree` dropped from x3 to
+    x2 and `os.rmdir` newly appears at K2b: `apply_batch`'s direct-delete branch and its
+    synchronous-purge branch now call the `rmtree_reparse_point_safe` wrapper instead of
+    `shutil.rmtree` directly (only `_atomic_move`'s cross-volume copy-fallback source removal
+    still does, plus the wrapper's own internal fallback call) -- see this file's top-of-module
+    comment."""
     source = _EXECUTOR_PATH.read_text(encoding="utf-8")
     homes = _primitive_call_homes(source, _FORBIDDEN_MUTATION_PRIMITIVES)
     empty = {name for name, found_in in homes.items() if not found_in}
@@ -222,6 +255,11 @@ def test_executor_scan_actually_found_every_real_mutation_primitive() -> None:
 
 
 def test_purge_mutation_primitives_confined_to_allowed_homes() -> None:
+    """K2b: purge.py no longer directly calls any forbidden primitive at all (`shutil.rmtree`/
+    `os.rmdir` now go through the imported `rmtree_reparse_point_safe` wrapper, the same way
+    `os.unlink` already went through `unlink_clear_readonly` before this fix) -- this assertion
+    (0 violations) is therefore expected to pass, but vacuously; see the wrapper-confinement test
+    directly below for the version of this proof that still has teeth (house rule 85a)."""
     source = _PURGE_PATH.read_text(encoding="utf-8")
     violations = _mutation_primitive_violations(source, _ALLOWED_HOMES_PURGE)
     assert violations == {}, (
@@ -231,13 +269,20 @@ def test_purge_mutation_primitives_confined_to_allowed_homes() -> None:
 
 
 def test_purge_scan_actually_found_a_real_mutation_primitive() -> None:
-    """purge.py directly calls only `shutil.rmtree` (the `entry.is_dir` branch of
-    `purge_expired`); its `os.unlink` happens through the imported `unlink_clear_readonly`
-    wrapper, not a direct call in THIS file -- so only `shutil.rmtree` is expected non-empty
-    here, unlike executor.py's all-four (see the test above)."""
+    """Guards the guard (house rule 85a), K2b revision: purge.py calls zero forbidden primitives
+    directly now (see the test above) -- its real mutations happen entirely through two imported,
+    audited wrapper functions (`rmtree_reparse_point_safe`, `unlink_clear_readonly`), both defined
+    and confined in executor.py. This proves BOTH wrappers are genuinely called, and confined to
+    `purge_expired` -- the direct equivalent, for the wrapper-mediated shape, of the old bare-
+    primitive proof this test replaces."""
     source = _PURGE_PATH.read_text(encoding="utf-8")
-    homes = _primitive_call_homes(source, _FORBIDDEN_MUTATION_PRIMITIVES)
-    assert homes["shutil.rmtree"], "scan found zero shutil.rmtree calls in purge.py"
+    homes = _primitive_call_homes(source, _PURGE_WRAPPER_NAMES)
+    for wrapper_name in _PURGE_WRAPPER_NAMES:
+        assert homes[wrapper_name], f"scan found zero {wrapper_name} calls in purge.py"
+        assert all(home in _ALLOWED_HOMES_PURGE for home in homes[wrapper_name]), (
+            f"{wrapper_name} is called from outside the allowed home(s) "
+            f"{sorted(_ALLOWED_HOMES_PURGE)} in purge.py: {homes[wrapper_name]}"
+        )
 
 
 # --- 2. Runtime shape: apply_batch's preflight guard precedes every mutation path --------------
