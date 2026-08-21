@@ -30,6 +30,7 @@ dependencies = [
     # would be required for a `windows_toasts`-only in-process `on_activated` callback, since
     # this feature's own checker process is short-lived and exits right after firing the toast
     # -- see notifications.py's module docstring).
+    "mcp>=1.2.0,<2.0.0",
 ]
 
 [project.optional-dependencies]

@@ -42,12 +42,12 @@ jobs:
           uv run python scripts/git_guard.py config --global user.email "fixture@reclaim.test"
           uv run python scripts/git_guard.py config --global user.name "Reclaim Fixture Builder"
 
-      # Scoped explicitly to these eight safety-gate files, not the whole evals/ directory: every
+      # Scoped explicitly to these nine safety-gate files, not the whole evals/ directory: every
       # other evals/*.py file is a gold-set/operating-point measurement that needs the [ai]
       # extra (torch/PIL/numpy/datasketch/...) to even collect, and this job deliberately does
       # NOT install it — those measurements run in ci.yml's ai-layer-with-extras job instead
       # (`pytest tests/ evals/test_ai_safety_gate.py -v`, extras installed there). None of the
-      # eight needs the ai extra: test_safety_gate.py tests the deterministic engine's
+      # nine needs the ai extra: test_safety_gate.py tests the deterministic engine's
       # SafetyValidator hard gate directly; test_ai_safety_gate.py constructs
       # AICluster/AIClusterMember objects with hardcoded scores to prove the structural
       # recommend-only guarantee (never runs a real model); test_safe_mode_gate.py tests the
@@ -59,8 +59,12 @@ jobs:
       # pre-flight guard structurally precedes any mutation it can reach;
       # test_reclaimable_bytes_link_aware_gate.py is a pure `ast`-module structural scan of
       # schemas.py/service.py/cli.py; test_cache_reclaimable_bytes_gate.py exercises
-      # `reclaim.detectors`/`reclaim.index` directly against real `os.link()` fixtures. Verified:
-      # all eight collect and pass with zero ai deps installed.
+      # `reclaim.detectors`/`reclaim.index` directly against real `os.link()` fixtures;
+      # test_mcp_safety_gate.py (R7) proves the MCP control surface never imports
+      # reclaim.executor/send2trash directly and that no registered tool schema accepts a raw
+      # path/paths parameter -- `mcp` is a core dependency (pyproject.toml), not an `[ai]`-extra
+      # one, so this job's plain `uv sync` already installs it. Verified: all nine collect and
+      # pass with zero ai deps installed.
       #
       # test_safe_mode_gate.py was added here after a real gap was found: `pyproject.toml`'s
       # `testpaths = ["tests"]` means a bare `pytest` NEVER discovers anything under evals/, so
@@ -77,8 +81,11 @@ jobs:
       # correctness gate under evals/ that scripts/verify.py alone runs, but this job's own list
       # never picked up, would be the identical silent-skip gap this docstring already warns
       # about, just for a new file instead of test_safe_mode_gate.py.
-      - name: Safety gates -- deterministic, adversarial, AI recommend-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, and hardlink-aware reclaimable-bytes
-        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py -v --junitxml=pytest-results.xml
+      #
+      # test_mcp_safety_gate.py is added here up front, at the same time this gate is
+      # introduced, specifically to not repeat that exact discoverability gap a second time.
+      - name: Safety gates -- deterministic, adversarial, AI recommend-only, MCP recommend/rule-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, and hardlink-aware reclaimable-bytes
+        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py evals/test_mcp_safety_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml

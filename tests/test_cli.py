@@ -859,3 +859,72 @@ snooze_days = 3
 
     state = load_state(state_path)
     assert state.snoozed_until is not None
+
+
+# --- mcp-serve: the R7 MCP control surface (docs/AUDIT-2026-08.md) -----------------------------
+
+
+def test_mcp_serve_parses_with_no_host_or_port_flag() -> None:
+    """`mcp-serve` never binds a network socket (see `reclaim.mcp.server.run_mcp_server`'s
+    docstring) -- proven here at the argparse level: `--host`/`--port`, which every HTTP-serving
+    subcommand accepts, are simply not registered flags on this subcommand at all."""
+    args = _build_parser().parse_args(["mcp-serve"])
+    assert not hasattr(args, "host")
+    assert not hasattr(args, "port")
+
+    for flag in ("--host", "--port"):
+        with pytest.raises(SystemExit) as exc_info:
+            _build_parser().parse_args(["mcp-serve", flag, "127.0.0.1"])
+        assert exc_info.value.code == 2
+
+
+def test_mcp_serve_refuses_to_run_elevated(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom() -> None:
+        from reclaim.elevation import ElevatedProcessError
+
+        raise ElevatedProcessError("simulated: process is elevated")
+
+    monkeypatch.setattr("reclaim.cli.assert_not_elevated", _boom)
+
+    exit_code = main(["mcp-serve"])
+    assert exit_code == 1
+    assert "simulated: process is elevated" in capsys.readouterr().err
+
+
+def test_mcp_serve_reports_clean_message_for_malformed_toml_syntax(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same D16 friendly-error contract every other config-reading subcommand gets (see
+    `test_apply_reports_clean_message_for_malformed_toml_syntax` above) -- `mcp-serve` reads
+    config.toml through the identical `_load_config_or_none` helper, not a separate path."""
+    bad_config = tmp_path / "config.toml"
+    bad_config.write_text("this is not [valid toml", encoding="utf-8")
+    db = tmp_path / "index.sqlite3"
+
+    exit_code = main(["mcp-serve", "--db", str(db), "--config", str(bad_config)])
+    assert exit_code == 1
+    assert "config.toml is invalid" in capsys.readouterr().err
+
+
+def test_mcp_serve_builds_state_and_runs_the_server_over_stdio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_dashboard_opens_browser_and_delegates_to_serve`'s mocking approach: the
+    real `FastMCP.run` (which blocks forever reading stdio) is replaced with a spy so this test
+    never hangs, while still proving `reclaim mcp-serve` reaches it with the right transport."""
+    from mcp.server.fastmcp import FastMCP
+
+    run_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        FastMCP,
+        "run",
+        lambda self, **kw: run_calls.append(kw),  # type: ignore[method-assign]
+    )
+
+    db = tmp_path / "index.sqlite3"
+    exit_code = main(["mcp-serve", "--db", str(db)])
+
+    assert exit_code == 0
+    assert run_calls == [{"transport": "stdio"}]

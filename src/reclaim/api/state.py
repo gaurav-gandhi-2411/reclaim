@@ -220,6 +220,22 @@ class AppState:
     # this dataclass is (test isolation; see `create_app`'s matching constructor parameters).
     anthropic_key_path: Path = field(default_factory=lambda: DEFAULT_ANTHROPIC_KEY_PATH)
     ai_explanation_cache_dir: Path = field(default_factory=lambda: DEFAULT_AI_EXPLANATION_CACHE_DIR)
+    # R7 concurrency fix (docs/AUDIT-2026-08.md, adversarial re-verification of PR #39): a
+    # single-flight guard for `reclaim.mcp.server.delete`, same "check-and-set under `lock`,
+    # refuse if already running" idiom `POST /api/apply` uses for `apply_status` above --
+    # deliberately its own field, NOT a reuse of `apply_status`, so an MCP-initiated delete never
+    # overwrites the HTTP dashboard's own `GET /api/apply/status` view with a result it didn't
+    # trigger. `reclaim.mcp.server.delete` is synchronous (an MCP tool call is one request/
+    # response, not a background task), so unlike `apply_status` this is a plain bool, not a
+    # richer progress-tracking dataclass: there is nothing to poll mid-flight, only "is one
+    # already running" to check before starting another. Without this, two concurrent `delete()`
+    # calls for the identical selection both pass hash validation and both reach `apply_batch`
+    # -- live-reproduced: the second one fails at the file level (the first already moved it)
+    # but the tool call itself still returns `isError=False`, a misleading "the call succeeded"
+    # shape on a call that deleted nothing (`files_succeeded=0` is the only honest signal, easy
+    # for a caller/agent to miss). Guarding here refuses the second call immediately, before it
+    # ever re-derives candidates or computes a hash, with an unambiguous typed error instead.
+    mcp_delete_in_progress: bool = False
 
     @property
     def live_mode(self) -> Mode:

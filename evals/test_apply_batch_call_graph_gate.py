@@ -220,6 +220,36 @@ def _files_calling(root: Path, target_name: str) -> set[str]:
     return callers
 
 
+def _apply_batch_calls_missing_scan_index(root: Path) -> dict[str, list[str]]:
+    """Q3 rebase fix (docs/AUDIT-2026-08.md): for every `.py` file under `root`, every enclosing
+    top-level function containing a bare `apply_batch(...)` call whose keyword arguments do NOT
+    include `scan_index=` -- keyed by relative file path, value is the list of enclosing function
+    names. Presence of the keyword alone is what this checks (not its runtime value): the real
+    bug this proof exists to catch is a call site omitting `scan_index=` entirely and silently
+    falling back to `apply_batch`'s `scan_index: ScanIndex | None = None` default, which disables
+    the M1 full-subtree re-walk for that call site's irreversible directory candidates while the
+    cheaper top-level `(dev, ino)` identity check still runs -- see `_preflight_skip_reason`'s
+    docstring. Found live during PR #39's rebase onto post-P0-K1a main: `api/service.py::
+    mcp_execute_delete` called `apply_batch(...)` with no `scan_index=` at all, unlike
+    `run_apply`'s call a few dozen lines above it in the same file -- this exact AST-level gate
+    did not previously check for it (only which FILES call `apply_batch`, not which keyword
+    arguments each call passes), so the gap survived a passing `test_apply_batch_real_callers_
+    are_exactly_the_known_closed_set` run undetected until a live adversarial re-verification
+    pass caught it."""
+    missing: dict[str, list[str]] = {}
+    for py_file in sorted(root.rglob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"))
+        for top_fn in _top_level_functions(tree):
+            for node in ast.walk(top_fn):
+                if isinstance(node, ast.Call) and _call_target_name(node) == "apply_batch":
+                    kw_names = {kw.arg for kw in node.keywords}
+                    if "scan_index" not in kw_names:
+                        missing.setdefault(py_file.relative_to(root).as_posix(), []).append(
+                            top_fn.name
+                        )
+    return missing
+
+
 # --- 1. Static: every mutation primitive is confined to its expected allowed home -------------
 
 
@@ -394,4 +424,25 @@ def test_apply_batch_real_callers_are_exactly_the_known_closed_set() -> None:
     assert callers == set(_EXPECTED_APPLY_BATCH_CALLER_FILES), (
         f"apply_batch's real call sites changed: expected exactly "
         f"{sorted(_EXPECTED_APPLY_BATCH_CALLER_FILES)}, found {sorted(callers)}"
+    )
+
+
+# --- 5. Every real apply_batch call passes scan_index= (Q3 rebase fix) -------------------------
+
+
+def test_apply_batch_every_real_call_passes_scan_index() -> None:
+    """The closed-caller-SET proof above (section 4) only proves which FILES call `apply_batch`
+    -- it says nothing about which keyword arguments each call passes, so it did not catch
+    `api/service.py::mcp_execute_delete` omitting `scan_index=` entirely during PR #39's rebase
+    onto post-P0-K1a main (see `_apply_batch_calls_missing_scan_index`'s docstring for the full
+    incident). This closes that gap: every top-level function anywhere under `src/reclaim/` that
+    calls bare `apply_batch(...)` must pass `scan_index=` explicitly -- `cli.py::_run_apply`,
+    `api/service.py::run_apply`, and `api/service.py::mcp_execute_delete` alike -- so a future
+    caller (or a future rebase) that drops it is caught here, not discovered by a live
+    adversarial pass against a real filesystem."""
+    missing = _apply_batch_calls_missing_scan_index(_SRC_ROOT)
+    assert missing == {}, (
+        f"apply_batch call(s) found without an explicit scan_index= keyword argument -- this "
+        f"silently disables the M1 full-subtree re-walk identity re-check for that call site's "
+        f"irreversible directory candidates: {missing}"
     )
