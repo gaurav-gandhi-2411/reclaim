@@ -2802,3 +2802,86 @@ Edge via CDP, `websockets` — already a transitive dep, nothing new installed) 
 
 **Not done this session** (disclosed gap): no automated screenshot-diff/visual-regression test
 added — this is a single new-feature PR, not the "UI has settled" trigger rule 15f gates on.
+
+### 2026-08-21 — P0-K1a fix: apply_batch identity re-verification at mutation time (DRAFT, M1 cost budget exceeded — needs a decision)
+
+Dispatched as a P0 fix: `apply_batch` (the shared mutation choke point for CLI apply, `POST
+/api/apply`, and future MCP `delete`) acted on stale DB-index data with zero re-verification
+against live filesystem state at mutation time — live-reproduced this session: swapping content
+at a candidate's path between scan and apply caused the swapped content to be permanently
+deleted or misrouted into the vault. Branch `fix/apply-batch-identity-reverify`.
+
+**Identity check (K1a)**: `os.stat(path, follow_symlinks=False)`'s `(st_dev, st_ino)`, confirmed
+via a real NTFS junction test (build-and-repoint, not mocked) to give correct, reparse-point-
+aware identity semantics with no `ctypes`/`GetFileInformationByHandle` needed.
+`preflight.check_identity_unchanged_since_scan` is the new probe; `Candidate` gained
+`dev`/`ino`/`mtime` fields (defaulted `0`/`0`/`0.0`, matching `FileRecord`'s own Stage-2
+convention), wired at all THREE real construction sites — `detectors.generate_candidates`,
+`dedup.generate_duplicate_candidates`, and `api.service._build_user_selected_candidate` (a third
+site not named in the original design brief, found during implementation — leaving it
+unwired would have silently disabled the identity check for every AI-suggestion/user-selected
+apply).
+
+**M1 (tiered directory re-walk)**: implemented as designed — `retention_days=None` (irreversible)
+directory candidates get a FULL subtree re-walk (`executor._direct_delete_directory_mismatch`,
+new `apply_batch(..., scan_index=...)` parameter) comparing every scan-recorded entry's live
+`(dev, ino)`, flagging any live entry the scan never recorded, and flagging any live file now
+hardlink-connected into a different RECOGNIZED environment (reusing `check_hardlink_shared_
+active_install` per-file rather than a raw `nlink>1` threshold — a raw threshold would
+false-positive on package/model caches' normal internal hardlinking; disclosed as a deliberate
+substitution for the design brief's literal "new hardlink since scan" wording, since no nlink
+baseline is persisted today). Vaulted/recycle-bin directory candidates get only the cheaper
+top-level check — recoverable, so the disclosed M1(iv) gap (a depth-2 content change inside a
+vaulted directory is not caught) is accepted, not a bug.
+
+**M1 cost budget — EXCEEDED, flagged per the task's own explicit stop condition, not
+silently shipped**: measured (not estimated) real wall-clock overhead of the full re-walk
+against the largest real directory candidate reachable from this worktree
+(`C:\Users\gaura\ml-projects\gg-portfolio\node_modules`, 45,608 files / 5,161 dirs / 50,769
+entries) — re-walk alone: 5.2355s (0.1031ms/entry). A same-machine, same-shape synthetic
+throwaway tree (25,810 entries) cross-check: re-walk 2.1334s vs. a real `shutil.rmtree` apply
+of the same tree at 6.3471s — **overhead = 33.6% of real apply time, roughly 3.4x over the
+task's 10% budget** (and over the design report's original ~0.4% estimate by two orders of
+magnitude). Both `os.stat`-per-entry (re-walk) and `unlink`/`rmdir`-per-entry (real delete)
+are comparable-cost NTFS metadata operations at this file count, so the ratio is not a
+measurement artifact — confirmed via two independent measurements on two different trees.
+**Per the task's explicit instruction, implementation stopped here rather than unilaterally
+redesigning the re-walk's cost profile** (e.g. skipping `build_record`'s git-repo detection,
+which the current implementation reuses wholesale from `scanner.build_record` for
+correctness/consistency, at a cost this measurement did not isolate) — this PR stays DRAFT
+with the finding disclosed prominently for a human decision, not merged, not marked done.
+
+**M2 (restore-destination)**: `restore_batch`'s pre-existing `os.path.exists(...)` check already
+implements "never overwrite an unrecognized destination" unconditionally — documented explicitly
+in code (no legitimate "recognized, safe to overwrite" case exists in this codebase's real data
+shapes: `entry.restored` is checked before this point, and `_atomic_move`'s ADR-0004 guarantee
+means a completed restore never leaves a partial file behind for a later restore to find).
+`purge_expired` is explicitly out of scope (lower severity — only ever touches this tool's own
+vault copies, never an arbitrary user path).
+
+**M4 (six teeth-proofs)**: `evals/test_apply_identity_reverify.py`, new safety-gate file
+(registered in `scripts/verify.py`'s `_SAFETY_GATE_FILES`) — all 8 tests pass: (i) delete-and-
+recreate same path → skip; (ii) real `mklink /J` junction repoint → skip; (iii) depth-2 content
+change, direct-delete → skip (M1's whole point); (iv) depth-2 content change, vaulted → NOT
+caught, documented gap; (v) restore into occupied destination → skip, occupier untouched, vault
+copy preserved; (vi) three unchanged-path regression cases (direct-delete/vault/restore) still
+work normally.
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy all clean; 947
+passed, 28 skipped, 1 deselected, 87.88% total coverage; `executor.py` 92.95% (floor 90%),
+`preflight.py` covered under the same run. `evals/test_apply_batch_call_graph_gate.py`'s
+structural AST proof (mutation primitives confined to allowed homes, preflight guard precedes
+every mutation path, closed call-site set) still passes unmodified.
+
+**Not done this session (disclosed, per M5)**: (1) NTFS MFT sequence-number reuse — practically
+ignorable (~65,536 forced reuse cycles needed on the same MFT record inside one scan-to-apply
+window); (2) same-inode in-place content edits — not caught, by design, different threat class;
+(3) `FSCTL_SET_REPARSE_POINT` in-place reparse-point retargeting — theoretical, untested, no raw
+`DeviceIoControl` call added. All three documented verbatim in `preflight.py`'s new check and in
+the PR body.
+
+**Status**: PR opened as DRAFT (never merged) per this task's own instruction (safety-critical,
+deletion-adjacent code). Blocks #37 and further merges until the M1 cost-budget finding above is
+resolved by a human decision — accept the overhead, ship a lighter-weight identity-only re-walk
+(skip git-detection/ext computation `build_record` currently pays for), or gate M1 behind a
+size/entry-count threshold are three options surfaced, none picked unilaterally.
