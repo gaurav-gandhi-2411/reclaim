@@ -643,7 +643,15 @@ def test_recycle_bin_apply_calls_send2trash_and_never_shutil_move(
     import reclaim.executor as executor_module
 
     calls: list[str] = []
-    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: calls.append(path))
+
+    def _fake_send2trash(path: str) -> None:
+        # K2a (audit finding): a real `send2trash` call genuinely removes `path` from its
+        # original location -- this fake must too, or `apply_batch`'s own post-condition
+        # verification (correctly) reports the item as failed, since nothing actually changed.
+        calls.append(path)
+        Path(path).unlink()
+
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", _fake_send2trash)
     monkeypatch.setattr(
         executor_module.shutil,
         "move",
@@ -678,7 +686,10 @@ def test_restore_refuses_recycle_bin_batch_with_documented_error(
 ) -> None:
     import reclaim.executor as executor_module
 
-    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: None)
+    # K2a (audit finding): a real `send2trash` call genuinely removes the path -- this fake must
+    # too, or `apply_batch`'s own post-condition verification (correctly) reports the item as
+    # failed, since nothing actually changed.
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: Path(path).unlink())
 
     target = tmp_path / "file.bin"
     target.write_bytes(b"content")
@@ -746,7 +757,15 @@ def test_apply_batch_safe_mode_with_recycle_bin_method_succeeds_normally(
     import reclaim.executor as executor_module
 
     calls: list[str] = []
-    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: calls.append(path))
+
+    def _fake_send2trash(path: str) -> None:
+        # K2a (audit finding): a real `send2trash` call genuinely removes `path` from its
+        # original location -- this fake must too, or `apply_batch`'s own post-condition
+        # verification (correctly) reports the item as failed, since nothing actually changed.
+        calls.append(path)
+        Path(path).unlink()
+
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", _fake_send2trash)
 
     target = tmp_path / "file.bin"
     target.write_bytes(b"content")

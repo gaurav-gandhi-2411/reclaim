@@ -1340,9 +1340,23 @@ def test_run_apply_completes_and_leaves_a_durable_manifest_with_zero_status_poll
 def test_recycle_bin_batch_restore_is_blocked_with_real_executor_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import shutil
+
     import reclaim.executor as executor_module
 
-    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: None)
+    def _fake_send2trash(path: str) -> None:
+        # K2a (audit finding): a real `send2trash` call genuinely removes `path` from its
+        # original location (file or directory) -- this fake must too, or `apply_batch`'s own
+        # post-condition verification (correctly) reports the item as failed, since nothing
+        # actually changed. `tier_a_paths` below can include a directory candidate
+        # (`node_modules_dir`), so this must handle both, not just `Path.unlink()`.
+        target = Path(path)
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", _fake_send2trash)
 
     root = tmp_path / "tree"
     _build_tree(root)
