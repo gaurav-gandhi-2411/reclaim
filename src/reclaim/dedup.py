@@ -760,6 +760,11 @@ def generate_duplicate_candidates(
                     safety_reason_code=result.reason_code,
                     retention_days=config.categories.duplicates.retention_days,
                     reclaimable_bytes=estimate.reclaimable_bytes,
+                    # P0-K1a: scan-time identity baseline -- `duplicate` is the FileRecord this
+                    # candidate is built from, already read above; no new os.stat().
+                    dev=duplicate.dev,
+                    ino=duplicate.ino,
+                    mtime=duplicate.mtime,
                 )
             )
     return candidates

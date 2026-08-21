@@ -818,6 +818,28 @@ class ScanIndex:
         row = cursor.fetchone()
         return int(row["total"])
 
+    def subtree_entry_count(self, under: Path) -> int:
+        """Cheap `COUNT(*)` over the same rows `candidate_inventory(under=...)` would return,
+        without materializing a single `FileRecord` -- used purely to decide whether a live
+        full-subtree re-walk (`executor._direct_delete_directory_mismatch`, gated by
+        `apply_batch`'s entry-count guard -- P0-K1a/M1 cost-budget follow-up) is affordable
+        BEFORE attempting it, never as a safety-relevant count itself. The re-walk, when it does
+        run, is still the actual source of truth for identity comparisons -- this is a pure
+        cost-estimation query over the last scan's own recorded shape of this subtree, which is
+        by definition all this decision can see before paying the re-walk's own live-filesystem
+        cost. Counts both files and directories (unlike `subtree_size_bytes`, which sums only
+        file rows) because the re-walk itself visits and compares both.
+        """
+        prefix = under.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT COUNT(*) AS total FROM files "
+            "WHERE (path = ? OR (path >= ? AND path < ?)) AND is_cloud_placeholder = 0",
+            (prefix, lower, upper),
+        )
+        row = cursor.fetchone()
+        return int(row["total"])
+
     def has_any_records(self) -> bool:
         """Cheap existence check for the UI's "no scan yet" empty state — `EXISTS(...)` short-
         circuits on the first row instead of materializing the whole inventory just to check

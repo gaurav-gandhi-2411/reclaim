@@ -2802,3 +2802,322 @@ Edge via CDP, `websockets` — already a transitive dep, nothing new installed) 
 
 **Not done this session** (disclosed gap): no automated screenshot-diff/visual-regression test
 added — this is a single new-feature PR, not the "UI has settled" trigger rule 15f gates on.
+
+### 2026-08-21 — P0-K1a fix: apply_batch identity re-verification at mutation time (DRAFT, M1 cost budget exceeded — needs a decision)
+
+Dispatched as a P0 fix: `apply_batch` (the shared mutation choke point for CLI apply, `POST
+/api/apply`, and future MCP `delete`) acted on stale DB-index data with zero re-verification
+against live filesystem state at mutation time — live-reproduced this session: swapping content
+at a candidate's path between scan and apply caused the swapped content to be permanently
+deleted or misrouted into the vault. Branch `fix/apply-batch-identity-reverify`.
+
+**Identity check (K1a)**: `os.stat(path, follow_symlinks=False)`'s `(st_dev, st_ino)`, confirmed
+via a real NTFS junction test (build-and-repoint, not mocked) to give correct, reparse-point-
+aware identity semantics with no `ctypes`/`GetFileInformationByHandle` needed.
+`preflight.check_identity_unchanged_since_scan` is the new probe; `Candidate` gained
+`dev`/`ino`/`mtime` fields (defaulted `0`/`0`/`0.0`, matching `FileRecord`'s own Stage-2
+convention), wired at all THREE real construction sites — `detectors.generate_candidates`,
+`dedup.generate_duplicate_candidates`, and `api.service._build_user_selected_candidate` (a third
+site not named in the original design brief, found during implementation — leaving it
+unwired would have silently disabled the identity check for every AI-suggestion/user-selected
+apply).
+
+**M1 (tiered directory re-walk)**: implemented as designed — `retention_days=None` (irreversible)
+directory candidates get a FULL subtree re-walk (`executor._direct_delete_directory_mismatch`,
+new `apply_batch(..., scan_index=...)` parameter) comparing every scan-recorded entry's live
+`(dev, ino)`, flagging any live entry the scan never recorded, and flagging any live file now
+hardlink-connected into a different RECOGNIZED environment (reusing `check_hardlink_shared_
+active_install` per-file rather than a raw `nlink>1` threshold — a raw threshold would
+false-positive on package/model caches' normal internal hardlinking; disclosed as a deliberate
+substitution for the design brief's literal "new hardlink since scan" wording, since no nlink
+baseline is persisted today). Vaulted/recycle-bin directory candidates get only the cheaper
+top-level check — recoverable, so the disclosed M1(iv) gap (a depth-2 content change inside a
+vaulted directory is not caught) is accepted, not a bug.
+
+**M1 cost budget — EXCEEDED, flagged per the task's own explicit stop condition, not
+silently shipped**: measured (not estimated) real wall-clock overhead of the full re-walk
+against the largest real directory candidate reachable from this worktree
+(`C:\Users\gaura\ml-projects\gg-portfolio\node_modules`, 45,608 files / 5,161 dirs / 50,769
+entries) — re-walk alone: 5.2355s (0.1031ms/entry). A same-machine, same-shape synthetic
+throwaway tree (25,810 entries) cross-check: re-walk 2.1334s vs. a real `shutil.rmtree` apply
+of the same tree at 6.3471s — **overhead = 33.6% of real apply time, roughly 3.4x over the
+task's 10% budget** (and over the design report's original ~0.4% estimate by two orders of
+magnitude). Both `os.stat`-per-entry (re-walk) and `unlink`/`rmdir`-per-entry (real delete)
+are comparable-cost NTFS metadata operations at this file count, so the ratio is not a
+measurement artifact — confirmed via two independent measurements on two different trees.
+**Per the task's explicit instruction, implementation stopped here rather than unilaterally
+redesigning the re-walk's cost profile** (e.g. skipping `build_record`'s git-repo detection,
+which the current implementation reuses wholesale from `scanner.build_record` for
+correctness/consistency, at a cost this measurement did not isolate) — this PR stays DRAFT
+with the finding disclosed prominently for a human decision, not merged, not marked done.
+
+**M2 (restore-destination)**: `restore_batch`'s pre-existing `os.path.exists(...)` check already
+implements "never overwrite an unrecognized destination" unconditionally — documented explicitly
+in code (no legitimate "recognized, safe to overwrite" case exists in this codebase's real data
+shapes: `entry.restored` is checked before this point, and `_atomic_move`'s ADR-0004 guarantee
+means a completed restore never leaves a partial file behind for a later restore to find).
+`purge_expired` is explicitly out of scope (lower severity — only ever touches this tool's own
+vault copies, never an arbitrary user path).
+
+**M4 (six teeth-proofs)**: `evals/test_apply_identity_reverify.py`, new safety-gate file
+(registered in `scripts/verify.py`'s `_SAFETY_GATE_FILES`) — all 8 tests pass: (i) delete-and-
+recreate same path → skip; (ii) real `mklink /J` junction repoint → skip; (iii) depth-2 content
+change, direct-delete → skip (M1's whole point); (iv) depth-2 content change, vaulted → NOT
+caught, documented gap; (v) restore into occupied destination → skip, occupier untouched, vault
+copy preserved; (vi) three unchanged-path regression cases (direct-delete/vault/restore) still
+work normally.
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy all clean; 947
+passed, 28 skipped, 1 deselected, 87.88% total coverage; `executor.py` 92.95% (floor 90%),
+`preflight.py` covered under the same run. `evals/test_apply_batch_call_graph_gate.py`'s
+structural AST proof (mutation primitives confined to allowed homes, preflight guard precedes
+every mutation path, closed call-site set) still passes unmodified.
+
+**Not done this session (disclosed, per M5)**: (1) NTFS MFT sequence-number reuse — practically
+ignorable (~65,536 forced reuse cycles needed on the same MFT record inside one scan-to-apply
+window); (2) same-inode in-place content edits — not caught, by design, different threat class;
+(3) `FSCTL_SET_REPARSE_POINT` in-place reparse-point retargeting — theoretical, untested, no raw
+`DeviceIoControl` call added. All three documented verbatim in `preflight.py`'s new check and in
+the PR body.
+
+**Status**: PR opened as DRAFT (never merged) per this task's own instruction (safety-critical,
+deletion-adjacent code). Blocks #37 and further merges until the M1 cost-budget finding above is
+resolved by a human decision — accept the overhead, ship a lighter-weight identity-only re-walk
+(skip git-detection/ext computation `build_record` currently pays for), or gate M1 behind a
+size/entry-count threshold are three options surfaced, none picked unilaterally.
+
+### 2026-08-21 — P0-K1a follow-up: batched `GetFileInformationByHandleEx` re-walk (real, measured
+### improvement — cost budget still NOT reliably met; a second, distinct bottleneck disclosed)
+
+Dispatched to act on the M1 cost-budget finding above: replace `_live_subtree_records`'s
+`os.stat()`-per-entry identity read with `preflight.enumerate_directory_identity` — a single open
+directory `HANDLE` (`CreateFileW`+`FILE_FLAG_BACKUP_SEMANTICS`) per directory, then a small,
+buffer-growth-bounded number of `GetFileInformationByHandleEx`/`FileIdBothDirectoryInfo` calls
+returning every child's `FileId`, size, attributes, and timestamps in one shot — zero per-child
+`CreateFile`/open operations. `dev` (the volume-identity half of `(dev, ino)`) is read once per
+directory via a single `os.stat()` on the directory itself, not per entry — safe because every
+child of a directory shares its parent's volume unless it's a reparse point, which this walk's own
+recursion already excludes.
+
+**Prerequisite equivalence proof (hard gate, per this task's own instruction) — PASSED**:
+`evals/test_apply_safety_preflight.py::test_batch_enumerated_file_id_matches_os_stat_ino_for_real_files`
+builds real files (short names, a long name to perturb struct offsets, a nested directory) and
+asserts the batched `FileId` exactly equals `os.stat(path, follow_symlinks=False).st_ino` for
+every one of them — a wrong `_FILE_ID_BOTH_DIR_INFO` struct offset would read garbage, not a
+plausible-looking wrong inode, so an exact match is real evidence the layout (`FileId` at byte
+offset 96, 104-byte fixed header — verified via `ctypes.sizeof`/`.offset` before relying on it) is
+correct. Four more tests cover the disclosed edge cases: `.`/`..` filtering, a genuinely empty
+directory (returns `[]`, not `None`), a missing/unreadable directory (returns `None`), and 2,000
+real files forcing the multi-call buffer-growth pagination loop (not just the single-call happy
+path) — all pass.
+
+**Real measurement (disposable `robocopy /MIR` mirror of this machine's actual
+`%LOCALAPPDATA%\npm-cache`, 88,864 files / 11,205 dirs — never the live directory itself)**,
+interleaved OLD-vs-NEW repetitions (not a single reversed pair — 5 reps, alternating order every
+rep, medians reported to wash out real OS-file-metadata-cache-warming noise a single reversed pair
+didn't fully control for; see this session's own disposable `bench_m1_rewalk_v2.py`, not committed
+— throwaway measurement tooling, not shipped code):
+
+- **`_live_subtree_records` alone** (exactly what this fix touches): OLD median 11.19s → NEW
+  median 7.87s — **1.42x speedup, real and reproducible** across all 5 reps individually, not
+  just in the median.
+- **`_direct_delete_directory_mismatch` full** (the same boundary the original 17-28s/5.2355s
+  findings measured — includes the walk above PLUS an UNCHANGED third loop): OLD median 16.67s →
+  NEW median 12.30s — **1.35x speedup**, but with high per-rep variance (NEW ranged 9.30s–17.08s
+  across the 5 reps; one individual NEW rep exceeded the ~15s budget even though the median did
+  not).
+
+**Root cause of the smaller-than-hoped improvement, disclosed rather than silently absorbed**:
+`_direct_delete_directory_mismatch`'s third loop (`live_record.path.stat(follow_symlinks=False)
+.st_nlink` for every live FILE, feeding `check_hardlink_shared_active_install`) is a SEPARATE,
+UNCHANGED per-entry `os.stat()` pass this fix does not touch — `FILE_ID_BOTH_DIR_INFO` (the struct
+this task's own brief specifies) has no `nNumberOfLinks` field, and no batched Win32 directory-
+query API provides one; getting nlink for a child still requires opening that child's own real
+handle, the exact cost this fix exists to eliminate. This is a distinct, technically-necessary
+architectural boundary, not an oversight: condition (a)/(b) (identity mismatch, unexpectedly-new
+entries) and condition (c) (hardlink-into-a-different-environment) are different mechanisms, and
+only the first pair is what `GetFileInformationByHandleEx` can batch. The gap between "walk-only"
+(1.42x, my fix's true, clean improvement) and "full-check" (1.35x, diluted by the untouched third
+loop) is the direct, measured evidence of this.
+
+**Verdict on this fix's own stated success criterion ("under the ~15s absolute threshold")**:
+MEDIAN now under budget (12.30s < 15s) where OLD's median was not (16.67s > 15s) — a real,
+measured improvement — but NOT reliably/consistently under budget on a per-run basis given the
+observed variance (one of 5 NEW reps hit 17.08s). Whether this residual is acceptable, or whether
+the third loop's nlink-stat cost also needs its own fix (a genuinely different, harder problem —
+no batched Win32 API exists for it), is a human decision this PR does not make unilaterally,
+matching this fix's own original draft-status posture.
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy clean; 952 passed, 28
+skipped, 1 deselected, 87.93% total coverage; `executor.py` 92.95% (floor 90%, unchanged). All 8 of
+M4's teeth-proof tests in `evals/test_apply_identity_reverify.py` and all 8 tests in
+`evals/test_apply_batch_call_graph_gate.py` pass unmodified — same behavior, faster mechanism, no
+regression.
+
+**Status**: still DRAFT, not merged. This commit is additive to the same branch/PR
+(`fix/apply-batch-identity-reverify`) per this task's own instruction — it measurably narrows, but
+does not fully close, the M1 cost-budget finding; the human decision point from the prior
+checkpoint (accept remaining overhead / also address the third loop's nlink cost / gate M1 behind
+a size threshold) still stands, now with a tighter, better-characterized number to decide against.
+
+### 2026-08-21 — ADR-0032: entry-count guard downgrade + synchronous purge (P1-P5, resolves the
+### M1 cost-budget human-decision point above — picked option 3, "gate M1 behind a threshold")
+
+Dispatched to resolve the prior checkpoint's open decision point using real measurements at every
+step (commits `9fc093b`, `4d1b795`, `7d87103`, `f62c27c` on this branch — HEAD `f62c27c` at the
+time of this checkpoint). Design: downgrade large direct-delete candidates to vault (so M1's
+re-walk is never reached for them, structurally — the existing tiered-by-recoverability design
+already does this once `item_method="vault"`), and synchronously purge the ones this makes
+`retention_days=0` so bytes are actually freed within the same `apply` call, not merely
+"eligible for a future run."
+
+**P1 — retention_days=0 now means bytes are ACTUALLY freed within the same apply call.**
+`purge` is on-demand only (`reclaim purge --apply` / dashboard button) — VERIFIED by reading
+`cli.py`/`packaging/reclaim.iss`: no automatic trigger exists anywhere in this codebase today
+(the only scheduled task registered by the installer is `check-disk-space`, a read-only
+notification check — it never calls `purge_expired`). So before this fix, a guard-downgraded
+`retention_days=0` item genuinely sat vaulted with zero bytes freed until a human or script ran
+`reclaim purge` separately. Chose option (a), synchronous purge within the same `apply_batch`
+call — see `docs/architecture/adr/0032-entry-count-guard-and-synchronous-purge.md` for the full
+reasoning. **Real proof** (disposable fixture: 500 real 100KB files under a real, temporary
+directory on this machine's C: drive, `package_cache` category, `size_guard_exempt=True`,
+`rebuildable=True`, `direct_delete_entry_count_guard=10` override to trigger the guard on a
+fast-to-build fixture):
+- real `shutil.disk_usage()` before: 155,668,959,232 bytes free
+- real `shutil.disk_usage()` after (same `apply_batch` call): 155,720,110,080 bytes free
+- **real measured delta: +51,150,848 bytes** (matches the 50,000,000 logical bytes plus real
+  NTFS block-size rounding/allocation overhead — the small gap is expected, not an error)
+- `report.disk_free_delta_bytes=50,962,432` (the report's own OS-measurement, taken at slightly
+  different wall-clock instants than the standalone `shutil.disk_usage()` calls around it —
+  consistent with the same real freeing event, not a discrepancy)
+- `cache_dir.exists()` → `False`, `vault_path.exists()` → `False` — genuinely gone from BOTH
+  locations, not merely reported as freed.
+
+**P2 — reconciled with ADR-0001, full ADR written.** Does NOT reopen ADR-0001's rejected
+"auto-purge everything on every run" alternative: that rejection is specifically about items
+whose category carries a REAL retention window (`old_installers`/`archive_pairs`/`large_logs`/
+`duplicates`) — this fix's synchronous purge is scoped, by construction, to
+`candidate.retention_days is None` items (checked BEFORE guard resolution), i.e. items that were
+ALREADY going to be permanently deleted with zero review checkpoint the instant `apply` ran,
+before ADR-0003/0005 ever existed. See
+`docs/architecture/adr/0032-entry-count-guard-and-synchronous-purge.md` for the full argument.
+`README.md` updated: a careful reader could otherwise be confused seeing `method=vault` in a
+per-item report for a category documented as "delete immediately" — added one clarifying
+paragraph; the underlying promise (bytes gone by the time `apply` returns) is unchanged, so no
+other README wording needed correcting.
+
+**P3 — hardlink check drop on the vault path, verified airtight, real wall-clock measured.**
+Reasoning verified: `_atomic_move` tries same-volume `os.rename` first (a single metadata op,
+touches nothing about hardlink siblings), falling back to copy-then-delete only cross-volume —
+`check_hardlink_shared_active_install`'s own docstring already establishes deleting `path` is
+NOT destructive to any sibling by construction in EITHER case (an unlink only decrements the
+shared inode's reference count). Grep-confirmed no UI/reporting path depends on this specific
+`skip_reason` firing for a vault-method item. Skipped `check_hardlink_shared_active_install`'s
+top-level call (`_preflight_skip_reason`) for `method="vault"` specifically; kept fully,
+unconditionally, for `direct_delete`/`recycle_bin`.
+
+**Real, fresh measurement this session** (real, disposable `robocopy /MIR` mirror of THIS
+machine's actual `%LOCALAPPDATA%\npm-cache`, confirmed 88,864 files + 11,204 dirs = 100,068
+entries — matching the original N1/N2 fixture almost exactly), same fixture, both code paths,
+back to back, 3 reps each:
+- **(A) OLD path** (`_preflight_skip_reason(item_method="direct_delete", ...)`, exercises the
+  full M1 re-walk including the unbatchable nlink pass): reps `9.71s, 9.43s, 9.22s`, **median
+  9.43s**.
+- **(B) NEW path** (`_preflight_skip_reason(item_method="vault", ...)`, the entry-count-guard-
+  downgraded candidate's real code path): reps `0.001s, 0.000s, 0.000s`, **median 0.000s** — M1's
+  re-walk structurally never invoked, confirmed by the real timing, not just by code inspection.
+- **(C) Real end-to-end** `apply_batch(apply=True)` with the REAL SHIPPED DEFAULT
+  `direct_delete_entry_count_guard=87_882` (not overridden) against this exact real fixture:
+  **39.41s total**, `entry_count_guard_hit=True` (confirmed via the real structlog line:
+  `subtree_entry_count=100068`), `method=vault`, `synchronously_purged=True`. This total is
+  dominated by the real, unavoidable per-file cost of `shutil.rmtree`-ing 100,068 real entries
+  during the synchronous purge (the same cost a real permanent delete of that many files would
+  pay regardless of mechanism) — NOT directly comparable to a hypothetical OLD-path full-`apply`
+  number, which this session did not separately re-measure (would require rebuilding the
+  88,864-file mirror a second time purely to pay its own destructive `rmtree` cost again, for a
+  number this session judged not worth the added time given (A) vs (B) already isolates and
+  proves the exact claim P3 makes: the specific per-candidate cost this fix removes goes from a
+  real, measured 9.43s to a real, measured ~0s).
+
+**P4 — real threshold, real distribution, both measured on this machine.** A whole-`%LOCALAPPDATA%`
+scan was attempted first and abandoned mid-session (ran >20 minutes with zero progress output,
+consistent with this codebase's own documented "2.67M-file scan sat silent for 7+ minutes"
+finding at smaller scale — killed in favor of a faster, scoped, still-real measurement). **Real
+distribution**, scanned directly via `generate_candidates` against a real scan of this machine's
+actual `npm-cache`/`pip\Cache`/`uv\cache`/`.cache` roots (each cache root's own directory row
+inserted via one `upsert_records` call reflecting exactly what a real `reclaim scan C:\` would
+have recorded for it — a real full-disk scan was not run to avoid its own multi-minute cost, but
+the inserted row is the literal, honest equivalent of what one would produce):
+
+| category | entry_count | size_bytes | size_guard_exempt | path |
+|---|---:|---:|---|---|
+| package_cache | 100,069 | 1,577,638,377 | True | `npm-cache` |
+| package_cache | 58,833 | 1,835,002,693 | True | `uv\cache` |
+| package_cache | 7,029 | 166,644,982 | True | `pip\Cache` |
+| dev_artifact_pycache | 5 | 98,649 | False | HF modules `__pycache__` |
+| dev_artifact_pycache | 3 | 99,042 | False | HF modules `__pycache__` |
+| dev_artifact_pycache | 2 | 183 | False | HF modules `__pycache__` |
+
+6 real direct-delete-eligible directory candidates found; `min=2 max=100,069 p50=7,029`; exactly
+1 of 6 (`npm-cache` itself) is at or above the real shipped default guard (87,882) — real,
+observed confirmation the threshold sits in a meaningful place on THIS machine's real data: it
+fires on the one candidate that would have cost ~9.4s+ of re-walk overhead, and does not fire on
+`uv\cache` (58,833 entries, below threshold — an entry-count-guard candidate whose walk cost
+would be smaller, though still non-trivial; left on the fast direct-delete path by design, since
+the threshold's whole point is to gate on where re-walk cost crosses the budget, not to gate on
+every large candidate regardless of actual cost).
+
+**Threshold derivation** (calculation over N1/N2's already-measured per-entry costs, per the
+task's own instruction — not a fresh full-scale benchmark, since P3's fix does not change the
+per-entry re-walk RATE for candidates that remain on the direct-delete path): basis is the
+`_direct_delete_directory_mismatch` full-cost measurement from the prior checkpoint (100,069
+entries, 5 reps, NEW median 12.30s, **worst rep 17.08s** — worst, not median, used deliberately,
+since the prior checkpoint itself flagged the median as not reliably under budget on a per-run
+basis). `worst_rate = 17.08s / 100,069 entries = 170.68us/entry`; `threshold = 15s / worst_rate =
+87,882.6`, floored to **87,882** — the exact, real crossing point, not a round number. Shipped as
+`executor._DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD` / `SafetyConfig.
+direct_delete_entry_count_guard`.
+
+**P5 — five teeth-proofs, all real, all passing** (`evals/test_apply_identity_reverify.py`, this
+PR's existing safety-gate file): (i) guard-downgraded + unchanged identity → not skipped, real
+vault move, real synchronous purge, `synchronously_purged=True`; (ii) guard-downgraded +
+top-level identity mismatch → skipped, never vaulted, never purged, same skip-and-continue
+pattern as every other candidate; (iii) bytes actually freed — both original path AND vault path
+genuinely absent from disk after the same `apply_batch` call; (iv) crash-safety, TWO real windows
+proven via the exact `KeyboardInterrupt`-injection pattern `tests/test_recovery.py` already
+established for ADR-0026 — **(iv-a)** a crash between the vault "done" write and the purge intent
+write leaves the item as a completely ordinary, valid, restorable vault entry (`reclaim.recovery.
+compute_reconciliation` finds NOTHING to reconcile — no orphaned intent of any kind — and
+`restore_batch` restores it exactly as if synchronous purge never existed); **(iv-b)** a crash
+between the purge intent and its own "done" write reconciles as `"completed"` via
+`reclaim.recovery.reconcile_manifest`'s EXISTING, unmodified machinery (`_source_and_target`
+already handles `operation="purge"` generically, regardless of which code path wrote the intent
+— zero new code needed in `reclaim.recovery` for this to work). Conclusion on the task's own
+(a)/(b) framing: **(a) — there IS a real, durable restore window** (not brief): (iv-a)'s window
+lasts until whatever next runs `apply_batch`/`reclaim purge` against the manifest, indistinguishable
+from an ordinary un-purged `retention_days=0` vault entry. Plus one unit-level correctness test
+for `ScanIndex.subtree_entry_count` (`tests/test_index.py`) and four `apply_batch`-level guard-
+interaction tests (`tests/test_executor.py`: configured-threshold respected, does-not-trigger-
+below-threshold, `size_guard_exempt` does NOT exempt from THIS axis — the key motivating
+interaction — and the disclosed `scan_index is None` fallback). One PRE-EXISTING test
+(`evals/test_apply_safety_preflight.py::test_apply_batch_skips_hardlink_shared_active_install_
+and_continues_the_rest_of_the_batch`) asserted the OLD, now-intentionally-changed vault-path
+behavior — split into two tests: the direct-delete regression (unchanged, still passes) and a
+new vault-method non-skip proof. `evals/test_safe_mode_gate.py`'s exhaustive safe-mode proof
+extended with the two new required keyword args (`entry_count_guard`/`subtree_entry_count`,
+including a `subtree_entry_count` value matrix) rather than merely satisfied with dummy values —
+mode=SAFE's short-circuit is proven to override this new axis too, not just the pre-existing ones.
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy all clean; **964
+passed, 28 skipped, 1 deselected**, 88.03% total coverage; `executor.py` 93.51% (floor 90%),
+`purge.py` 90.65% (floor 85%), `config.py` 99.50% (floor 90%), `safety.py` 100% (floor 92%),
+`mode.py` 98.15% (floor 90%) — all 5 safety-critical module floors met.
+
+**Status**: still DRAFT, not merged (safety-critical, deletion-adjacent code — per this task's
+own standing instruction). Commits `9fc093b` (index), `4d1b795` (executor/config/cli/api core),
+`7d87103` (ADR-0032), `f62c27c` (README) pushed to `fix/apply-batch-identity-reverify`. This
+checkpoint resolves the prior session's open M1 cost-budget human-decision point by picking
+option 3 ("gate M1 behind a size/entry-count threshold") — combined with a synchronous purge so
+the resulting vault-then-purge detour never costs real disk-free-delta accuracy, and with the
+P3 hardlink-check narrowing since it was independently verified safe along the way. No further
+open decision points from the prior checkpoint remain outstanding.

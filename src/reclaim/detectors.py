@@ -867,6 +867,10 @@ def generate_candidates(
                 size_guard_exempt=_category_size_guard_exempt(rc.category_group, config),
                 rebuildable=rc.category_group in REBUILDABLE_CATEGORY_GROUPS,
                 reclaimable_bytes=reclaimable_bytes,
+                # P0-K1a: scan-time identity baseline, already read above -- no new os.stat().
+                dev=record.dev,
+                ino=record.ino,
+                mtime=record.mtime,
             )
         )
     return candidates

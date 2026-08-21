@@ -8,7 +8,7 @@ import stat
 import time
 import uuid
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TextIO
 
@@ -16,12 +16,25 @@ import send2trash
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
-from reclaim.models import Candidate, Mode, Tier, Verdict
+from reclaim.index import ScanIndex
+from reclaim.models import (
+    FILE_ATTRIBUTE_REPARSE_POINT,
+    Candidate,
+    FileRecord,
+    Mode,
+    Tier,
+    Verdict,
+)
 from reclaim.preflight import PreflightSkipReason as PreflightSkipReason  # re-exported; api/
 
 # schemas.py imports this type from here rather than reaching into `reclaim.preflight` directly,
 # same convention as this module's own `long_path` re-export below.
-from reclaim.preflight import check_file_in_use, check_hardlink_shared_active_install
+from reclaim.preflight import (
+    check_file_in_use,
+    check_hardlink_shared_active_install,
+    check_identity_unchanged_since_scan,
+    enumerate_directory_identity,
+)
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
@@ -338,6 +351,25 @@ class ItemApplyResult:
     # still `False` for a skipped item (it did not happen), but callers that need to tell "never
     # attempted" apart from "attempted and failed" should check this field, not just `error`.
     skip_reason: PreflightSkipReason | None = None
+    # ADR-0032: `True` only for a guard-downgraded (entry-count or byte-size), rebuildable,
+    # `retention_days=0` candidate whose vault copy was ALSO successfully purged back out again,
+    # synchronously, within this same `apply_batch` call — see that function's docstring. `False`
+    # (the default) for every other outcome, including a `retention_days=0` item whose
+    # synchronous purge attempt itself failed (it stays validly vaulted, `succeeded` is still
+    # `True` for the underlying vault move, just not yet purged — a future `reclaim purge` run
+    # will pick it up like any other purge-eligible entry).
+    synchronously_purged: bool = False
+    # K2a (audit finding): `True` when this item's underlying move/delete call raised NO
+    # exception at all, but `_verify_apply_postcondition`'s real, fresh on-disk check afterward
+    # found the mutation didn't actually happen (or only partially happened) — distinct from
+    # `error` carrying a message from an ATTEMPTED mutation the OS/filesystem itself rejected.
+    # `error` is still populated (with `_verify_apply_postcondition`'s own message) for this case
+    # too, so any caller that only ever checked `error is not None` for "something's wrong" keeps
+    # working — this field exists so a caller that specifically needs to tell "the OS said no"
+    # apart from "the OS silently did nothing" (K2b's reproduced `shutil.rmtree`/junction case is
+    # the motivating real-world example, but this check is deliberately root-cause-independent)
+    # can do so. Always `False` when `succeeded` is `True`.
+    postcondition_verification_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +407,13 @@ class BatchApplyReport:
     disk_free_before_bytes: int | None
     disk_free_after_bytes: int | None
     disk_free_delta_bytes: int | None
+    # ADR-0032: subset of `files_succeeded`/`bytes_freed` that was ALSO synchronously purged
+    # back out of the vault within this same call — see `ItemApplyResult.synchronously_purged`.
+    # Reported separately, mirroring `purge.PurgeReport.stale_count`/`stale_bytes`'s pattern, so
+    # a caller never has to infer "were these bytes actually freed yet" from `disk_free_delta_
+    # bytes` alone. `0`/`0` for every existing caller/batch that never triggers a guard downgrade.
+    synchronously_purged_count: int = 0
+    bytes_synchronously_purged: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,6 +565,96 @@ def unlink_clear_readonly(path: str) -> None:
         os.unlink(path)  # noqa: PTH108
 
 
+# --- K2b: shutil.rmtree's own junction-attack guard is silently defeated by this module's own
+# long_path()/onexc conventions ------------------------------------------------------------------
+#
+# `shutil.rmtree` refuses to recurse into a symlink/junction handed to it as its OWN top-level
+# argument -- it detects this internally (an `os.path.islink`-based check) and raises before doing
+# anything. But every `shutil.rmtree` call in this module (and `purge.py`'s) is made with
+# `onexc=rmtree_clear_readonly` (ADR-0004's read-only-file retry handler, needed for git
+# packfiles/loose objects) -- and `rmtree_clear_readonly`'s own contract is "chmod the path, then
+# retry whatever `func` `shutil.rmtree` handed us". For the junction-guard's own internal raise,
+# the `func` `shutil.rmtree` hands `onexc` is `os.path.islink` itself (a read-only probe, not a
+# delete) -- so `rmtree_clear_readonly` chmods a reparse point (a harmless no-op) and re-invokes
+# `islink`, discards its boolean return value, and `shutil.rmtree` returns NORMALLY having deleted
+# nothing at all. No exception ever reaches the caller. Reproduced directly against this
+# interpreter's real `shutil.rmtree` (not merely inferred): confirmed live against a real `mklink
+# /J` junction, both with and without the `\\?\` long-path prefix -- the long-path prefix is not
+# actually load-bearing to the bug (this interpreter's `shutil.rmtree` already detects a bare-path
+# junction as a symlink too), but IS load-bearing to why `onexc=rmtree_clear_readonly` swallows it:
+# without an `onexc` handler at all, the same call raises loudly instead of returning silently.
+# See `evals/test_apply_identity_reverify.py`'s K2d teeth-proof for the full reproduction.
+#
+# Nested reparse points (a junction somewhere INSIDE a real directory `shutil.rmtree` is walking,
+# rather than the top-level argument itself) are unaffected by this bug -- verified empirically:
+# `shutil.rmtree` correctly removes only the junction's own directory entry when it encounters one
+# mid-walk, never recursing into what it points at, and correctly removes the rest of the real
+# tree around it. The blind spot is exclusively the TOP-LEVEL argument's own identity.
+
+
+def _is_reparse_point(path: str) -> bool:
+    r"""True if `path` (already `\\?\`-prefixed) is itself a reparse point (an NTFS junction or a
+    directory/file symlink) rather than a real file or directory -- the exact distinction K2b's
+    fix needs before ever calling `shutil.rmtree` on a top-level path. Same
+    `os.stat(..., follow_symlinks=False)` + `FILE_ATTRIBUTE_REPARSE_POINT` pattern already
+    established in `scanner.build_record`/`preflight.py` -- reused here, not reinvented. A path
+    that can no longer be stat'd at all (already gone) is reported `False`, not raised -- callers
+    that care about existence separately use `_path_exists_no_follow`.
+    """
+    try:
+        st = os.stat(path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path; see above
+    except OSError:
+        return False
+    return bool(st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _path_exists_no_follow(path: str) -> bool:
+    r"""True if a filesystem entry exists AT `path` itself (already `\\?\`-prefixed) -- a reparse
+    point counts as existing even if its target is missing (a "dangling" junction/symlink).
+
+    Deliberately NOT `os.path.exists`, which follows a reparse point through to its target and
+    reports a dangling junction as absent even though its own directory entry is still physically
+    present on disk (verified empirically) -- exactly the wrong answer for K2a's post-condition
+    check, whose entire job is "did the delete/move actually remove the entry that was here",
+    not "does whatever this entry currently resolves to still exist". Same
+    `os.stat(..., follow_symlinks=False)` primitive as `_is_reparse_point`, for the same reason.
+    """
+    try:
+        os.stat(path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path; see above
+    except OSError:
+        return False
+    return True
+
+
+def rmtree_reparse_point_safe(path: str) -> None:
+    """K2b: the fix for `shutil.rmtree`'s silently-defeated junction guard (see this section's
+    module comment above) -- every direct-delete/permanent-removal call site in this module (and
+    `purge.py`'s) that could be handed a path that is ITSELF a reparse point must call this
+    instead of `shutil.rmtree` directly.
+
+    Checks `_is_reparse_point` FIRST: a reparse point is removed as a single directory-entry
+    operation via `os.rmdir()` -- never recursed into, never touching whatever it points at. This
+    is the correct, safe removal call for a junction/symlink itself (as opposed to recursively
+    deleting into its target, which `shutil.rmtree` would do if it were ever tricked into treating
+    the reparse point as an ordinary directory). Clears the read-only attribute and retries once
+    on `PermissionError`, mirroring `unlink_clear_readonly`'s own retry shape -- a reparse point
+    is not normally read-only, but nothing rules it out on a real, arbitrary user filesystem.
+
+    Falls through to the original `shutil.rmtree(path, onexc=rmtree_clear_readonly)` recursive
+    removal only once `_is_reparse_point` has confirmed `path` is a REAL directory, not a reparse
+    point -- nested reparse points inside that real tree are unaffected by this fix (already
+    handled correctly by `shutil.rmtree` on its own; see this section's module comment).
+    """
+    if _is_reparse_point(path):
+        try:
+            os.rmdir(path)  # noqa: PTH106 -- \\?\ str, not Path; see module note above
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)  # noqa: PTH101
+            os.rmdir(path)  # noqa: PTH106
+        return
+    shutil.rmtree(path, onexc=rmtree_clear_readonly)
+
+
 def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     r"""Moves `src` to `dst` with an "either fully succeeds, or `src` is left completely
     untouched with zero orphaned debris at `dst`" guarantee — never a partial state, and never
@@ -599,7 +728,12 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
                 f"{pre_stats[0]} files/{pre_stats[1]} bytes, destination has "
                 f"{post_stats[0]} files/{post_stats[1]} bytes"
             )
-        shutil.rmtree(long_src, onexc=rmtree_clear_readonly)
+        # K2b: `long_src` is the caller's own top-level path (`candidate.path`/a manifest entry's
+        # `original_path`) -- exactly the shape that can itself be a reparse point (a directory
+        # junction candidate routed to `vault` rather than `direct_delete`, then hitting this
+        # cross-volume copy fallback). Plain `shutil.rmtree` would silently no-op on that case
+        # (see this module's K2b section comment above `rmtree_reparse_point_safe`).
+        rmtree_reparse_point_safe(long_src)
     else:
         pre_size = os.path.getsize(long_src)  # noqa: PTH202
         try:
@@ -878,6 +1012,8 @@ def _effective_method_and_retention_days(
     mode: Mode,
     size_guard_bytes: int,
     size_guard_retention_days: int,
+    entry_count_guard: int,
+    subtree_entry_count: int | None,
 ) -> tuple[QuarantineMethod, int | None]:
     """Stage 2 safety boundary, checked FIRST, before any other branch in this function: when
     `mode` is `Mode.SAFE`, the result is unconditionally `("recycle_bin", candidate.
@@ -918,19 +1054,47 @@ def _effective_method_and_retention_days(
     guard-downgraded candidate (a hypothetical misconfigured category with `retention_days=None`
     that isn't one of the four known-rebuildable groups) keeps the safer `size_guard_retention_
     days` default.
+
+    P0-K1a/M1 cost-budget follow-up (ADR-0032): a SECOND, independent guard axis, keyed on entry
+    COUNT rather than bytes. M1's full-subtree re-walk (`_direct_delete_directory_mismatch`,
+    reached only for a directory candidate whose resolved method is `"direct_delete"`) has a
+    real, measured per-entry wall-clock cost with no further batching available for its hardlink
+    pass (see PLAN.md's 2026-08-21 checkpoints) — a candidate can be small in `size_bytes` (or
+    outright `size_guard_exempt`, like `package_caches`) while still containing enough entries to
+    make that re-walk take longer than a human waiting on `apply` should ever have to (the
+    `%LOCALAPPDATA%\\npm-cache` real worst case: 88,864 files, package_caches, exempt from the
+    size guard, yet the single most expensive candidate this fix has actually measured). This
+    guard fires independently of `size_guard_exempt` — that flag only ever meant "this category's
+    RECOVERY cost doesn't scale with size," never "this category's RE-WALK cost doesn't scale
+    with entry count," and the two are unrelated axes. `subtree_entry_count` is `None` whenever
+    the caller has no `ScanIndex` to cheaply count against (mirrors M1's own `scan_index is None`
+    fallback) or the candidate isn't a directory (an entry-count guard is meaningless for a single
+    file) — this guard simply never fires in that case, same fail-open-on-this-axis-only posture
+    M1's own `scan_index is None` fallback already established (the size guard and the top-level
+    identity check still apply regardless).
     """
     if mode == Mode.SAFE:
         return "recycle_bin", candidate.retention_days
 
     if candidate.retention_days is None:
-        if candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt:
+        size_guard_hit = (
+            candidate.size_bytes >= size_guard_bytes and not candidate.size_guard_exempt
+        )
+        entry_count_guard_hit = (
+            subtree_entry_count is not None and subtree_entry_count >= entry_count_guard
+        )
+        if size_guard_hit or entry_count_guard_hit:
             retention_days = 0 if candidate.rebuildable else size_guard_retention_days
             logger.info(
                 "executor.retention_size_guard_downgrade",
                 path=str(candidate.path),
                 size_bytes=candidate.size_bytes,
+                subtree_entry_count=subtree_entry_count,
                 category=candidate.category,
                 size_guard_bytes=size_guard_bytes,
+                entry_count_guard=entry_count_guard,
+                size_guard_hit=size_guard_hit,
+                entry_count_guard_hit=entry_count_guard_hit,
                 retention_days=retention_days,
             )
             return "vault", retention_days
@@ -984,28 +1148,302 @@ def _reverify_direct_delete_candidates(
 _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES = 1024 * 1024 * 1024
 _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS = 30
 
+# P0-K1a/M1 cost-budget follow-up (ADR-0032): real, measured crossing point, not a round number
+# picked without data. Basis: PLAN.md's 2026-08-21 "batched GetFileInformationByHandleEx re-walk"
+# checkpoint measured `_direct_delete_directory_mismatch`'s full cost (walk + the unbatchable
+# per-file hardlink/nlink pass) against a disposable mirror of this machine's real
+# `%LOCALAPPDATA%\npm-cache` (88,864 files + 11,205 dirs = 100,069 entries): 5 interleaved reps,
+# NEW median 12.30s, range 9.30s-17.08s. Using the WORST observed rep (not the median) as the
+# per-entry rate basis is a deliberate safety margin, not an oversight: the median alone was
+# already flagged in that checkpoint as "NOT reliably under budget on a per-run basis" (one of
+# five reps exceeded the ~15s absolute ceiling even though the median did not) -- a human waiting
+# on `apply` cares about the run they actually get, not the average of five they didn't.
+# worst_rate = 17.08s / 100,069 entries = 170.68us/entry; threshold = 15s / worst_rate =
+# 87,882.6 entries, floored to the largest entry count whose worst-observed-rate-scaled estimate
+# still lands at or under the 15s ceiling. Recorded here, not derived at import time, so this
+# constant's value is legible from the source alone without re-running the division.
+_DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD = 87_882
 
-def _preflight_skip_reason(candidate: Candidate) -> PreflightSkipReason | None:
-    """Audit P0-1 (docs/AUDIT-2026-08.md): the two R6 pre-flight safety checks, run in order,
-    against one candidate right before `apply_batch` would otherwise attempt to move/delete it.
-    Returns the first that fires -- either one alone is sufficient reason to skip the item
-    without attempting the real mutation, so there is no need to run (or report) both.
 
-    `check_hardlink_shared_active_install` is applied unconditionally here, to every apply
-    (including a human-confirmed, single-item apply from the dashboard), not gated behind any
-    "is this an unattended/scheduled run" flag -- `apply_batch` has no such notion today (R6's
-    autonomous-cleanup allowlist doesn't exist yet either; see the audit's R6/D3 sections), and
-    the check itself is genuinely defense-in-depth (deleting a hardlink-shared path is not
+def _top_level_identity_mismatch(candidate: Candidate) -> str | None:
+    """P0-K1a: re-verifies `candidate.path`'s live `(dev, ino)` against the scan-time baseline
+    carried on `candidate` itself (`Candidate.dev`/`.ino`, populated at candidate-generation
+    time -- see `models.Candidate`'s own field comment for the three real construction sites).
+    Returns a short, loggable description of the mismatch, or `None` if the identity still
+    matches (or no real baseline was ever wired through for this candidate -- see below).
+
+    `candidate.dev == 0 and candidate.ino == 0` is treated as "no scan-time baseline available"
+    (a not-yet-updated test/eval fixture; on a real NTFS volume device 0 / inode 0 never occurs
+    for an actual file), NOT as a confirmed match or a confirmed mismatch -- silently treating an
+    absent baseline as a match would be permissive-by-accident, and treating it as a mismatch
+    would make every legacy-constructed `Candidate` skip unconditionally. This is the one place
+    that distinction is made; `preflight.check_identity_unchanged_since_scan` itself has no
+    opinion on what `0, 0` means, since it only ever sees whatever baseline its caller supplies.
+    """
+    if candidate.dev == 0 and candidate.ino == 0:
+        return None
+    check = check_identity_unchanged_since_scan(
+        candidate.path,
+        recorded_dev=candidate.dev,
+        recorded_ino=candidate.ino,
+        recorded_mtime=candidate.mtime,
+        recorded_size_bytes=candidate.size_bytes,
+    )
+    if not check.identity_changed:
+        return None
+    return (
+        f"{candidate.path}: live (dev, ino)=({check.live_dev}, {check.live_ino}) no longer "
+        f"matches the scan's recorded ({check.recorded_dev}, {check.recorded_ino})"
+    )
+
+
+def _live_subtree_records(root: Path) -> list[FileRecord]:
+    """M1: read-only re-walk of `root` and everything reachable under it without crossing a
+    reparse point -- mirrors `scanner._walk_subtree`'s exact walk shape (stack-based,
+    reparse-point-gated recursion) but writes nothing to any index and is only ever used
+    immediately before an irreversible delete, never during a normal scan.
+
+    P0-K1a cost-budget fix (this PR): per-entry identity used to come from `os.stat()` (via
+    `scanner.build_record`) -- on Windows, one real `CreateFile`+`GetFileInformationByHandle`+
+    `CloseHandle` cycle PER ENTRY, measured at 17-28s added to a real apply against the actual
+    worst-case direct-delete candidate reachable on this machine (`%LOCALAPPDATA%\\npm-cache`,
+    88,864 files -- see PLAN.md's 2026-08-21 checkpoint). Replaced with
+    `preflight.enumerate_directory_identity`'s batched `GetFileInformationByHandleEx`/
+    `FileIdBothDirectoryInfo` read -- one open directory handle and a small, bounded number of
+    calls per DIRECTORY instead of one real open per ENTRY. `dev` (the volume-identity half of
+    `(dev, ino)`) is read once per directory via a single `os.stat()` on the directory itself --
+    every child of a directory is, by construction, on the SAME volume as its parent UNLESS it's
+    a reparse point (already excluded from this walk's own recursion below), so one `os.stat()`
+    per directory (not per entry) is both correct and orders of magnitude cheaper. `git_repo_root`/
+    `git_repo_clean`/`mtime`/`ctime` are left at `FileRecord`'s own Stage-1 defaults (`None`/
+    `False`/`0.0`/`0.0`) -- this throwaway re-verification pass never reads any of the four, and
+    computing git-repo state per entry was a large, avoidable share of the original cost this fix
+    removes.
+
+    A directory this walk can't open/enumerate (permission error, vanished mid-walk) is silently
+    excluded from the returned list -- the same thing `scanner._walk_subtree` does with a
+    `SkippedPath`, minus the reporting (this is a throwaway re-verification pass, not a scan).
+    Disclosed gap (unchanged by this fix): an entry excluded this way (and its entire subtree, if
+    it was a directory) is invisible to `_direct_delete_directory_mismatch`'s comparisons -- it
+    can be neither "unexpectedly new" nor "identity mismatched" if this walk never saw it. This is
+    the safe direction for what this function itself can decide (nothing here silently approves a
+    mutation), but a directory that became genuinely unreadable between scan and apply still
+    degrades this check's coverage for whatever sits below it. See this PR's body.
+    """
+    records: list[FileRecord] = []
+    stack = [root]
+    while stack:
+        current_dir = stack.pop()
+        prefixed = long_path(current_dir)
+        try:
+            dev = os.stat(prefixed, follow_symlinks=False).st_dev  # noqa: PTH116 -- \\?\ str, not Path
+        except OSError:
+            continue
+        entries = enumerate_directory_identity(prefixed)
+        if entries is None:
+            continue
+        for entry in entries:
+            entry_path = current_dir / entry.name
+            record = FileRecord(
+                path=entry_path,
+                is_dir=entry.is_dir,
+                size_bytes=entry.size_bytes,
+                attributes=entry.attributes,
+                ext=Path(entry.name).suffix.lower() if not entry.is_dir else "",
+                git_repo_root=None,
+                git_repo_clean=False,
+                dev=dev,
+                ino=entry.ino,
+            )
+            records.append(record)
+            if record.is_dir and not entry.is_reparse_point:
+                stack.append(entry_path)
+    return records
+
+
+def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanIndex) -> str | None:
+    """M1: full-subtree re-verification for an irreversible (`item_method="direct_delete"`)
+    DIRECTORY candidate, run immediately before the real `shutil.rmtree`. Unlike every other
+    category (`_top_level_identity_mismatch`'s top-level `(dev, ino)` only), a direct-delete
+    directory's own top-level identity staying intact says nothing about what changed INSIDE it
+    between scan and apply -- a rename-in-place or a new hardlink several levels deep never
+    touches the top directory's own inode. Returns a short, loggable description of the FIRST
+    mismatch condition found, or `None` if the live tree still matches everything the scan
+    recorded for this subtree.
+
+    Two of the three conditions from this fix's design brief, implemented as written:
+    (a) any entry the scan recorded under this subtree (`scan_index.candidate_inventory(under=
+        candidate.path)` -- the same query `detectors._reclaimable_bytes_for_candidate` already
+        uses) whose live `(dev, ino)` no longer matches what was recorded.
+    (b) any LIVE entry (file or directory) under this subtree the scan never recorded at all --
+        something was added to this tree after the scan ran and before this apply reached it.
+
+    The third condition ("a NEW hardlink created between scan and apply") is deliberately
+    implemented differently than its literal wording, and that substitution is disclosed here
+    and in this PR's body, not silently made:
+    (c) any live FILE under this subtree that is now hardlink-connected into a DIFFERENT
+        recognized live environment than its own -- `check_hardlink_shared_active_install`, the
+        SAME check `_preflight_skip_reason` already runs once at the top level for every
+        candidate, reused here per live file in the subtree instead of a raw `st_nlink > 1`
+        threshold, and reused as an ABSOLUTE "is this true right now" check rather than a
+        TEMPORAL "did this become true since scan" comparison. Two reasons:
+          1. `FileRecord`/the scan index do not persist an nlink baseline today -- capturing one
+             is a new DB column + migration, out of this fix's approved scope.
+          2. A raw `nlink > 1` threshold would false-positive constantly on package/model
+             caches, whose normal, safe, everyday state IS internal hardlinking (ADR-0006) --
+             exactly the legitimate case `check_hardlink_shared_active_install`'s existing
+             "different RECOGNIZED environment" semantics already exists to distinguish from
+             the unsafe case.
+        This substitution is strictly conservative in the SAFE direction: anything the literal
+        "new hardlink into a different environment since scan" would have caught, this also
+        catches (if it's new AND into a different environment, it is by construction also
+        CURRENTLY into a different environment). It can additionally fire on a PRE-EXISTING
+        different-environment hardlink the scan simply never evaluated at that depth -- a
+        false-positive in the strict "did anything change" sense, never a false negative in the
+        safety sense.
+    """
+    recorded_by_path = {
+        record.path.as_posix(): record
+        for record in scan_index.candidate_inventory(under=candidate.path)
+    }
+    live_by_path = {
+        record.path.as_posix(): record for record in _live_subtree_records(candidate.path)
+    }
+
+    for posix_path in live_by_path:
+        if posix_path not in recorded_by_path:
+            return f"{posix_path}: present now, was never recorded by the scan"
+
+    for posix_path, recorded_record in recorded_by_path.items():
+        live_record = live_by_path.get(posix_path)
+        if live_record is None:
+            continue  # gone since scan -- nothing left to delete there, not a safety concern
+        if live_record.dev != recorded_record.dev or live_record.ino != recorded_record.ino:
+            return f"{posix_path}: live (dev, ino) no longer matches the scan's recorded value"
+
+    for posix_path, live_record in live_by_path.items():
+        if live_record.is_dir:
+            continue
+        try:
+            nlink = live_record.path.stat(follow_symlinks=False).st_nlink
+        except OSError:
+            continue
+        if nlink <= 1:
+            continue
+        if check_hardlink_shared_active_install(live_record.path).is_shared_with_other_environment:
+            return f"{posix_path}: hardlink-connected into a different live environment"
+    return None
+
+
+def _preflight_skip_reason(
+    candidate: Candidate, *, item_method: QuarantineMethod, scan_index: ScanIndex | None
+) -> PreflightSkipReason | None:
+    """Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a (this session): the pre-flight safety checks
+    run in order, against one candidate right before `apply_batch` would otherwise attempt to
+    move/delete it. Returns the first that fires -- any one alone is sufficient reason to skip
+    the item without attempting the real mutation, so there is no need to run (or report) more
+    than the first hit.
+
+    `check_hardlink_shared_active_install` is applied to every DIRECT-DELETE and RECYCLE-BIN
+    apply (including a human-confirmed, single-item apply from the dashboard), not gated behind
+    any "is this an unattended/scheduled run" flag -- `apply_batch` has no such notion today
+    (R6's autonomous-cleanup allowlist doesn't exist yet either; see the audit's R6/D3 sections),
+    and the check itself is genuinely defense-in-depth (deleting a hardlink-shared path is not
     destructive to its siblings -- see `preflight.check_hardlink_shared_active_install`'s
-    docstring) rather than a hard safety violation, so applying it to every apply path is the
+    docstring) rather than a hard safety violation, so applying it to those two paths is the
     conservative choice: it costs a skip a human can investigate and re-apply after review, never
     a silent unsafe delete. Revisit this call site (not the check itself) if/when a real
     "attended vs. unattended" distinction is ever added to this function's signature.
+
+    P0-K1a/M1 cost-budget follow-up (ADR-0032, P3): SKIPPED for `item_method == "vault"`
+    specifically -- verified airtight, not assumed: a vault move is `_atomic_move`'s same-volume
+    `os.rename` in the common case (a single metadata operation, doesn't touch the target's bytes
+    or its hardlink siblings at all) and, in the rare cross-volume fallback, a copy-then-delete of
+    `src` -- and the check's own docstring already establishes that deleting `path` "is NOT
+    destructive to any hardlink sibling by construction" (an unlink only decrements the shared
+    inode's reference count; every surviving name still resolves to the identical bytes) for
+    EITHER case. Vault additionally never destroys anything at all -- the item is fully restorable
+    via `reclaim undo` right up until (and, per ADR-0032, briefly past) its retention window --
+    which is strictly weaker grounds for pausing an unattended apply than direct-delete's genuine
+    permanence. No UI/reporting path was found to depend on `hardlink_shared_active_install` firing
+    specifically for a vault-method item (grep-confirmed: the only consumer of this skip_reason
+    literal outside this module is the generic `PreflightSkipReason` display, which renders any
+    skip reason identically regardless of which one fired) -- so skipping it here costs nothing a
+    vaulted candidate's own user was relying on to see. Kept fully, unconditionally, for
+    `direct_delete` and `recycle_bin` -- it is load-bearing there, per the original P0-1 finding.
+
+    P0-K1a identity checks, run last (the two checks above are cheaper and were here first):
+    `_top_level_identity_mismatch` runs for every candidate; `_direct_delete_directory_mismatch`
+    (M1) additionally runs for a directory candidate whose resolved `item_method` is
+    `"direct_delete"` (permanent, unrecoverable) -- vaulted/recycle-bin directory candidates are
+    recoverable, so only the cheaper top-level check applies to them, matching this fix's
+    approved tiered-by-recoverability design. `scan_index is None` (a caller that hasn't been
+    updated to pass one -- every real production caller, CLI `apply`/`POST /api/apply`, always
+    does) means M1's subtree re-walk cannot run at all for this candidate; this is logged loudly
+    and the candidate falls back to the top-level-only check, same protection every vaulted
+    candidate already gets -- a disclosed, narrower-coverage fallback, never a silent skip of
+    the identity check altogether.
     """
     if check_file_in_use(candidate.path, is_dir=candidate.is_dir):
         return "file_in_use"
-    if check_hardlink_shared_active_install(candidate.path).is_shared_with_other_environment:
+    if (
+        item_method != "vault"
+        and check_hardlink_shared_active_install(candidate.path).is_shared_with_other_environment
+    ):
         return "hardlink_shared_active_install"
+
+    top_level_detail = _top_level_identity_mismatch(candidate)
+    if top_level_detail is not None:
+        logger.info("executor.identity_mismatch_detected", detail=top_level_detail)
+        return "identity_changed_since_scan"
+
+    if item_method == "direct_delete" and candidate.is_dir:
+        if scan_index is None:
+            logger.warning(
+                "executor.direct_delete_directory_reverify_unavailable",
+                path=str(candidate.path),
+            )
+        else:
+            subtree_detail = _direct_delete_directory_mismatch(candidate, scan_index)
+            if subtree_detail is not None:
+                logger.info("executor.identity_mismatch_detected", detail=subtree_detail)
+                return "identity_changed_since_scan"
+    return None
+
+
+def _verify_apply_postcondition(
+    original_path: Path, *, item_method: QuarantineMethod, vault_path: Path | None
+) -> str | None:
+    """K2a (audit finding): real, fresh post-condition check run immediately after a
+    move/delete call in `apply_batch`'s per-item loop returns WITHOUT raising, and BEFORE
+    `succeeded=True` is ever recorded for that item. Returns a short, loggable description of
+    what didn't actually happen, or `None` if the filesystem genuinely matches what a successful
+    `item_method` mutation should have produced.
+
+    The absence of an exception is never sufficient evidence of success on this platform — see
+    K2b's `shutil.rmtree`/junction finding (this module's `rmtree_reparse_point_safe` section
+    comment) for a reproduced, real case of an operation returning normally having mutated
+    nothing at all. This check is deliberately independent of K2b's specific root-cause fix: it
+    is the general contract every mutation in this loop must satisfy, not a patch for one bug.
+
+    `_path_exists_no_follow` (not `os.path.exists`/`Path.exists()`) is used throughout — a
+    dangling reparse point (target removed, entry itself still present) must still count as
+    "still here", which a target-following existence check would wrongly report as gone.
+    """
+    if _path_exists_no_follow(long_path(original_path)):
+        return (
+            f"{original_path}: still exists on disk after a {item_method} operation that raised "
+            "no error -- the operation silently did not remove it"
+        )
+    if item_method == "vault":
+        if vault_path is None:  # unreachable: apply_batch always computes vault_path for "vault"
+            return f"{original_path}: vault method with no vault_path to verify against"
+        if not _path_exists_no_follow(long_path(vault_path)):
+            return (
+                f"{original_path}: original path is gone, but nothing exists at the recorded "
+                f"vault_path {vault_path} -- the item is neither at its original location nor "
+                "recoverable from the vault"
+            )
     return None
 
 
@@ -1021,7 +1459,9 @@ def apply_batch(
     now: float | None = None,
     direct_delete_size_guard_bytes: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_BYTES,
     direct_delete_size_guard_retention_days: int = _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS,
+    direct_delete_entry_count_guard: int = _DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD,
     on_progress: ProgressCallback | None = None,
+    scan_index: ScanIndex | None = None,
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
@@ -1052,13 +1492,29 @@ def apply_batch(
     rule 104: errors are part of the API, not silent) — *except* for the pre-delete safety
     re-check below, which is a whole-batch abort by design.
 
-    Audit P0-1 (docs/AUDIT-2026-08.md): immediately before each item's real mutation, when
-    `apply=True`, two pre-flight checks run (`_preflight_skip_reason`, `reclaim.preflight`) — "is
-    this path currently held open by another process" and "is this path hardlink-connected into a
-    DIFFERENT live Python environment than its own". Either one skips just that item (never
-    attempted, no manifest intent written, `ItemApplyResult.skip_reason` set) and the batch
-    continues — the same "abort the item, not the run" shape every other per-item failure in this
-    loop already follows, not a new abort mode.
+    Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a (this session): immediately before each item's
+    real mutation, when `apply=True`, `_preflight_skip_reason` (`reclaim.preflight`) runs every
+    pre-flight check — "is this path currently held open by another process", "is this path
+    hardlink-connected into a DIFFERENT live Python environment than its own", and "does this
+    path's live identity still match what the scan recorded for it" (K1a: a live-reproduced
+    finding this session that swapping content at a candidate's path between scan and apply
+    caused the swapped content to be permanently deleted or misrouted into the vault — see
+    `_top_level_identity_mismatch`/`_direct_delete_directory_mismatch`). Any one check skips
+    just that item (never attempted, no manifest intent written, `ItemApplyResult.skip_reason`
+    set) and the batch continues — the same "abort the item, not the run" shape every other
+    per-item failure in this loop already follows, not a new abort mode.
+
+    `scan_index` (P0-K1a/M1): the SAME `ScanIndex` the candidates were generated against —
+    required for the full-subtree re-walk `_direct_delete_directory_mismatch` runs against every
+    irreversible (`retention_days is None`, resolved `item_method="direct_delete"`) DIRECTORY
+    candidate. `None` (the default, preserving every existing caller's behavior — this test
+    suite's ~600 tests included) disables that specific re-walk and logs the gap loudly per
+    item (`executor.direct_delete_directory_reverify_unavailable`) rather than silently doing
+    less than the caller might expect; the top-level `(dev, ino)` identity check still runs
+    regardless. Both real production callers — CLI `reclaim apply` and `POST /api/apply` — pass
+    a live `scan_index` opened immediately before this call. Named `scan_index`, not `index`,
+    to avoid shadowing this function's own per-item loop counter (`for index, candidate in
+    enumerate(candidates, ...)`) a few dozen lines below.
 
     `method` (`"vault"`/`"recycle_bin"`) only governs candidates whose category has a real
     retention window; a candidate with `retention_days is None` always direct-deletes
@@ -1070,6 +1526,38 @@ def apply_batch(
     ADR-0003: a `retention_days is None` candidate at or above `direct_delete_size_guard_bytes`
     is forced to `vault` instead of `direct_delete`, with `direct_delete_size_guard_retention_days`
     as its retention window — recovery cost, not category, gates permanent deletion.
+
+    ADR-0032 (P0-K1a/M1 cost-budget follow-up): a SECOND, independent guard, keyed on entry count
+    rather than bytes — a `retention_days is None` DIRECTORY candidate whose scan-recorded subtree
+    entry count (`scan_index.subtree_entry_count`, a cheap indexed `COUNT(*)`, never a live walk)
+    is at or above `direct_delete_entry_count_guard` is force-downgraded to `vault` the same way
+    the byte-size guard is — independent of `size_guard_exempt` (that flag is about RECOVERY cost,
+    this guard is about RE-WALK cost; a `package_caches` candidate like a real `npm-cache` root can
+    be exempt from the byte guard yet still contain enough entries to make M1's full re-walk take
+    longer than a human waiting on `apply` should have to). Requires `scan_index` to be non-`None`
+    and the candidate to be a directory; otherwise this guard axis simply never fires (the size
+    guard and the top-level identity check still apply regardless) — same disclosed,
+    narrower-coverage-not-silent-skip posture `scan_index is None` already has for M1 itself. A
+    guard-downgraded candidate this way gets `retention_days=0` under the exact same ADR-0005
+    rebuildable-category rule as a byte-size-guard downgrade — and, per ADR-0032, that
+    `retention_days=0` result is what makes it eligible for the synchronous purge below.
+
+    ADR-0032, synchronous purge for guard-downgraded zero-retention items: a candidate whose
+    CATEGORY resolves to `retention_days=None` (i.e. was always going to be permanently,
+    irreversibly deleted with no review checkpoint at all) but gets force-vaulted to
+    `retention_days=0` by either guard above is, immediately after the main per-item loop below
+    (same batch, same manifest lock, same `apply_batch` call), purged right back out of the vault
+    — so `retention_days=0` means what it says: bytes are actually gone from the volume by the
+    time this call returns, not merely "eligible for a future `reclaim purge` run" (closing the
+    gap ADR-0001's own real-disk-free-delta requirement exists for). Scoped narrowly and
+    explicitly to `candidate.retention_days is None` (checked BEFORE guard resolution, not the
+    resolved `item_retention_days`) so a category a human explicitly configured with
+    `retention_days=0` in `config.toml` is never swept into this — that item never had this fix's
+    guard involved at all, so it keeps the ordinary "vault now, `reclaim purge` explicitly later"
+    checkpoint unchanged. See `ItemApplyResult.synchronously_purged` for the per-item outcome and
+    `docs/architecture/adr/0032-entry-count-guard-and-synchronous-purge.md` for the full
+    reasoning, including why this does not reopen ADR-0001's rejected "auto-purge everything on
+    every run" alternative.
 
     Defense in depth, in two layers:
     1. Raises `SafetyInvariantError` and refuses the *entire* batch if any candidate's
@@ -1119,6 +1607,13 @@ def apply_batch(
     )
 
     items: list[ItemApplyResult] = []
+    # ADR-0032: `(index into items, the just-written vault "done" manifest entry)` for every
+    # succeeded item this call must synchronously purge right back out again -- see this
+    # function's own docstring section on synchronous purge. Collected during the main loop,
+    # acted on in a second pass immediately after it (still inside this `try:`, still holding the
+    # same manifest lock) so every vault "done" record is durable BEFORE any purge intent for the
+    # same item is ever written.
+    pending_synchronous_purges: list[tuple[int, QuarantineManifestEntry]] = []
     total_candidates = len(candidates)
     last_heartbeat = time.monotonic()
     # ADR-0026: one manifest file handle held open for the whole batch (not re-opened per item)
@@ -1142,12 +1637,23 @@ def apply_batch(
                     on_progress(index - 1, total_candidates, candidate.category)
                 last_heartbeat = heartbeat_now
 
+            # ADR-0032: cheap indexed COUNT, never a live walk -- only worth querying at all for
+            # the exact shape the entry-count guard can ever fire on (a directory candidate whose
+            # category would otherwise direct-delete it); every other candidate leaves this
+            # `None` and the guard axis simply never fires for it, same as `scan_index is None`.
+            subtree_entry_count = (
+                scan_index.subtree_entry_count(candidate.path)
+                if scan_index is not None and candidate.is_dir and candidate.retention_days is None
+                else None
+            )
             item_method, item_retention_days = _effective_method_and_retention_days(
                 candidate,
                 method,
                 mode=mode,
                 size_guard_bytes=direct_delete_size_guard_bytes,
                 size_guard_retention_days=direct_delete_size_guard_retention_days,
+                entry_count_guard=direct_delete_entry_count_guard,
+                subtree_entry_count=subtree_entry_count,
             )
             item_retention_until = (
                 now_ts + item_retention_days * _SECONDS_PER_DAY
@@ -1179,11 +1685,14 @@ def apply_batch(
             if manifest_fh is None:  # unreachable: opened above whenever apply=True
                 raise RuntimeError("apply_batch: manifest file handle unexpectedly not open")
 
-            # Audit P0-1 (docs/AUDIT-2026-08.md): the two R6 pre-flight safety checks, run BEFORE
-            # anything is written to the manifest at all -- a skipped item was never attempted,
-            # so (unlike a caught mutation failure) there is no intent to record and no "aborted"
-            # phase to close out; `reclaim.recovery` never needs to know this item existed.
-            skip_reason = _preflight_skip_reason(candidate)
+            # Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a: the pre-flight safety checks, run
+            # BEFORE anything is written to the manifest at all -- a skipped item was never
+            # attempted, so (unlike a caught mutation failure) there is no intent to record and
+            # no "aborted" phase to close out; `reclaim.recovery` never needs to know this item
+            # existed.
+            skip_reason = _preflight_skip_reason(
+                candidate, item_method=item_method, scan_index=scan_index
+            )
             if skip_reason is not None:
                 logger.info(
                     "executor.apply_item_skipped_preflight",
@@ -1242,7 +1751,10 @@ def apply_batch(
                     send2trash.send2trash(str(candidate.path))
                 else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
                     if candidate.is_dir:
-                        shutil.rmtree(long_path(candidate.path), onexc=rmtree_clear_readonly)
+                        # K2b: `candidate.path` is this call's own top-level target -- exactly
+                        # the shape that can itself be a reparse point (a junction/symlink
+                        # candidate). Plain `shutil.rmtree` here silently no-ops on that case.
+                        rmtree_reparse_point_safe(long_path(candidate.path))
                     else:
                         unlink_clear_readonly(long_path(candidate.path))
             except Exception as exc:  # broad: isolates one item's failure from the batch
@@ -1271,10 +1783,44 @@ def apply_batch(
                 )
                 continue
 
+            # K2a (audit finding): the mutation call above raised no exception -- but on this
+            # platform that is NOT sufficient evidence anything actually happened (K2b's
+            # `shutil.rmtree`/junction finding is the reproduced real case). Verify the real,
+            # fresh on-disk post-condition BEFORE ever recording `succeeded=True` for this item.
+            postcondition_error = _verify_apply_postcondition(
+                candidate.path, item_method=item_method, vault_path=vault_path
+            )
+            if postcondition_error is not None:
+                logger.warning(
+                    "executor.apply_item_postcondition_failed",
+                    path=str(candidate.path),
+                    method=item_method,
+                    detail=postcondition_error,
+                )
+                # Same "caught, handled failure -- not a crash" shape as the except block above:
+                # close out the intent as aborted, never leave it dangling for `reclaim.recovery`.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                items.append(
+                    ItemApplyResult(
+                        path=candidate.path,
+                        category=candidate.category,
+                        category_group=candidate.category_group,
+                        size_bytes=candidate.size_bytes,
+                        tier=candidate.tier,
+                        method=item_method,
+                        succeeded=False,
+                        error=postcondition_error,
+                        vault_path=None,
+                        postcondition_verification_failed=True,
+                    )
+                )
+                continue
+
             # ADR-0026, phase 2 (success path): the action is now real on disk; log it done,
             # fsynced. A kill between the two `_append_and_sync` calls above leaves an intent
             # whose target now exists — `reclaim.recovery` reconciles it as "completed".
-            _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "done"}))
+            done_entry = intent_entry.model_copy(update={"phase": "done"})
+            _append_and_sync(manifest_fh, done_entry)
             items.append(
                 ItemApplyResult(
                     path=candidate.path,
@@ -1288,6 +1834,76 @@ def apply_batch(
                     vault_path=vault_path,
                 )
             )
+            # ADR-0032: scoped to `candidate.retention_days is None` (the CATEGORY's own,
+            # pre-guard setting) -- never `item_retention_days == 0` alone, which a human could
+            # also reach by explicitly configuring `retention_days: 0` for some category in
+            # config.toml. Only a guard-downgrade-from-direct-delete gets synchronously purged;
+            # an explicitly-configured zero-retention category keeps the ordinary vault-now,
+            # purge-later checkpoint untouched.
+            if (
+                item_method == "vault"
+                and item_retention_days == 0
+                and candidate.retention_days is None
+            ):
+                pending_synchronous_purges.append((len(items) - 1, done_entry))
+
+        # ADR-0032: second pass, same manifest lock, same `try:` -- see docstring. Runs after
+        # every item in the batch has had its own apply intent/done pair written, so a purge
+        # intent for one item is never interleaved with another item's still-open apply intent.
+        # `manifest_fh is not None` is re-checked (not just asserted) here even though it's
+        # unreachable for `pending_synchronous_purges` to be non-empty when `manifest_fh is None`
+        # (every entry in it came from the `apply=True`-only success path above, which already
+        # requires an open handle) -- mypy can't see that invariant across the two loops, and a
+        # narrowed local name is clearer than a `# type: ignore`.
+        if manifest_fh is not None:
+            for item_index, vault_done_entry in pending_synchronous_purges:
+                purge_vault_path = vault_done_entry.vault_path
+                if purge_vault_path is None:  # unreachable: only "vault" entries were collected
+                    continue
+                purge_intent = vault_done_entry.model_copy(
+                    update={
+                        "phase": "intent",
+                        "intent_id": uuid.uuid4().hex,
+                        "operation": "purge",
+                    }
+                )
+                _append_and_sync(manifest_fh, purge_intent)
+                try:
+                    if vault_done_entry.is_dir:
+                        # K2b: a vaulted candidate whose `os.rename` succeeded (the common,
+                        # same-volume case in `_atomic_move`) moves a reparse point AS a reparse
+                        # point -- so `purge_vault_path` can itself be a junction here. Plain
+                        # `shutil.rmtree` would silently no-op on that case.
+                        rmtree_reparse_point_safe(long_path(purge_vault_path))
+                    else:
+                        unlink_clear_readonly(long_path(purge_vault_path))
+                except OSError as exc:
+                    # Not a failure of the apply itself -- the item is still validly vaulted and
+                    # restorable; it simply stays a normal, retention_days=0 vault entry,
+                    # eligible for the next `reclaim purge` run same as before this fix existed.
+                    logger.warning(
+                        "executor.apply_synchronous_purge_failed",
+                        path=str(vault_done_entry.original_path),
+                        vault_path=str(purge_vault_path),
+                        error=str(exc),
+                    )
+                    _append_and_sync(
+                        manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
+                    )
+                    continue
+                _append_and_sync(
+                    manifest_fh,
+                    purge_intent.model_copy(
+                        update={"phase": "done", "purged": True, "purged_at": now_ts}
+                    ),
+                )
+                items[item_index] = replace(items[item_index], synchronously_purged=True)
+                logger.info(
+                    "executor.apply_synchronous_purge_completed",
+                    path=str(vault_done_entry.original_path),
+                    vault_path=str(purge_vault_path),
+                    size_bytes=vault_done_entry.size_bytes,
+                )
     finally:
         if manifest_fh is not None:
             _close_manifest_for_sync(manifest_fh)
@@ -1303,6 +1919,7 @@ def apply_batch(
 
     succeeded_items = [item for item in items if item.succeeded]
     failed_items = [item for item in items if not item.succeeded]
+    purged_items = [item for item in succeeded_items if item.synchronously_purged]
     return BatchApplyReport(
         batch_id=batch_id,
         apply=apply,
@@ -1318,6 +1935,8 @@ def apply_batch(
         disk_free_before_bytes=disk_free_before,
         disk_free_after_bytes=disk_free_after,
         disk_free_delta_bytes=disk_free_delta,
+        synchronously_purged_count=len(purged_items),
+        bytes_synchronously_purged=sum(item.size_bytes for item in purged_items),
     )
 
 
@@ -1551,6 +2170,24 @@ def restore_batch(
                 )
                 continue
 
+            # M2 (P0-K1a follow-up, this session): "recognized vs unrecognized" destination
+            # design decision, stated explicitly rather than left implicit in the bare
+            # `os.path.exists` check below -- `restore_batch` writes to `entry.original_path`,
+            # an ARBITRARY user path, not this tool's own vault directory, so an accidental
+            # overwrite here is strictly worse than an accidental overwrite inside the vault
+            # (`purge_expired`'s lower-severity, deliberately out-of-scope case for this same
+            # fix -- see this PR's body). Considered and REJECTED: treating a manifest-known
+            # "partial-quarantine remnant" (an entry this exact restore's own manifest already
+            # has a record for) as a recognized, safe-to-overwrite case. Rejected because no such
+            # case actually exists in this codebase's real data shapes: by the time this line
+            # runs, `entry.restored` has already been checked `True` above (idempotent
+            # short-circuit, reported as `already_restored` and never reaches here), and
+            # `_atomic_move`'s own ADR-0004 guarantee means a `phase="done"` restore NEVER
+            # leaves a partial file at `original_path` for a later restore to legitimately find
+            # sitting there. There is therefore no "recognized" case: ANYTHING present at
+            # `original_path` right now is unrecognized by construction, and this check
+            # unconditionally skips rather than overwrites, full stop -- not a placeholder for a
+            # future distinction, the actual, final decision.
             if os.path.exists(long_path(entry.original_path)):  # noqa: PTH110 -- \\?\, not Path
                 items.append(
                     RestoreItemResult(

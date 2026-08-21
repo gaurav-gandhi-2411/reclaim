@@ -83,36 +83,42 @@ def _safety() -> SafetyValidator:
 def test_safe_mode_never_produces_vault_or_direct_delete_method(tmp_path: Path) -> None:
     """Exhaustive proof over `_effective_method_and_retention_days` — the ONE function that
     decides `apply_batch`'s per-candidate method: every combination of `retention_days`
-    (including the size-guard-triggering case ADR-0003 would normally route to `vault`) and
-    every requested batch `method` (`vault`/`recycle_bin`) resolves to `"recycle_bin"` when
+    (including the size-guard-triggering case ADR-0003 would normally route to `vault`),
+    `subtree_entry_count` (including the ADR-0032 entry-count-guard-triggering case), and every
+    requested batch `method` (`vault`/`recycle_bin`) resolves to `"recycle_bin"` when
     `mode=Mode.SAFE`, with no exception. This is what makes the `vault`/`direct_delete`
     branches in `apply_batch`'s per-candidate loop structurally unreachable in safe mode, not
     merely unreached in whatever scenarios this test file happens to construct."""
     retention_days_values: list[int | None] = [None, 0, 1, 30, 9999]
     requested_methods: list[str] = ["vault", "recycle_bin"]
+    subtree_entry_count_values: list[int | None] = [None, 0, 9999]
     huge_candidate = _candidate(tmp_path / "huge.bin", size_bytes=10 * 1024 * 1024 * 1024)
 
     for retention_days in retention_days_values:
         for requested_method in requested_methods:
-            for candidate, label in (
-                (_candidate(tmp_path / "f.bin", retention_days=retention_days), "normal"),
-                (
-                    _dataclass_replace(huge_candidate, retention_days=retention_days),
-                    "size-guard-eligible",
-                ),
-            ):
-                method, _resolved_retention = _effective_method_and_retention_days(
-                    candidate,
-                    requested_method,  # type: ignore[arg-type]
-                    mode=Mode.SAFE,
-                    size_guard_bytes=1024,
-                    size_guard_retention_days=30,
-                )
-                assert method == "recycle_bin", (
-                    f"safe mode produced method={method!r} for retention_days="
-                    f"{retention_days!r}, requested={requested_method!r} ({label}) — the "
-                    "permanent-delete/vault path is not actually unreachable"
-                )
+            for subtree_entry_count in subtree_entry_count_values:
+                for candidate, label in (
+                    (_candidate(tmp_path / "f.bin", retention_days=retention_days), "normal"),
+                    (
+                        _dataclass_replace(huge_candidate, retention_days=retention_days),
+                        "size-guard-eligible",
+                    ),
+                ):
+                    method, _resolved_retention = _effective_method_and_retention_days(
+                        candidate,
+                        requested_method,  # type: ignore[arg-type]
+                        mode=Mode.SAFE,
+                        size_guard_bytes=1024,
+                        size_guard_retention_days=30,
+                        entry_count_guard=100,
+                        subtree_entry_count=subtree_entry_count,
+                    )
+                    assert method == "recycle_bin", (
+                        f"safe mode produced method={method!r} for retention_days="
+                        f"{retention_days!r}, requested={requested_method!r} ({label}), "
+                        f"subtree_entry_count={subtree_entry_count!r} — the permanent-delete/"
+                        "vault path is not actually unreachable"
+                    )
 
 
 def test_apply_batch_refuses_non_recycle_bin_method_in_safe_mode_before_any_io(

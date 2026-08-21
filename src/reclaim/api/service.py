@@ -1017,6 +1017,18 @@ def _build_user_selected_candidate(
         safety_verdict=result.verdict,
         safety_reason_code=result.reason_code,
         retention_days=_USER_SELECTED_RETENTION_DAYS,
+        # P0-K1a: `record` above is a FRESH `FileRecord` (just built by `build_record_for_path`
+        # a few lines up, not a stale scan-index row) -- its dev/ino/mtime are the correct
+        # scan-time-equivalent baseline for `executor._preflight_skip_reason`'s identity
+        # re-check, same as the other two `Candidate`-construction sites. Not called out by name
+        # in this fix's original design note (which only named `detectors.py`/`dedup.py`), but
+        # this is the third and only other place a `Candidate` reaching `apply_batch` is built
+        # from real data -- leaving it at the 0/0/0.0 default would silently disable the
+        # identity check for every AI-suggestion/user-selected apply, not just narrow its
+        # coverage.
+        dev=record.dev,
+        ino=record.ino,
+        mtime=record.mtime,
     )
 
 
@@ -1033,6 +1045,8 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
             error=item.error,
             vault_path=item.vault_path.as_posix() if item.vault_path is not None else None,
             skip_reason=item.skip_reason,
+            synchronously_purged=item.synchronously_purged,
+            postcondition_verification_failed=item.postcondition_verification_failed,
         )
         for item in report.items
     ]
@@ -1060,6 +1074,8 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
         disk_free_before_bytes=report.disk_free_before_bytes,
         disk_free_after_bytes=report.disk_free_after_bytes,
         disk_free_delta_bytes=report.disk_free_delta_bytes,
+        synchronously_purged_count=report.synchronously_purged_count,
+        bytes_synchronously_purged=report.bytes_synchronously_purged,
     )
 
 
@@ -1198,20 +1214,29 @@ def run_apply(
             state.apply_status.current_category = current_category
 
     try:
-        report = apply_batch(
-            selected,
-            safety=state.safety,
-            apply=apply,
-            method=method,
-            mode=state.live_mode,
-            vault_dir=state.vault_dir,
-            manifest_path=state.manifest_path,
-            direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
-            direct_delete_size_guard_retention_days=(
-                state.config.safety.direct_delete_size_guard_retention_days
-            ),
-            on_progress=_on_progress,
-        )
+        # P0-K1a/M1: a fresh `ScanIndex` opened right here so `apply_batch`'s full-subtree
+        # re-walk has the SAME persisted scan data to re-verify irreversible directory
+        # candidates against -- `selected` above was built from its own separately-scoped
+        # `with ScanIndex(...)` block that has already closed by this point.
+        with ScanIndex(state.db_path) as apply_scan_index:
+            report = apply_batch(
+                selected,
+                safety=state.safety,
+                apply=apply,
+                method=method,
+                mode=state.live_mode,
+                vault_dir=state.vault_dir,
+                manifest_path=state.manifest_path,
+                direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+                direct_delete_size_guard_retention_days=(
+                    state.config.safety.direct_delete_size_guard_retention_days
+                ),
+                direct_delete_entry_count_guard=(
+                    state.config.safety.direct_delete_entry_count_guard
+                ),
+                on_progress=_on_progress,
+                scan_index=apply_scan_index,
+            )
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
         logger.warning("api.apply_failed", error=str(exc))

@@ -25,7 +25,7 @@ from reclaim.executor import (
     _open_manifest_for_sync,
     fold_latest_manifest_entries,
     long_path,
-    rmtree_clear_readonly,
+    rmtree_reparse_point_safe,
     unlink_clear_readonly,
 )
 from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, FileRecord, Mode, Verdict
@@ -357,7 +357,13 @@ def purge_expired(
 
             try:
                 if entry.is_dir:
-                    shutil.rmtree(long_path(vault_path), onexc=rmtree_clear_readonly)
+                    # K2b (executor.py audit finding): `vault_path` can itself be a reparse
+                    # point (a junction candidate whose `_atomic_move` used the common,
+                    # same-volume `os.rename` path moves the reparse point AS a reparse point) --
+                    # plain `shutil.rmtree` silently no-ops on that case; see
+                    # `executor.rmtree_reparse_point_safe`'s own module comment for the full
+                    # reproduction.
+                    rmtree_reparse_point_safe(long_path(vault_path))
                 else:
                     unlink_clear_readonly(long_path(vault_path))
             except OSError as exc:

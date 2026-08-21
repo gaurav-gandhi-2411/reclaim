@@ -789,20 +789,27 @@ def _run_apply(args: argparse.Namespace) -> int:
     if args.apply:
         _print_batch_duration_warning("apply", len(selected))
     try:
-        report = apply_batch(
-            selected,
-            safety=safety,
-            apply=args.apply,
-            method=method,
-            mode=config.mode,
-            vault_dir=args.vault_dir,
-            manifest_path=args.manifest,
-            direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
-            direct_delete_size_guard_retention_days=(
-                config.safety.direct_delete_size_guard_retention_days
-            ),
-            on_progress=_cli_progress_printer("apply"),
-        )
+        # P0-K1a/M1: a fresh `ScanIndex` opened right here (the earlier `with ScanIndex(...)`
+        # above, used for candidate generation, has already closed by this point) so
+        # `apply_batch`'s full-subtree re-walk has the SAME persisted scan data to re-verify
+        # irreversible directory candidates against.
+        with ScanIndex(args.db) as apply_scan_index:
+            report = apply_batch(
+                selected,
+                safety=safety,
+                apply=args.apply,
+                method=method,
+                mode=config.mode,
+                vault_dir=args.vault_dir,
+                manifest_path=args.manifest,
+                direct_delete_size_guard_bytes=config.safety.direct_delete_size_guard_bytes,
+                direct_delete_size_guard_retention_days=(
+                    config.safety.direct_delete_size_guard_retention_days
+                ),
+                direct_delete_entry_count_guard=config.safety.direct_delete_entry_count_guard,
+                on_progress=_cli_progress_printer("apply"),
+                scan_index=apply_scan_index,
+            )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
         return 1
@@ -817,6 +824,16 @@ def _run_apply(args: argparse.Namespace) -> int:
         print(  # noqa: T201
             f"reclaim apply: disk free before={report.disk_free_before_bytes} "
             f"after={report.disk_free_after_bytes} delta={report.disk_free_delta_bytes}"
+        )
+    if report.synchronously_purged_count > 0:
+        # ADR-0032: an entry-count/size-guard-downgraded, rebuildable candidate was vaulted
+        # (M1's re-walk skipped, only the cheap top-level check applied) and then immediately
+        # purged back out within this same apply — "vault" in the method column above never
+        # meant "still sitting in the vault" for these specific items.
+        print(  # noqa: T201
+            f"  synchronously purged (guard-downgraded, rebuildable, freed immediately): "
+            f"count={report.synchronously_purged_count} "
+            f"bytes={report.bytes_synchronously_purged}"
         )
     for category, breakdown in sorted(report.category_breakdown.items()):
         print(  # noqa: T201

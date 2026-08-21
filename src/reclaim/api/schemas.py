@@ -396,6 +396,18 @@ class ItemApplyResultOut(BaseModel):
     # for a locked file and a hardlink-shared file with no way to tell them apart -- the reason
     # was previously only visible in structlog, never in the response body.
     skip_reason: PreflightSkipReason | None = None
+    # ADR-0032: mirrors `executor.ItemApplyResult.synchronously_purged` exactly -- `True` only
+    # for a guard-downgraded, rebuildable, retention_days=0 candidate whose vault copy was ALSO
+    # purged back out, synchronously, within this same apply call. See that field's docstring.
+    synchronously_purged: bool = False
+    # K2a follow-up (API-boundary gap, same shape as the skip_reason follow-up above): mirrors
+    # `executor.ItemApplyResult.postcondition_verification_failed` exactly -- `True` only when
+    # apply_batch's real-filesystem post-condition check caught the OS silently no-op'ing a
+    # mutation it reported as successful (e.g. the K2b junction/reparse-point rmtree case).
+    # `error` already carries a human-readable message for this case, but without this field a
+    # caller of `POST /api/apply` can only detect "silent no-op" by string-matching `error`
+    # rather than checking a structured field. Always `False` when `succeeded` is `True`.
+    postcondition_verification_failed: bool = False
 
 
 class CategoryBreakdownOut(BaseModel):
@@ -424,6 +436,10 @@ class ApplyResponse(BaseModel):
     disk_free_before_bytes: int | None
     disk_free_after_bytes: int | None
     disk_free_delta_bytes: int | None
+    # ADR-0032: mirrors `executor.BatchApplyReport.synchronously_purged_count`/`bytes_
+    # synchronously_purged` exactly.
+    synchronously_purged_count: int = 0
+    bytes_synchronously_purged: int = 0
 
 
 class ApplyStatusOut(BaseModel):

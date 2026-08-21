@@ -97,6 +97,32 @@ def test_inventory_under_filters_by_prefix(index: ScanIndex) -> None:
     assert {r.path for r in scoped} == {Path("C:/Data/keep/a.txt")}
 
 
+def test_subtree_entry_count_counts_files_and_dirs_excludes_placeholders(
+    index: ScanIndex,
+) -> None:
+    """ADR-0032 (P0-K1a/M1 cost-budget follow-up): counts BOTH files and directories under the
+    prefix (unlike `subtree_size_bytes`, which sums file rows only -- the entry-count guard cares
+    about total re-walk work, and the re-walk visits directories too), excludes cloud
+    placeholders (matches `candidate_inventory`'s own filter -- the set `_direct_delete_
+    directory_mismatch` actually compares against), and excludes anything outside the prefix."""
+    placeholder = _record(
+        "C:/Data/cache/placeholder.jpg", attributes=FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+    )
+    index.upsert_records(
+        [
+            _record("C:/Data/cache", is_dir=True),
+            _record("C:/Data/cache/a.txt"),
+            _record("C:/Data/cache/sub", is_dir=True),
+            _record("C:/Data/cache/sub/b.txt"),
+            placeholder,
+            _record("C:/Other/unrelated.txt"),
+        ],
+        scanned_at=1.0,
+    )
+    assert index.subtree_entry_count(Path("C:/Data/cache")) == 4  # cache, a.txt, sub, sub/b.txt
+    assert index.subtree_entry_count(Path("C:/Data/nonexistent")) == 0
+
+
 def test_prune_missing_removes_rows_not_in_seen_paths(index: ScanIndex) -> None:
     index.upsert_records(
         [_record("C:/Data/stale.txt"), _record("C:/Data/kept.txt")], scanned_at=1.0

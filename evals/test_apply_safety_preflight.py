@@ -18,8 +18,10 @@ from reclaim.models import Candidate, FileRecord, Tier, Verdict
 from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
+    enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
+from reclaim.scanner import long_path
 
 # Audit P0-1 (docs/AUDIT-2026-08.md): the safety-named home for both R6 pre-flight regression
 # guards ("no live process holds it", "not hardlink-backed into an active install") AND the
@@ -305,6 +307,93 @@ def test_check_hardlink_shared_active_install_false_for_an_unresolvable_path(
     assert result.is_shared_with_other_environment is False
 
 
+# --- (d) batched directory-identity enumeration: reclaim.preflight.enumerate_directory_identity -
+#
+# P0-K1a M1 cost-budget fix: `executor._live_subtree_records` used to call `os.stat()` once per
+# entry (17-28s added to a real apply against the worst-case real fixture -- PLAN.md's 2026-08-21
+# checkpoint). `enumerate_directory_identity` replaces that with one open directory handle and a
+# batched `GetFileInformationByHandleEx`/`FileIdBothDirectoryInfo` read. This is a HARD
+# PREREQUISITE test (per this fix's own task brief): if `FileId` doesn't match `os.stat().st_ino`
+# for the same real file, this whole approach is unsound and must not be relied on anywhere.
+
+
+def test_batch_enumerated_file_id_matches_os_stat_ino_for_real_files(tmp_path: Path) -> None:
+    """Real files (not mocked) -- `enumerate_directory_identity`'s `FileId` must exactly equal
+    `os.stat(path, follow_symlinks=False).st_ino` for every one of them, and `is_dir`/attributes
+    must agree with `os.stat`'s own `st_file_attributes`. A wrong struct offset would read
+    garbage, not a plausible-looking wrong inode -- so an exact match across several real files
+    (not just one) is real evidence the `_FILE_ID_BOTH_DIR_INFO` layout is correct, not a
+    coincidence."""
+    names = ["a.txt", "b.bin", "a_much_longer_filename_to_perturb_struct_offsets.dat"]
+    for i, name in enumerate(names):
+        (tmp_path / name).write_bytes(f"content-{i}".encode() * (i + 1))
+    nested_dir = tmp_path / "nested_subdir"
+    nested_dir.mkdir()
+
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    by_name = {entry.name: entry for entry in entries}
+    assert set(by_name) == {*names, "nested_subdir"}
+
+    for name in names:
+        live_path = tmp_path / name
+        st = os.stat(live_path, follow_symlinks=False)  # noqa: PTH116 -- comparing against the
+        # exact call this fix replaces, not a Path-vs-str style choice.
+        entry = by_name[name]
+        assert entry.ino == st.st_ino, f"{name}: FileId {entry.ino} != st_ino {st.st_ino}"
+        assert entry.is_dir is False
+        assert entry.size_bytes == st.st_size
+
+    dir_entry = by_name["nested_subdir"]
+    dir_st = os.stat(nested_dir, follow_symlinks=False)  # noqa: PTH116
+    assert dir_entry.ino == dir_st.st_ino
+    assert dir_entry.is_dir is True
+
+
+def test_batch_enumerated_directory_dot_and_dotdot_are_filtered(tmp_path: Path) -> None:
+    (tmp_path / "only_child.txt").write_bytes(b"x")
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    assert "." not in {e.name for e in entries}
+    assert ".." not in {e.name for e in entries}
+
+
+def test_batch_enumerated_directory_empty_returns_empty_list(tmp_path: Path) -> None:
+    empty_dir = tmp_path / "genuinely_empty"
+    empty_dir.mkdir()
+    entries = enumerate_directory_identity(long_path(empty_dir))
+    assert entries == []  # NOT None -- the directory opened fine, it just has nothing in it
+
+
+def test_batch_enumerated_directory_missing_path_returns_none(tmp_path: Path) -> None:
+    assert enumerate_directory_identity(long_path(tmp_path / "does-not-exist")) is None
+
+
+def test_batch_enumerated_directory_many_entries_spans_multiple_buffer_reads(
+    tmp_path: Path,
+) -> None:
+    """`_DIR_ENUM_INITIAL_BUFFER_BYTES` (64KB) comfortably fits a few hundred short-named
+    entries in one `GetFileInformationByHandleEx` call -- this creates enough real files that a
+    single read cannot possibly hold them all, exercising the multi-call pagination loop for
+    real rather than only ever hitting the single-call happy path."""
+    file_count = 2000
+    for i in range(file_count):
+        (tmp_path / f"file_{i:05d}.bin").write_bytes(b"x")
+
+    entries = enumerate_directory_identity(long_path(tmp_path))
+    assert entries is not None
+    assert len(entries) == file_count
+    names = {e.name for e in entries}
+    assert names == {f"file_{i:05d}.bin" for i in range(file_count)}
+    # Every entry's identity is independently real, not a byproduct of pagination miscounting --
+    # spot-check a real `os.stat` on a sample spread across the run (first, middle, last).
+    for i in (0, file_count // 2, file_count - 1):
+        target = tmp_path / f"file_{i:05d}.bin"
+        st = os.stat(target, follow_symlinks=False)  # noqa: PTH116
+        matching = next(e for e in entries if e.name == target.name)
+        assert matching.ino == st.st_ino
+
+
 # --- Integration: apply_batch skips instead of attempting the mutation -------------------------
 
 
@@ -354,9 +443,11 @@ def test_apply_batch_skips_file_in_use_and_continues_the_rest_of_the_batch(
     assert report.files_failed == 1
 
 
-def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest_of_the_batch(
+def test_apply_batch_direct_delete_still_skips_hardlink_shared_active_install(
     tmp_path: Path,
 ) -> None:
+    """P0-K1a original finding: load-bearing, unconditionally, for `direct_delete` -- unchanged
+    by ADR-0032/P3 (which only ever skips this check for `method="vault"`)."""
     cache_root = tmp_path / "uv-cache"
     cache_root.mkdir()
     cache_file = cache_root / "six.py"
@@ -374,7 +465,10 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     manifest_path = tmp_path / "manifest.jsonl"
 
     report = apply_batch(
-        [_candidate(cache_file, size_bytes=26), _candidate(normal_target, size_bytes=14)],
+        [
+            _candidate(cache_file, size_bytes=26, retention_days=None),
+            _candidate(normal_target, size_bytes=14, retention_days=None),
+        ],
         safety=_safety(),
         apply=True,
         method="vault",
@@ -386,6 +480,7 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     cache_result = _result_for(report.items, cache_file)
     normal_result = _result_for(report.items, normal_target)
 
+    assert cache_result.method == "direct_delete"
     assert cache_result.succeeded is False
     assert cache_result.skip_reason == "hardlink_shared_active_install"
     assert cache_result.error is None
@@ -399,6 +494,49 @@ def test_apply_batch_skips_hardlink_shared_active_install_and_continues_the_rest
     assert report.files_processed == 2
     assert report.files_succeeded == 1
     assert report.files_failed == 1
+
+
+def test_apply_batch_vault_method_does_not_skip_hardlink_shared_active_install(
+    tmp_path: Path,
+) -> None:
+    """ADR-0032/P3: a vault move is a same-volume rename (or, cross-volume, a copy-then-delete
+    of the source) -- neither destroys the hardlink-shared sibling, and the item stays fully
+    restorable via `reclaim undo` -- so the top-level `check_hardlink_shared_active_install` gate
+    is provably unnecessary specifically for `method="vault"` and is skipped for it. Same
+    fixture shape as the direct-delete regression above, `method="vault"` instead."""
+    cache_root = tmp_path / "uv-cache"
+    cache_root.mkdir()
+    cache_file = cache_root / "six.py"
+    cache_file.write_bytes(b"stdlib-ish-module-content")
+
+    venv = _make_venv(tmp_path / "project" / ".venv")
+    site_packages = venv / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    os.link(cache_file, site_packages / "six.py")
+
+    vault_dir = tmp_path / "vault"
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(cache_file, size_bytes=26)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=vault_dir,
+        manifest_path=manifest_path,
+        now=_NOW,
+    )
+
+    cache_result = _result_for(report.items, cache_file)
+    assert cache_result.method == "vault"
+    assert cache_result.succeeded is True
+    assert cache_result.skip_reason is None
+    assert not cache_file.exists()  # moved into the vault, not skipped
+    assert cache_result.vault_path is not None
+    assert cache_result.vault_path.exists()
+    # The hardlink sibling inside the "live install" is untouched either way -- vaulting one
+    # name never affects the content or existence of the other name sharing the same inode.
+    assert (site_packages / "six.py").exists()
 
 
 def test_apply_batch_dry_run_never_probes_preflight_checks(

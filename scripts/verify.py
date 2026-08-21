@@ -67,6 +67,16 @@ _JUNIT_PATH = "pytest-results.xml"
 # extra or network (confirmed: pure ast/stdlib + `reclaim.detectors`/`reclaim.index`, collect and
 # pass in a bare `uv sync`) -- leaving a new safety/correctness gate out of this list is exactly
 # the silent-skip gap this script's own docstring exists to prevent.
+#
+# test_apply_identity_reverify.py added 2026-08-21 (P0-K1a, live-reproduced this session):
+# `apply_batch` acted on stale DB-index data with zero re-verification against live filesystem
+# state at mutation time -- a content swap at a candidate's path between scan and apply caused
+# the swapped content to be permanently deleted or misrouted into the vault. The six teeth-proofs
+# this fix's design brief requires (delete-and-recreate, junction repoint, depth>=2 directory
+# content change for both direct-delete and vaulted categories, restore-into-occupied-
+# destination, and the unchanged-path regression case) plus the "still works normally" cases. No
+# [ai] extra, no network -- same "no excuse to skip it" reasoning as every other file in this
+# tuple.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -78,6 +88,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_apply_batch_call_graph_gate.py",
     "evals/test_reclaimable_bytes_link_aware_gate.py",
     "evals/test_cache_reclaimable_bytes_gate.py",
+    "evals/test_apply_identity_reverify.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
