@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -549,6 +551,238 @@ async def test_list_candidates_and_preview_apply_refuse_a_stale_scan_id(tmp_path
             {"scan_id": stale_scan_id, "rule_id_or_category": "dev_artifacts", "tier": "A"},
         )
         assert preview_result.isError is True
+
+
+# --- Q3 rebase re-verification: MCP-path-specific identity attacks (docs/AUDIT-2026-08.md) -----
+#
+# The three tests below reproduce, through the real MCP `delete` tool specifically (not
+# `apply_batch` called directly, which `evals/test_apply_identity_reverify.py` already covers),
+# the exact P0-K1a live-reproduced finding that fix closed for the CLI/HTTP paths: swapping the
+# real filesystem content at a candidate's path between `preview_apply` and `delete` must never
+# result in the swapped content being silently deleted/vaulted. These are the money-shot proofs
+# that `mcp_execute_delete`'s Q3 rebase fix (passing `scan_index=` to `apply_batch`, and the
+# top-level `(dev, ino)` check that runs regardless of it) genuinely closes the gap for the MCP
+# surface specifically, not just CLI/HTTP.
+
+
+async def test_delete_refuses_when_path_swapped_between_preview_and_delete_via_mcp(
+    tmp_path: Path,
+) -> None:
+    """The money-shot P0-K1a reproduction through the MCP surface: `preview_apply`'s
+    `selection_hash` is a commitment over PATHS (and the stale DB index), never live filesystem
+    identity -- deleting the real `node_modules` directory and recreating a directory with
+    different content at the exact same path between `preview_apply` and `delete` produces the
+    IDENTICAL hash (same scan_id/tier/rule_id_or_category/paths), so `SelectionMismatchError`
+    alone cannot catch this. The swapped content must survive: `apply_batch`'s
+    `_top_level_identity_mismatch` preflight check (compared against the `(dev, ino)` baseline
+    recorded at scan time) is the only thing standing between this attack and a real deletion of
+    unrelated, unreviewed content -- and it runs unconditionally for every candidate, independent
+    of whether `scan_index=` was passed."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+
+        preview = (
+            await session.call_tool(
+                "preview_apply",
+                {
+                    "scan_id": scan_id,
+                    "rule_id_or_category": "dev_artifact_node_modules",
+                    "tier": "A",
+                },
+            )
+        ).structuredContent
+
+        # Swap the real directory at the exact same path -- new inode, same path string, so the
+        # commitment hash (paths only) is unaffected but the live filesystem identity is not.
+        node_modules_dir = paths["node_modules_dir"]
+        shutil.rmtree(node_modules_dir)
+        node_modules_dir.mkdir(parents=True)
+        canary = node_modules_dir / "SWAPPED-UNRELATED-CONTENT.txt"
+        canary.write_text("this directory was swapped in after preview_apply -- must survive")
+
+        delete_result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id,
+                "rule_id_or_category": "dev_artifact_node_modules",
+                "tier": "A",
+                "selection_hash": preview["selection_hash"],
+            },
+        )
+        # Not a hard refusal (the hash genuinely matched) -- a per-item skip, surfaced as
+        # files_succeeded=0/files_failed=1, same shape the identity-reverify eval suite asserts
+        # for the CLI/HTTP paths.
+        assert delete_result.isError is False, delete_result.content
+        outcome = delete_result.structuredContent
+        assert outcome["files_succeeded"] == 0
+        assert outcome["files_failed"] == 1
+        assert outcome["bytes_freed"] == 0
+
+    # The real, disk-level proof: the swapped-in content is untouched, never vaulted.
+    assert node_modules_dir.exists()
+    assert canary.exists()
+    assert canary.read_text() == "this directory was swapped in after preview_apply -- must survive"
+    assert not any((tmp_path / "vault").rglob("SWAPPED-UNRELATED-CONTENT.txt"))
+
+
+async def test_delete_refuses_when_junction_repointed_between_preview_and_delete_via_mcp(
+    tmp_path: Path,
+) -> None:
+    """Same P0-K1a shape as the path-swap test above, but via a real NTFS junction repoint
+    (`mklink /J`, deleted and recreated pointing somewhere else) between `preview_apply` and
+    `delete` -- reproduces `evals/test_apply_identity_reverify.py::test_junction_repoint_is_
+    skipped`'s exact attack, now through the MCP `delete` tool specifically.
+
+    The scanner counts a reparse point itself but never recurses into it (see `scanner.py`'s own
+    comment) -- so, unlike the plain-directory path-swap test above, the CANDIDATE here is the
+    `node_modules` entry itself being a junction (not a real directory containing one), which the
+    `dev_artifact_node_modules` detector rule can still see via the adjacent `package.json`
+    manifest-adjacency check without ever needing to recurse into it."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    project_dir = root / "Project"
+    project_dir.mkdir()
+    (project_dir / "package.json").write_bytes(b'{"name": "demo"}')
+
+    target_a = tmp_path / "target_a"
+    target_a.mkdir()
+    (target_a / "index.js").write_bytes(b"x" * 5_000)
+
+    target_b = tmp_path / "target_b"
+    target_b.mkdir()
+    (target_b / "b.txt").write_text("from target B -- must survive", encoding="utf-8")
+
+    link = project_dir / "node_modules"
+    result = subprocess.run(  # noqa: S603 -- fixed test args, not untrusted input
+        ["cmd", "/c", "mklink", "/J", str(link), str(target_a)],  # noqa: S607
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
+
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+
+        preview = (
+            await session.call_tool(
+                "preview_apply",
+                {
+                    "scan_id": scan_id,
+                    "rule_id_or_category": "dev_artifact_node_modules",
+                    "tier": "A",
+                },
+            )
+        ).structuredContent
+        assert preview["item_count"] == 1
+
+        link.rmdir()  # removes only the reparse point -- target_a's own contents untouched
+        repoint = subprocess.run(  # noqa: S603
+            ["cmd", "/c", "mklink", "/J", str(link), str(target_b)],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert repoint.returncode == 0, repoint.stderr or repoint.stdout
+
+        delete_result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id,
+                "rule_id_or_category": "dev_artifact_node_modules",
+                "tier": "A",
+                "selection_hash": preview["selection_hash"],
+            },
+        )
+        assert delete_result.isError is False, delete_result.content
+        outcome = delete_result.structuredContent
+        assert outcome["files_succeeded"] == 0
+        assert outcome["files_failed"] == 1
+
+    # Neither the original target nor the swapped-in one was ever touched.
+    assert (target_a / "index.js").exists()
+    assert (target_b / "b.txt").exists()
+
+
+async def test_delete_refuses_a_selection_hash_reused_across_a_fresh_scan_of_identical_content(
+    tmp_path: Path,
+) -> None:
+    """`compute_selection_hash` includes `scan_id` in its committed payload (not just paths/tier/
+    rule_id_or_category) -- verified here live: a hash computed under `scan_id=A` must be refused
+    when replayed against `scan_id=B`, even when B's rescan produces an IDENTICAL-looking
+    selection (same rule/category/tier, same single node_modules path) with nothing on disk
+    having changed at all. Without `scan_id` in the hash input, a hash captured from one scan
+    generation could be replayed against a later one that happens to resolve to the same paths --
+    this proves that specific bypass is closed, not merely that some staleness check exists."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id_a = await _poll_scan_status_until_completed(session)
+
+        preview_a = (
+            await session.call_tool(
+                "preview_apply",
+                {
+                    "scan_id": scan_id_a,
+                    "rule_id_or_category": "dev_artifact_node_modules",
+                    "tier": "A",
+                },
+            )
+        ).structuredContent
+        hash_from_scan_a = preview_a["selection_hash"]
+
+        # Rescan the IDENTICAL tree -- nothing on disk changed, but scan_generation (and so
+        # scan_id) increments regardless, same as `test_delete_refuses_a_stale_scan_id` above.
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id_b = await _poll_scan_status_until_completed(session)
+        assert scan_id_b != scan_id_a
+
+        preview_b = (
+            await session.call_tool(
+                "preview_apply",
+                {
+                    "scan_id": scan_id_b,
+                    "rule_id_or_category": "dev_artifact_node_modules",
+                    "tier": "A",
+                },
+            )
+        ).structuredContent
+        # Same logical selection (identical single path), different scan generation -> the
+        # commitment hash must differ, proving scan_id is genuinely part of the hash input, not
+        # just checked separately.
+        assert preview_b["selection_hash"] != hash_from_scan_a
+        assert preview_b["sample_paths"] == preview_a["sample_paths"]
+
+        # Attempt to replay scan A's hash against the CURRENT scan_id (B) -- must be refused.
+        delete_result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id_b,
+                "rule_id_or_category": "dev_artifact_node_modules",
+                "tier": "A",
+                "selection_hash": hash_from_scan_a,
+            },
+        )
+        assert delete_result.isError is True
+        [content] = delete_result.content
+        assert "selection_hash" in content.text or "match" in content.text.lower()
+
+    assert paths["node_modules_dir"].exists()
 
 
 # The schema-level "no registered tool accepts a raw path" proof (including a negative test that
