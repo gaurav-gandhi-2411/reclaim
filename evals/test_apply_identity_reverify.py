@@ -694,3 +694,127 @@ def test_entry_count_guard_crash_between_purge_intent_and_done_reconciles_as_com
     folded_after = fold_latest_manifest_entries(manifest_path)
     assert len(folded_after) == 1
     assert folded_after[0].purged is True  # reconciled from real on-disk state, not guessed
+
+
+# --- K2a/K2b/K2d (this session's follow-up audit finding): `shutil.rmtree` + `long_path()` +
+# junction defeats `apply_batch`'s own success reporting -----------------------------------------
+#
+# Root cause (K2b): every `shutil.rmtree` call site in `executor.py`/`purge.py` passes
+# `onexc=rmtree_clear_readonly` (needed for read-only git packfiles -- ADR-0004). When
+# `shutil.rmtree` is handed a Windows junction/symlink directly as its own top-level argument, it
+# detects this internally and raises -- but the `func` it hands `onexc` for that specific raise is
+# `os.path.islink` (a read-only probe), not a delete call. `rmtree_clear_readonly`'s own contract
+# ("chmod, then retry `func(path)`") re-invokes `islink`, discards the return value, and
+# `shutil.rmtree` returns NORMALLY having deleted nothing. `apply_batch` previously had no way to
+# tell this apart from a genuine success -- see `executor.rmtree_reparse_point_safe`'s own module
+# comment for the full mechanism and how K2b fixes it.
+#
+# Two independent teeth-proofs below: the first proves K2b's actual root-cause fix against a real
+# `mklink /J` junction through the full `apply_batch` path; the second proves K2a's post-condition
+# CONTRACT independently of K2b, by forcing a hypothetical silent no-op via monkeypatch -- so this
+# safety net does not depend on K2b's fix being the only bug of this shape that will ever exist.
+
+
+def test_direct_delete_junction_is_genuinely_removed_not_silently_noop(tmp_path: Path) -> None:
+    """K2b/K2d: before this fix, a direct-delete candidate whose path was itself an NTFS junction
+    was silently untouched by `apply_batch` while still being reported `succeeded=True` -- see
+    this section's module comment for the exact mechanism. No `scan_index` is passed and no
+    scan-time `(dev, ino)` baseline is set (`dev=0, ino=0`, `_candidate`'s own default) so this
+    test isolates K2b's fix specifically, independent of M1's separate subtree re-walk."""
+    target = tmp_path / "target"
+    target.mkdir()
+    canary_content = b"must survive -- this is the junction's TARGET, never the candidate itself"
+    (target / "canary.txt").write_bytes(canary_content)
+
+    link = tmp_path / "cache_link"
+    _make_junction(link, target)
+
+    candidate = _candidate(link, is_dir=True, size_bytes=0, retention_days=None, rebuildable=True)
+
+    report = apply_batch(
+        [candidate],
+        safety=_safety(),
+        apply=True,
+        method="vault",  # irrelevant: retention_days=None forces direct_delete (ADR-0001)
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    result = _apply_result_for(report.items, link)
+    assert result.method == "direct_delete"
+    assert result.skip_reason is None
+
+    # The load-bearing assertion: never silently "succeeded" with the junction physically
+    # untouched. Either it was genuinely removed, or it was explicitly rejected -- never silent.
+    if result.succeeded:
+        assert result.error is None
+        assert result.postcondition_verification_failed is False
+        assert not link.exists()
+        # Prove the directory ENTRY itself (not merely what it resolved to) is gone, not just
+        # left dangling: re-creating a junction at the exact same path only succeeds if nothing
+        # (reparse point or otherwise) still occupies it.
+        _make_junction(link, target)
+        assert link.exists()
+        link.rmdir()  # cleanup -- removes only this fresh junction entry, not `target`
+    else:
+        assert result.error is not None
+        assert result.postcondition_verification_failed is True
+
+    # Either way, the junction's TARGET -- a completely separate directory this candidate never
+    # named -- must never be touched.
+    assert target.exists()
+    assert (target / "canary.txt").exists()
+    assert (target / "canary.txt").read_bytes() == canary_content
+
+    # Manifest never records a "done" phase for this item unless the delete genuinely happened.
+    raw_entries = read_manifest_entries(tmp_path / "manifest.jsonl")
+    matching = [e for e in raw_entries if e.original_path == link]
+    phases = {e.phase for e in matching}
+    if result.succeeded:
+        assert phases == {"intent", "done"}
+    else:
+        assert phases == {"intent", "aborted"}
+        assert "done" not in phases
+
+
+def test_postcondition_check_catches_a_hypothetical_silent_noop_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K2a's contract, proven independently of K2b's specific root-cause fix: ANY mutation call
+    that returns without raising, but leaves the original path genuinely untouched, must be
+    caught by `apply_batch`'s own post-condition verification -- not merely relying on one fixed
+    root cause never recurring. Monkeypatches `unlink_clear_readonly` (the direct_delete,
+    single-file code path) to a no-op that raises nothing and touches nothing -- simulating
+    exactly the failure SHAPE K2b's real bug exhibited (an operation reporting success while
+    changing nothing) without depending on the junction reproduction at all."""
+    import reclaim.executor as executor_module
+
+    target = tmp_path / "orphaned_cache.bin"
+    original_content = b"never actually deleted by the patched no-op"
+    target.write_bytes(original_content)
+
+    monkeypatch.setattr(executor_module, "unlink_clear_readonly", lambda path: None)
+
+    candidate = _candidate(target, size_bytes=len(original_content), retention_days=None)
+    report = apply_batch(
+        [candidate],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    result = _apply_result_for(report.items, target)
+    assert result.succeeded is False
+    assert result.postcondition_verification_failed is True
+    assert result.error is not None
+    assert "silently did not remove it" in result.error
+    assert target.exists()  # never actually touched -- the no-op is faithfully simulated
+    assert target.read_bytes() == original_content
+
+    raw_entries = read_manifest_entries(tmp_path / "manifest.jsonl")
+    matching = [e for e in raw_entries if e.original_path == target]
+    assert {e.phase for e in matching} == {"intent", "aborted"}  # never a "done" entry
