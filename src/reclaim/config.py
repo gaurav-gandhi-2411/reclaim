@@ -18,7 +18,13 @@ logger = structlog.get_logger(__name__)
 # ADR-0027 (schema versioning): the config shape as of introducing `schema_version` — bump
 # whenever a top-level or category field is added/removed/changed in a way that would otherwise
 # be invisible to a reader of an older release.
-CONFIG_SCHEMA_VERSION = 1
+# Bumped 1 -> 2: `TempAndBrowserCachesConfig.min_temp_root_age_hours` (the temp-root age-guard
+# field, see its own comment below) is a new category field per the discipline stated above --
+# a config.toml genuinely older than this addition never wrote that key, and per ADR-0027 this is
+# exactly the "add a field with a default" case the versioning scheme exists to make routine, not
+# breaking (the field's own safe default, `24.0 * 7`, means no reader/writer version-skew
+# scenario is introduced by this bump alone).
+CONFIG_SCHEMA_VERSION = 2
 
 # ADR-0027: every config/category class below sets `extra="ignore"` (never `"allow"`) —
 # config.toml is parsed into `Config` and consulted in-memory (`load_effective_config`'s
@@ -521,8 +527,13 @@ class Config(BaseSettings):
     # caller that doesn't go through `load_config` — is the conservative default, never an
     # accidental power-mode config.
     mode: Mode = Mode.SAFE
-    # ADR-0027: absent (pre-versioning) config.toml files validate with this defaulting to `1` —
-    # the literal truth, since `1` is the version every existing field on this class belongs to.
+    # ADR-0027: absent (pre-versioning or otherwise unversioned) config.toml files validate with
+    # this defaulting to `CONFIG_SCHEMA_VERSION` (deliberately coupled, unlike
+    # `QuarantineManifestEntry.schema_version` -- see ADR-0027's "second, easy-to-miss consequence
+    # of the bump" section for why that model decouples and this one does not: `Config` is never
+    # re-serialized back to config.toml, so there is no read-modify-write cycle for a missing key
+    # to be mislabeled across, and treating an unversioned file as "current" rather than a frozen
+    # historical version is a deliberate, documented trade-off, not an oversight).
     # A hand-edited config.toml is never expected to set this itself; it exists for a future
     # release's migration logic, not as a user-facing knob.
     schema_version: int = Field(default=CONFIG_SCHEMA_VERSION)

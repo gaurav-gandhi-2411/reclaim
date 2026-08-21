@@ -178,7 +178,11 @@ def test_backward_compat_pre_adr0027_toml_with_no_schema_version_key_parses(
     tmp_path: Path,
 ) -> None:
     """A config.toml written before this ADR (no schema_version key anywhere) parses fine, with
-    schema_version defaulting to 1 -- the literal truth for that file."""
+    schema_version defaulting to CONFIG_SCHEMA_VERSION -- `Config` deliberately couples its field
+    default to the current constant rather than a frozen historical literal (unlike
+    `QuarantineManifestEntry`, which decouples -- see ADR-0027 for why the two models differ:
+    `Config` is never re-serialized back to config.toml, so there is no stale-version-mislabeling
+    risk from treating an unversioned file as "current")."""
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
@@ -193,7 +197,7 @@ enabled = true
 
     config = load_config(config_path)
 
-    assert config.schema_version == 1
+    assert config.schema_version == CONFIG_SCHEMA_VERSION
     assert config.safety.deny == ["C:/protected/*"]
     assert config.categories.dev_artifacts.enabled is True
 
@@ -226,15 +230,16 @@ enabled = true
 
 def test_forward_compat_unknown_top_level_key_does_not_raise(tmp_path: Path) -> None:
     """Tolerance for an unrecognized key is gated on the file HONESTLY claiming to be from a
-    newer release (`schema_version` genuinely > `CONFIG_SCHEMA_VERSION`) -- `schema_version = 1`
-    (the CURRENT version) alongside an unrecognized key is exactly the ambiguous case
-    `test_unknown_top_level_key_with_no_newer_schema_version_claim_raises` below proves gets
-    rejected instead, so this test uses a real future version (2) to demonstrate genuine
-    forward compat, not the security-boundary case."""
+    newer release (`schema_version` genuinely > `CONFIG_SCHEMA_VERSION`) -- `schema_version ==
+    CONFIG_SCHEMA_VERSION` (the CURRENT version) alongside an unrecognized key is exactly the
+    ambiguous case `test_unknown_top_level_key_with_no_newer_schema_version_claim_raises` below
+    proves gets rejected instead, so this test uses a real future version
+    (`CONFIG_SCHEMA_VERSION + 1`) to demonstrate genuine forward compat, not the security-boundary
+    case."""
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        """
-schema_version = 2
+        f"""
+schema_version = {CONFIG_SCHEMA_VERSION + 1}
 a_future_top_level_key = "something new"
 """,
         encoding="utf-8",
@@ -242,17 +247,17 @@ a_future_top_level_key = "something new"
 
     config = load_config(config_path)
 
-    assert config.schema_version == 2
+    assert config.schema_version == CONFIG_SCHEMA_VERSION + 1
 
 
 def test_forward_compat_unknown_category_level_key_does_not_raise(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        """
-schema_version = 2
+        f"""
+schema_version = {CONFIG_SCHEMA_VERSION + 1}
 
 [categories]
-a_future_category = { enabled = true }
+a_future_category = {{ enabled = true }}
 
 [categories.dev_artifacts]
 enabled = true
@@ -295,8 +300,8 @@ def test_unknown_category_field_with_schema_version_equal_to_current_raises(
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        """
-schema_version = 1
+        f"""
+schema_version = {CONFIG_SCHEMA_VERSION}
 
 [categories.dev_artifacts]
 enabled = true
@@ -481,8 +486,8 @@ def test_load_config_logs_warning_on_unknown_top_level_and_category_keys(
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        """
-schema_version = 2
+        f"""
+schema_version = {CONFIG_SCHEMA_VERSION + 1}
 a_future_top_level_key = "x"
 
 [categories.dev_artifacts]
@@ -494,7 +499,7 @@ a_future_field = "y"
 
     load_config(config_path)
 
-    # schema_version=2 (> CONFIG_SCHEMA_VERSION) also logs its own
+    # schema_version=CONFIG_SCHEMA_VERSION + 1 (> CONFIG_SCHEMA_VERSION) also logs its own
     # "config.newer_schema_version_detected" warning (no "scope" key) -- filter to just the
     # unknown-keys ones this test cares about.
     key_warnings = [
