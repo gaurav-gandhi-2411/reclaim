@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
+
 # ADR reference: docs/AUDIT-2026-08.md, P0-1. `apply_batch`'s real mutation loop
 # (`executor.py`) had zero pre-flight probe for either of R6's two required checks before this
 # module existed: "is this path currently held open by another process" and "is this path
@@ -379,3 +381,198 @@ def check_identity_unchanged_since_scan(
         recorded_size_bytes=recorded_size_bytes,
         live_size_bytes=st.st_size,
     )
+
+
+# --- (d) batched directory-identity enumeration (P0-K1a M1 cost-budget fix) --------------------
+#
+# M1's full-subtree re-walk (`executor._live_subtree_records`) used to call `os.stat()` once per
+# entry (via `scanner.build_record`) -- on Windows this means one real
+# `CreateFile`+`GetFileInformationByHandle`+`CloseHandle` cycle PER ENTRY, since `st_ino`/`st_dev`
+# require a real by-handle query that `os.DirEntry.stat()`'s cached `FindNextFile` data doesn't
+# carry (see `scanner.build_record`'s own comment on this exact tradeoff). Measured real cost
+# against the actual worst-case direct-delete candidate reachable on this machine
+# (`%LOCALAPPDATA%\npm-cache`, 88,864 files): 17-28s added to a real apply, ~3.4x over this fix's
+# own 10% cost budget (PLAN.md's 2026-08-21 checkpoint).
+#
+# `GetFileInformationByHandleEx`/`FileIdBothDirectoryInfo` is the batched replacement: ONE open
+# directory HANDLE (`CreateFileW` + `FILE_FLAG_BACKUP_SEMANTICS`, same requirement
+# `_raw_probe_exclusive_open` above already documents for opening a directory handle at all), then
+# a small, buffer-growth-bounded number of `GetFileInformationByHandleEx` calls return EVERY
+# child's `FileId` (the same 64-bit NTFS file-record identity `st_ino` exposes), size, timestamps,
+# and attributes in one shot -- zero per-child `CreateFile`/open operations. `FileId` equivalence
+# to `os.stat().st_ino` for the same file is empirically confirmed against a real fixture, not
+# assumed -- see `evals/test_apply_safety_preflight.py::
+# test_batch_enumerated_file_id_matches_os_stat_ino_for_real_files`.
+
+_FILE_ID_BOTH_DIRECTORY_INFO_CLASS = 10  # FILE_INFO_BY_HANDLE_CLASS.FileIdBothDirectoryInfo
+_ERROR_NO_MORE_FILES = 18
+_ERROR_MORE_DATA = 234
+# Deliberately permissive (unlike `_raw_probe_exclusive_open`'s exclusive `dwShareMode=0` above):
+# this is a read-only directory LISTING, not a lock probe, and must not itself interfere with any
+# concurrent access to the tree it's reading.
+_FILE_SHARE_READ_WRITE_DELETE = 0x00000001 | 0x00000002 | 0x00000004
+_DIR_ENUM_INITIAL_BUFFER_BYTES = 64 * 1024
+# A single filename would need to be ~8M UTF-16 characters to still not fit at this size (NTFS's
+# own max path component length is 255 characters) -- this cap exists only to bound a pathological
+# retry loop, never expected to actually bind in practice.
+_DIR_ENUM_MAX_BUFFER_BYTES = 16 * 1024 * 1024
+# Not already defined in `models.py` (only `FILE_ATTRIBUTE_REPARSE_POINT`/
+# `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` are) -- local since this is the only place in this module
+# that needs it.
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+
+
+class _FILE_ID_BOTH_DIR_INFO(ctypes.Structure):
+    """The fixed-size portion of `FILE_ID_BOTH_DIR_INFO` (winnt.h) -- `FileName` is a variable-
+    length trailing array, read manually from the raw buffer at `ctypes.sizeof(this)` using
+    `FileNameLength`, not declared as a ctypes field. Field layout (offsets, alignment) verified
+    empirically via `ctypes.sizeof`/`.offset` before relying on it: this layout gives `FileId` at
+    offset 96 and a total fixed size of 104 bytes, matching every public reference for this
+    struct -- and further confirmed by the real FileId-vs-`st_ino` equivalence test this module's
+    own docstring above points to (a wrong offset would read garbage, not a plausible-looking
+    wrong inode, so that test is a real check on this layout too, not just on the API choice)."""
+
+    _fields_ = [
+        ("NextEntryOffset", ctypes.wintypes.ULONG),
+        ("FileIndex", ctypes.wintypes.ULONG),
+        ("CreationTime", ctypes.wintypes.LARGE_INTEGER),
+        ("LastAccessTime", ctypes.wintypes.LARGE_INTEGER),
+        ("LastWriteTime", ctypes.wintypes.LARGE_INTEGER),
+        ("ChangeTime", ctypes.wintypes.LARGE_INTEGER),
+        ("EndOfFile", ctypes.wintypes.LARGE_INTEGER),
+        ("AllocationSize", ctypes.wintypes.LARGE_INTEGER),
+        ("FileAttributes", ctypes.wintypes.ULONG),
+        ("FileNameLength", ctypes.wintypes.ULONG),
+        ("EaSize", ctypes.wintypes.ULONG),
+        ("ShortNameLength", ctypes.c_byte),
+        ("ShortName", ctypes.c_wchar * 12),
+        ("FileId", ctypes.wintypes.LARGE_INTEGER),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryEntryIdentity:
+    """One child of `enumerate_directory_identity`'s target directory -- `.`/`..` already
+    filtered out. `ino` is normalized to the same UNSIGNED 64-bit range Python's
+    `os.stat().st_ino` uses (Win32's `FileId` is a signed `LARGE_INTEGER`; a top-bit-set
+    file-record number would otherwise come back negative and never compare equal to `st_ino`)."""
+
+    name: str
+    attributes: int
+    ino: int
+    size_bytes: int
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self.attributes & _FILE_ATTRIBUTE_DIRECTORY)
+
+    @property
+    def is_reparse_point(self) -> bool:
+        return bool(self.attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def enumerate_directory_identity(path: str) -> list[DirectoryEntryIdentity] | None:  # pragma: no
+    # cover -- real Win32 call; exercised for real via a real directory fixture in
+    # `evals/test_apply_safety_preflight.py`, same reasoning as `_raw_probe_exclusive_open`/
+    # `_raw_enumerate_hardlink_names` above: there's no meaningful way to fake a real
+    # `GetFileInformationByHandleEx` result other than actually calling it.
+    r"""Every child of `path` (files AND subdirectories), each carrying its NTFS file-record
+    identity, attributes, and size -- read via a SINGLE open directory handle and a small,
+    buffer-growth-bounded number of `GetFileInformationByHandleEx` calls, never one real
+    `CreateFile`/open PER CHILD. `.`/`..` (always present in this enumeration, same as
+    `FindFirstFile`/`FindNextFile`) are filtered out before returning. `path` should already be
+    `\\?\`-prefixed by the caller for MAX_PATH safety (see `scanner.long_path`) -- this function
+    itself does no path preparation, same convention `_raw_probe_exclusive_open` above uses.
+
+    Returns `None` if `path` itself can't be opened as a directory handle at all (permission
+    error, vanished, not a directory) -- callers already treat a whole-directory listing failure
+    as "skip this subtree" (see `executor._live_subtree_records`'s own docstring for why that's
+    the safe direction), same as the plain `os.scandir` failure this replaces. Returns `[]` for a
+    genuinely empty directory (still opens and enumerates fine -- `.`/`..` are the only entries,
+    and both are filtered).
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.GetFileInformationByHandleEx.restype = ctypes.wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+    ]
+
+    handle = kernel32.CreateFileW(
+        path,
+        _GENERIC_READ,
+        _FILE_SHARE_READ_WRITE_DELETE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    # See `_raw_probe_exclusive_open` above for why INVALID_HANDLE_VALUE must be computed via
+    # ctypes itself rather than hardcoded.
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        return None
+
+    results: list[DirectoryEntryIdentity] = []
+    try:
+        buf_size = _DIR_ENUM_INITIAL_BUFFER_BYTES
+        buf = ctypes.create_string_buffer(buf_size)
+        header_size = ctypes.sizeof(_FILE_ID_BOTH_DIR_INFO)
+        while True:
+            ok = kernel32.GetFileInformationByHandleEx(
+                handle, _FILE_ID_BOTH_DIRECTORY_INFO_CLASS, buf, buf_size
+            )
+            if not ok:
+                err = ctypes.get_last_error()
+                if err == _ERROR_NO_MORE_FILES:
+                    break
+                if err == _ERROR_MORE_DATA and buf_size < _DIR_ENUM_MAX_BUFFER_BYTES:
+                    # A single entry (almost always one with a long filename) didn't fit in the
+                    # current buffer -- nothing was consumed by a failed call, so growing and
+                    # retrying resumes from the exact same enumeration position, not a repeat or
+                    # a skip.
+                    buf_size = min(buf_size * 2, _DIR_ENUM_MAX_BUFFER_BYTES)
+                    buf = ctypes.create_string_buffer(buf_size)
+                    continue
+                # Any other failure: stop with whatever was gathered so far -- same conservative
+                # posture `_live_subtree_records`'s pre-existing `except OSError: continue` used
+                # (a directory this walk can't finish listing degrades this check's coverage for
+                # whatever sits below it, never silently approves a mutation).
+                break
+
+            raw = buf.raw
+            offset = 0
+            while True:
+                entry = _FILE_ID_BOTH_DIR_INFO.from_buffer_copy(raw, offset)
+                name_start = offset + header_size
+                name = raw[name_start : name_start + entry.FileNameLength].decode("utf-16-le")
+                if name not in (".", ".."):
+                    ino = entry.FileId if entry.FileId >= 0 else entry.FileId + (1 << 64)
+                    results.append(
+                        DirectoryEntryIdentity(
+                            name=name,
+                            attributes=entry.FileAttributes,
+                            ino=ino,
+                            size_bytes=entry.EndOfFile,
+                        )
+                    )
+                if entry.NextEntryOffset == 0:
+                    break
+                offset += entry.NextEntryOffset
+    finally:
+        kernel32.CloseHandle(handle)
+    return results

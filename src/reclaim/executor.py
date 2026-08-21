@@ -26,9 +26,10 @@ from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
     check_identity_unchanged_since_scan,
+    enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import GitRepoCache, SkippedPath, build_record, build_record_for_path
+from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
 logger = structlog.get_logger(__name__)
@@ -1025,38 +1026,64 @@ def _top_level_identity_mismatch(candidate: Candidate) -> str | None:
 def _live_subtree_records(root: Path) -> list[FileRecord]:
     """M1: read-only re-walk of `root` and everything reachable under it without crossing a
     reparse point -- mirrors `scanner._walk_subtree`'s exact walk shape (stack-based,
-    reparse-point-gated recursion via `scanner.build_record`'s own `should_recurse`) but writes
-    nothing to any index and is only ever used immediately before an irreversible delete, never
-    during a normal scan.
+    reparse-point-gated recursion) but writes nothing to any index and is only ever used
+    immediately before an irreversible delete, never during a normal scan.
 
-    An entry this walk can't stat/list (permission error, vanished mid-walk) is silently
+    P0-K1a cost-budget fix (this PR): per-entry identity used to come from `os.stat()` (via
+    `scanner.build_record`) -- on Windows, one real `CreateFile`+`GetFileInformationByHandle`+
+    `CloseHandle` cycle PER ENTRY, measured at 17-28s added to a real apply against the actual
+    worst-case direct-delete candidate reachable on this machine (`%LOCALAPPDATA%\\npm-cache`,
+    88,864 files -- see PLAN.md's 2026-08-21 checkpoint). Replaced with
+    `preflight.enumerate_directory_identity`'s batched `GetFileInformationByHandleEx`/
+    `FileIdBothDirectoryInfo` read -- one open directory handle and a small, bounded number of
+    calls per DIRECTORY instead of one real open per ENTRY. `dev` (the volume-identity half of
+    `(dev, ino)`) is read once per directory via a single `os.stat()` on the directory itself --
+    every child of a directory is, by construction, on the SAME volume as its parent UNLESS it's
+    a reparse point (already excluded from this walk's own recursion below), so one `os.stat()`
+    per directory (not per entry) is both correct and orders of magnitude cheaper. `git_repo_root`/
+    `git_repo_clean`/`mtime`/`ctime` are left at `FileRecord`'s own Stage-1 defaults (`None`/
+    `False`/`0.0`/`0.0`) -- this throwaway re-verification pass never reads any of the four, and
+    computing git-repo state per entry was a large, avoidable share of the original cost this fix
+    removes.
+
+    A directory this walk can't open/enumerate (permission error, vanished mid-walk) is silently
     excluded from the returned list -- the same thing `scanner._walk_subtree` does with a
     `SkippedPath`, minus the reporting (this is a throwaway re-verification pass, not a scan).
-    Disclosed gap: an entry excluded this way (and its entire subtree, if it was a directory)
-    is invisible to `_direct_delete_directory_mismatch`'s comparisons -- it can be neither
-    "unexpectedly new" nor "identity mismatched" if this walk never saw it. This is the safe
-    direction for what this function itself can decide (nothing here silently approves a
+    Disclosed gap (unchanged by this fix): an entry excluded this way (and its entire subtree, if
+    it was a directory) is invisible to `_direct_delete_directory_mismatch`'s comparisons -- it
+    can be neither "unexpectedly new" nor "identity mismatched" if this walk never saw it. This is
+    the safe direction for what this function itself can decide (nothing here silently approves a
     mutation), but a directory that became genuinely unreadable between scan and apply still
     degrades this check's coverage for whatever sits below it. See this PR's body.
     """
-    git_cache = GitRepoCache()
     records: list[FileRecord] = []
     stack = [root]
     while stack:
         current_dir = stack.pop()
+        prefixed = long_path(current_dir)
         try:
-            entries = list(os.scandir(long_path(current_dir)))
+            dev = os.stat(prefixed, follow_symlinks=False).st_dev  # noqa: PTH116 -- \\?\ str, not Path
         except OSError:
             continue
-        skipped: list[SkippedPath] = []
+        entries = enumerate_directory_identity(prefixed)
+        if entries is None:
+            continue
         for entry in entries:
-            built = build_record(entry, current_dir, git_cache, skipped)
-            if built is None:
-                continue
-            record, should_recurse = built
+            entry_path = current_dir / entry.name
+            record = FileRecord(
+                path=entry_path,
+                is_dir=entry.is_dir,
+                size_bytes=entry.size_bytes,
+                attributes=entry.attributes,
+                ext=Path(entry.name).suffix.lower() if not entry.is_dir else "",
+                git_repo_root=None,
+                git_repo_clean=False,
+                dev=dev,
+                ino=entry.ino,
+            )
             records.append(record)
-            if should_recurse:
-                stack.append(record.path)
+            if record.is_dir and not entry.is_reparse_point:
+                stack.append(entry_path)
     return records
 
 
