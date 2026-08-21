@@ -1334,21 +1334,32 @@ def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyRespo
     Method is auto-resolved from the live mode exactly like `resolve_apply_selection` already
     does for the HTTP apply path -- safe mode only ever allows the Recycle Bin (`apply_batch`
     enforces this structurally regardless), so an MCP client never needs its own method
-    selector."""
+    selector.
+
+    P0-K1a/M1 rebase fix (Q3, docs/AUDIT-2026-08.md): opens a fresh `ScanIndex` and passes it
+    as `apply_batch`'s `scan_index=`, exactly like `run_apply` above -- without this, the
+    top-level `(dev, ino)` identity check (`_top_level_identity_mismatch`) still runs
+    unconditionally, but the full-subtree re-walk `_direct_delete_directory_mismatch` runs
+    against every irreversible direct-delete DIRECTORY candidate is silently unavailable (see
+    `_preflight_skip_reason`'s docstring: `scan_index is None` means "M1's subtree re-walk
+    cannot run at all for this candidate"), which would leave the MCP `delete` tool with weaker
+    protection than the HTTP `POST /api/apply` path for that one candidate shape."""
     method: QuarantineMethod = "recycle_bin" if state.live_mode == Mode.SAFE else "vault"
-    report = apply_batch(
-        selected,
-        safety=state.safety,
-        apply=True,
-        method=method,
-        mode=state.live_mode,
-        vault_dir=state.vault_dir,
-        manifest_path=state.manifest_path,
-        direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
-        direct_delete_size_guard_retention_days=(
-            state.config.safety.direct_delete_size_guard_retention_days
-        ),
-    )
+    with ScanIndex(state.db_path) as mcp_apply_scan_index:
+        report = apply_batch(
+            selected,
+            safety=state.safety,
+            apply=True,
+            method=method,
+            mode=state.live_mode,
+            vault_dir=state.vault_dir,
+            manifest_path=state.manifest_path,
+            direct_delete_size_guard_bytes=state.config.safety.direct_delete_size_guard_bytes,
+            direct_delete_size_guard_retention_days=(
+                state.config.safety.direct_delete_size_guard_retention_days
+            ),
+            scan_index=mcp_apply_scan_index,
+        )
     return _apply_response(report)
 
 
