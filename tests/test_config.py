@@ -113,6 +113,64 @@ def test_load_config_returns_defaults_when_path_is_none() -> None:
     assert load_config(None) == Config()
 
 
+# --- P0 fix (2026-08 audit, temp-sweep age-guard finding): min_temp_root_age_hours floor --------
+
+
+def test_bare_config_defaults_temp_root_age_guard_to_seven_days() -> None:
+    """Default matches this project's own Track A manual cleanup threshold (7 days) -- the
+    shipped default had drifted more aggressive than what was manually judged safe."""
+    assert Config().categories.temp_and_browser_caches.min_temp_root_age_hours == 24.0 * 7
+
+
+def test_config_toml_can_override_temp_root_age_guard_above_the_floor(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[categories.temp_and_browser_caches]
+min_temp_root_age_hours = 48.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.categories.temp_and_browser_caches.min_temp_root_age_hours == 48.0
+
+
+def test_temp_root_age_guard_below_hard_floor_raises(tmp_path: Path) -> None:
+    """A misconfigured value below the 24h hard floor is rejected outright at config-load time --
+    never silently clamped -- so a value below the floor can never quietly defeat the guard
+    against sweeping just-written temp files (installer mid-extraction, active download, running
+    application scratch state)."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[categories.temp_and_browser_caches]
+min_temp_root_age_hours = 1.0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="min_temp_root_age_hours"):
+        load_config(config_path)
+
+
+def test_temp_root_age_guard_exactly_at_hard_floor_is_accepted(tmp_path: Path) -> None:
+    """The floor itself (24.0) is inclusive, not exclusive."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[categories.temp_and_browser_caches]
+min_temp_root_age_hours = 24.0
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.categories.temp_and_browser_caches.min_temp_root_age_hours == 24.0
+
+
 # --- Backward compat: pre-this-ADR config.toml, read by this code -----------------------------
 
 
