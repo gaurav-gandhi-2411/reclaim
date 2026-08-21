@@ -17,7 +17,14 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, FileRecord, Mode, Tier, Verdict
+from reclaim.models import (
+    FILE_ATTRIBUTE_REPARSE_POINT,
+    Candidate,
+    FileRecord,
+    Mode,
+    Tier,
+    Verdict,
+)
 from reclaim.preflight import PreflightSkipReason as PreflightSkipReason  # re-exported; api/
 
 # schemas.py imports this type from here rather than reaching into `reclaim.preflight` directly,
@@ -352,6 +359,17 @@ class ItemApplyResult:
     # `True` for the underlying vault move, just not yet purged — a future `reclaim purge` run
     # will pick it up like any other purge-eligible entry).
     synchronously_purged: bool = False
+    # K2a (audit finding): `True` when this item's underlying move/delete call raised NO
+    # exception at all, but `_verify_apply_postcondition`'s real, fresh on-disk check afterward
+    # found the mutation didn't actually happen (or only partially happened) — distinct from
+    # `error` carrying a message from an ATTEMPTED mutation the OS/filesystem itself rejected.
+    # `error` is still populated (with `_verify_apply_postcondition`'s own message) for this case
+    # too, so any caller that only ever checked `error is not None` for "something's wrong" keeps
+    # working — this field exists so a caller that specifically needs to tell "the OS said no"
+    # apart from "the OS silently did nothing" (K2b's reproduced `shutil.rmtree`/junction case is
+    # the motivating real-world example, but this check is deliberately root-cause-independent)
+    # can do so. Always `False` when `succeeded` is `True`.
+    postcondition_verification_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,6 +565,96 @@ def unlink_clear_readonly(path: str) -> None:
         os.unlink(path)  # noqa: PTH108
 
 
+# --- K2b: shutil.rmtree's own junction-attack guard is silently defeated by this module's own
+# long_path()/onexc conventions ------------------------------------------------------------------
+#
+# `shutil.rmtree` refuses to recurse into a symlink/junction handed to it as its OWN top-level
+# argument -- it detects this internally (an `os.path.islink`-based check) and raises before doing
+# anything. But every `shutil.rmtree` call in this module (and `purge.py`'s) is made with
+# `onexc=rmtree_clear_readonly` (ADR-0004's read-only-file retry handler, needed for git
+# packfiles/loose objects) -- and `rmtree_clear_readonly`'s own contract is "chmod the path, then
+# retry whatever `func` `shutil.rmtree` handed us". For the junction-guard's own internal raise,
+# the `func` `shutil.rmtree` hands `onexc` is `os.path.islink` itself (a read-only probe, not a
+# delete) -- so `rmtree_clear_readonly` chmods a reparse point (a harmless no-op) and re-invokes
+# `islink`, discards its boolean return value, and `shutil.rmtree` returns NORMALLY having deleted
+# nothing at all. No exception ever reaches the caller. Reproduced directly against this
+# interpreter's real `shutil.rmtree` (not merely inferred): confirmed live against a real `mklink
+# /J` junction, both with and without the `\\?\` long-path prefix -- the long-path prefix is not
+# actually load-bearing to the bug (this interpreter's `shutil.rmtree` already detects a bare-path
+# junction as a symlink too), but IS load-bearing to why `onexc=rmtree_clear_readonly` swallows it:
+# without an `onexc` handler at all, the same call raises loudly instead of returning silently.
+# See `evals/test_apply_identity_reverify.py`'s K2d teeth-proof for the full reproduction.
+#
+# Nested reparse points (a junction somewhere INSIDE a real directory `shutil.rmtree` is walking,
+# rather than the top-level argument itself) are unaffected by this bug -- verified empirically:
+# `shutil.rmtree` correctly removes only the junction's own directory entry when it encounters one
+# mid-walk, never recursing into what it points at, and correctly removes the rest of the real
+# tree around it. The blind spot is exclusively the TOP-LEVEL argument's own identity.
+
+
+def _is_reparse_point(path: str) -> bool:
+    r"""True if `path` (already `\\?\`-prefixed) is itself a reparse point (an NTFS junction or a
+    directory/file symlink) rather than a real file or directory -- the exact distinction K2b's
+    fix needs before ever calling `shutil.rmtree` on a top-level path. Same
+    `os.stat(..., follow_symlinks=False)` + `FILE_ATTRIBUTE_REPARSE_POINT` pattern already
+    established in `scanner.build_record`/`preflight.py` -- reused here, not reinvented. A path
+    that can no longer be stat'd at all (already gone) is reported `False`, not raised -- callers
+    that care about existence separately use `_path_exists_no_follow`.
+    """
+    try:
+        st = os.stat(path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path; see above
+    except OSError:
+        return False
+    return bool(st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _path_exists_no_follow(path: str) -> bool:
+    r"""True if a filesystem entry exists AT `path` itself (already `\\?\`-prefixed) -- a reparse
+    point counts as existing even if its target is missing (a "dangling" junction/symlink).
+
+    Deliberately NOT `os.path.exists`, which follows a reparse point through to its target and
+    reports a dangling junction as absent even though its own directory entry is still physically
+    present on disk (verified empirically) -- exactly the wrong answer for K2a's post-condition
+    check, whose entire job is "did the delete/move actually remove the entry that was here",
+    not "does whatever this entry currently resolves to still exist". Same
+    `os.stat(..., follow_symlinks=False)` primitive as `_is_reparse_point`, for the same reason.
+    """
+    try:
+        os.stat(path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path; see above
+    except OSError:
+        return False
+    return True
+
+
+def rmtree_reparse_point_safe(path: str) -> None:
+    """K2b: the fix for `shutil.rmtree`'s silently-defeated junction guard (see this section's
+    module comment above) -- every direct-delete/permanent-removal call site in this module (and
+    `purge.py`'s) that could be handed a path that is ITSELF a reparse point must call this
+    instead of `shutil.rmtree` directly.
+
+    Checks `_is_reparse_point` FIRST: a reparse point is removed as a single directory-entry
+    operation via `os.rmdir()` -- never recursed into, never touching whatever it points at. This
+    is the correct, safe removal call for a junction/symlink itself (as opposed to recursively
+    deleting into its target, which `shutil.rmtree` would do if it were ever tricked into treating
+    the reparse point as an ordinary directory). Clears the read-only attribute and retries once
+    on `PermissionError`, mirroring `unlink_clear_readonly`'s own retry shape -- a reparse point
+    is not normally read-only, but nothing rules it out on a real, arbitrary user filesystem.
+
+    Falls through to the original `shutil.rmtree(path, onexc=rmtree_clear_readonly)` recursive
+    removal only once `_is_reparse_point` has confirmed `path` is a REAL directory, not a reparse
+    point -- nested reparse points inside that real tree are unaffected by this fix (already
+    handled correctly by `shutil.rmtree` on its own; see this section's module comment).
+    """
+    if _is_reparse_point(path):
+        try:
+            os.rmdir(path)  # noqa: PTH106 -- \\?\ str, not Path; see module note above
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)  # noqa: PTH101
+            os.rmdir(path)  # noqa: PTH106
+        return
+    shutil.rmtree(path, onexc=rmtree_clear_readonly)
+
+
 def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     r"""Moves `src` to `dst` with an "either fully succeeds, or `src` is left completely
     untouched with zero orphaned debris at `dst`" guarantee — never a partial state, and never
@@ -620,7 +728,12 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
                 f"{pre_stats[0]} files/{pre_stats[1]} bytes, destination has "
                 f"{post_stats[0]} files/{post_stats[1]} bytes"
             )
-        shutil.rmtree(long_src, onexc=rmtree_clear_readonly)
+        # K2b: `long_src` is the caller's own top-level path (`candidate.path`/a manifest entry's
+        # `original_path`) -- exactly the shape that can itself be a reparse point (a directory
+        # junction candidate routed to `vault` rather than `direct_delete`, then hitting this
+        # cross-volume copy fallback). Plain `shutil.rmtree` would silently no-op on that case
+        # (see this module's K2b section comment above `rmtree_reparse_point_safe`).
+        rmtree_reparse_point_safe(long_src)
     else:
         pre_size = os.path.getsize(long_src)  # noqa: PTH202
         try:
@@ -1298,6 +1411,42 @@ def _preflight_skip_reason(
     return None
 
 
+def _verify_apply_postcondition(
+    original_path: Path, *, item_method: QuarantineMethod, vault_path: Path | None
+) -> str | None:
+    """K2a (audit finding): real, fresh post-condition check run immediately after a
+    move/delete call in `apply_batch`'s per-item loop returns WITHOUT raising, and BEFORE
+    `succeeded=True` is ever recorded for that item. Returns a short, loggable description of
+    what didn't actually happen, or `None` if the filesystem genuinely matches what a successful
+    `item_method` mutation should have produced.
+
+    The absence of an exception is never sufficient evidence of success on this platform — see
+    K2b's `shutil.rmtree`/junction finding (this module's `rmtree_reparse_point_safe` section
+    comment) for a reproduced, real case of an operation returning normally having mutated
+    nothing at all. This check is deliberately independent of K2b's specific root-cause fix: it
+    is the general contract every mutation in this loop must satisfy, not a patch for one bug.
+
+    `_path_exists_no_follow` (not `os.path.exists`/`Path.exists()`) is used throughout — a
+    dangling reparse point (target removed, entry itself still present) must still count as
+    "still here", which a target-following existence check would wrongly report as gone.
+    """
+    if _path_exists_no_follow(long_path(original_path)):
+        return (
+            f"{original_path}: still exists on disk after a {item_method} operation that raised "
+            "no error -- the operation silently did not remove it"
+        )
+    if item_method == "vault":
+        if vault_path is None:  # unreachable: apply_batch always computes vault_path for "vault"
+            return f"{original_path}: vault method with no vault_path to verify against"
+        if not _path_exists_no_follow(long_path(vault_path)):
+            return (
+                f"{original_path}: original path is gone, but nothing exists at the recorded "
+                f"vault_path {vault_path} -- the item is neither at its original location nor "
+                "recoverable from the vault"
+            )
+    return None
+
+
 def apply_batch(
     candidates: list[Candidate],
     *,
@@ -1602,7 +1751,10 @@ def apply_batch(
                     send2trash.send2trash(str(candidate.path))
                 else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
                     if candidate.is_dir:
-                        shutil.rmtree(long_path(candidate.path), onexc=rmtree_clear_readonly)
+                        # K2b: `candidate.path` is this call's own top-level target -- exactly
+                        # the shape that can itself be a reparse point (a junction/symlink
+                        # candidate). Plain `shutil.rmtree` here silently no-ops on that case.
+                        rmtree_reparse_point_safe(long_path(candidate.path))
                     else:
                         unlink_clear_readonly(long_path(candidate.path))
             except Exception as exc:  # broad: isolates one item's failure from the batch
@@ -1627,6 +1779,39 @@ def apply_batch(
                         succeeded=False,
                         error=str(exc),
                         vault_path=None,
+                    )
+                )
+                continue
+
+            # K2a (audit finding): the mutation call above raised no exception -- but on this
+            # platform that is NOT sufficient evidence anything actually happened (K2b's
+            # `shutil.rmtree`/junction finding is the reproduced real case). Verify the real,
+            # fresh on-disk post-condition BEFORE ever recording `succeeded=True` for this item.
+            postcondition_error = _verify_apply_postcondition(
+                candidate.path, item_method=item_method, vault_path=vault_path
+            )
+            if postcondition_error is not None:
+                logger.warning(
+                    "executor.apply_item_postcondition_failed",
+                    path=str(candidate.path),
+                    method=item_method,
+                    detail=postcondition_error,
+                )
+                # Same "caught, handled failure -- not a crash" shape as the except block above:
+                # close out the intent as aborted, never leave it dangling for `reclaim.recovery`.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                items.append(
+                    ItemApplyResult(
+                        path=candidate.path,
+                        category=candidate.category,
+                        category_group=candidate.category_group,
+                        size_bytes=candidate.size_bytes,
+                        tier=candidate.tier,
+                        method=item_method,
+                        succeeded=False,
+                        error=postcondition_error,
+                        vault_path=None,
+                        postcondition_verification_failed=True,
                     )
                 )
                 continue
@@ -1685,7 +1870,11 @@ def apply_batch(
                 _append_and_sync(manifest_fh, purge_intent)
                 try:
                     if vault_done_entry.is_dir:
-                        shutil.rmtree(long_path(purge_vault_path), onexc=rmtree_clear_readonly)
+                        # K2b: a vaulted candidate whose `os.rename` succeeded (the common,
+                        # same-volume case in `_atomic_move`) moves a reparse point AS a reparse
+                        # point -- so `purge_vault_path` can itself be a junction here. Plain
+                        # `shutil.rmtree` would silently no-op on that case.
+                        rmtree_reparse_point_safe(long_path(purge_vault_path))
                     else:
                         unlink_clear_readonly(long_path(purge_vault_path))
                 except OSError as exc:
