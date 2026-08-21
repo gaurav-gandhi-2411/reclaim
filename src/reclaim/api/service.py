@@ -888,7 +888,7 @@ def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
     groups: list[OneClickGroupOut] = []
     for group, items in grouped.items():
         plain_label, safety_reason = plain_language_category(group)
-        total_bytes = sum(item.size_bytes for item in items)
+        total_bytes = sum(_effective_reclaimable_bytes(item) for item in items)
         groups.append(
             OneClickGroupOut(
                 category_group=group,
