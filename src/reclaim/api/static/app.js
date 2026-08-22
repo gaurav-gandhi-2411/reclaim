@@ -1655,6 +1655,7 @@ export {
   openFullDriveConfirmDialog,
   closeFullDriveConfirmDialog,
   renderSimpleIdle,
+  renderApplyReport,
 };
 
 function updateApplyBar() {
@@ -1706,6 +1707,26 @@ async function runApply(dryRun) {
   }
 }
 
+// Same house rule as renderQuickCleanResult above: recycle_bin/vault are both moves
+// (recoverable), never described as "freed"; only direct_delete really frees the space
+// immediately. Advanced mode's Review Queue apply lets the user pick the quarantine method
+// (see the #apply-method dropdown), so this has to branch the same way Simple mode already does.
+function applyReportBytesPhrase(report) {
+  const humanBytes = `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes)`;
+  if (report.method === "recycle_bin") {
+    return report.apply
+      ? `${humanBytes} moved to the Recycle Bin — empty the Recycle Bin to free the space.`
+      : `${humanBytes} would be moved to the Recycle Bin.`;
+  }
+  if (report.method === "vault") {
+    return report.apply
+      ? `${humanBytes} moved to the Reclaim vault — restorable from the Quarantine & Restore ` +
+          "tab; the space is held until purged."
+      : `${humanBytes} would be moved to the Reclaim vault.`;
+  }
+  return report.apply ? `${humanBytes} permanently freed.` : `${humanBytes} would be permanently freed.`;
+}
+
 function renderApplyReport(container, report) {
   container.innerHTML = "";
   const panel = document.createElement("div");
@@ -1723,8 +1744,7 @@ function renderApplyReport(container, report) {
   summary.style.margin = "0";
   summary.textContent =
     `${report.files_succeeded}/${report.files_processed} succeeded, ` +
-    `${report.files_failed} failed — ${report.bytes_freed_human} ` +
-    `(${report.bytes_freed.toLocaleString()} bytes) ${report.apply ? "freed" : "would be freed"}.`;
+    `${report.files_failed} failed — ${applyReportBytesPhrase(report)}`;
   panel.appendChild(summary);
 
   if (report.category_breakdown.length > 0) {
