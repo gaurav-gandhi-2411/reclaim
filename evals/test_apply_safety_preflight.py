@@ -20,6 +20,7 @@ from reclaim.models import Candidate, FileRecord, Mode, Tier, Verdict
 from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
+    check_within_allowed_scope,
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
@@ -708,3 +709,198 @@ def test_old_temp_root_child_with_open_handle_is_skipped_at_apply_time(tmp_path:
     assert result.skip_reason == "file_in_use"
     assert result.error is None  # never attempted -- not an OS error
     assert old_locked_file.exists()  # untouched: still at its original location
+
+
+# --- AE1 (P0 fix, this session): ownership/scope check ------------------------------------------
+#
+# Identity re-verification (K1a, above) answers "is this still the same file the scan recorded" --
+# it says nothing about whether the invoking user has any legitimate claim on it. Real,
+# live-reproduced finding: a `ReclaimSmokeTest` profile with a persisted pre-#47 whole-drive-scan
+# index still offered a one-click "Clean these now" against 13,991 other-users'-files candidates
+# -- PR #47 fixed SCAN-time scope, but did nothing about candidates already sitting in an index
+# from before that fix shipped, and identity re-verification would have happily confirmed every
+# one of those candidates' identity was unchanged (because it was -- the OTHER user's files were
+# never touched, which is exactly the problem).
+
+
+def test_check_within_allowed_scope_true_for_the_root_itself_and_a_nested_descendant(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "home"
+    nested = root / "projects" / "app" / "node_modules"
+    nested.mkdir(parents=True)
+
+    assert check_within_allowed_scope(root, allowed_roots=[root])
+    assert check_within_allowed_scope(nested, allowed_roots=[root])
+
+
+def test_check_within_allowed_scope_false_for_a_sibling_directory(tmp_path: Path) -> None:
+    root = tmp_path / "Users" / "own_profile"
+    sibling = tmp_path / "Users" / "other_profile" / "projects" / "app" / "node_modules"
+    root.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+
+    assert not check_within_allowed_scope(sibling, allowed_roots=[root])
+
+
+def test_check_within_allowed_scope_true_when_any_one_of_multiple_roots_matches(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    opted_in_root = tmp_path / "D" / "projects"
+    outside = tmp_path / "D" / "other_stuff"
+    home.mkdir()
+    opted_in_root.mkdir(parents=True)
+    outside.mkdir(parents=True)
+
+    assert check_within_allowed_scope(opted_in_root, allowed_roots=[home, opted_in_root])
+    assert not check_within_allowed_scope(outside, allowed_roots=[home, opted_in_root])
+
+
+def test_check_within_allowed_scope_does_not_require_the_path_to_exist(tmp_path: Path) -> None:
+    """A scan-index row must be checkable even if the live file has since vanished -- `resolve()`
+    doesn't require existence, and neither does this check."""
+    root = tmp_path / "home"
+    root.mkdir()
+    vanished = root / "gone" / "file.txt"
+
+    assert check_within_allowed_scope(vanished, allowed_roots=[root])
+
+
+def test_apply_batch_allowed_roots_none_by_default_never_skips_for_scope(tmp_path: Path) -> None:
+    """Regression proof for the ~600+-test backward-compat default (same posture `mode`'s own
+    default already documents in `apply_batch`'s docstring): a caller that omits `allowed_roots`
+    entirely gets ZERO ownership/scope protection -- the check must not fire at all, for a
+    candidate anywhere, when the parameter is left at its default `None`."""
+    far_away_target = tmp_path / "Users" / "somebody_else" / "leftover.bin"
+    far_away_target.parent.mkdir(parents=True)
+    far_away_target.write_bytes(b"x" * 100)
+
+    report = apply_batch(
+        [_candidate(far_away_target, size_bytes=100)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    result = _result_for(report.items, far_away_target)
+    assert result.succeeded is True
+    assert result.skip_reason is None
+
+
+def test_apply_batch_skips_a_cross_tenant_candidate_outside_allowed_roots_zero_files_touched(
+    tmp_path: Path,
+) -> None:
+    """THE teeth-proof (AE1): with `allowed_roots` set to the invoking user's own profile, a
+    candidate from another user's directory -- the exact `dev_artifacts`-under-a-sibling-profile
+    shape the real `ReclaimSmokeTest` smoke test found (X2/PR #47) -- must be skipped with
+    `outside_user_scope`, not attempted, and must remain untouched on disk. A second, legitimate
+    same-user candidate in the same batch is still applied normally -- the same "abort the item,
+    not the run" shape `test_apply_batch_skips_file_in_use_and_continues_the_rest_of_the_batch`
+    above already establishes for `file_in_use`."""
+    own_profile = tmp_path / "Users" / "ReclaimSmokeTest"
+    other_profile = tmp_path / "Users" / "OtherRealUser"
+
+    own_target = own_profile / "projects" / "myapp" / "node_modules" / "leftpad" / "index.js"
+    own_target.parent.mkdir(parents=True)
+    own_target.write_bytes(b"x" * 4096)
+
+    cross_tenant_target = (
+        other_profile / "ml-projects" / "otherapp" / "node_modules" / "lodash" / "index.js"
+    )
+    cross_tenant_target.parent.mkdir(parents=True)
+    cross_tenant_target.write_bytes(b"x" * 4096)
+
+    report = apply_batch(
+        [
+            _candidate(cross_tenant_target, size_bytes=4096),
+            _candidate(own_target, size_bytes=4096),
+        ],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+        allowed_roots=(own_profile,),
+    )
+
+    cross_tenant_result = _result_for(report.items, cross_tenant_target)
+    own_result = _result_for(report.items, own_target)
+
+    assert cross_tenant_result.succeeded is False
+    assert cross_tenant_result.skip_reason == "outside_user_scope"
+    assert cross_tenant_result.error is None  # never attempted -- not an OS error
+    assert cross_tenant_target.exists()  # untouched: zero files touched, exactly as required
+    assert cross_tenant_target.read_bytes() == b"x" * 4096  # byte-for-byte unchanged, not just gone
+
+    assert own_result.succeeded is True
+    assert own_result.skip_reason is None
+    assert not own_target.exists()  # the legitimate candidate was genuinely vaulted
+
+    assert report.files_processed == 2
+    assert report.files_succeeded == 1
+    assert report.files_failed == 1
+
+
+def test_apply_batch_scope_check_runs_before_file_in_use_probe_cheapest_first(
+    tmp_path: Path,
+) -> None:
+    """The scope check is pure path comparison (no syscall at all) -- it must run before, and
+    take priority over, `file_in_use` (which requires a real `CreateFileW` probe) for a candidate
+    that would fail BOTH checks, matching `_preflight_skip_reason`'s own documented "cheapest
+    first" ordering. Verified via the reported skip_reason, not by timing."""
+    other_profile_locked = tmp_path / "Users" / "OtherRealUser" / "locked.bin"
+    other_profile_locked.parent.mkdir(parents=True)
+    other_profile_locked.write_bytes(b"locked-content")
+
+    own_profile = tmp_path / "Users" / "ReclaimSmokeTest"
+    own_profile.mkdir(parents=True)
+
+    handle = open(other_profile_locked, "r+b")  # noqa: SIM115, PTH123
+    try:
+        report = apply_batch(
+            [_candidate(other_profile_locked, size_bytes=14)],
+            safety=_safety(),
+            apply=True,
+            method="vault",
+            vault_dir=tmp_path / "vault",
+            manifest_path=tmp_path / "manifest.jsonl",
+            now=_NOW,
+            allowed_roots=(own_profile,),
+        )
+    finally:
+        handle.close()
+
+    result = _result_for(report.items, other_profile_locked)
+    assert result.skip_reason == "outside_user_scope"
+
+
+def test_apply_batch_allows_an_explicitly_opted_in_second_root_outside_home(tmp_path: Path) -> None:
+    """A legitimate, user-confirmed whole-drive/second-root scan (PR #47's own opt-in flow) must
+    still work -- `allowed_roots` accepts more than one root, and a candidate under ANY of them
+    is in scope. Proves the fix isn't "home only, whole-drive scanning is now broken"."""
+    home = tmp_path / "Users" / "ReclaimSmokeTest"
+    opted_in_drive = tmp_path / "D" / "projects" / "old-app" / "node_modules" / "leftpad"
+    home.mkdir(parents=True)
+    opted_in_drive.mkdir(parents=True)
+    target = opted_in_drive / "index.js"
+    target.write_bytes(b"x" * 100)
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=100)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+        allowed_roots=(home, tmp_path / "D"),
+    )
+
+    result = _result_for(report.items, target)
+    assert result.succeeded is True
+    assert result.skip_reason is None
