@@ -53,11 +53,27 @@ def compiled_exe_dir() -> Path | None:
 
 def data_root() -> Path:
     """Anchor for every `data/`-relative default path in this app: the real running
-    executable's own directory when compiled under Nuitka, or the current working directory
-    otherwise -- see `compiled_exe_dir`'s docstring for why compiled-vs-not is detected the way
-    it is. Dev/test runs (always launched from the repo root, and free to override any default
-    via each call site's own `path: Path | None` parameter) are unaffected; only the frozen
-    build's behavior changes, and only in the direction of "no longer crashes when CWD isn't the
-    install dir."""
+    executable's own directory when compiled under Nuitka, or `Path(".")` otherwise -- see
+    `compiled_exe_dir`'s docstring for why compiled-vs-not is detected the way it is.
+
+    Deliberately `Path(".")`, NOT `Path.cwd()`, in the fallback case: `Path.cwd()` is captured
+    ONCE, eagerly, at whatever moment this function happens to be called (for a module-level
+    `DEFAULT_X_PATH = data_root() / "data" / "x"` constant, that's import time) -- a LATER CWD
+    change (e.g. a test's `monkeypatch.chdir(tmp_path)`, the exact pattern several tests in this
+    codebase use to prove a default resolves relative to "wherever we are now") would silently
+    stop affecting the already-baked-in absolute value. `Path(".") / "data" / "x"` instead
+    collapses to the plain relative `Path("data/x")` (verified: `str()` output is byte-identical
+    to the original bare-literal form), preserving this codebase's original lazy-resolve-at-use
+    behavior for dev/test exactly -- a regression caught the hard way (2026-08-22): `tests/
+    test_mode.py::test_default_log_path_used_when_none_given` chdirs into an isolated `tmp_path`
+    and expects `current_mode()`'s no-arg fallback to read THAT directory's own (absent) mode
+    log, not whatever CWD was active when `reclaim.mode` was first imported -- an eager
+    `Path.cwd()` broke that guarantee for all ten call sites at once, and did so SILENTLY on any
+    clean checkout (no stray `data/mode_log.jsonl` at the importing CWD to expose it), only
+    surfacing as a real assertion failure on a working tree that happened to have one from
+    earlier manual testing. Only the frozen build's behavior changes from before this whole fix
+    landed (no longer crashes when CWD isn't the install dir); dev/test runs are now BYTE-
+    IDENTICAL to pre-fix behavior, not merely "equivalent in the common case."
+    """
     compiled_dir = compiled_exe_dir()
-    return compiled_dir if compiled_dir is not None else Path.cwd()
+    return compiled_dir if compiled_dir is not None else Path()

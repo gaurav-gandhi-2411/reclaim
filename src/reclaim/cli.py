@@ -44,10 +44,14 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
-# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
-# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
-# working-directory-less invocation today, but "not reachable today" is a property of today's
-# call sites, not of the code.
+# Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
+# this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
+# anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test resolution is
+# deliberately UNCHANGED (still lazily CWD-relative, exactly like the original bare
+# `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation). Not yet
+# reachable from any working-directory-less invocation today, but "not reachable today" is a
+# property of today's call sites, not of the code.
 _DEFAULT_DB_PATH = data_root() / "data" / "reclaim_index.sqlite3"
 _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
