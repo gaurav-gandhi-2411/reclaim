@@ -13,6 +13,7 @@ from reclaim.api.schemas import (
     ApplyRequest,
     ApplyStatusOut,
     CandidatesResponse,
+    CandidatesWarmStatusOut,
     CategoryExplanationResponse,
     DiagnosticsResponse,
     DuplicateClusterReviewResponse,
@@ -36,7 +37,14 @@ from reclaim.api.schemas import (
     UpdateCategorySettingRequest,
     UpdateCheckResponse,
 )
-from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.api.state import (
+    AIAnalysisStatus,
+    ApplyStatus,
+    AppState,
+    CandidatesWarmStatus,
+    RestoreStatus,
+    ScanStatus,
+)
 from reclaim.drives import NoFixedDrivesFoundError
 from reclaim.executor import (
     BatchNotFoundError,
@@ -223,6 +231,38 @@ def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -
 
     background_tasks.add_task(service.run_scan, state, roots, started_at)
     return service.to_scan_status_out(status_snapshot)
+
+
+@router.get("/candidates/warm-status", response_model=CandidatesWarmStatusOut)
+def candidates_warm_status(request: Request) -> CandidatesWarmStatusOut:
+    """AE3: poll target for `POST /api/candidates/warm` — see `CandidatesWarmStatus`'s own
+    docstring for why this exists (a real, multi-minute cold-compute cost on a large index, with
+    no feedback, driving a "Not Responding" server state before this fix)."""
+    state = get_state(request)
+    with state.lock:
+        return service.to_candidates_warm_status_out(state.candidates_warm_status)
+
+
+@router.post("/candidates/warm", response_model=CandidatesWarmStatusOut, status_code=202)
+def start_candidates_warm(
+    background_tasks: BackgroundTasks, request: Request
+) -> CandidatesWarmStatusOut:
+    """AE3: mirrors `POST /api/apply`'s background-task + polling shape exactly. A caller (the
+    dashboard frontend) should check `GET /api/candidates/warm-status` first — if already
+    `"ready"` for the current scan generation, calling `/api/summary`/`/api/treemap`/etc.
+    directly is already fast and this endpoint is unnecessary; this exists for the COLD-cache
+    case, so that cost is visible and non-blocking instead of hanging the request thread."""
+    state = get_state(request)
+    with state.lock:
+        if state.candidates_warm_status.status == "computing":
+            raise HTTPException(status_code=409, detail="a candidates warm-up is already running")
+        state.candidates_warm_status = CandidatesWarmStatus(
+            status="computing", scan_generation=state.scan_generation, started_at=time.time()
+        )
+        status_snapshot = state.candidates_warm_status
+
+    background_tasks.add_task(service.run_candidates_warm, state)
+    return service.to_candidates_warm_status_out(status_snapshot)
 
 
 @router.get("/summary", response_model=SummaryResponse)

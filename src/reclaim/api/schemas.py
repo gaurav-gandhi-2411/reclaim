@@ -165,6 +165,23 @@ class ScanStatusOut(BaseModel):
     drives_done: int | None
 
 
+class CandidatesWarmStatusOut(BaseModel):
+    """AE1 (P0 finding, this session): `GET /api/candidates/warm-status`'s response -- lets a
+    caller check whether `_all_candidates`'s shared cache (`/api/summary`/`/api/treemap`/
+    `/api/candidates`/`/api/clean/one-click-summary` all draw from it) is warm BEFORE calling one
+    of those directly, so a large-index cold-compute (real-observed: multiple minutes on an
+    82.1 GB / 13,998-candidate index) degrades into a visible wait, not a "Not Responding" hang
+    with zero feedback. See `reclaim.api.state.CandidatesWarmStatus`'s own docstring."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # "idle" | "computing" | "ready" | "failed" -- see CandidatesWarmStatusLiteral
+    started_at: float | None
+    finished_at: float | None
+    elapsed_seconds: float | None
+    error: str | None
+
+
 class FixedDrivesResponse(BaseModel):
     """`GET /api/scan/fixed-drives` -- every locally-attached fixed drive on this machine
     (`reclaim.drives.list_fixed_drives`), so SIMPLE mode's explicit "scan the whole drive"

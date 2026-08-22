@@ -446,6 +446,44 @@ async function pollScanStatus() {
 }
 
 // --- Overview: summary stats + category cards -----------------------------------------------------
+//
+// AE3 (P0 finding, this session): `/api/summary` draws from a shared candidate cache
+// (`_all_candidates`) that, on a large persisted index (real-observed: 82.1 GB / 13,998
+// candidates), can take several MINUTES to compute on a cold cache -- previously nothing here
+// distinguished that from a hang: the Overview tab just sat on "Loading summary…" indefinitely
+// while the server process itself went "Not Responding". `ensureCandidatesWarm` below checks
+// readiness first and, on a cold cache, triggers a background warm-up (`POST /api/candidates/
+// warm`) and polls it with a real elapsed-time message instead of blocking silently. Deliberately
+// NOT a percentage progress bar -- the underlying detector/dedup pass has no cheap way to report
+// fine-grained progress within this fix's scope (the fix is "stop blocking silently", not "make
+// the algorithm itself instrumented or faster"). Scoped to the Overview tab specifically for now;
+// `/api/treemap`/`/api/candidates`/`/api/clean/one-click-summary` share the identical underlying
+// cold-start cost via the same cache and would benefit from the same treatment -- not yet done,
+// disclosed rather than silently incomplete.
+
+const CANDIDATES_WARM_POLL_INTERVAL_MS = 1500;
+
+async function ensureCandidatesWarm(stateEl) {
+  let status = await api("/api/candidates/warm-status");
+  if (status.status === "ready") return;
+  if (status.status !== "computing") {
+    status = await api("/api/candidates/warm", { method: "POST" });
+  }
+  while (status.status === "computing") {
+    const elapsed = status.elapsed_seconds != null ? Math.round(status.elapsed_seconds) : 0;
+    renderState(stateEl, "loading", {
+      title: "Indexing your files…",
+      message:
+        `This can take a few minutes the first time after a large scan — ${elapsed}s so far. ` +
+        "The page is not stuck; this runs in the background.",
+    });
+    await new Promise((resolve) => setTimeout(resolve, CANDIDATES_WARM_POLL_INTERVAL_MS));
+    status = await api("/api/candidates/warm-status");
+  }
+  if (status.status === "failed") {
+    throw new ApiError(status.error ?? "candidates warm-up failed", 500);
+  }
+}
 
 async function loadOverview() {
   const stateEl = document.getElementById("overview-state");
@@ -454,6 +492,8 @@ async function loadOverview() {
   renderState(stateEl, "loading", { title: "Loading summary…" });
 
   try {
+    await ensureCandidatesWarm(stateEl);
+    renderState(stateEl, "loading", { title: "Loading summary…" });
     const summary = await api("/api/summary");
     if (!summary.has_scan) {
       renderState(stateEl, "empty", {
