@@ -90,6 +90,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # whole-drive/volume-root traversal, plus a structural gate on app.js's own source proving the
 # primary button is wired to that endpoint and never directly to `/api/scan/full-drive`. No [ai]
 # extra, no network -- same "no excuse to skip" reasoning as every other file in this tuple.
+#
+# test_config_env_var_normalization_gate.py added alongside the 8.3 short-name P0 fix (2026-08
+# session): AST-based proof that every environment-variable read in config.py routes through
+# `_win_path` (gate #1: no bypass exists) AND that `_win_path` itself still calls
+# `_resolve_long_path(...)` before returning (gate #2: the chokepoint hasn't been silently
+# weakened). Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar
+# as every file above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -105,6 +112,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_apply_identity_reverify.py",
     "evals/test_r2_llm_env_var_gate.py",
     "evals/test_scan_scope_gate.py",
+    "evals/test_config_env_var_normalization_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
