@@ -659,6 +659,59 @@ def test_compute_eta_seconds_is_none_when_the_observed_rate_is_effectively_zero(
     assert _compute_eta_seconds(1, 100, 1e12) is None
 
 
+def test_candidates_warm_status_starts_idle(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    status = client.get("/api/candidates/warm-status").json()
+    assert status["status"] == "idle"
+    assert status["started_at"] is None
+    assert status["elapsed_seconds"] is None
+
+
+def test_candidates_warm_reaches_ready_and_warms_the_shared_cache(tmp_path: Path) -> None:
+    """AE3: `POST /api/candidates/warm` + `GET /api/candidates/warm-status` -- TestClient's ASGI
+    transport runs `BackgroundTasks` synchronously as part of the request/response cycle (same
+    documented behavior `_scan_and_wait` already relies on), so by the time the POST call
+    returns, the warm-up has already completed for real; polling status immediately after shows
+    `"ready"`, and a subsequent `/api/summary` call uses the now-warm cache."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.post("/api/candidates/warm")
+    assert response.status_code == 202
+    assert response.json()["status"] == "computing"
+
+    status = client.get("/api/candidates/warm-status").json()
+    assert status["status"] == "ready"
+    assert status["started_at"] is not None
+    assert status["finished_at"] is not None
+    assert status["elapsed_seconds"] is not None
+
+    summary = client.get("/api/summary").json()
+    assert summary["has_scan"] is True
+    assert paths["kept_file"].exists()  # sanity: nothing mutated by warming the cache
+
+
+def test_candidates_warm_already_running_returns_409(tmp_path: Path) -> None:
+    """Same single-flight guard `test_apply_already_running_returns_409` below already
+    establishes for `apply_status` -- manually forced into `"computing"` here since TestClient's
+    synchronous background-task execution means a real `POST` call never actually leaves the
+    status in `"computing"` by the time it returns (see the test above)."""
+    from reclaim.api.state import CandidatesWarmStatus
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.candidates_warm_status = CandidatesWarmStatus(
+            status="computing", scan_generation=0, started_at=time.time()
+        )
+
+    response = client.post("/api/candidates/warm")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
 def test_apply_already_running_returns_409(tmp_path: Path) -> None:
     """fix/apply-progress-feedback: `POST /api/apply` became a background-task + single-flight
     pattern, same guard `ScanStatus`/`AIAnalysisStatus` already have -- mirrors
