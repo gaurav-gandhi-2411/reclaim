@@ -90,8 +90,14 @@ jobs:
       # action) scans only the invoking user's own profile, never a whole-drive/volume-root
       # traversal, plus a structural check on app.js's own source that the primary button stays
       # wired to it. No [ai] extra needed.
-      - name: Safety gates -- deterministic, adversarial, AI recommend-only, MCP recommend/rule-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, hardlink-aware reclaimable-bytes, and default scan-scope boundary
-        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py evals/test_mcp_safety_gate.py evals/test_scan_scope_gate.py -v --junitxml=pytest-results.xml
+      #
+      # test_config_env_var_normalization_gate.py (8.3 short-name P0 fix, 2026-08) is added here
+      # up front too, for the same reason: an AST-based structural gate proving every env-var
+      # read in config.py routes through `_win_path`'s long-path normalization is exactly the
+      # kind of safety-critical check this job exists to run remotely, not just locally via
+      # scripts/verify.py. Zero deps beyond stdlib `ast`, no [ai] extra needed.
+      - name: Safety gates -- deterministic, adversarial, AI recommend-only, MCP recommend/rule-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, hardlink-aware reclaimable-bytes, default scan-scope boundary, and config env-var normalization
+        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py evals/test_mcp_safety_gate.py evals/test_scan_scope_gate.py evals/test_config_env_var_normalization_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
