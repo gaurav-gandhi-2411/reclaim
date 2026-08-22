@@ -295,6 +295,99 @@ def test_check_disk_space_measurement_failure_degrades_gracefully(
     assert result.reason == "measurement_failed"
 
 
+class _RecordingLogger:
+    """Minimal stand-in for `notifications.py`'s module-level `structlog` logger -- see the
+    identical helper in `tests/test_mode.py` for why a hand-rolled recorder is used instead of
+    `caplog` (this project's structlog isn't wired to stdlib logging)."""
+
+    def __init__(self) -> None:
+        self.infos: list[tuple[str, dict[str, Any]]] = []
+
+    def info(self, event: str, **kwargs: Any) -> None:
+        self.infos.append((event, kwargs))
+
+    def warning(self, event: str, **kwargs: Any) -> None:  # pragma: no cover - unused here
+        pass
+
+
+# AI3: before this, a scheduled-task-triggered check that decided NOT to notify (disabled,
+# below threshold, snoozed, debounced) wrote nothing to the structured log -- only a `print()`
+# in cli.py's `_run_check_disk_space`, which Task Scheduler's no-console invocation discards.
+# That made a real no-toast result ambiguous between "correctly decided not to notify" and
+# "the process never got that far." These four tests prove each silent branch now leaves a
+# `notifications.check_no_notify` log entry naming the exact reason.
+
+
+def test_check_disk_space_disabled_logs_the_no_notify_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingLogger()
+    monkeypatch.setattr("reclaim.notifications.logger", recorder)
+
+    check_disk_space(
+        _config(enabled=False), anchor=tmp_path, state_path=tmp_path / "state.json", now=_NOW
+    )
+
+    assert recorder.infos == [("notifications.check_no_notify", {"reason": "disabled"})]
+
+
+def test_check_disk_space_below_threshold_logs_the_no_notify_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingLogger()
+    monkeypatch.setattr("reclaim.notifications.logger", recorder)
+    monkeypatch.setattr(
+        "reclaim.notifications.shutil.disk_usage",
+        lambda _anchor: _FakeDiskUsage(total=100, used=50),
+    )
+
+    check_disk_space(_config(), anchor=tmp_path, state_path=tmp_path / "state.json", now=_NOW)
+
+    assert recorder.infos == [
+        ("notifications.check_no_notify", {"reason": "below_threshold", "percent_used": 50.0})
+    ]
+
+
+def test_check_disk_space_snoozed_logs_the_no_notify_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingLogger()
+    monkeypatch.setattr("reclaim.notifications.logger", recorder)
+    monkeypatch.setattr(
+        "reclaim.notifications.shutil.disk_usage",
+        lambda _anchor: _FakeDiskUsage(total=100, used=90),
+    )
+    state_path = tmp_path / "state.json"
+    apply_snooze(state_path, snooze_days=7, now=_NOW - 10.0)
+
+    check_disk_space(_config(), anchor=tmp_path, state_path=state_path, now=_NOW)
+
+    assert recorder.infos == [
+        ("notifications.check_no_notify", {"reason": "snoozed", "percent_used": 90.0})
+    ]
+
+
+def test_check_disk_space_debounced_logs_the_no_notify_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _RecordingLogger()
+    monkeypatch.setattr("reclaim.notifications.logger", recorder)
+    monkeypatch.setattr(
+        "reclaim.notifications.shutil.disk_usage",
+        lambda _anchor: _FakeDiskUsage(total=100, used=90),
+    )
+    state_path = tmp_path / "state.json"
+    record_notified(state_path, now=_NOW - 3600.0)
+
+    check_disk_space(
+        _config(renotify_after_hours=24.0), anchor=tmp_path, state_path=state_path, now=_NOW
+    )
+
+    assert recorder.infos == [
+        ("notifications.check_no_notify", {"reason": "debounced", "percent_used": 90.0})
+    ]
+
+
 def test_check_disk_space_zero_total_bytes_does_not_divide_by_zero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
