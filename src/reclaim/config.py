@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import os
 import re
 import tomllib
@@ -103,12 +105,78 @@ DEFAULT_FINANCE_TOKENS: tuple[str, ...] = (
 )
 
 
+# P0 fix (2026-08 session, live-reproduced): `os.environ.get("TEMP")` (and, in principle, any
+# other env-derived path this module resolves) can come back already in Windows' 8.3 short-name
+# (DOS alias) form -- confirmed live this session on a real machine with a 16-character username,
+# where `%TEMP%` resolved to `C:/Users/RECLAI~1/AppData/Local/Temp` while `%USERPROFILE%`/
+# `%LOCALAPPDATA%` correctly resolved long-form on the same account. The scanner always indexes
+# real long-form paths (`FindFirstFileW` never returns 8.3 names), so a detector pattern built
+# from an unresolved short-form path can structurally never match anything in the index --
+# `detect_temp_and_browser_caches` silently proposed zero `windows_temp` candidates, permanently,
+# for any affected user, with no error anywhere (confirmed via the real production SQL query and
+# a real packaged `reclaim.exe` dry-run apply report). `_resolve_long_path` below fixes this at
+# the source, for every caller of `_win_path`, not just the one confirmed-affected env var.
+
+_MAX_PATH = 260  # Win32's traditional MAX_PATH; not exposed by `ctypes.wintypes`, so defined
+# locally -- same convention `preflight.py`'s own local Win32 constants use. Only an initial
+# buffer size here: `_resolve_long_path` retries with a larger, exactly-sized buffer if
+# `GetLongPathNameW` itself reports a longer result is needed, so this never truncates.
+
+
+def _resolve_long_path(path: str) -> str:
+    """Resolves `path` to its Windows long-form path via `GetLongPathNameW`, converting any 8.3
+    (DOS short-name) path component back to its real long form -- e.g.
+    `C:\\Users\\RECLAI~1\\AppData\\Local\\Temp` -> `C:\\Users\\reclaimuser\\AppData\\Local\\Temp`.
+    Real Win32 call, same `ctypes.WinDLL(..., use_last_error=True)` convention `preflight.py`
+    uses elsewhere in this codebase.
+
+    Fails safe -- returns `path` UNCHANGED -- on any failure: not on Windows (no `ctypes.WinDLL`),
+    the path doesn't exist yet (a plausible state for an env-derived root before the first real
+    scan/apply touches it), or any other Win32 error. Matches this codebase's established "never
+    crash on this class of environment probe" convention (`elevation.is_elevated`,
+    `update_check.check_for_update`) -- a path that can't be long-form-resolved is exactly as
+    usable as it was before this function existed, never worse.
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        # Not on Windows -- same "no real Win32 concept here" case `elevation.is_elevated`
+        # documents for its own equivalent probe (e.g. a non-Windows dev/CI environment).
+        return path
+    kernel32.GetLongPathNameW.restype = ctypes.wintypes.DWORD
+    kernel32.GetLongPathNameW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPWSTR,
+        ctypes.wintypes.DWORD,
+    ]
+    buf_len = _MAX_PATH
+    buf = ctypes.create_unicode_buffer(buf_len)
+    length = kernel32.GetLongPathNameW(path, buf, buf_len)
+    if length == 0:
+        # Failed outright -- most commonly ERROR_FILE_NOT_FOUND for a root that doesn't exist
+        # yet. Fall back to the original, unresolved value rather than raising.
+        return path
+    if length > buf_len:
+        # Buffer was too small; `length` is the actually-required size (Win32 contract for this
+        # call) -- retry once with a correctly-sized buffer rather than returning a truncated
+        # path.
+        buf = ctypes.create_unicode_buffer(length)
+        length = kernel32.GetLongPathNameW(path, buf, length)
+        if length == 0:
+            return path
+    return buf.value
+
+
 def _win_path(env_var: str, fallback: str) -> str:
-    """Resolves a Windows env var to a posix-form path string, falling back to a literal
-    default when the env var is unset (e.g. a CI runner or dev session missing a profile
-    var) so the Stage 3 category defaults are still deterministic in that case."""
+    """Resolves a Windows env var to a posix-form, long-form path string, falling back to a
+    literal default when the env var is unset (e.g. a CI runner or dev session missing a profile
+    var) so the Stage 3 category defaults are still deterministic in that case.
+
+    Long-form resolution (`_resolve_long_path`) runs BEFORE the posix conversion below -- see
+    that function's docstring for why an unresolved 8.3 short-form value here would silently
+    break every detector pattern built from it."""
     value = os.environ.get(env_var)
-    return Path(value).as_posix() if value else fallback
+    return Path(_resolve_long_path(value)).as_posix() if value else fallback
 
 
 def _default_package_cache_paths() -> list[str]:

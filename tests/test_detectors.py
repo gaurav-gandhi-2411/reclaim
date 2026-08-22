@@ -261,6 +261,69 @@ def test_temp_root_children_proposed_but_never_the_root_itself(index: ScanIndex)
     assert Path("C:/Users/gg/AppData/Local/Temp") not in paths
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Win32-only: GetLongPathNameW/GetShortPathNameW")
+def test_windows_temp_candidates_proposed_when_temp_env_var_was_short_form(
+    index: ScanIndex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end regression proof for the P0 fix (2026-08 session, live-reproduced): before
+    `config._win_path` resolved 8.3 short-name (DOS alias) env vars to their long form, a `%TEMP%`
+    value that came back short-form (a real, confirmed-live condition on any long-enough username
+    -- `C:\\Users\\RECLAI~1\\AppData\\Local\\Temp`) built a `temp_and_browser_caches` `temp_roots`
+    pattern that could structurally never match the scanner's real long-form indexed paths --
+    `detect_temp_and_browser_caches` proposed zero `windows_temp` candidates, permanently.
+
+    Proves the fix across the REAL full call chain: `config._default_temp_roots()` (reading a
+    genuinely short-form `%TEMP%`, via a real `GetShortPathNameW` round trip, not a hand-authored
+    fake short name) -> `detect_temp_and_browser_caches` (matching against an index seeded with
+    real long-form paths, exactly as a real scan would produce)."""
+    import ctypes
+    import ctypes.wintypes
+
+    from reclaim.config import _default_temp_roots
+
+    long_temp_dir = tmp_path / "a_long_enough_directory_name_for_8dot3_generation" / "Temp"
+    long_temp_dir.mkdir(parents=True)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetShortPathNameW.restype = ctypes.wintypes.DWORD
+    kernel32.GetShortPathNameW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.LPWSTR,
+        ctypes.wintypes.DWORD,
+    ]
+    buf = ctypes.create_unicode_buffer(260)
+    length = kernel32.GetShortPathNameW(str(long_temp_dir), buf, 260)
+    assert length != 0, f"GetShortPathNameW failed for {long_temp_dir!r}"
+    short_temp = buf.value
+    if "~" not in short_temp:
+        # Checked against the FULL path, not just its last component -- only the
+        # `a_long_enough_directory_name_for_8dot3_generation` segment is long enough to trigger
+        # short-name generation; the trailing `Temp` segment is already short-form-eligible-length
+        # either way, so it alone would never carry the `~` marker.
+        pytest.skip(
+            "8.3 short-name generation is disabled for this volume "
+            "(NtfsDisable8dot3NameCreation) -- cannot exercise the real short-form condition."
+        )
+
+    monkeypatch.setenv("TEMP", short_temp)
+
+    temp_roots = _default_temp_roots()
+    resolved_root = Path(temp_roots[0])
+    # The fix itself: the resolved root must be the real LONG form, never the short alias just
+    # injected via the env var above.
+    assert "~" not in str(resolved_root)
+
+    _seed(
+        index,
+        _record(long_temp_dir.as_posix(), is_dir=True),
+        _record((long_temp_dir / "scratch.tmp").as_posix()),
+    )
+
+    result = detect_temp_and_browser_caches(index, cache_paths=[], temp_roots=temp_roots)
+
+    assert (long_temp_dir / "scratch.tmp") in _paths(result)
+
+
 def test_thumbnail_cache_is_categorized_distinctly_from_browser_cache(index: ScanIndex) -> None:
     _seed(
         index,
