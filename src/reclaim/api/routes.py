@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from reclaim.api import ai_orchestration, service
 from reclaim.api.schemas import (
@@ -301,7 +302,7 @@ def duplicate_cluster_review(request: Request, limit: int = 15) -> DuplicateClus
 @router.post("/apply", response_model=ApplyStatusOut, status_code=202)
 def apply(
     payload: ApplyRequest, background_tasks: BackgroundTasks, request: Request
-) -> ApplyStatusOut:
+) -> ApplyStatusOut | JSONResponse:
     """fix/apply-progress-feedback: mirrors `POST /api/scan`'s background-task + polling shape —
     a large apply's ADR-0026 fsync cost previously blocked this HTTP request for the whole
     multi-minute duration with zero progress and real risk of a client/proxy timeout. Request-
@@ -320,6 +321,33 @@ def apply(
         # different client) not respecting the safe-mode contract — e.g. requesting a blanket
         # tier-apply with no explicit paths — a real 400, not a sign anything is broken.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except service.CandidatesNotWarmError as exc:
+        # Same single-flight courtesy POST /api/candidates/warm's own route already gives the
+        # frontend: kick off a warm-up here too (if one isn't already running) so a caller that
+        # didn't know to call that endpoint first still converges on a retry, instead of needing
+        # its own separate warm-up trigger.
+        #
+        # Returns a JSONResponse directly (background attached to it) rather than `raise
+        # HTTPException` -- BackgroundTasks registered via `background_tasks.add_task` are only
+        # executed if attached to the Response object FastAPI actually returns; on an exception
+        # path, FastAPI's own exception handler builds an independent Response for the
+        # HTTPException, which never sees this function's `background_tasks` instance, so the
+        # warm-up would silently never run. Confirmed live: with `raise HTTPException(...)`, the
+        # courtesy warm-up never started (`warm-status` stayed "computing" indefinitely, not
+        # merely slow) -- caught by this fix's own regression test before it shipped.
+        response_background = None
+        with state.lock:
+            if state.candidates_warm_status.status != "computing":
+                state.candidates_warm_status = CandidatesWarmStatus(
+                    status="computing",
+                    scan_generation=state.scan_generation,
+                    started_at=time.time(),
+                )
+                background_tasks.add_task(service.run_candidates_warm, state)
+                response_background = background_tasks
+        return JSONResponse(
+            status_code=409, content={"detail": str(exc)}, background=response_background
+        )
 
     started_at = time.time()
     with state.lock:
