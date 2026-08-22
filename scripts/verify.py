@@ -83,6 +83,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # variable (not just no "ANTHROPIC_API_KEY" substring -- see that file's own module docstring).
 # Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar as the
 # files above.
+#
+# test_config_env_var_normalization_gate.py added alongside the 8.3 short-name P0 fix (2026-08
+# session): AST-based proof that every environment-variable read in config.py routes through
+# `_win_path` (gate #1: no bypass exists) AND that `_win_path` itself still calls
+# `_resolve_long_path(...)` before returning (gate #2: the chokepoint hasn't been silently
+# weakened). Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar
+# as every file above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -97,6 +104,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_cache_reclaimable_bytes_gate.py",
     "evals/test_apply_identity_reverify.py",
     "evals/test_r2_llm_env_var_gate.py",
+    "evals/test_config_env_var_normalization_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
