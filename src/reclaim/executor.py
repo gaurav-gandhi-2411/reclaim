@@ -16,6 +16,7 @@ import send2trash
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from reclaim.app_paths import data_root
 from reclaim.index import ScanIndex
 from reclaim.models import (
     FILE_ATTRIBUTE_REPARSE_POINT,
@@ -56,7 +57,11 @@ logger = structlog.get_logger(__name__)
 # `DirectDeleteRestoreImpossibleError`.
 QuarantineMethod = Literal["vault", "recycle_bin", "direct_delete"]
 
-DEFAULT_VAULT_DIR = Path("data/quarantine")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+DEFAULT_VAULT_DIR = data_root() / "data" / "quarantine"
 DEFAULT_MANIFEST_PATH = DEFAULT_VAULT_DIR / "manifest.jsonl"
 _SECONDS_PER_DAY = 86400.0
 

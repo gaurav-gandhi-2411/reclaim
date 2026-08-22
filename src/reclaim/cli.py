@@ -7,6 +7,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from reclaim.app_paths import data_root
 from reclaim.config import Config, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
@@ -43,7 +44,11 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
-_DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+_DEFAULT_DB_PATH = data_root() / "data" / "reclaim_index.sqlite3"
 _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420

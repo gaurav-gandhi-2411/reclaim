@@ -5,10 +5,9 @@ import logging
 import logging.handlers
 from pathlib import Path
 
-import pytest
 import structlog
 
-from reclaim.logging_config import DEFAULT_LOG_PATH, _data_root, configure_logging
+from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 
 _EVENT_NAME = "test_logging_config.sample_event"
 
@@ -134,25 +133,6 @@ def test_default_log_path_is_absolute_not_cwd_relative_at_use_time() -> None:
     assert DEFAULT_LOG_PATH.is_absolute()
 
 
-def test_data_root_falls_back_to_cwd_when_not_compiled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The real, always-true-in-a-test-run case: `_compiled_exe_dir()` returns `None` outside a
-    Nuitka-compiled program (confirmed empirically this session -- `__compiled__` is a Nuitka
-    compile-time construct, not something a test can fake at the name-lookup level), so
-    `_data_root()` must fall back to `Path.cwd()` exactly as it did before this fix."""
-    monkeypatch.setattr("reclaim.logging_config._compiled_exe_dir", lambda: None)
-    assert _data_root() == Path.cwd()
-
-
-def test_data_root_uses_the_compiled_exe_directory_when_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The fix itself, exercised via the testable seam: when `_compiled_exe_dir()` reports a
-    directory (the real compiled-build case, monkeypatched here since a live Nuitka compile
-    can't run inside this test suite), `_data_root()` must anchor there instead of `Path.cwd()`
-    -- this is what makes the frozen build's `data/logs/` land next to the real exe regardless
-    of the launching process's working directory."""
-    fake_exe_dir = tmp_path / "Reclaim"
-    monkeypatch.setattr("reclaim.logging_config._compiled_exe_dir", lambda: fake_exe_dir)
-    assert _data_root() == fake_exe_dir
+# `data_root()`/`compiled_exe_dir()` themselves now live in reclaim.app_paths (generalized to
+# every `data/`-relative default in the app, not just this module's) -- see
+# tests/test_app_paths.py for their own dedicated coverage.

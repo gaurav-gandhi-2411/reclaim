@@ -8,6 +8,8 @@ from pathlib import Path
 import httpx
 import structlog
 
+from reclaim.app_paths import data_root
+
 logger = structlog.get_logger(__name__)
 
 # R2 (per-category LLM explainer). Structural guarantee (spec'd by the build brief, enforced by
@@ -53,7 +55,11 @@ _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _REQUEST_TIMEOUT_SECONDS = 15.0
 _MAX_RESPONSE_TOKENS = 500
 
-DEFAULT_CACHE_DIR = Path("data/ai_explanations")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+DEFAULT_CACHE_DIR = data_root() / "data" / "ai_explanations"
 
 
 @dataclass(frozen=True, slots=True)
