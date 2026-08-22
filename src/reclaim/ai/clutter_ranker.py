@@ -9,6 +9,7 @@ import blake3
 from reclaim.ai._optional import require
 from reclaim.ai.feedback_store import FeatureVector
 from reclaim.ai.models import AICluster, AIClusterMember, AITrack
+from reclaim.app_paths import data_root
 
 # Feature: generic clutter-likelihood ranker (ADR-0021). Recommend-only: PRIORITIZES the
 # AIReviewQueue by predicted clutter-likelihood so likely-clutter items surface first,
@@ -35,7 +36,15 @@ from reclaim.ai.models import AICluster, AIClusterMember, AITrack
 # SAME `extract_numeric_features` function below — eliminating training-serving skew by
 # construction, not by convention.
 
-DEFAULT_MODEL_PATH = Path("data/ai_models/clutter_ranker.txt")
+# Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
+# this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
+# anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test resolution is
+# deliberately UNCHANGED (still lazily CWD-relative, exactly like the original bare
+# `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation). Not yet
+# reachable from any working-directory-less invocation today, but "not reachable today" is a
+# property of today's call sites, not of the code.
+DEFAULT_MODEL_PATH = data_root() / "data" / "ai_models" / "clutter_ranker.txt"
 
 FEATURE_NAMES: tuple[str, ...] = (
     "log_size_bytes",

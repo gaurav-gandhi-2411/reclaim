@@ -7,7 +7,7 @@ from pathlib import Path
 
 import structlog
 
-from reclaim.logging_config import configure_logging
+from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 
 _EVENT_NAME = "test_logging_config.sample_event"
 
@@ -111,3 +111,36 @@ def test_configure_logging_reconfigures_for_a_different_path(tmp_path: Path) -> 
     ]
     assert len(file_handlers) == 1
     assert Path(file_handlers[0].baseFilename) == second_path.resolve()
+
+
+# --- P0 fix (2026-08-22, live-reproduced under a real frozen install): DEFAULT_LOG_PATH must
+# not depend on CWD at the time it happens to be *used* --------------------------------------
+#
+# Bug: packaging/reclaim.iss registers a `reclaim-notify:` URI protocol handler for the disk-
+# space toast's Snooze button. A `shell\open\command` registry value has no working-directory
+# concept, so the process's CWD at launch is whatever the invoking shell context happened to be
+# (observed live: `C:\Windows\System32`) -- a bare `Path("data/logs/reclaim.log")` crashed with
+# an unhandled `PermissionError` from `resolved_path.parent.mkdir(...)` before the app ever
+# reached the actual snooze logic, so clicking Snooze on a real toast silently did nothing.
+
+
+def test_default_log_path_is_built_from_data_root() -> None:
+    """Regression proof for the actual bug, at the correct level: `DEFAULT_LOG_PATH` must be
+    `data_root() / "data" / "logs" / "reclaim.log"`, not a bare `Path("data/logs/reclaim.log")`
+    literal independently constructed -- the fix is `data_root()` anchoring to the real exe's
+    directory when compiled, not "always absolute" (that would be a DIFFERENT, wrong regression
+    proof: in this always-uncompiled test environment, `data_root()` is `Path(".")`, so the
+    correct value here is the plain relative `data/logs/reclaim.log`, byte-identical to the
+    pre-fix literal -- see `reclaim.app_paths.data_root`'s docstring for why an eager
+    `Path.cwd()` capture instead of `Path(".")` would silently break `monkeypatch.chdir(
+    tmp_path)`-based test isolation elsewhere in this codebase, which is exactly what happened
+    and was caught the hard way when this fix was first generalized beyond this one module)."""
+    from reclaim.app_paths import data_root
+
+    assert data_root() / "data" / "logs" / "reclaim.log" == DEFAULT_LOG_PATH
+    assert not DEFAULT_LOG_PATH.is_absolute()
+
+
+# `data_root()`/`compiled_exe_dir()` themselves now live in reclaim.app_paths (generalized to
+# every `data/`-relative default in the app, not just this module's) -- see
+# tests/test_app_paths.py for their own dedicated coverage.

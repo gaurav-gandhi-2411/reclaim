@@ -409,6 +409,116 @@ def test_my_files_scan_already_running_returns_409(
     assert "already running" in response.json()["detail"]
 
 
+# --- AE1 (P0 fix, this session): a stale, pre-#47 persisted index remains fully actionable ------
+#
+# Real, live-reproduced finding: `ReclaimSmokeTest`'s dashboard, on a fresh server start, showed
+# `GET /api/scan/status` -> `root: null` (idle, no scan this session) while `/api/summary` still
+# reported the FULL 82.1 GB / 13,998-candidate total from an old pre-#47 whole-drive scan, and the
+# Overview screen offered a real one-click "Clean these now" against those candidates -- including
+# 13,991 `dev_artifacts` items under OTHER users' profiles. PR #47 fixed scan-TIME scope; it did
+# nothing about data a scan from before that fix already persisted. This is reproduced here the
+# same way: scan a broad root once (simulating the old, unscoped whole-drive scan), then reset
+# `scan_status` back to idle (simulating a fresh server start with no scan this session but the
+# same persisted index) -- exactly the state the real profile was found in.
+
+
+def test_stale_cross_tenant_candidates_are_excluded_from_summary_after_a_scan_status_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    other_profile = broad_root / "OtherRealUser"
+
+    own_node_modules = own_profile / "projects" / "myapp" / "node_modules" / "leftpad"
+    _write(own_node_modules / "index.js", b"x" * 4096)
+    (own_profile / "projects" / "myapp" / "package.json").write_bytes(b"{}")
+
+    other_node_modules = other_profile / "ml-projects" / "otherapp" / "node_modules" / "lodash"
+    _write(other_node_modules / "index.js", b"y" * 4096)
+    (other_profile / "ml-projects" / "otherapp" / "package.json").write_bytes(b"{}")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)  # simulates the old, pre-#47 unscoped whole-drive scan
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.scan_status = ScanStatus()  # simulates a fresh server start: idle, root=None
+        app_state.candidates_cache = None  # force a fresh (post-reset) candidate computation
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    summary = client.get("/api/summary").json()
+    dev_artifacts_category = next(
+        (c for c in summary["categories"] if c["category_group"] == "dev_artifacts"), None
+    )
+    assert dev_artifacts_category is not None, "own profile's own dev_artifacts must still count"
+    assert dev_artifacts_category["file_count"] == 1, (
+        "only the own-profile candidate should count -- the other profile's stale candidate "
+        f"must be excluded: {summary}"
+    )
+
+    candidates = client.get("/api/candidates?tier=A").json()["candidates"]
+    for candidate in candidates:
+        assert other_profile.as_posix() not in candidate["path"], (
+            f"candidate {candidate['path']} reaches outside the invoking user's own profile -- "
+            "exactly the stale-index P0 finding this test guards against"
+        )
+
+
+def test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense-in-depth teeth-proof at the apply choke point itself, not just candidate-
+    generation filtering: an explicit `paths=[...]` apply request (Review Queue / AI Suggestions'
+    "apply this specific file" flow) bypasses `_all_candidates`' scope filter entirely by design
+    (`resolve_apply_selection`'s perf/apply-scoped-to-paths branch calls `generate_candidates`
+    directly, never `_cached_all_candidates`) -- `apply_batch`'s OWN `allowed_roots` check is what
+    actually stops a cross-tenant path here, proving the two layers are independent, not one
+    silently relying on the other."""
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    other_profile = broad_root / "OtherRealUser"
+
+    own_node_modules = own_profile / "projects" / "myapp" / "node_modules" / "leftpad"
+    _write(own_node_modules / "index.js", b"x" * 4096)
+    (own_profile / "projects" / "myapp" / "package.json").write_bytes(b"{}")
+
+    other_node_modules = other_profile / "ml-projects" / "otherapp" / "node_modules" / "lodash"
+    other_target = other_node_modules / "index.js"
+    _write(other_target, b"y" * 4096)
+    (other_profile / "ml-projects" / "otherapp" / "package.json").write_bytes(b"{}")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.scan_status = ScanStatus()
+        app_state.candidates_cache = None
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    result = _apply_and_wait(
+        client, {"tier": "A", "paths": [other_target.as_posix()], "dry_run": False}
+    )
+
+    assert result["files_processed"] == 1
+    assert result["files_succeeded"] == 0
+    assert result["files_failed"] == 1
+    item = next(i for i in result["items"] if i["path"] == other_target.as_posix())
+    assert item["succeeded"] is False
+    assert item["skip_reason"] == "outside_user_scope"
+    assert item["error"] is None  # never attempted -- not an OS error
+    assert other_target.exists()
+    assert other_target.read_bytes() == b"y" * 4096  # byte-for-byte untouched
+
+
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
 # NOTE (P0 fix, 2026-08-22): `POST /api/scan/full-drive` is no longer SIMPLE mode's DEFAULT
 # action -- `POST /api/scan/my-files` (tests above) is. This endpoint remains as a deliberate,
@@ -657,6 +767,59 @@ def test_compute_eta_seconds_is_none_when_the_observed_rate_is_effectively_zero(
 
     # 1 entry over an absurdly long elapsed time -> a rate far below the trust threshold.
     assert _compute_eta_seconds(1, 100, 1e12) is None
+
+
+def test_candidates_warm_status_starts_idle(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    status = client.get("/api/candidates/warm-status").json()
+    assert status["status"] == "idle"
+    assert status["started_at"] is None
+    assert status["elapsed_seconds"] is None
+
+
+def test_candidates_warm_reaches_ready_and_warms_the_shared_cache(tmp_path: Path) -> None:
+    """AE3: `POST /api/candidates/warm` + `GET /api/candidates/warm-status` -- TestClient's ASGI
+    transport runs `BackgroundTasks` synchronously as part of the request/response cycle (same
+    documented behavior `_scan_and_wait` already relies on), so by the time the POST call
+    returns, the warm-up has already completed for real; polling status immediately after shows
+    `"ready"`, and a subsequent `/api/summary` call uses the now-warm cache."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    response = client.post("/api/candidates/warm")
+    assert response.status_code == 202
+    assert response.json()["status"] == "computing"
+
+    status = client.get("/api/candidates/warm-status").json()
+    assert status["status"] == "ready"
+    assert status["started_at"] is not None
+    assert status["finished_at"] is not None
+    assert status["elapsed_seconds"] is not None
+
+    summary = client.get("/api/summary").json()
+    assert summary["has_scan"] is True
+    assert paths["kept_file"].exists()  # sanity: nothing mutated by warming the cache
+
+
+def test_candidates_warm_already_running_returns_409(tmp_path: Path) -> None:
+    """Same single-flight guard `test_apply_already_running_returns_409` below already
+    establishes for `apply_status` -- manually forced into `"computing"` here since TestClient's
+    synchronous background-task execution means a real `POST` call never actually leaves the
+    status in `"computing"` by the time it returns (see the test above)."""
+    from reclaim.api.state import CandidatesWarmStatus
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.candidates_warm_status = CandidatesWarmStatus(
+            status="computing", scan_generation=0, started_at=time.time()
+        )
+
+    response = client.post("/api/candidates/warm")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
 
 
 def test_apply_already_running_returns_409(tmp_path: Path) -> None:

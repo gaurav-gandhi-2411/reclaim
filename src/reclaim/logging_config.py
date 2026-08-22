@@ -7,6 +7,8 @@ from pathlib import Path
 
 import structlog
 
+from reclaim.app_paths import data_root
+
 # data/ is this app's existing convention for all local state (scan index, quarantine vault,
 # mode log, first-run marker -- see executor.DEFAULT_MANIFEST_PATH, mode.DEFAULT_MODE_LOG_PATH,
 # first_run.DEFAULT_FIRST_RUN_STATE_PATH), and the packaged installer's Start Menu/desktop
@@ -14,7 +16,24 @@ import structlog
 # inside it (see packaging/reclaim.iss) rather than wherever the shortcut happens to be
 # launched from. The log file follows the same convention -- one answer to "where does Reclaim
 # keep its stuff", not a second one under %LOCALAPPDATA% that only this file would use.
-DEFAULT_LOG_PATH = Path("data/logs/reclaim.log")
+#
+# P0 fix (2026-08-22, live-reproduced under a real frozen install): a bare CWD-relative Path
+# breaks for any invocation path that has no way to set WorkingDir at all --
+# packaging/reclaim.iss's [Registry] `reclaim-notify:` URI protocol handler (the toast's Snooze
+# button) is the one CONFIRMED-live case: a `shell\open\command` registry value has no working-
+# directory concept, so the process's CWD at launch is whatever the invoking shell context
+# happened to be (observed: `C:\Windows\System32`) -- `resolved_path.parent.mkdir(...)` below
+# crashed with a raw, unhandled `PermissionError` before the app ever reached the actual snooze
+# logic, so clicking Snooze on a real toast silently did nothing. `data_root()` (see
+# `reclaim.app_paths`) anchors to the real running executable's directory when compiled (matching
+# the "next to the app" semantic this comment already documents) and falls back to today's
+# CWD-relative behavior otherwise -- so dev/test runs (always launched from the repo root) are
+# unaffected; only the frozen build's behavior changes, and only in the direction of "no longer
+# crashes when CWD isn't the install dir." Originally landed here alone (PR #51); generalized to
+# every other `data/`-relative default in the app (`mode.py`, `first_run.py`, `executor.py`,
+# `api/app.py`, `mcp/server.py`) once AA1 established "not reachable today" is a property of
+# today's call sites, not of the code.
+DEFAULT_LOG_PATH = data_root() / "data" / "logs" / "reclaim.log"
 
 # Size-based rotation, not time-based: Reclaim is invoked as a short-lived CLI command most of
 # the time (scan/apply/purge/undo/mode all exit immediately) with the dashboard as the one

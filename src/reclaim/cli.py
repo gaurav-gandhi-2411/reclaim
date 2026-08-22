@@ -7,6 +7,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from reclaim.app_paths import data_root
 from reclaim.config import Config, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
@@ -43,7 +44,15 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
-_DEFAULT_DB_PATH = Path("data/reclaim_index.sqlite3")
+# Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
+# this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
+# anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test resolution is
+# deliberately UNCHANGED (still lazily CWD-relative, exactly like the original bare
+# `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation). Not yet
+# reachable from any working-directory-less invocation today, but "not reachable today" is a
+# property of today's call sites, not of the code.
+_DEFAULT_DB_PATH = data_root() / "data" / "reclaim_index.sqlite3"
 _DEFAULT_CONFIG_PATH = Path("config.toml")
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
@@ -870,6 +879,14 @@ def _run_apply(args: argparse.Namespace) -> int:
                 direct_delete_entry_count_guard=config.safety.direct_delete_entry_count_guard,
                 on_progress=_cli_progress_printer("apply"),
                 scan_index=apply_scan_index,
+                # AE1: defense-in-depth — `selected` above is already filtered to `_under_root(
+                # c.path, root)`, so this never restricts anything further here; it exists so the
+                # apply choke point itself never trusts an already-filtered caller's list without
+                # re-checking, the same two-layer posture the direct-delete safety re-check above
+                # already uses. `Path.home()` is included too since `root` (the CLI's own
+                # explicit `--path`) may legitimately be a subdirectory of it, not the whole home
+                # tree itself.
+                allowed_roots=(Path.home(), root),
             )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201

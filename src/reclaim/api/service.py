@@ -27,6 +27,7 @@ from reclaim.api.schemas import (
     ApplyStatusOut,
     CandidateOut,
     CandidatesResponse,
+    CandidatesWarmStatusOut,
     CategoryBreakdownOut,
     CategoryCardOut,
     CategoryExplanationResponse,
@@ -66,7 +67,14 @@ from reclaim.api.schemas import (
     format_bytes,
     plain_language_category,
 )
-from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.api.state import (
+    AIAnalysisStatus,
+    ApplyStatus,
+    AppState,
+    CandidatesWarmStatus,
+    RestoreStatus,
+    ScanStatus,
+)
 from reclaim.config import CategoriesConfig, set_category_enabled
 from reclaim.dedup import (
     cluster_needs_manual_review,
@@ -103,6 +111,7 @@ from reclaim.models import (
     Tier,
     Verdict,
 )
+from reclaim.preflight import check_within_allowed_scope
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
@@ -117,12 +126,52 @@ _TIER_SELECTIONS: dict[str, frozenset[Tier]] = {
 }
 
 
+def resolve_allowed_apply_roots(state: AppState, *, home: Path | None = None) -> list[Path]:
+    """AE1: the invoking user's own profile, plus -- when the CURRENT scan's tracked root is set
+    and sits outside it -- that root too. This IS the "explicitly opted-in" signal
+    `preflight.check_within_allowed_scope`'s module comment refers to: `user_scan_roots` (PR #47)
+    already requires an explicit confirmation dialog before any scan reaches outside
+    `Path.home()`, so `state.scan_status.root` being a non-home root at all only happens when the
+    invoking user already went through that confirmation for THIS session's scan -- no separate
+    flag needed.
+
+    Deliberately does NOT look at anything persisted (an old scan's root, a config default) --
+    only the live, current-process `state.scan_status.root`, which is `None` on a fresh server
+    start regardless of what a PREVIOUS process's scan (or a scan from before PR #47 shipped)
+    left sitting in the persisted index. This is exactly what makes this fix close the real,
+    live-reproduced gap: a `ReclaimSmokeTest` profile with an old pre-#47 whole-drive-scan index
+    still persisted has `scan_status.root is None` on every fresh server start, so its
+    out-of-home candidates are excluded here regardless of how they got into the index.
+
+    `home` is injectable for tests, same convention `user_scan_roots`/`suggested_scan_roots`
+    already use.
+    """
+    resolved_home = home if home is not None else Path.home()
+    roots = [resolved_home]
+    scan_root = state.scan_status.root
+    if scan_root is not None and not check_within_allowed_scope(
+        scan_root, allowed_roots=[resolved_home]
+    ):
+        roots.append(scan_root)
+    return roots
+
+
 def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     """Combined detector + exact-duplicate candidate list — the same two-function contract
     `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
 
     Uses `state.effective_config` (mode-resolved fresh on every call), never `state.config`
     directly — see `AppState.effective_config`'s docstring.
+
+    AE1: filtered to `resolve_allowed_apply_roots(state)` before returning -- this is the SAME
+    choke point `build_summary`, `build_treemap`, `list_candidates`, `build_one_click_summary`,
+    and apply-selection all draw from (via `_cached_all_candidates` below), so a candidate outside
+    the invoking user's scope never reaches any of them: not counted in summary totals, not shown
+    in the treemap or review queue, never offered by "Clean these now" — not merely skipped
+    silently at apply time. `apply_batch` ALSO independently re-checks scope at the actual
+    mutation choke point (defense in depth, same two-layer posture this function's own callers
+    already use for the direct-delete safety re-check) -- a hypothetical future caller that builds
+    a candidate list some other way is still protected there.
 
     UNCACHED — this is the expensive pass `_cached_all_candidates` below memoizes per scan
     generation. Call sites that need every candidate for the CURRENT scan should go through that
@@ -131,7 +180,10 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     config = state.effective_config
     candidates = generate_candidates(index, config, state.safety)
     candidates += generate_duplicate_candidates(index, config, state.safety)
-    return candidates
+    allowed_roots = resolve_allowed_apply_roots(state)
+    return [
+        c for c in candidates if check_within_allowed_scope(c.path, allowed_roots=allowed_roots)
+    ]
 
 
 def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
@@ -155,6 +207,73 @@ def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]
         state.candidates_cache = candidates
         state.candidates_cache_generation = generation
         return candidates
+
+
+def is_candidates_cache_warm(state: AppState) -> bool:
+    """AE3: true iff `_cached_all_candidates` would return WITHOUT recomputing anything right
+    now — the same freshness check that function makes internally, exposed so a route handler
+    can decide whether to call it directly (fast) or kick off a background warm-up first
+    (`run_candidates_warm` below) instead of blocking the request thread."""
+    with state.candidates_cache_lock:
+        return (
+            state.candidates_cache is not None
+            and state.candidates_cache_generation == state.scan_generation
+        )
+
+
+def run_candidates_warm(state: AppState) -> None:
+    """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
+    real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
+    thread, via Starlette's worker-thread pool (same dispatch `run_scan`/`run_apply` already use
+    for their own background bodies). `state.lock` guards `candidates_warm_status` reads/writes
+    against a concurrent `GET /api/candidates/warm-status` poll, same convention every other
+    status dataclass in this module already follows.
+
+    Deliberately does NOT itself decide whether a warm-up is needed or already running — the
+    route handler (`POST /api/candidates/warm`) owns that single-flight check-and-set, under
+    `state.lock`, BEFORE scheduling this as a background task (same reasoning `POST /api/scan`'s
+    own route handler documents for why `cancel_scan_event` is cleared there and not here: a
+    client polling immediately after the response could otherwise race this function's own
+    "mark as computing" step).
+    """
+    try:
+        with ScanIndex(state.db_path) as index:
+            _cached_all_candidates(index, state)
+    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+        # the status endpoint, never crash silently into Starlette's background-task machinery —
+        # same posture `run_apply`/`run_scan` already use for their own background bodies.
+        logger.warning("api.candidates_warm_failed", error=str(exc))
+        with state.lock:
+            state.candidates_warm_status = CandidatesWarmStatus(
+                status="failed",
+                scan_generation=state.scan_generation,
+                started_at=state.candidates_warm_status.started_at,
+                finished_at=time.time(),
+                error=str(exc),
+            )
+        return
+
+    with state.lock:
+        state.candidates_warm_status = CandidatesWarmStatus(
+            status="ready",
+            scan_generation=state.scan_generation,
+            started_at=state.candidates_warm_status.started_at,
+            finished_at=time.time(),
+        )
+
+
+def to_candidates_warm_status_out(status: CandidatesWarmStatus) -> CandidatesWarmStatusOut:
+    elapsed_seconds = None
+    if status.started_at is not None:
+        end = status.finished_at if status.finished_at is not None else time.time()
+        elapsed_seconds = end - status.started_at
+    return CandidatesWarmStatusOut(
+        status=status.status,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        elapsed_seconds=elapsed_seconds,
+        error=status.error,
+    )
 
 
 # --- Scan --------------------------------------------------------------------------------
@@ -1271,6 +1390,7 @@ def run_apply(
                 direct_delete_entry_count_guard=(
                     state.config.safety.direct_delete_entry_count_guard
                 ),
+                allowed_roots=resolve_allowed_apply_roots(state),
                 on_progress=_on_progress,
                 scan_index=apply_scan_index,
             )
@@ -1391,6 +1511,7 @@ def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyRespo
                 state.config.safety.direct_delete_size_guard_retention_days
             ),
             scan_index=mcp_apply_scan_index,
+            allowed_roots=resolve_allowed_apply_roots(state),
         )
     return _apply_response(report)
 

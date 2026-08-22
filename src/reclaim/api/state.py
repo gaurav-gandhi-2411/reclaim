@@ -20,6 +20,7 @@ ScanStatusLiteral = Literal["idle", "running", "completed", "failed", "cancelled
 AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
 ApplyStatusLiteral = Literal["idle", "running", "completed", "failed"]
 RestoreStatusLiteral = Literal["idle", "running", "completed", "failed"]
+CandidatesWarmStatusLiteral = Literal["idle", "computing", "ready", "failed"]
 # full-drive-scan-eta: which of `api.service.run_scan`'s two phases (per root) is currently
 # active -- "estimating" while `scanner.count_entries_fast` is deriving `entries_estimated_total`,
 # "scanning" while the real `scanner.scan_tree` walk is running, "done" once every root has
@@ -123,6 +124,36 @@ class RestoreStatus:
 
 
 @dataclass(slots=True)
+class CandidatesWarmStatus:
+    """AE1's `_all_candidates` cold-compute status (P0 finding, this session): the shared
+    candidate-generation pass every one of `build_summary`/`build_treemap`/`list_candidates`/
+    `build_one_click_summary`/apply-selection's blanket path draws from (`api.service.
+    _cached_all_candidates`) is real, unbounded work on a large persisted index -- live-observed
+    on a real profile with an 82.1 GB / 13,998-candidate index: a cold-cache `/api/summary` call
+    ran for MINUTES with zero feedback, driving the server process to a sustained "Not
+    Responding" state. This status exists so a caller can check readiness and trigger a
+    background warm-up BEFORE calling `/api/summary` directly, instead of blocking the request
+    thread (and the caller's UI) for the full duration with nothing to show. Mirrors
+    `AIAnalysisStatus`'s exact shape/staleness-key convention: `scan_generation` records which
+    `AppState.scan_generation` this warm-up covered, so a caller can tell a `"ready"` status is
+    stale (a newer scan has since completed) without forcing a recompute on every check.
+
+    Deliberately does NOT expose fine-grained item-level progress (a percentage, an item
+    counter) -- the underlying `generate_candidates`/`generate_duplicate_candidates`/hardlink-
+    dedup-clustering pass has no cheap, already-instrumented way to report that within this
+    fix's scope (AE3 was explicit: "do not fix the algorithm now"). `elapsed_seconds` (computed
+    at read time from `started_at`) is the only progress signal available -- an honest "still
+    working, N seconds so far" rather than a fabricated percentage.
+    """
+
+    status: CandidatesWarmStatusLiteral = "idle"
+    scan_generation: int | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True)
 class AppState:
     """Single-process, in-memory application state.
 
@@ -215,6 +246,10 @@ class AppState:
     candidates_cache: list[Candidate] | None = None
     candidates_cache_generation: int | None = None
     candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    # AE1: single-flight background-warm status for the cache above -- see
+    # `CandidatesWarmStatus`'s own docstring for the real cold-start cost this exists to make
+    # non-blocking/visible instead of silent.
+    candidates_warm_status: CandidatesWarmStatus = field(default_factory=CandidatesWarmStatus)
     # R2: where the DPAPI-encrypted Anthropic API key blob lives, and where per-category
     # explanation cache entries are written -- overridable the same way every other path on
     # this dataclass is (test isolation; see `create_app`'s matching constructor parameters).

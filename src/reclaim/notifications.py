@@ -9,6 +9,7 @@ from pathlib import Path
 
 import structlog
 
+from reclaim.app_paths import data_root
 from reclaim.config import NotificationsConfig
 
 logger = structlog.get_logger(__name__)
@@ -26,7 +27,20 @@ logger = structlog.get_logger(__name__)
 # logic is fully unit-testable without a real Windows desktop/notification session; the toast
 # call is not (see this module's own test file for exactly which surface is/isn't covered).
 
-DEFAULT_STATE_PATH = Path("data/notification_state.json")
+# Anchored via reclaim.app_paths.data_root: CWD-independent when compiled -- the frozen build
+# now anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test
+# resolution is deliberately UNCHANGED (still lazily CWD-relative, exactly like the original
+# bare `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation).
+#
+# CONFIRMED reachable from a working-directory-less invocation today: packaging/reclaim.iss's
+# Task Scheduler action invokes `reclaim.exe check-disk-space` with NO --state/--config override
+# (WorkingDirectory covers it there), but the [Registry] `reclaim-notify:` protocol handler --
+# which has no working-directory concept at all -- currently compensates by hardcoding an
+# absolute --state path in the registry command itself; this fix means that compensation is no
+# longer load-bearing, not that it's been removed (removing it is a separate, unnecessary change
+# here).
+DEFAULT_STATE_PATH = data_root() / "data" / "notification_state.json"
 
 _SECONDS_PER_HOUR = 3600.0
 _SECONDS_PER_DAY = 86400.0
