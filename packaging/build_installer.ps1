@@ -399,6 +399,32 @@ $nuitkaArgs = @(
     "--include-package=cv2", "--include-package=numpy", "--include-package=datasketch",
     "--include-package=docx", "--include-package=pypdf", "--include-package=rapidocr_onnxruntime",
     "--include-package=scipy",
+    # windows_toasts (PR #38, R5 disk-space toast) + winrt: without these, a real installed
+    # build fired `ModuleNotFoundError: No module named 'winrt.windows.foundation'` at toast
+    # time (confirmed via a real traceback in the app's own reclaim.log). Root cause: Nuitka's
+    # default standalone build only follows imports it can find via static AST analysis of
+    # Python source. `windows_toasts` itself IS statically imported (reclaim.notifications'
+    # deferred `from windows_toasts import ...` inside send_disk_space_toast, plus
+    # windows_toasts' own static `from winrt.windows.ui.notifications import ...` and `from
+    # winrt.windows.data.xml.dom import ...`) -- so those three winrt pieces get bundled by
+    # accident. But `winrt.windows.foundation` (HResult/AsyncStatus, needed for the toast's
+    # async activation/button-click machinery) is only reached at runtime from *inside* the
+    # native `_winrt_windows_ui_notifications.pyd` extension module's own C-level import call,
+    # invisible to Nuitka's Python-source scan -- so it, and the sibling
+    # `winrt.windows.foundation.collections`, were silently dropped from every prior build.
+    # `winrt` itself is a PEP 420 implicit namespace package (no `__init__.py`) assembled from
+    # five separate `winrt-*` PyPI wheels that all install into one shared `winrt/` directory
+    # in site-packages -- `--include-package=winrt` walks that whole merged directory
+    # unconditionally, independent of what's statically reachable, which is exactly the
+    # guarantee this dynamic-import gap needs. `--include-package=windows_toasts` is added
+    # explicitly too (not left to the incidental discovery above) to match this list's existing
+    # practice of naming every runtime dependency it needs rather than relying on transitive
+    # discovery. Verified at small scale (not via a full installer rebuild -- see
+    # RELEASE_RUNBOOK.md/PLAN.md for why): a scoped Nuitka --standalone compile of an isolated
+    # script mirroring reclaim.notifications.send_disk_space_toast's exact import/call sequence
+    # reproduced the identical `ModuleNotFoundError: No module named 'winrt.windows.foundation'`
+    # without these two flags, and resolved cleanly (toast fired, no exception) with them.
+    "--include-package=winrt", "--include-package=windows_toasts",
     "--include-data-dir=src/reclaim/api/static=reclaim/api/static",
     "--include-data-dir=src/reclaim/api/templates=reclaim/api/templates",
     "--include-data-dir=src/reclaim/ai/models=reclaim/ai/models",
