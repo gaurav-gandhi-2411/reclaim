@@ -36,10 +36,14 @@ from reclaim.safety import SafetyValidator
 # module docstring); every real read or mutation goes through `reclaim.api.service`'s
 # choke-point functions, the same layer `reclaim.api.routes` (the HTTP surface) already uses.
 
-# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
-# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
-# working-directory-less invocation today, but "not reachable today" is a property of today's
-# call sites, not of the code.
+# Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
+# this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
+# anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test resolution is
+# deliberately UNCHANGED (still lazily CWD-relative, exactly like the original bare
+# `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation). Not yet
+# reachable from any working-directory-less invocation today, but "not reachable today" is a
+# property of today's call sites, not of the code.
 _DEFAULT_VAULT_DIR = data_root() / "data" / "quarantine"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_VAULT_DIR / "manifest.jsonl"
 

@@ -124,13 +124,21 @@ def test_configure_logging_reconfigures_for_a_different_path(tmp_path: Path) -> 
 # reached the actual snooze logic, so clicking Snooze on a real toast silently did nothing.
 
 
-def test_default_log_path_is_absolute_not_cwd_relative_at_use_time() -> None:
-    """Regression proof for the actual bug: the old `Path("data/logs/reclaim.log")` stayed
-    relative until something resolved it against whatever CWD was active *at that moment* --
-    exactly the property that broke under the protocol handler's arbitrary launch CWD. An
-    absolute `DEFAULT_LOG_PATH` cannot be re-broken by a later CWD change the way a relative one
-    could."""
-    assert DEFAULT_LOG_PATH.is_absolute()
+def test_default_log_path_is_built_from_data_root() -> None:
+    """Regression proof for the actual bug, at the correct level: `DEFAULT_LOG_PATH` must be
+    `data_root() / "data" / "logs" / "reclaim.log"`, not a bare `Path("data/logs/reclaim.log")`
+    literal independently constructed -- the fix is `data_root()` anchoring to the real exe's
+    directory when compiled, not "always absolute" (that would be a DIFFERENT, wrong regression
+    proof: in this always-uncompiled test environment, `data_root()` is `Path(".")`, so the
+    correct value here is the plain relative `data/logs/reclaim.log`, byte-identical to the
+    pre-fix literal -- see `reclaim.app_paths.data_root`'s docstring for why an eager
+    `Path.cwd()` capture instead of `Path(".")` would silently break `monkeypatch.chdir(
+    tmp_path)`-based test isolation elsewhere in this codebase, which is exactly what happened
+    and was caught the hard way when this fix was first generalized beyond this one module)."""
+    from reclaim.app_paths import data_root
+
+    assert data_root() / "data" / "logs" / "reclaim.log" == DEFAULT_LOG_PATH
+    assert not DEFAULT_LOG_PATH.is_absolute()
 
 
 # `data_root()`/`compiled_exe_dir()` themselves now live in reclaim.app_paths (generalized to

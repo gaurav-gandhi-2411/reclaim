@@ -36,10 +36,14 @@ from reclaim.app_paths import data_root
 # SAME `extract_numeric_features` function below — eliminating training-serving skew by
 # construction, not by convention.
 
-# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
-# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
-# working-directory-less invocation today, but "not reachable today" is a property of today's
-# call sites, not of the code.
+# Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
+# this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
+# anchors to the real exe's directory instead of an arbitrary launch CWD. Dev/test resolution is
+# deliberately UNCHANGED (still lazily CWD-relative, exactly like the original bare
+# `Path("data/...")` literal -- data_root()'s own docstring explains why eager `Path.cwd()`
+# capture would silently break `monkeypatch.chdir(tmp_path)`-based test isolation). Not yet
+# reachable from any working-directory-less invocation today, but "not reachable today" is a
+# property of today's call sites, not of the code.
 DEFAULT_MODEL_PATH = data_root() / "data" / "ai_models" / "clutter_ranker.txt"
 
 FEATURE_NAMES: tuple[str, ...] = (
