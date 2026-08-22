@@ -1711,6 +1711,15 @@ async function runApply(dryRun) {
 // (recoverable), never described as "freed"; only direct_delete really frees the space
 // immediately. Advanced mode's Review Queue apply lets the user pick the quarantine method
 // (see the #apply-method dropdown), so this has to branch the same way Simple mode already does.
+//
+// P0 residual-gap fix (2026-08, Z5): the old code's third branch was a bare `else`, so ANY
+// method value it didn't recognize — not just the real `direct_delete` — silently fell through
+// to "permanently freed." `QuarantineMethod` (src/reclaim/executor.py) is a closed 3-value
+// Python Literal today, but a future 4th value added there with no matching frontend update
+// would have been mislabeled as "freed" with nothing to catch it — the exact silent-wrong-
+// answer shape this whole engagement exists to close. `direct_delete` now has its own explicit
+// branch; anything else (including a genuinely unrecognized method) gets a neutral, honest
+// phrase that commits to no specific outcome, rather than an unverified "freed" claim.
 function applyReportBytesPhrase(report) {
   const humanBytes = `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes)`;
   if (report.method === "recycle_bin") {
@@ -1724,7 +1733,12 @@ function applyReportBytesPhrase(report) {
           "tab; the space is held until purged."
       : `${humanBytes} would be moved to the Reclaim vault.`;
   }
-  return report.apply ? `${humanBytes} permanently freed.` : `${humanBytes} would be permanently freed.`;
+  if (report.method === "direct_delete") {
+    return report.apply ? `${humanBytes} permanently freed.` : `${humanBytes} would be permanently freed.`;
+  }
+  return report.apply
+    ? `${humanBytes} processed (unrecognized method "${report.method}" — outcome not confirmed).`
+    : `${humanBytes} would be processed (unrecognized method "${report.method}" — outcome not confirmed).`;
 }
 
 function renderApplyReport(container, report) {
