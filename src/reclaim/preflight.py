@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -23,9 +24,23 @@ from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
 # deleted or misrouted into the vault. `check_identity_unchanged_since_scan` below is the third
 # read-only probe this module answers, same posture as the two above: it only says whether the
 # live path's identity still matches what the scan recorded, never what to do about a mismatch.
+#
+# AE1 (this session, live-reproduced finding): identity re-verification answers "is this still
+# the same file", never "does this user have any legitimate claim on it" -- a DIFFERENT question.
+# PR #47 fixed SCAN-time scope (a new scan won't reach another user's files), but did nothing
+# about candidates already sitting in a PERSISTED index from before that fix shipped -- a real
+# `ReclaimSmokeTest` profile with an old pre-#47 whole-drive-scan index still offered a one-click
+# "Clean these now" against 13,991 other-users'-files candidates, and neither identity
+# re-verification nor anything else in the apply path would have refused them.
+# `check_within_allowed_scope` below is the fourth read-only probe this module answers: whether
+# a path falls within a set of roots the CURRENT operation is actually scoped to, independent of
+# whether the path's on-disk identity matches what a scan recorded for it.
 
 PreflightSkipReason = Literal[
-    "file_in_use", "hardlink_shared_active_install", "identity_changed_since_scan"
+    "file_in_use",
+    "hardlink_shared_active_install",
+    "identity_changed_since_scan",
+    "outside_user_scope",
 ]
 
 # --- (a) live-process handle probe -------------------------------------------------------------
@@ -383,7 +398,44 @@ def check_identity_unchanged_since_scan(
     )
 
 
-# --- (d) batched directory-identity enumeration (P0-K1a M1 cost-budget fix) --------------------
+# --- (d) ownership/scope check (AE1) ------------------------------------------------------------
+#
+# Distinct from identity re-verification above by design, not folded into it: identity answers
+# "is this still the same file the scan recorded", which says nothing about whether the invoking
+# user has any legitimate claim on it at all. A file can pass identity re-verification perfectly
+# (nothing about it changed since the scan) and still belong to a different user entirely -- the
+# real, live-reproduced case this check exists for: a persisted scan index from before PR #47's
+# scan-scope fix still contains real candidates under other users' profiles, and nothing about
+# THEIR identity ever changes just because a newer, better-scoped version of this tool shipped.
+
+
+def check_within_allowed_scope(path: Path, *, allowed_roots: Sequence[Path]) -> bool:
+    """True if `path` is one of `allowed_roots` itself, or nested under one of them.
+
+    `resolve()` (not a raw string-prefix compare) so `..`/relative segments and case/short-name
+    differences can't produce a false "in scope" -- same reasoning `cli._under_root` already
+    established for the CLI's own `--path`-scoped apply filter. Deliberately does NOT require any
+    of `path`/`allowed_roots` to exist on disk (`resolve()` doesn't require that) -- a scan-index
+    row must be checkable even if the live file has since vanished; that's a different, already-
+    handled failure mode (`apply_batch`'s per-item `try/except`), not this check's problem.
+
+    `allowed_roots` is caller-supplied on purpose -- this module has no notion of "the current
+    user" or "the current scan's opted-in root" of its own; see `executor._preflight_skip_reason`
+    / `api.service._cached_all_candidates` for where those are actually resolved (`Path.home()`
+    plus, when set, the live scan's own explicitly-confirmed root -- PR #47 already requires
+    explicit confirmation before any scan reaches outside `Path.home()` in the first place, so a
+    non-home `scan_status.root` being set at all IS the "explicitly opted-in" signal, not a
+    separate flag this check needs to know about).
+    """
+    resolved_path = path.resolve()
+    for root in allowed_roots:
+        resolved_root = root.resolve()
+        if resolved_path == resolved_root or resolved_root in resolved_path.parents:
+            return True
+    return False
+
+
+# --- (e) batched directory-identity enumeration (P0-K1a M1 cost-budget fix) --------------------
 #
 # M1's full-subtree re-walk (`executor._live_subtree_records`) used to call `os.stat()` once per
 # entry (via `scanner.build_record`) -- on Windows this means one real

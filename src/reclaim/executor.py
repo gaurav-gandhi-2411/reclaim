@@ -34,6 +34,7 @@ from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
     check_identity_unchanged_since_scan,
+    check_within_allowed_scope,
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
@@ -1345,13 +1346,27 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
 
 
 def _preflight_skip_reason(
-    candidate: Candidate, *, item_method: QuarantineMethod, scan_index: ScanIndex | None
+    candidate: Candidate,
+    *,
+    item_method: QuarantineMethod,
+    scan_index: ScanIndex | None,
+    allowed_roots: Sequence[Path] | None,
 ) -> PreflightSkipReason | None:
-    """Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a (this session): the pre-flight safety checks
-    run in order, against one candidate right before `apply_batch` would otherwise attempt to
-    move/delete it. Returns the first that fires -- any one alone is sufficient reason to skip
-    the item without attempting the real mutation, so there is no need to run (or report) more
-    than the first hit.
+    """Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a (this session) + AE1 (this session): the
+    pre-flight safety checks run in order, against one candidate right before `apply_batch` would
+    otherwise attempt to move/delete it. Returns the first that fires -- any one alone is
+    sufficient reason to skip the item without attempting the real mutation, so there is no need
+    to run (or report) more than the first hit.
+
+    AE1's ownership/scope check runs FIRST -- cheapest of all (a pure path comparison, no syscall
+    at all, unlike every check below it) and answers a genuinely different question than identity
+    re-verification does (see `preflight.check_within_allowed_scope`'s module comment): does the
+    invoking user have any legitimate claim on this path AT ALL, independent of whether its
+    on-disk identity still matches what a scan recorded. `allowed_roots is None` (a caller that
+    hasn't been updated to pass any -- no real production caller should ever be in this state;
+    CLI/HTTP/MCP all resolve and pass a real set, see `apply_batch`'s own docstring) means this
+    check is SKIPPED entirely for the candidate, same disclosed-narrower-coverage posture
+    `scan_index is None` already has below for M1 -- never a silent "treat as in scope".
 
     `check_hardlink_shared_active_install` is applied to every DIRECT-DELETE and RECYCLE-BIN
     apply (including a human-confirmed, single-item apply from the dashboard), not gated behind
@@ -1393,6 +1408,16 @@ def _preflight_skip_reason(
     candidate already gets -- a disclosed, narrower-coverage fallback, never a silent skip of
     the identity check altogether.
     """
+    if allowed_roots is not None and not check_within_allowed_scope(
+        candidate.path, allowed_roots=allowed_roots
+    ):
+        logger.info(
+            "executor.outside_user_scope_skipped",
+            path=str(candidate.path),
+            allowed_roots=[str(root) for root in allowed_roots],
+        )
+        return "outside_user_scope"
+
     if check_file_in_use(candidate.path, is_dir=candidate.is_dir):
         return "file_in_use"
     if (
@@ -1471,9 +1496,23 @@ def apply_batch(
     direct_delete_entry_count_guard: int = _DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD,
     on_progress: ProgressCallback | None = None,
     scan_index: ScanIndex | None = None,
+    allowed_roots: Sequence[Path] | None = None,
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
+
+    `allowed_roots` (AE1): when provided, every candidate whose path falls outside all of
+    `allowed_roots` is skipped (`skip_reason="outside_user_scope"`) before any other pre-flight
+    check runs — see `_preflight_skip_reason`'s docstring and `preflight.check_within_allowed_
+    scope`'s module comment for why this is a distinct question from identity re-verification.
+    `None` (the default) disables the check entirely — same test-compatibility posture `mode`'s
+    own default already documents in this exact function: preserves every existing caller's
+    exact current behavior (this test suite's ~600+ tests included), and every REAL end-user
+    entry point (CLI `apply`, `POST /api/apply`, MCP `delete`) must pass a real value explicitly.
+    A caller that omits it gets NO ownership/scope protection, the same way a caller that omits
+    a live `mode` gets no live safe-mode enforcement — this is a deliberate, disclosed default,
+    never a silent "safe by default" claim this function doesn't actually make for an unspecified
+    parameter.
 
     `on_progress` (fix/apply-progress-feedback): optional interval-gated progress hook — see
     `ProgressCallback`'s docstring. Defaults to `None` so every existing caller (this test
@@ -1700,7 +1739,10 @@ def apply_batch(
             # no "aborted" phase to close out; `reclaim.recovery` never needs to know this item
             # existed.
             skip_reason = _preflight_skip_reason(
-                candidate, item_method=item_method, scan_index=scan_index
+                candidate,
+                item_method=item_method,
+                scan_index=scan_index,
+                allowed_roots=allowed_roots,
             )
             if skip_reason is not None:
                 logger.info(
