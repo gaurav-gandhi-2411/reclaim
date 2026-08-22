@@ -14,7 +14,70 @@ import structlog
 # inside it (see packaging/reclaim.iss) rather than wherever the shortcut happens to be
 # launched from. The log file follows the same convention -- one answer to "where does Reclaim
 # keep its stuff", not a second one under %LOCALAPPDATA% that only this file would use.
-DEFAULT_LOG_PATH = Path("data/logs/reclaim.log")
+#
+# P0 fix (2026-08-22, live-reproduced under a real frozen install): a bare CWD-relative Path
+# breaks for exactly one real invocation path that has no way to set WorkingDir at all --
+# packaging/reclaim.iss's [Registry] `reclaim-notify:` URI protocol handler (the toast's Snooze
+# button). A `shell\open\command` registry value has no working-directory concept, so the
+# process's CWD at launch is whatever the invoking shell context happened to be (observed:
+# `C:\Windows\System32`) -- `resolved_path.parent.mkdir(...)` below crashed with a raw,
+# unhandled `PermissionError` before the app ever reached the actual snooze logic, so clicking
+# Snooze on a real toast silently did nothing. `_data_root()` anchors to the real running
+# executable's directory when compiled (matching the "next to the app" semantic this comment
+# already documents) and falls back to today's CWD-relative behavior otherwise -- so dev/test
+# runs (always launched from the repo root) are unaffected; only the frozen build's behavior
+# changes, and only in the direction of "no longer crashes when CWD isn't the install dir."
+#
+# KNOWN SIBLING GAP, not fixed here: `mode.DEFAULT_MODE_LOG_PATH`, `first_run.
+# DEFAULT_FIRST_RUN_STATE_PATH`, and `executor.DEFAULT_MANIFEST_PATH`/`DEFAULT_VAULT_DIR` share
+# the identical bare-relative-Path construction and would crash the same way if ever reached
+# from a working-directory-less invocation context -- confirmed NOT currently reachable that way
+# (the one registered protocol handler only calls `check-disk-space --apply-snooze`, which never
+# touches any of the three), so left as-is rather than fixed speculatively. See docs/AUDIT-
+# 2026-08.md's residual-gaps list.
+
+
+def _compiled_exe_dir() -> Path | None:
+    """The real compiled executable's own directory when running under Nuitka, or `None`
+    otherwise (source/dev/test runs). Isolated from `_data_root()` below purely for
+    testability -- `__compiled__` is a Nuitka compile-time construct with no runtime equivalent
+    a test can fake (confirmed empirically: it is not even a real `builtins` module attribute,
+    see the note below), so this function itself is exercised for real only by an actual
+    compiled build; `_data_root()`'s fallback logic is what a normal test run can cover, by
+    monkeypatching this function directly.
+
+    `sys.executable` under Nuitka `--standalone` points at an internal Python shim Nuitka
+    creates alongside the real exe, not the compiled exe itself -- it happens to share the exe's
+    directory, but `__compiled__.original_argv0` is the field Nuitka actually documents for this
+    purpose (confirmed via a real scoped `--standalone` compile this session, package/submodule
+    layout matching this app's own entry_point.py -> cli.py -> logging_config.py chain: `sys.
+    frozen` is NOT set by Nuitka -- despite being a common PyInstaller-compatibility assumption --
+    but the bare name `__compiled__` IS resolvable in every module of a compiled program).
+    `__compiled__` does not exist as a name at all outside a Nuitka-compiled program, so
+    `NameError` is the correct, unambiguous "not frozen" signal -- never a heuristic guess.
+
+    Deliberately NOT `getattr(builtins, "__compiled__", None)`: also confirmed empirically (same
+    real compile) that Nuitka does NOT populate this as a real attribute on the `builtins`
+    module object -- `getattr` returns `None` even when compiled, silently defeating this whole
+    function. The bare name below IS how Nuitka actually exposes it (verified working in that
+    same compile) -- mypy has no stub for a dynamically injected builtin, hence the `type:
+    ignore` rather than switching to the broken `getattr` form.
+    """
+    try:
+        return Path(__compiled__.original_argv0).resolve().parent  # type: ignore[name-defined]
+    except NameError:
+        return None
+
+
+def _data_root() -> Path:
+    """Anchor for this module's `data/`-relative defaults: the real running executable's own
+    directory when compiled under Nuitka, or the current working directory otherwise -- see
+    `_compiled_exe_dir`'s docstring for why compiled-vs-not is detected the way it is."""
+    compiled_dir = _compiled_exe_dir()
+    return compiled_dir if compiled_dir is not None else Path.cwd()
+
+
+DEFAULT_LOG_PATH = _data_root() / "data" / "logs" / "reclaim.log"
 
 # Size-based rotation, not time-based: Reclaim is invoked as a short-lived CLI command most of
 # the time (scan/apply/purge/undo/mode all exit immediately) with the dashboard as the one

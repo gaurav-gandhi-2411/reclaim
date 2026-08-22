@@ -5,9 +5,10 @@ import logging
 import logging.handlers
 from pathlib import Path
 
+import pytest
 import structlog
 
-from reclaim.logging_config import configure_logging
+from reclaim.logging_config import DEFAULT_LOG_PATH, _data_root, configure_logging
 
 _EVENT_NAME = "test_logging_config.sample_event"
 
@@ -111,3 +112,47 @@ def test_configure_logging_reconfigures_for_a_different_path(tmp_path: Path) -> 
     ]
     assert len(file_handlers) == 1
     assert Path(file_handlers[0].baseFilename) == second_path.resolve()
+
+
+# --- P0 fix (2026-08-22, live-reproduced under a real frozen install): DEFAULT_LOG_PATH must
+# not depend on CWD at the time it happens to be *used* --------------------------------------
+#
+# Bug: packaging/reclaim.iss registers a `reclaim-notify:` URI protocol handler for the disk-
+# space toast's Snooze button. A `shell\open\command` registry value has no working-directory
+# concept, so the process's CWD at launch is whatever the invoking shell context happened to be
+# (observed live: `C:\Windows\System32`) -- a bare `Path("data/logs/reclaim.log")` crashed with
+# an unhandled `PermissionError` from `resolved_path.parent.mkdir(...)` before the app ever
+# reached the actual snooze logic, so clicking Snooze on a real toast silently did nothing.
+
+
+def test_default_log_path_is_absolute_not_cwd_relative_at_use_time() -> None:
+    """Regression proof for the actual bug: the old `Path("data/logs/reclaim.log")` stayed
+    relative until something resolved it against whatever CWD was active *at that moment* --
+    exactly the property that broke under the protocol handler's arbitrary launch CWD. An
+    absolute `DEFAULT_LOG_PATH` cannot be re-broken by a later CWD change the way a relative one
+    could."""
+    assert DEFAULT_LOG_PATH.is_absolute()
+
+
+def test_data_root_falls_back_to_cwd_when_not_compiled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real, always-true-in-a-test-run case: `_compiled_exe_dir()` returns `None` outside a
+    Nuitka-compiled program (confirmed empirically this session -- `__compiled__` is a Nuitka
+    compile-time construct, not something a test can fake at the name-lookup level), so
+    `_data_root()` must fall back to `Path.cwd()` exactly as it did before this fix."""
+    monkeypatch.setattr("reclaim.logging_config._compiled_exe_dir", lambda: None)
+    assert _data_root() == Path.cwd()
+
+
+def test_data_root_uses_the_compiled_exe_directory_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix itself, exercised via the testable seam: when `_compiled_exe_dir()` reports a
+    directory (the real compiled-build case, monkeypatched here since a live Nuitka compile
+    can't run inside this test suite), `_data_root()` must anchor there instead of `Path.cwd()`
+    -- this is what makes the frozen build's `data/logs/` land next to the real exe regardless
+    of the launching process's working directory."""
+    fake_exe_dir = tmp_path / "Reclaim"
+    monkeypatch.setattr("reclaim.logging_config._compiled_exe_dir", lambda: fake_exe_dir)
+    assert _data_root() == fake_exe_dir
