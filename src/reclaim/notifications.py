@@ -217,6 +217,7 @@ def check_disk_space(
     threshold = config.disk_threshold_percent
 
     if not config.enabled:
+        logger.info("notifications.check_no_notify", reason="disabled")
         return DiskSpaceCheckResult(
             status="ok",
             percent_used=None,
@@ -246,6 +247,9 @@ def check_disk_space(
     crossed = evaluate_threshold(percent_used, threshold)
 
     if not crossed:
+        logger.info(
+            "notifications.check_no_notify", reason="below_threshold", percent_used=percent_used
+        )
         return DiskSpaceCheckResult(
             status="ok",
             percent_used=percent_used,
@@ -258,6 +262,7 @@ def check_disk_space(
 
     state = load_state(state_path)
     if is_snoozed(state, now=current):
+        logger.info("notifications.check_no_notify", reason="snoozed", percent_used=percent_used)
         return DiskSpaceCheckResult(
             status="ok",
             percent_used=percent_used,
@@ -268,6 +273,7 @@ def check_disk_space(
             reason="snoozed",
         )
     if not _should_renotify(state, now=current, renotify_after_hours=config.renotify_after_hours):
+        logger.info("notifications.check_no_notify", reason="debounced", percent_used=percent_used)
         return DiskSpaceCheckResult(
             status="ok",
             percent_used=percent_used,
