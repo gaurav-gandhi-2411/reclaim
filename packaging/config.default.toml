@@ -79,6 +79,11 @@ enabled = true
 # Unset (None) by default: regenerated automatically on next use, so apply permanently
 # deletes rather than vaulting. Uncomment to vault + allow restore instead.
 # retention_days = 30
+# P0 fix (2026-08 audit): a temp_roots direct child younger than this (by mtime) is never
+# proposed as a candidate at all -- protects an in-progress installer's temp files, an active
+# download, or a running application's scratch state from being swept while still in use.
+# Hard floor of 24 (hours) enforced in code; a lower value here is rejected at config-load time.
+# min_temp_root_age_hours = 168  # 7 days (default)
 
 [categories.crash_dumps]
 # .dmp files anywhere, plus direct children of CrashDumps/WER report directories.

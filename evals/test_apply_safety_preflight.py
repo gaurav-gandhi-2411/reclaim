@@ -10,18 +10,20 @@ from reclaim.config import (
     Config,
     DuplicatesConfig,
     SafetyConfig,
+    TempAndBrowserCachesConfig,
 )
 from reclaim.dedup import generate_duplicate_candidates
+from reclaim.detectors import generate_candidates
 from reclaim.executor import ItemApplyResult, apply_batch
 from reclaim.index import ScanIndex
-from reclaim.models import Candidate, FileRecord, Tier, Verdict
+from reclaim.models import Candidate, FileRecord, Mode, Tier, Verdict
 from reclaim.preflight import (
     check_file_in_use,
     check_hardlink_shared_active_install,
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import long_path
+from reclaim.scanner import long_path, scan_tree
 
 # Audit P0-1 (docs/AUDIT-2026-08.md): the safety-named home for both R6 pre-flight regression
 # guards ("no live process holds it", "not hardlink-backed into an active install") AND the
@@ -34,6 +36,7 @@ from reclaim.scanner import long_path
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="scanner/executor target Windows/NTFS only")
 
 _NOW = 1_700_000_000.0
+_DAY_SECONDS = 86400.0
 
 
 # --- Shared test helpers ------------------------------------------------------------------------
@@ -565,3 +568,143 @@ def test_apply_batch_dry_run_never_probes_preflight_checks(
     )
     assert report.files_succeeded == 1
     assert report.items[0].skip_reason is None
+
+
+# --- P0 fix (2026-08 audit, temp-sweep age-guard finding): temp_roots min-age guard -------------
+#
+# `%TEMP%`/`C:\Windows\Temp` direct children previously had NO age check anywhere -- a file
+# written seconds ago (an in-progress installer's temp extraction, an active download's partial
+# file, a running application's scratch state) was exactly as eligible for direct-delete as a
+# year-old leftover. `config.TempAndBrowserCachesConfig.min_temp_root_age_hours` (default 7 days)
+# closes this at DETECTION time in `detectors.detect_temp_and_browser_caches`: a candidate younger
+# than the threshold never even reaches `generate_candidates`'s output, so there is no scan-to-
+# apply race window for it to begin with. This is a SEPARATE, independent layer from
+# `preflight.check_file_in_use`'s apply-time lock probe (tested extensively above) -- the age
+# guard closes a real gap that probe cannot (a file momentarily unlocked between writes is
+# invisible to a lock check but still caught by an age floor).
+#
+# The three tests below run the real, full, end-to-end pipeline (real files, a real `scan_tree`,
+# real `generate_candidates`/`apply_batch` calls -- no fabricated index rows) for exactly the
+# three properties this fix's safety brief requires:
+#   (i)   a file written 1 minute ago is never proposed as a candidate at all (filtered before
+#         `generate_candidates` ever returns it -- apply is never even reached);
+#   (ii)  a file 8 days old with no open handle is swept normally (both layers agree: old enough,
+#         not locked);
+#   (iii) a file 8 days old WITH an open handle is skipped at APPLY time by
+#         `check_file_in_use` -- proving that check still independently protects even an old,
+#         age-guard-eligible file that happens to be back in active use. The two layers are
+#         genuinely independent, not one subsuming the other.
+
+
+def _temp_and_browser_candidates(index: ScanIndex, config: Config) -> list[Candidate]:
+    return [
+        c
+        for c in generate_candidates(index, config, SafetyValidator(config), now=_NOW)
+        if c.category_group == "temp_and_browser_caches"
+    ]
+
+
+def _temp_root_config(temp_root: Path) -> Config:
+    """POWER mode (not the default SAFE) so a `windows_temp` candidate stays Tier A / eligible
+    for a real direct-delete apply below -- SAFE mode would force it to Tier B regardless, which
+    would make (ii)/(iii)'s `apply_batch` calls test a different, less realistic code path."""
+    return Config(
+        mode=Mode.POWER,
+        categories=CategoriesConfig(
+            temp_and_browser_caches=TempAndBrowserCachesConfig(
+                cache_paths=[], temp_roots=[temp_root.as_posix()]
+            )
+        ),
+    )
+
+
+def test_fresh_temp_root_child_never_proposed_as_a_candidate(tmp_path: Path) -> None:
+    """(i): a file written 1 minute ago is never proposed as a candidate -- not even Tier B --
+    so it is never at risk from anything `apply_batch` does, because it never reaches apply."""
+    temp_root = tmp_path / "Temp"
+    temp_root.mkdir()
+    fresh_file = temp_root / "fresh.tmp"
+    fresh_file.write_bytes(b"in-progress-installer-scratch-data")
+    os.utime(fresh_file, (_NOW - 60.0, _NOW - 60.0))  # written 1 minute before `now`
+
+    config = _temp_root_config(temp_root)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidates = _temp_and_browser_candidates(index, config)
+
+    assert fresh_file not in {c.path for c in candidates}
+
+
+def test_old_temp_root_child_with_no_open_handle_is_swept_normally(tmp_path: Path) -> None:
+    """(ii): a file 8 days old (well past the 7-day default threshold) with no open handle is
+    proposed as a real Tier A candidate and a real `apply_batch` genuinely removes it."""
+    temp_root = tmp_path / "Temp"
+    temp_root.mkdir()
+    old_file = temp_root / "old.tmp"
+    old_file.write_bytes(b"stale-temp-leftover")
+    os.utime(old_file, (_NOW - 8 * _DAY_SECONDS, _NOW - 8 * _DAY_SECONDS))  # 8 days old
+
+    config = _temp_root_config(temp_root)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidates = _temp_and_browser_candidates(index, config)
+        assert old_file in {c.path for c in candidates}
+        candidate = next(c for c in candidates if c.path == old_file)
+        assert candidate.tier == Tier.A
+
+        report = apply_batch(
+            [candidate],
+            safety=SafetyValidator(config),
+            apply=True,
+            mode=Mode.POWER,
+            vault_dir=tmp_path / "vault",
+            manifest_path=tmp_path / "manifest.jsonl",
+            now=_NOW,
+            scan_index=index,
+        )
+
+    result = _result_for(report.items, old_file)
+    assert result.succeeded is True
+    assert result.skip_reason is None
+    assert not old_file.exists()
+
+
+def test_old_temp_root_child_with_open_handle_is_skipped_at_apply_time(tmp_path: Path) -> None:
+    """(iii): a file 8 days old (age-guard-eligible, would otherwise be swept per (ii) above) but
+    WITH a live open handle at apply time is still skipped -- `check_file_in_use` is a genuinely
+    independent second layer, not redundant with the age guard."""
+    temp_root = tmp_path / "Temp"
+    temp_root.mkdir()
+    old_locked_file = temp_root / "old_locked.tmp"
+    old_locked_file.write_bytes(b"stale-but-back-in-active-use")
+    os.utime(
+        old_locked_file, (_NOW - 8 * _DAY_SECONDS, _NOW - 8 * _DAY_SECONDS)
+    )  # 8 days old, age-guard-eligible
+
+    config = _temp_root_config(temp_root)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidates = _temp_and_browser_candidates(index, config)
+        assert old_locked_file in {c.path for c in candidates}
+        candidate = next(c for c in candidates if c.path == old_locked_file)
+
+        handle = open(old_locked_file, "r+b")  # noqa: SIM115, PTH123 -- held across the apply call
+        try:
+            report = apply_batch(
+                [candidate],
+                safety=SafetyValidator(config),
+                apply=True,
+                mode=Mode.POWER,
+                vault_dir=tmp_path / "vault",
+                manifest_path=tmp_path / "manifest.jsonl",
+                now=_NOW,
+                scan_index=index,
+            )
+        finally:
+            handle.close()
+
+    result = _result_for(report.items, old_locked_file)
+    assert result.succeeded is False
+    assert result.skip_reason == "file_in_use"
+    assert result.error is None  # never attempted -- not an OS error
+    assert old_locked_file.exists()  # untouched: still at its original location

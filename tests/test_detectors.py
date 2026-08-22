@@ -250,7 +250,11 @@ def test_temp_root_children_proposed_but_never_the_root_itself(index: ScanIndex)
         _record("C:/Users/gg/AppData/Local/Temp/scratch.tmp"),
     )
     result = detect_temp_and_browser_caches(
-        index, cache_paths=[], temp_roots=["C:/Users/gg/AppData/Local/Temp"]
+        index,
+        cache_paths=[],
+        temp_roots=["C:/Users/gg/AppData/Local/Temp"],
+        min_temp_root_age_hours=0.0,
+        now=_NOW,
     )
     paths = _paths(result)
     assert Path("C:/Users/gg/AppData/Local/Temp/scratch.tmp") in paths
@@ -270,6 +274,8 @@ def test_thumbnail_cache_is_categorized_distinctly_from_browser_cache(index: Sca
             "C:/Users/gg/AppData/Local/Google/Chrome/User Data/Default/Cache",
         ],
         temp_roots=[],
+        min_temp_root_age_hours=0.0,
+        now=_NOW,
     )
     categories = {c.path.name: c.category for c in result}
     assert categories["thumbcache_256.db"] == "thumbnail_cache"
