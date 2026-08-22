@@ -879,6 +879,14 @@ def _run_apply(args: argparse.Namespace) -> int:
                 direct_delete_entry_count_guard=config.safety.direct_delete_entry_count_guard,
                 on_progress=_cli_progress_printer("apply"),
                 scan_index=apply_scan_index,
+                # AE1: defense-in-depth — `selected` above is already filtered to `_under_root(
+                # c.path, root)`, so this never restricts anything further here; it exists so the
+                # apply choke point itself never trusts an already-filtered caller's list without
+                # re-checking, the same two-layer posture the direct-delete safety re-check above
+                # already uses. `Path.home()` is included too since `root` (the CLI's own
+                # explicit `--path`) may legitimately be a subdirectory of it, not the whole home
+                # tree itself.
+                allowed_roots=(Path.home(), root),
             )
     except (SafetyInvariantError, SafeModeViolationError) as exc:
         print(f"reclaim apply: {exc}", file=sys.stderr)  # noqa: T201
