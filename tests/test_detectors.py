@@ -319,7 +319,9 @@ def test_windows_temp_candidates_proposed_when_temp_env_var_was_short_form(
         _record((long_temp_dir / "scratch.tmp").as_posix()),
     )
 
-    result = detect_temp_and_browser_caches(index, cache_paths=[], temp_roots=temp_roots)
+    result = detect_temp_and_browser_caches(
+        index, cache_paths=[], temp_roots=temp_roots, min_temp_root_age_hours=0.0, now=_NOW
+    )
 
     assert (long_temp_dir / "scratch.tmp") in _paths(result)
 
