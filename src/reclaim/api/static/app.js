@@ -916,9 +916,14 @@ function renderSimpleIdle() {
   const container = simpleViewEl();
   container.innerHTML = "";
 
+  // P0 fix (2026-08-22 real-disk finding): "Clean My Computer" scans only the invoking user's
+  // own files (POST /api/scan/my-files) by default -- never a whole-drive traversal. A real
+  // smoke-test scan found a full-drive default reached other local accounts' profile
+  // directories on a real multi-project dev machine, deletable only because of broad ACLs at
+  // the volume root -- see service.user_scan_roots's docstring for the full incident.
   const intro = document.createElement("p");
   intro.className = "rc-simple-intro";
-  intro.textContent = "Scans your whole computer and finds safe things to clean up.";
+  intro.textContent = "Scans your files and finds safe things to clean up.";
   container.appendChild(intro);
 
   const scanBtn = document.createElement("button");
@@ -927,6 +932,16 @@ function renderSimpleIdle() {
   scanBtn.textContent = "Clean My Computer";
   scanBtn.addEventListener("click", startSimpleScan);
   container.appendChild(scanBtn);
+
+  // Whole-drive scan stays available, but only as a deliberate, separately-surfaced opt-in --
+  // never the one-click default. openFullDriveConfirmDialog warns explicitly that this can
+  // reach other users' files before anything starts.
+  const advancedBtn = document.createElement("button");
+  advancedBtn.type = "button";
+  advancedBtn.className = "rc-btn rc-btn-secondary rc-simple-advanced-btn";
+  advancedBtn.textContent = "Scan the whole drive (advanced)";
+  advancedBtn.addEventListener("click", openFullDriveConfirmDialog);
+  container.appendChild(advancedBtn);
 
   if (simpleLastCleanedNote) {
     const note = document.createElement("p");
@@ -938,6 +953,39 @@ function renderSimpleIdle() {
 
 async function startSimpleScan() {
   const container = simpleViewEl();
+  try {
+    await api("/api/scan/my-files", { method: "POST" });
+  } catch (err) {
+    renderState(container, "error", {
+      title: "Could not start the scan",
+      message: err.message,
+      actionLabel: "Try again",
+      onAction: renderSimpleIdle,
+    });
+    return;
+  }
+  pollSimpleScan();
+}
+
+// --- Whole-drive scan opt-in (P0 fix, 2026-08-22) -----------------------------------------------
+//
+// "Scan the whole drive" is deliberately gated behind its own confirmation dialog, mirroring
+// openScanConfirmDialog's "pause before a real, unbounded-looking operation starts" pattern --
+// the dialog names the actual risk (other users' files may be reachable) rather than a generic
+// "are you sure?".
+
+function openFullDriveConfirmDialog() {
+  document.getElementById("full-drive-confirm-dialog").hidden = false;
+}
+
+function closeFullDriveConfirmDialog() {
+  document.getElementById("full-drive-confirm-dialog").hidden = true;
+}
+
+async function startFullDriveScanConfirmed() {
+  closeFullDriveConfirmDialog();
+  const container = simpleViewEl();
+  container.innerHTML = "";
   try {
     await api("/api/scan/full-drive", { method: "POST" });
   } catch (err) {
@@ -1165,16 +1213,22 @@ function renderSimpleCleanError(err) {
 
 function initSimpleMode() {
   renderSimpleIdle();
+  document
+    .getElementById("full-drive-confirm-cancel")
+    .addEventListener("click", closeFullDriveConfirmDialog);
+  document
+    .getElementById("full-drive-confirm-go")
+    .addEventListener("click", startFullDriveScanConfirmed);
 }
 
 // --- Shared dialog behavior: focus trap + Escape-to-close ---------------------------------------
 //
 // Every `.rc-overlay[role="dialog"]` (first-run-overlay, scan-confirm-dialog, quick-clean-dialog,
-// how-it-works-dialog, power-mode-dialog) is opened/closed by its own function setting `.hidden`
-// directly rather than through a shared helper -- aria-modal="true" alone gets none of Tab-trapping,
-// initial-focus-move, or Esc-to-close for free from the browser, so this one global listener covers
-// all five by watching for whichever dialog is currently open, instead of threading the same fix
-// through every open()/close() pair above.
+// how-it-works-dialog, power-mode-dialog, full-drive-confirm-dialog) is opened/closed by its own
+// function setting `.hidden` directly rather than through a shared helper -- aria-modal="true"
+// alone gets none of Tab-trapping, initial-focus-move, or Esc-to-close for free from the browser,
+// so this one global listener covers all six by watching for whichever dialog is currently open,
+// instead of threading the same fix through every open()/close() pair above.
 function openDialogEl() {
   return document.querySelector('.rc-overlay[role="dialog"]:not([hidden])');
 }
@@ -1195,6 +1249,7 @@ const DIALOG_ESCAPE_CLOSE_BUTTON_IDS = {
   "quick-clean-dialog": "quick-clean-cancel",
   "how-it-works-dialog": "how-it-works-close",
   "power-mode-dialog": "power-mode-cancel",
+  "full-drive-confirm-dialog": "full-drive-confirm-cancel",
 };
 
 function initDialogKeyboardBehavior() {
@@ -1597,6 +1652,9 @@ export {
   buildQuickCleanGroupCard,
   openScanConfirmDialog,
   closeScanConfirmDialog,
+  openFullDriveConfirmDialog,
+  closeFullDriveConfirmDialog,
+  renderSimpleIdle,
 };
 
 function updateApplyBar() {

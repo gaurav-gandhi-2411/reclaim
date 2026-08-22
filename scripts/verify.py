@@ -83,6 +83,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # variable (not just no "ANTHROPIC_API_KEY" substring -- see that file's own module docstring).
 # Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar as the
 # files above.
+#
+# test_scan_scope_gate.py added 2026-08-22 (P0 finding, real smoke-test scan by a non-admin
+# local account on a real multi-project dev machine): proves `POST /api/scan/my-files` (SIMPLE
+# mode's default "Clean My Computer" action) scans ONLY the invoking user's own profile, never a
+# whole-drive/volume-root traversal, plus a structural gate on app.js's own source proving the
+# primary button is wired to that endpoint and never directly to `/api/scan/full-drive`. No [ai]
+# extra, no network -- same "no excuse to skip" reasoning as every other file in this tuple.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -97,6 +104,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_cache_reclaimable_bytes_gate.py",
     "evals/test_apply_identity_reverify.py",
     "evals/test_r2_llm_env_var_gate.py",
+    "evals/test_scan_scope_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (

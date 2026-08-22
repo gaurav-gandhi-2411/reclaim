@@ -20,6 +20,7 @@ const {
   renderSimpleGroups,
   renderSimpleEmpty,
   buildQuickCleanGroupCard,
+  renderSimpleIdle,
 } = await import("../../src/reclaim/api/static/app.js");
 
 function container() {
@@ -146,6 +147,48 @@ test("renderSimpleEmpty shows a friendly empty state with a way back to idle", (
   assert.ok(panel, "must reuse the existing .rc-state-panel empty pattern");
   const btn = panel.querySelector("button");
   assert.ok(btn, "must offer a way back to the idle screen");
+});
+
+// --- renderSimpleIdle: P0 fix (2026-08-22 real-disk finding) -------------------------------
+//
+// "Clean My Computer" must default to a user-scoped scan (POST /api/scan/my-files) -- a real
+// smoke-test scan found the previous "whole computer"/full-drive default reached other local
+// accounts' profile directories on a real multi-project dev machine. These assertions pin the
+// user-facing copy so a future edit can't silently reintroduce "whole computer" language for the
+// default action, and prove the whole-drive opt-in is present but visually/textually distinct.
+
+test("renderSimpleIdle: intro copy no longer claims to scan the whole computer by default", () => {
+  renderSimpleIdle();
+  const el = container();
+  assert.ok(el.textContent.includes("Scans your files"));
+  assert.equal(
+    el.textContent.includes("Scans your whole computer"),
+    false,
+    "the default action's copy must not claim whole-computer scope"
+  );
+});
+
+test("renderSimpleIdle: exactly one primary 'Clean My Computer' button", () => {
+  renderSimpleIdle();
+  const el = container();
+  const primaryButtons = [...el.querySelectorAll("button")].filter(
+    (b) => b.textContent === "Clean My Computer"
+  );
+  assert.equal(primaryButtons.length, 1);
+});
+
+test("renderSimpleIdle: whole-drive scan is offered only as a distinct, secondary, explicitly-labeled action", () => {
+  renderSimpleIdle();
+  const el = container();
+  const advancedBtn = el.querySelector(".rc-simple-advanced-btn");
+  assert.ok(advancedBtn, "a secondary whole-drive-scan control must be present");
+  assert.ok(advancedBtn.textContent.toLowerCase().includes("whole drive"));
+  assert.ok(advancedBtn.textContent.toLowerCase().includes("advanced"));
+  assert.notEqual(
+    advancedBtn.className,
+    el.querySelector(".rc-simple-primary-btn").className,
+    "the whole-drive opt-in must not share the primary action's visual weight"
+  );
 });
 
 test("renderSimpleGroups renders exactly one 'Clean now' button and every group's plain_label", () => {

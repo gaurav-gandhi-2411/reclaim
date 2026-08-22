@@ -307,7 +307,113 @@ def test_scan_cancel_endpoint_stops_a_running_scan_with_a_consistent_partial_ind
     assert len(inventory) == status["entries_total"]
 
 
+# --- P0 fix (2026-08-22 real-disk finding): "Clean My Computer" scans only the invoking user's
+# own profile by default, never a whole-drive volume-root traversal -- see
+# `reclaim.api.service.user_scan_roots`'s docstring for the full incident this responds to. -----
+
+
+def test_my_files_scan_defaults_to_the_invoking_users_own_profile_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`POST /api/scan/my-files` (SIMPLE mode's DEFAULT action) must scan `service.
+    user_scan_roots()`'s result -- never `list_fixed_drives()` -- and must never touch it at
+    all. Real teeth-proof for the P0 finding: a fixture tree simulating a multi-account machine
+    (this user's own profile, sitting NEXT TO another account's profile with real dev-artifact
+    content) proves the scan/candidate universe never crosses into the sibling directory."""
+    from reclaim.api import service
+    from reclaim.detectors import generate_candidates
+
+    users_root = tmp_path / "Users"
+    own_profile = users_root / "ReclaimSmokeTest"
+    other_profile = users_root / "OtherRealUser"
+
+    # This user's own dev artifact -- legitimately theirs, fine to appear as a candidate.
+    own_node_modules = own_profile / "projects" / "myapp" / "node_modules" / "leftpad"
+    own_node_modules.mkdir(parents=True)
+    (own_profile / "projects" / "myapp" / "package.json").write_text("{}", encoding="utf-8")
+    (own_node_modules / "index.js").write_text("x" * 4096, encoding="utf-8")
+
+    # Another real local account's own dev artifact -- reachable on disk (broad volume-root
+    # ACLs, same shape as the real smoke-test finding) but NOT this user's to propose deleting.
+    other_node_modules = other_profile / "ml-projects" / "otherapp" / "node_modules" / "lodash"
+    other_node_modules.mkdir(parents=True)
+    (other_profile / "ml-projects" / "otherapp" / "package.json").write_text("{}", encoding="utf-8")
+    (other_node_modules / "index.js").write_text("x" * 4096, encoding="utf-8")
+
+    fake_list_fixed_drives_called = False
+
+    def fail_if_called() -> list[Path]:
+        nonlocal fake_list_fixed_drives_called
+        fake_list_fixed_drives_called = True
+        raise AssertionError("list_fixed_drives must never be reached by POST /api/scan/my-files")
+
+    monkeypatch.setattr(service, "list_fixed_drives", fail_if_called)
+    monkeypatch.setattr(service, "user_scan_roots", lambda: [own_profile])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "windows"))
+    response = client.post("/api/scan/my-files")
+    assert response.status_code == 202, response.text
+    assert not fake_list_fixed_drives_called
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "completed", status
+    assert status["root"] == own_profile.as_posix()
+    assert status["drives_total"] == 1
+
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    with ScanIndex(state.db_path) as index:
+        candidates = generate_candidates(index, state.effective_config, state.safety)
+
+    assert len(candidates) >= 1, "the own-profile dev-artifact fixture must produce a candidate"
+    for candidate in candidates:
+        assert other_profile.as_posix() not in candidate.path.as_posix(), (
+            f"candidate {candidate.path} reaches outside the scanned user's own profile -- "
+            "exactly the P0 finding this test guards against"
+        )
+        assert candidate.path.as_posix().startswith(own_profile.as_posix()), (
+            f"candidate {candidate.path} is outside the scanned root {own_profile}"
+        )
+
+
+def test_my_files_scan_reports_500_when_user_profile_directory_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    missing_home = tmp_path / "does-not-exist"
+    monkeypatch.setattr(service, "user_scan_roots", lambda: [missing_home])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "windows"))
+    response = client.post("/api/scan/my-files")
+    assert response.status_code == 500
+    assert "not found" in response.json()["detail"] or "inaccessible" in response.json()["detail"]
+
+
+def test_my_files_scan_already_running_returns_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+    from reclaim.api.state import ScanStatus
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(service, "user_scan_roots", lambda: [home])
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "windows"))
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        app_state.scan_status = ScanStatus(status="running", root=tmp_path, started_at=time.time())
+
+    response = client.post("/api/scan/my-files")
+    assert response.status_code == 409
+    assert "already running" in response.json()["detail"]
+
+
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
+# NOTE (P0 fix, 2026-08-22): `POST /api/scan/full-drive` is no longer SIMPLE mode's DEFAULT
+# action -- `POST /api/scan/my-files` (tests above) is. This endpoint remains as a deliberate,
+# separately-surfaced opt-in (see app.js's openFullDriveConfirmDialog); the orchestration tests
+# below still apply unchanged to it.
 
 
 def test_scan_fixed_drives_endpoint_returns_a_real_drive_list(tmp_path: Path) -> None:

@@ -3121,3 +3121,67 @@ option 3 ("gate M1 behind a size/entry-count threshold") — combined with a syn
 the resulting vault-then-purge detour never costs real disk-free-delta accuracy, and with the
 P3 hardlink-check narrowing since it was independently verified safe along the way. No further
 open decision points from the prior checkpoint remain outstanding.
+
+### 2026-08-22 — P0 fix: default scan scope is the invoking user's own profile, never a
+### volume-root traversal (real smoke-test finding, DRAFT PR)
+
+A real smoke-test scan by a non-admin local account (`ReclaimSmokeTest`) on a real
+multi-project dev machine classified 13,927 of 13,991 `dev_artifacts` candidates as belonging
+to OTHER users' profile directories — reachable and deletable only because of broad ACLs at
+the volume root, not because the scanning user had any legitimate claim on that content. Only
+agent-level discipline (not the product itself) prevented an actual deletion during the smoke
+test.
+
+**Diagnosis (all three "first" questions, verified against the actual code, not assumed):**
+
+1. SIMPLE mode's single primary action, "Clean My Computer," called `POST /api/scan/full-drive`
+   (`reclaim.drives.list_fixed_drives` → every `DRIVE_FIXED` volume, scanned from its literal
+   root) with zero confirmation and zero narrower default — confirmed by reading `app.js`,
+   `routes.py`, `service.py`, `drives.py` directly.
+2. Zero ownership/ACL checks exist anywhere — `grep`-ing `safety.py`/`detectors.py` for any
+   SID/owner check returns nothing; `DEFAULT_PROTECTED_ROOTS` protects Windows/Program
+   Files/ProgramData, never `C:/Users/*`.
+3. Not a narrowly-multi-user-only bug — the code path is gated purely on `GetDriveTypeW`/ACLs,
+   not on how many real accounts exist. An admin account's own click reaches the identical path
+   and would surface other accounts' profiles the same way if ACLs permit it; blast radius is
+   smaller on a genuinely single-user machine only because there's nothing else on the volume to
+   reach.
+
+**Fix:** `reclaim.api.service.user_scan_roots()` (new, returns `[Path.home()]`) +
+`POST /api/scan/my-files` (new endpoint) is now SIMPLE mode's DEFAULT "Clean My Computer"
+action. `POST /api/scan/full-drive` remains available, but only as an explicit, separately-
+surfaced opt-in — the SIMPLE-mode UI gates it behind a new `full-drive-confirm-dialog` naming
+the actual risk before the whole-drive call can ever fire. ADVANCED mode's manual scan-path
+entry needed no change — it was already an explicit typed-path action with its own confirmation
+dialog. Full reasoning, alternatives considered (owner-SID filtering, warn-every-time, no-safe-
+default) in `docs/architecture/adr/0033-scan-default-scope-user-profile-not-volume-root.md`.
+
+**Teeth-proof** (`evals/test_scan_scope_gate.py`, registered in `scripts/verify.py`'s
+`_SAFETY_GATE_FILES` and `.github/workflows/eval.yml`'s safety-gate job): a fixture tree
+simulating two sibling local-account profiles (`Users/ReclaimSmokeTest` next to
+`Users/OtherRealUser`, each with a real manifest-adjacent `node_modules`), scanned via the exact
+primitive `POST /api/scan/my-files` uses — confirms zero candidates AND zero indexed rows ever
+reach the sibling account's directory (the walk never visits it, not merely filtered after the
+fact). Plus a structural gate reading `app.js`'s real source, proving the primary button stays
+wired to `startSimpleScan`/`/api/scan/my-files` and never directly to `/api/scan/full-drive` —
+defense-in-depth since `scripts/verify.py`'s pytest step never runs the JS suite
+(`tests/frontend/*.test.mjs`). Also added: 3 backend API tests (`tests/test_api.py`,
+`/api/scan/my-files` orchestration + 500/409 cases), 5 frontend JSDOM tests (`renderSimpleIdle`
+copy/button assertions in `simple-mode.test.mjs` + new `full-drive-confirm.test.mjs` dialog
+open/close) — `tests/frontend`'s `npm test`: **30 passed, 0 failed** (not part of
+`scripts/verify.py`; run directly via `cd tests/frontend && npm test`, jsdom devDependency
+installed fresh this session — already declared in `package.json`, not a new dependency).
+
+**Verification**: `uv run python scripts/verify.py` — ruff/ruff format/mypy all clean; **1059
+passed, 28 skipped, 1 deselected**, 88.51% total coverage; all 5 safety-critical module floors
+met (mode.py 98.15%/90%, purge.py 90.65%/85%, safety.py 100%/92%, executor.py 92.74%/90%,
+config.py 99.50%/90%).
+
+**Status**: DRAFT, not merged — safety-critical, default-scope change per this task's own
+standing instruction. Pre-existing, out-of-scope observation surfaced but NOT fixed this
+session: `.github/workflows/eval.yml`'s safety-gate job's own comments already document that
+`test_apply_identity_reverify.py` and `test_r2_llm_env_var_gate.py` are wired into
+`scripts/verify.py`'s local list but were never added to this CI job's own command line — the
+identical "wired locally, missing from CI" gap this job's comments warn about recurring, for
+two files unrelated to this session's change. Flagged for a future session; `test_scan_scope_gate.py`
+(this session's own new file) WAS added to both lists, so it does not repeat the gap.
