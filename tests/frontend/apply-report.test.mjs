@@ -82,3 +82,24 @@ test("renderApplyReport: direct_delete dry-run says 'would be permanently freed'
   const text = container().textContent;
   assert.ok(text.includes("would be permanently freed."), `got: ${text}`);
 });
+
+// P0 residual-gap close (Z5): before this, ANY method value the code didn't explicitly
+// recognize -- not just the real direct_delete -- fell through to the same "permanently freed"
+// wording, an unverified claim for a method the frontend has never seen before. These two tests
+// prove a genuinely unrecognized method value is now handled safely: never "freed" (an
+// affirmative claim about an outcome nothing here actually confirmed), and the method name
+// itself surfaces in the message so a real occurrence is diagnosable, not silently mislabeled.
+
+test("renderApplyReport: an unrecognized method never says 'freed' -- apply", () => {
+  renderApplyReport(container(), baseReport({ method: "future_unknown_method", apply: true }));
+  const text = container().textContent;
+  assert.equal(text.includes("freed"), false, "unrecognized method must never claim bytes were freed");
+  assert.ok(text.includes('unrecognized method "future_unknown_method"'), `got: ${text}`);
+});
+
+test("renderApplyReport: an unrecognized method never says 'freed' -- dry-run", () => {
+  renderApplyReport(container(), baseReport({ method: "future_unknown_method", apply: false }));
+  const text = container().textContent;
+  assert.equal(text.includes("freed"), false, "unrecognized method must never claim bytes were freed");
+  assert.ok(text.includes('unrecognized method "future_unknown_method"'), `got: ${text}`);
+});
