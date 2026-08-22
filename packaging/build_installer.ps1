@@ -242,7 +242,14 @@ Write-Output "    Patching bundled Nuitka: -O3 -> -O2 for the gcc backend compil
 # recreated from scratch each time. Fails loudly if Nuitka's internals no longer match the
 # expected text, rather than silently building at -O3 again on a future Nuitka version bump.
 $sconsSettingsPath = "$BuildVenvPath\Lib\site-packages\nuitka\build\SconsCompilerSettings.py"
-$patchResult = & "$BuildVenvPath\Scripts\python.exe" -c @'
+# Written to a scratch .py file and invoked by path -- same fix, same reason, as the dev-toolchain
+# check above: this block's heavy use of embedded `\"` inside triple-nested Python strings made it
+# an even more likely victim of the same -File here-string quote-stripping bug under PowerShell
+# 5.1 (confirmed: this exact block hit a "'(' was never closed" SyntaxError on the first retry
+# after fixing only the dev-toolchain check above -- the class wasn't fully fixed until this
+# sibling was found too).
+$nuitkaPatchScript = "$PSScriptRoot\build\nuitka_o2_patch.py"
+Set-Content -Path $nuitkaPatchScript -Value @'
 import os
 import sys
 path = sys.argv[1]
@@ -291,7 +298,9 @@ with open(tmp_path, "w", encoding="utf-8") as f:
     f.write(patched)
 os.replace(tmp_path, path)
 print("PATCHED")
-'@ $sconsSettingsPath
+'@
+$patchResult = & "$BuildVenvPath\Scripts\python.exe" $nuitkaPatchScript $sconsSettingsPath
+Remove-Item -Path $nuitkaPatchScript -Force
 if ($LASTEXITCODE -ne 0) {
     throw ("Nuitka's SconsCompilerSettings.py no longer matches the expected -O3 block " +
         "($patchResult) -- Nuitka was likely upgraded and changed its internals. Re-derive the " +
