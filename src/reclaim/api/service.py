@@ -27,6 +27,7 @@ from reclaim.api.schemas import (
     ApplyStatusOut,
     CandidateOut,
     CandidatesResponse,
+    CandidatesWarmStatusOut,
     CategoryBreakdownOut,
     CategoryCardOut,
     CategoryExplanationResponse,
@@ -66,7 +67,14 @@ from reclaim.api.schemas import (
     format_bytes,
     plain_language_category,
 )
-from reclaim.api.state import AIAnalysisStatus, ApplyStatus, AppState, RestoreStatus, ScanStatus
+from reclaim.api.state import (
+    AIAnalysisStatus,
+    ApplyStatus,
+    AppState,
+    CandidatesWarmStatus,
+    RestoreStatus,
+    ScanStatus,
+)
 from reclaim.config import CategoriesConfig, set_category_enabled
 from reclaim.dedup import (
     cluster_needs_manual_review,
@@ -199,6 +207,73 @@ def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]
         state.candidates_cache = candidates
         state.candidates_cache_generation = generation
         return candidates
+
+
+def is_candidates_cache_warm(state: AppState) -> bool:
+    """AE3: true iff `_cached_all_candidates` would return WITHOUT recomputing anything right
+    now — the same freshness check that function makes internally, exposed so a route handler
+    can decide whether to call it directly (fast) or kick off a background warm-up first
+    (`run_candidates_warm` below) instead of blocking the request thread."""
+    with state.candidates_cache_lock:
+        return (
+            state.candidates_cache is not None
+            and state.candidates_cache_generation == state.scan_generation
+        )
+
+
+def run_candidates_warm(state: AppState) -> None:
+    """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
+    real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
+    thread, via Starlette's worker-thread pool (same dispatch `run_scan`/`run_apply` already use
+    for their own background bodies). `state.lock` guards `candidates_warm_status` reads/writes
+    against a concurrent `GET /api/candidates/warm-status` poll, same convention every other
+    status dataclass in this module already follows.
+
+    Deliberately does NOT itself decide whether a warm-up is needed or already running — the
+    route handler (`POST /api/candidates/warm`) owns that single-flight check-and-set, under
+    `state.lock`, BEFORE scheduling this as a background task (same reasoning `POST /api/scan`'s
+    own route handler documents for why `cancel_scan_event` is cleared there and not here: a
+    client polling immediately after the response could otherwise race this function's own
+    "mark as computing" step).
+    """
+    try:
+        with ScanIndex(state.db_path) as index:
+            _cached_all_candidates(index, state)
+    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+        # the status endpoint, never crash silently into Starlette's background-task machinery —
+        # same posture `run_apply`/`run_scan` already use for their own background bodies.
+        logger.warning("api.candidates_warm_failed", error=str(exc))
+        with state.lock:
+            state.candidates_warm_status = CandidatesWarmStatus(
+                status="failed",
+                scan_generation=state.scan_generation,
+                started_at=state.candidates_warm_status.started_at,
+                finished_at=time.time(),
+                error=str(exc),
+            )
+        return
+
+    with state.lock:
+        state.candidates_warm_status = CandidatesWarmStatus(
+            status="ready",
+            scan_generation=state.scan_generation,
+            started_at=state.candidates_warm_status.started_at,
+            finished_at=time.time(),
+        )
+
+
+def to_candidates_warm_status_out(status: CandidatesWarmStatus) -> CandidatesWarmStatusOut:
+    elapsed_seconds = None
+    if status.started_at is not None:
+        end = status.finished_at if status.finished_at is not None else time.time()
+        elapsed_seconds = end - status.started_at
+    return CandidatesWarmStatusOut(
+        status=status.status,
+        started_at=status.started_at,
+        finished_at=status.finished_at,
+        elapsed_seconds=elapsed_seconds,
+        error=status.error,
+    )
 
 
 # --- Scan --------------------------------------------------------------------------------
