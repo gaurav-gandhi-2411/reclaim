@@ -4,9 +4,16 @@ import json
 import time
 from pathlib import Path
 
+from reclaim.app_paths import data_root
+
 # Marker file, not a log — "acknowledged" is a one-way, one-time transition (spec: "First-run
 # screen (shown once)"), so there is no history to fold, unlike mode_log.jsonl/manifest.jsonl.
-DEFAULT_FIRST_RUN_STATE_PATH = Path("data/first_run_state.json")
+#
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+DEFAULT_FIRST_RUN_STATE_PATH = data_root() / "data" / "first_run_state.json"
 
 
 def is_acknowledged(path: Path | None = None) -> bool:

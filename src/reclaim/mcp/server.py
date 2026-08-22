@@ -9,6 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from reclaim.api import service
 from reclaim.api.state import AppState, ScanStatus
+from reclaim.app_paths import data_root
 from reclaim.config import Config
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH
@@ -35,7 +36,11 @@ from reclaim.safety import SafetyValidator
 # module docstring); every real read or mutation goes through `reclaim.api.service`'s
 # choke-point functions, the same layer `reclaim.api.routes` (the HTTP surface) already uses.
 
-_DEFAULT_VAULT_DIR = Path("data/quarantine")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+_DEFAULT_VAULT_DIR = data_root() / "data" / "quarantine"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_VAULT_DIR / "manifest.jsonl"
 
 # `PreviewApplyResult.sample_paths`/an agent's own sanity-check need a preview, not a full
