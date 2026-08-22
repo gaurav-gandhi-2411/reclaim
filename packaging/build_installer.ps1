@@ -452,7 +452,14 @@ $nuitkaArgs = @(
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "$BuildVenvPath\Scripts\python.exe"
-foreach ($a in $nuitkaArgs) { $psi.ArgumentList.Add($a) }
+# ArgumentList (a real Collection<string>, no manual quoting needed) doesn't exist on this
+# machine's .NET Framework/CLR (4.0.30319.42000 under Windows PowerShell 5.1) -- confirmed by
+# direct reproduction: `$psi.ArgumentList` silently evaluates to $null (reflection finds no such
+# property at all) rather than throwing, so the foreach .Add() call this replaced failed with
+# "cannot call a method on a null-valued expression" on the very next rebuild attempt. Falling
+# back to the single pre-escaped `.Arguments` string form instead, with each arg quoted only when
+# it contains whitespace (none of $nuitkaArgs contain embedded quotes to worry about escaping).
+$psi.Arguments = ($nuitkaArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
 $psi.WorkingDirectory = $RepoRoot
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
