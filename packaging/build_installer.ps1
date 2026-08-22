@@ -196,7 +196,14 @@ uv pip install --python "$BuildVenvPath\Scripts\python.exe" nuitka
 if ($LASTEXITCODE -ne 0) { throw "nuitka install into the build venv failed (exit $LASTEXITCODE)" }
 
 Write-Output "    Asserting the dev toolchain is genuinely absent..."
-$devCheckOutput = & "$BuildVenvPath\Scripts\python.exe" -c @'
+# Written to a scratch .py file and invoked by path, not passed inline via `-c @'...'@`: passing
+# a quote-containing here-string as a native-process argument was found to silently strip every
+# embedded `"` under Windows PowerShell 5.1 (this script's own header says `pwsh`, but only 5.1 is
+# actually installed here) -- the child process then hit a SyntaxError before ever checking for
+# mypy/pytest/ruff, and this block's own error handling misread that crash as "contaminated" with
+# an empty package list. A real file argument has no such native-argv quoting to go through.
+$devCheckScript = "$PSScriptRoot\build\dev_toolchain_check.py"
+Set-Content -Path $devCheckScript -Value @'
 import sys
 contaminated = []
 for mod in ("mypy", "pytest", "ruff"):
@@ -210,6 +217,8 @@ if contaminated:
     sys.exit(1)
 print("CLEAN")
 '@
+$devCheckOutput = & "$BuildVenvPath\Scripts\python.exe" $devCheckScript
+Remove-Item -Path $devCheckScript -Force
 if ($LASTEXITCODE -ne 0) {
     throw ("Build venv is contaminated with dev-toolchain package(s): $devCheckOutput -- this is " +
         "exactly the bug that caused the 2026-07-30 out-of-memory failure (Nuitka tried to " +
