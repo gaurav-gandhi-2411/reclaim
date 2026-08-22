@@ -1243,6 +1243,13 @@ html[data-mode="simple"] #simple-view {
   padding: var(--rc-space-4) var(--rc-space-7);
 }
 
+/* P0 fix (2026-08-22): the whole-drive-scan opt-in sits visually secondary to the default
+   "Clean My Computer" action -- smaller, muted, never competing for the same primary attention. */
+.rc-simple-advanced-btn {
+  display: block;
+  margin: var(--rc-space-4) auto 0;
+}
+
 .rc-simple-summary-line {
   margin: 0 0 var(--rc-space-4);
 }
