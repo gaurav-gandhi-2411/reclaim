@@ -15,6 +15,7 @@ from reclaim.api import service
 from reclaim.api.routes import router
 from reclaim.api.security import LocalOriginPolicy, generate_csrf_token, local_origin_violation
 from reclaim.api.state import AppState
+from reclaim.app_paths import data_root
 from reclaim.config import Config
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
@@ -25,7 +26,11 @@ _PACKAGE_DIR = Path(__file__).parent
 _STATIC_DIR = _PACKAGE_DIR / "static"
 _TEMPLATES_DIR = _PACKAGE_DIR / "templates"
 
-_DEFAULT_VAULT_DIR = Path("data/quarantine")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+_DEFAULT_VAULT_DIR = data_root() / "data" / "quarantine"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_VAULT_DIR / "manifest.jsonl"
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420

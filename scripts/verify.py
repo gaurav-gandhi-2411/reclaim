@@ -97,6 +97,12 @@ _JUNIT_PATH = "pytest-results.xml"
 # `_resolve_long_path(...)` before returning (gate #2: the chokepoint hasn't been silently
 # weakened). Zero deps beyond stdlib `ast`, no [ai] extra needed -- same "no excuse to skip" bar
 # as every file above.
+#
+# test_data_path_cwd_independence_gate.py added alongside the protocol-handler log-path P0 fix
+# (PR #51) and its ten-module generalization (AB1): AST-based proof that no module under
+# src/reclaim/ builds a bare CWD-relative `Path("data/...")` literal -- every default must route
+# through `reclaim.app_paths.data_root()` instead. Zero deps beyond stdlib `ast`, no [ai] extra
+# needed -- same "no excuse to skip" bar as every file above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -113,6 +119,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_r2_llm_env_var_gate.py",
     "evals/test_scan_scope_gate.py",
     "evals/test_config_env_var_normalization_gate.py",
+    "evals/test_data_path_cwd_independence_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (

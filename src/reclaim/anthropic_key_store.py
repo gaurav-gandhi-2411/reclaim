@@ -3,6 +3,8 @@ from __future__ import annotations
 import ctypes
 from pathlib import Path
 
+from reclaim.app_paths import data_root
+
 # R2 (per-category LLM explainer): the ONLY place in this codebase that ever persists the
 # user's Anthropic API key. Uses Windows DPAPI (`CryptProtectData`/`CryptUnprotectData`,
 # current-user scope) via `ctypes` -- the exact same "touch a Windows-native API directly, no
@@ -21,7 +23,11 @@ from pathlib import Path
 # is "never log from this module, ever," the same zero-logging posture `document_text.py`/
 # `screenshot_ocr.py` already use for OCR'd/document text (see those modules' docstrings).
 
-DEFAULT_KEY_PATH = Path("data/anthropic_key.bin")
+# CWD-independent (see reclaim.app_paths.data_root's docstring, and PR #51 for the original
+# confirmed-live crash this class of bug caused elsewhere) -- not yet reachable from any
+# working-directory-less invocation today, but "not reachable today" is a property of today's
+# call sites, not of the code.
+DEFAULT_KEY_PATH = data_root() / "data" / "anthropic_key.bin"
 
 # CRYPTPROTECT_UI_FORBIDDEN: never show a Windows UI prompt, even on failure -- this call must
 # always be non-interactive (it can run from a background thread / a headless CI-adjacent dev
