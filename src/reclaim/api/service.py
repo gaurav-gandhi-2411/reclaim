@@ -209,16 +209,45 @@ def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]
         return candidates
 
 
+class CandidatesNotWarmError(RuntimeError):
+    """Raised by `resolve_apply_selection`'s blanket-apply branch (fix/apply-warm-check) when the
+    candidates cache is cold — a caller must warm it first via `POST /api/candidates/warm` +
+    `GET /api/candidates/warm-status` (same as `GET /api/summary`'s own `ensureCandidatesWarm`
+    frontend flow) rather than have this function block synchronously.
+
+    Before this: `resolve_apply_selection` is called synchronously from `POST /api/apply`'s route
+    handler BEFORE `state.apply_status` is ever set to "running" (see routes.py's `apply`) -- so a
+    blanket apply racing an in-flight `run_candidates_warm` job blocked on `candidates_cache_lock`
+    for that job's ENTIRE remaining duration (confirmed live: 13+ minutes on a first-time
+    ~1M-entry index), with `GET /api/apply/status` reporting "idle" the whole time since the
+    status write it's waiting to observe never happens until this call returns. AE3 fixed exactly
+    this failure shape for `GET /api/summary` (`ensureCandidatesWarm`) but never extended it to
+    this call site -- the same class of bug AE3 exists to prevent, just at a different choke
+    point."""
+
+
 def is_candidates_cache_warm(state: AppState) -> bool:
     """AE3: true iff `_cached_all_candidates` would return WITHOUT recomputing anything right
     now — the same freshness check that function makes internally, exposed so a route handler
     can decide whether to call it directly (fast) or kick off a background warm-up first
-    (`run_candidates_warm` below) instead of blocking the request thread."""
-    with state.candidates_cache_lock:
+    (`run_candidates_warm` below) instead of blocking the request thread.
+
+    NON-blocking acquire, deliberately: `candidates_cache_lock` is held across the ENTIRE
+    compute-or-fetch critical section by design (see `_cached_all_candidates`'s docstring) — a
+    plain `with state.candidates_cache_lock:` here would make THIS "is it fast to proceed?"
+    check itself block for the full duration of any in-flight compute, which is exactly the
+    hang `resolve_apply_selection`'s CandidatesNotWarmError branch (fix/apply-warm-check) exists
+    to avoid. A lock currently held by someone else means a compute is genuinely in progress,
+    which is itself a valid "not warm" answer -- no need to wait for it to find that out."""
+    if not state.candidates_cache_lock.acquire(blocking=False):
+        return False
+    try:
         return (
             state.candidates_cache is not None
             and state.candidates_cache_generation == state.scan_generation
         )
+    finally:
+        state.candidates_cache_lock.release()
 
 
 def run_candidates_warm(state: AppState) -> None:
@@ -1284,6 +1313,12 @@ def resolve_apply_selection(
     # `_cached_all_candidates` (perf/dedup-cache, docs/AUDIT-2026-08.md P0-3) rather than
     # `_all_candidates` directly -- this was one of the 5 uncached call sites that fix covers.
     if request.paths is None:
+        if not is_candidates_cache_warm(state):
+            raise CandidatesNotWarmError(
+                "the candidates cache is not warm yet -- call POST /api/candidates/warm and "
+                "poll GET /api/candidates/warm-status until status is 'ready', then retry this "
+                "apply request"
+            )
         with ScanIndex(state.db_path) as index:
             candidates = _cached_all_candidates(index, state)
     else:

@@ -825,7 +825,13 @@ def test_candidates_warm_already_running_returns_409(tmp_path: Path) -> None:
 def test_apply_already_running_returns_409(tmp_path: Path) -> None:
     """fix/apply-progress-feedback: `POST /api/apply` became a background-task + single-flight
     pattern, same guard `ScanStatus`/`AIAnalysisStatus` already have -- mirrors
-    `test_scan_already_running_returns_409` above."""
+    `test_scan_already_running_returns_409` above.
+
+    `paths=[]` (not omitted/blanket): resolve_apply_selection's cache-warm check
+    (fix/apply-warm-check) only applies to the blanket branch and would otherwise raise
+    CandidatesNotWarmError before this test's own "already running" guard is ever reached --
+    an explicit (even empty) paths list takes the cheap per-path branch instead, matching what
+    this test actually means to exercise."""
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
     app_state = client.app.state.reclaim
     from reclaim.api.state import ApplyStatus
@@ -833,7 +839,7 @@ def test_apply_already_running_returns_409(tmp_path: Path) -> None:
     with app_state.lock:
         app_state.apply_status = ApplyStatus(status="running", started_at=time.time())
 
-    response = client.post("/api/apply", json={"tier": "A"})
+    response = client.post("/api/apply", json={"tier": "A", "paths": []})
     assert response.status_code == 409
     assert "already running" in response.json()["detail"]
 
@@ -1046,6 +1052,20 @@ def _scan_and_wait(client: TestClient, root: Path) -> dict[str, object]:
     status = client.get("/api/scan/status").json()
     assert status["status"] == "completed", status
     return status
+
+
+def _warm_candidates_and_wait(client: TestClient) -> None:
+    """fix/apply-warm-check: a blanket (`paths: None`) `POST /api/apply` now requires the
+    candidates cache to already be warm (`CandidatesNotWarmError` otherwise) -- tests exercising
+    that real blanket-apply feature (as opposed to testing the cold-cache 409 itself) call this
+    first, same as a real client would via `POST /api/candidates/warm` +
+    `GET /api/candidates/warm-status` (app.js's `ensureCandidatesWarm`). TestClient runs
+    BackgroundTasks synchronously (see `_scan_and_wait`'s docstring), so status is already
+    "ready" by the time `.post()` returns -- the assert is a real check, not a formality."""
+    response = client.post("/api/candidates/warm")
+    assert response.status_code == 202
+    status = client.get("/api/candidates/warm-status").json()
+    assert status["status"] == "ready", status
 
 
 def _apply_and_wait(client: TestClient, payload: dict[str, object]) -> dict[str, object]:
@@ -1333,6 +1353,7 @@ def test_apply_category_group_filter_scopes_selection(tmp_path: Path) -> None:
     paths = _build_tree(root)
     client = _make_app(tmp_path, config=_config(root))
     _scan_and_wait(client, root)
+    _warm_candidates_and_wait(client)  # blanket apply (no `paths`) needs a warm cache
 
     body = _apply_and_wait(client, {"tier": "A", "category_group": "large_logs"})
     assert body["apply"] is False
@@ -2217,6 +2238,131 @@ def test_cached_all_candidates_serializes_concurrent_recompute_for_the_same_gene
     assert call_count == 1, "the second caller recomputed instead of reusing the first's result"
     assert len(results) == 2
     assert results[0] == results[1]
+
+
+# fix/apply-warm-check (P1, found live during AC2): resolve_apply_selection's blanket-apply
+# branch used to call `_cached_all_candidates` directly, so a blanket apply racing an in-flight
+# `run_candidates_warm` job blocked synchronously inside POST /api/apply's route handler --
+# BEFORE `state.apply_status` is ever set to "running" -- for that job's entire remaining
+# duration (confirmed live: 13+ minutes on a real ~1M-entry index), with GET /api/apply/status
+# reporting "idle" throughout since the write it's waiting to observe never happens until the
+# blocked call returns. These tests prove the fix: a cold cache now fails fast with an actionable
+# error instead of blocking, and a blanket apply genuinely in-flight against a running warm-up
+# returns immediately rather than waiting for it.
+
+
+def test_resolve_apply_selection_blanket_raises_when_cache_not_warm(tmp_path: Path) -> None:
+    from reclaim.api import service
+    from reclaim.api.schemas import ApplyRequest
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+
+    with pytest.raises(service.CandidatesNotWarmError):
+        service.resolve_apply_selection(
+            state, ApplyRequest(tier="both", paths=None, method="vault", dry_run=True)
+        )
+
+
+def test_resolve_apply_selection_blanket_succeeds_once_cache_is_warm(tmp_path: Path) -> None:
+    from reclaim.api import service
+    from reclaim.api.schemas import ApplyRequest
+    from reclaim.index import ScanIndex
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+
+    with ScanIndex(state.db_path) as index:
+        service._cached_all_candidates(index, state)  # warms the cache directly, no HTTP round-trip
+
+    _selected, method, apply = service.resolve_apply_selection(
+        state, ApplyRequest(tier="both", paths=None, method="vault", dry_run=True)
+    )
+    assert method == "vault"
+    assert apply is False
+
+
+def test_post_apply_blanket_returns_409_and_starts_a_warmup_when_cache_is_cold(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    resp = client.post(
+        "/api/apply",
+        json={"tier": "both", "paths": None, "method": "vault", "dry_run": True},
+    )
+    assert resp.status_code == 409
+    assert "warm" in resp.json()["detail"].lower()
+
+    # The courtesy warm-up this 409 path kicks off must actually be running/ready shortly after --
+    # not just a helpful-sounding error message with no real follow-through.
+    for _ in range(100):
+        status = client.get("/api/candidates/warm-status").json()
+        if status["status"] == "ready":
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"courtesy warm-up never reached ready: {status}")
+
+
+def test_post_apply_blanket_does_not_block_on_an_in_flight_candidates_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact regression this fix closes: before it, this test's blanket POST /api/apply would
+    have blocked for the whole `first_call_may_finish` wait (mirroring the live 13+ minute hang) --
+    now it must return (409, cold cache) near-instantly regardless of the in-flight warm-up."""
+    import threading
+
+    from reclaim.api import service
+
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    warm_started = threading.Event()
+    warm_may_finish = threading.Event()
+    real = service.generate_duplicate_candidates
+
+    def _blocking(*args: object, **kwargs: object) -> list[object]:
+        warm_started.set()
+        assert warm_may_finish.wait(timeout=30), "warm-up caller never released"
+        return real(*args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(service, "generate_duplicate_candidates", _blocking)
+
+    # TestClient runs BackgroundTasks synchronously as part of the request/response cycle (see
+    # `_scan_and_wait`'s docstring) -- a plain `client.post("/api/candidates/warm")` on the main
+    # thread would itself block on `warm_may_finish` here, never letting the apply call below
+    # race it. A real background thread is required to genuinely reproduce two requests in
+    # flight at once, same as `test_cached_all_candidates_serializes_concurrent_recompute_for_
+    # the_same_generation` above does for its own two callers.
+    warm_thread = threading.Thread(target=lambda: client.post("/api/candidates/warm"))
+    warm_thread.start()
+    assert warm_started.wait(timeout=10), "warm-up never reached the hash pass"
+
+    started = time.time()
+    resp = client.post(
+        "/api/apply",
+        json={"tier": "both", "paths": None, "method": "vault", "dry_run": True},
+    )
+    elapsed = time.time() - started
+
+    warm_may_finish.set()
+    warm_thread.join(timeout=30)
+    assert not warm_thread.is_alive()
+
+    assert resp.status_code == 409
+    assert elapsed < 5, f"blanket apply blocked on the in-flight warm-up: {elapsed:.1f}s"
 
 
 def test_category_cards_use_hardlink_aware_reclaimable_bytes_not_logical_size(
