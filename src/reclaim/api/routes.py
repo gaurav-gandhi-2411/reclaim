@@ -128,22 +128,72 @@ def scan_suggested_roots() -> SuggestedScanRootsResponse:
 
 @router.get("/scan/fixed-drives", response_model=FixedDrivesResponse)
 def scan_fixed_drives() -> FixedDrivesResponse:
-    """SIMPLE mode's "scan my whole computer" action shows what's about to be scanned before the
-    user commits (full-drive-scan-eta) -- lets the frontend render the drive list without its
-    own drive-enumeration logic."""
+    """SIMPLE mode's explicit "scan the whole drive" opt-in (P0 fix, 2026-08-22 -- see
+    `service.user_scan_roots`'s docstring: no longer the default) shows what's about to be
+    scanned before the user commits (full-drive-scan-eta) -- lets the frontend render the drive
+    list without its own drive-enumeration logic."""
     try:
         return service.fixed_drives()
     except NoFixedDrivesFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/scan/my-files", response_model=ScanStatusOut, status_code=202)
+def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> ScanStatusOut:
+    """P0 fix (2026-08-22 real-disk finding, see `service.user_scan_roots`'s docstring for the
+    full incident): SIMPLE mode's DEFAULT "Clean My Computer" action -- scans only the invoking
+    user's own profile (`Path.home()`), never a whole fixed-drive volume. Same background-task +
+    single-flight + polling shape as `POST /api/scan`/`POST /api/scan/full-drive` (indeed the
+    same background task, `service.run_scan`, just with `roots=service.user_scan_roots()`),
+    reusing `GET /api/scan/status` for progress/ETA polling rather than a second status
+    endpoint."""
+    state = get_state(request)
+    roots = service.user_scan_roots()
+    root = roots[0]
+    if not root.is_dir():
+        raise HTTPException(
+            status_code=500,
+            detail=f"user profile directory not found or inaccessible: {root}",
+        )
+
+    started_at = time.time()
+    with state.lock:
+        if state.scan_status.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"a scan is already running for {state.scan_status.root}",
+            )
+        # Scan cancellation: see the matching comment in `start_scan` above -- same race
+        # avoided the same way.
+        state.cancel_scan_event.clear()
+        state.scan_status = ScanStatus(
+            status="running",
+            root=root,
+            started_at=started_at,
+            phase="estimating",
+            current_drive=root.as_posix(),
+            drives_total=len(roots),
+            drives_done=0,
+        )
+        status_snapshot = state.scan_status
+
+    background_tasks.add_task(service.run_scan, state, roots, started_at)
+    return service.to_scan_status_out(status_snapshot)
+
+
 @router.post("/scan/full-drive", response_model=ScanStatusOut, status_code=202)
 def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -> ScanStatusOut:
-    """SIMPLE mode's "scan my whole computer" action (full-drive-scan-eta) -- same background-
-    task + single-flight + polling shape as `POST /api/scan` (indeed the same background task,
-    `service.run_scan`, just with `roots=list_fixed_drives()` instead of a single user-supplied
-    path), reusing `GET /api/scan/status` for progress/ETA polling rather than a second status
-    endpoint."""
+    """Whole-drive scan (full-drive-scan-eta) -- every locally-attached fixed drive, from its
+    volume root. P0 fix (2026-08-22, see `service.user_scan_roots`'s docstring): this is NO
+    LONGER SIMPLE mode's default action -- `POST /api/scan/my-files` (the invoking user's own
+    profile only) is. This endpoint remains available as a deliberate, separately-surfaced
+    opt-in for a user who genuinely wants a whole-drive scan (the SIMPLE-mode UI gates it behind
+    its own explicit confirmation dialog warning that a volume-root scan can reach other users'
+    files if the filesystem's ACLs happen to allow it -- see `app.js`'s
+    `openFullDriveConfirmDialog`). Same background-task + single-flight + polling shape as
+    `POST /api/scan` (indeed the same background task, `service.run_scan`, just with
+    `roots=service.fixed_drive_roots()` instead of a single user-supplied path), reusing
+    `GET /api/scan/status` for progress/ETA polling rather than a second status endpoint."""
     state = get_state(request)
     try:
         roots = service.fixed_drive_roots()

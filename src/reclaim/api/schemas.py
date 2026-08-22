@@ -167,9 +167,10 @@ class ScanStatusOut(BaseModel):
 
 class FixedDrivesResponse(BaseModel):
     """`GET /api/scan/fixed-drives` -- every locally-attached fixed drive on this machine
-    (`reclaim.drives.list_fixed_drives`), so a SIMPLE-mode "scan my whole computer" UI can show
-    what's about to be scanned before the user commits, without its own drive-enumeration logic
-    (full-drive-scan-eta)."""
+    (`reclaim.drives.list_fixed_drives`), so SIMPLE mode's explicit "scan the whole drive"
+    opt-in (P0 fix, 2026-08-22 -- see `service.user_scan_roots`'s docstring: no longer the
+    default) can show what's about to be scanned before the user commits, without its own
+    drive-enumeration logic (full-drive-scan-eta)."""
 
     model_config = ConfigDict(extra="forbid")
 

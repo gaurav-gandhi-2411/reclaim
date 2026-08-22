@@ -185,11 +185,43 @@ def suggested_scan_roots(*, home: Path | None = None) -> SuggestedScanRootsRespo
 
 def fixed_drives() -> FixedDrivesResponse:
     """Backs `GET /api/scan/fixed-drives` -- every locally-attached fixed drive on this machine,
-    so a SIMPLE-mode "scan my whole computer" UI can show what's about to be scanned before the
-    user commits (full-drive-scan-eta). Propagates `reclaim.drives.NoFixedDrivesFoundError`
-    straight through -- the route layer converts it to a 500, same posture `SafeModeViolationError`
-    gets in `apply`."""
+    so SIMPLE mode's explicit "scan the whole drive" opt-in (P0 fix, 2026-08-22 -- see
+    `user_scan_roots`'s docstring: no longer the default) can show what's about to be scanned
+    before the user commits (full-drive-scan-eta). Propagates
+    `reclaim.drives.NoFixedDrivesFoundError` straight through -- the route layer converts it to a
+    500, same posture `SafeModeViolationError` gets in `apply`."""
     return FixedDrivesResponse(drives=[d.as_posix() for d in list_fixed_drives()])
+
+
+def user_scan_roots(*, home: Path | None = None) -> list[Path]:
+    """P0 fix (2026-08-22 real-disk finding): the invoking user's own profile (`Path.home()`) --
+    SIMPLE mode's default "Clean My Computer" action (`POST /api/scan/my-files`) scans ONLY this,
+    never `list_fixed_drives()`'s whole-volume enumeration.
+
+    Background: a real smoke-test scan by a non-admin local account on a real multi-project dev
+    machine, run through what was then the SIMPLE-mode default (a full-drive scan from the
+    volume root), classified 13,927 of 13,991 `dev_artifacts` candidates as belonging to OTHER
+    users' profile directories -- reachable and deletable only because of broad ACLs granting
+    Modify rights at the volume root, not because the scanning user had any legitimate claim on
+    that content. Only agent-level discipline (not the product itself) prevented an actual
+    deletion during that smoke test. `list_fixed_drives()`'s volume-root traversal is real and
+    still useful (a deliberate, separately-surfaced "scan the whole drive" opt-in -- see
+    `POST /api/scan/full-drive`), but it must never again be what a single click reaches by
+    default.
+
+    Every existing detector default that needs to look outside a literal `%USERPROFILE%\\...`
+    path (package/model caches under `%LOCALAPPDATA%`, `.conda`, `.m2`, `.gradle`, temp roots --
+    see `config.py`'s `_default_*_paths` helpers) already resolves those paths from
+    `%USERPROFILE%`/`%LOCALAPPDATA%`, both of which sit INSIDE the user's own profile tree --
+    scanning `Path.home()` alone already reaches every one of them; nothing needs widening past
+    it for SIMPLE mode's default candidate categories to keep working.
+
+    `home` is injectable for tests, mirroring `suggested_scan_roots`'s own convention -- a
+    production caller always resolves it fresh (never cached), since a scan root is real,
+    per-request filesystem state, not something safe to memoize across requests/users.
+    """
+    resolved_home = home if home is not None else Path.home()
+    return [resolved_home]
 
 
 def fixed_drive_roots() -> list[Path]:

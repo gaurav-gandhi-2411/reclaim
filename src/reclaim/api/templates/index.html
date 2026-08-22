@@ -351,6 +351,23 @@
     </div>
   </div>
 
+  <!-- Whole-drive scan opt-in (P0 fix, 2026-08-22): "Clean My Computer" now scans only the
+       invoking user's own files by default (POST /api/scan/my-files) -- a real smoke-test scan
+       found the previous full-drive default reached other local accounts' profile directories
+       on a real multi-project dev machine, deletable only because of broad ACLs at the volume
+       root. This dialog is the explicit, separately-surfaced opt-in required before a whole-drive
+       scan can start at all -- it names the actual risk rather than a generic "are you sure?". -->
+  <div id="full-drive-confirm-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="full-drive-confirm-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="full-drive-confirm-title">Scan the whole drive?</h2>
+      <p>This scans every folder on your fixed drives, starting from the drive root — not just your own files. On a shared or multi-account computer, this can include other people's files if Windows' permissions happen to allow it. Scanning only reads file metadata; nothing is changed or deleted by a scan itself, and nothing is ever deleted without your review afterward.</p>
+      <div class="rc-dialog-actions">
+        <button id="full-drive-confirm-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="full-drive-confirm-go" type="button" class="rc-btn rc-btn-primary">Scan the whole drive</button>
+      </div>
+    </div>
+  </div>
+
   <!-- "How this works" — plain-language explanation of the safety model, on demand. -->
   <div id="how-it-works-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="how-it-works-title" hidden>
     <div class="rc-overlay-panel">

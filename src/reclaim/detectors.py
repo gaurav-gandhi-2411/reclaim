@@ -320,7 +320,12 @@ def detect_model_caches(
 
 
 def detect_temp_and_browser_caches(
-    index: ScanIndex, cache_paths: Sequence[str], temp_roots: Sequence[str]
+    index: ScanIndex,
+    cache_paths: Sequence[str],
+    temp_roots: Sequence[str],
+    *,
+    min_temp_root_age_hours: float,
+    now: float,
 ) -> list[RawCandidate]:
     """Browser cache directories and the Explorer thumbnail cache are proposed whole (matched
     by pattern); `%TEMP%`/`C:\\Windows\\Temp` are never proposed as a whole directory — only
@@ -330,6 +335,14 @@ def detect_temp_and_browser_caches(
     The thumbnail cache is a `.db` file, which `SafetyValidator` blocks by default as a
     database extension — that's intentional and correct (spec: let the validator's verdict be
     authoritative here, the detector doesn't special-case it away).
+
+    P0 fix (2026-08 audit, temp-sweep age-guard finding): a `temp_roots` direct child younger
+    than `min_temp_root_age_hours` (by mtime) is never proposed as a candidate at all — see
+    `TempAndBrowserCachesConfig.min_temp_root_age_hours`'s docstring for why this is a detection-
+    time guard, independent of and complementary to `preflight.check_file_in_use`'s apply-time
+    lock probe. Deliberately scoped to `temp_roots` only — the `cache_paths` browser/thumbnail
+    directories above are matched and proposed whole, unaffected by this guard, matching the
+    scope of the original finding.
     """
     candidates: list[RawCandidate] = []
     seen: set[Path] = set()
@@ -356,6 +369,7 @@ def detect_temp_and_browser_caches(
                 )
             )
 
+    min_age_seconds = min_temp_root_age_hours * 3600.0
     seen_roots: set[Path] = set()
     for pattern in temp_roots:
         for root_record in index.files_matching_path_pattern(pattern, is_dir=True):
@@ -363,6 +377,13 @@ def detect_temp_and_browser_caches(
                 continue
             seen_roots.add(root_record.path)
             for child in index.direct_children(root_record.path):
+                age_seconds = now - child.mtime
+                if age_seconds < min_age_seconds:
+                    # Younger than the age floor -- never proposed, not even Tier B (matches
+                    # `detect_dev_artifacts`'s "no manifest adjacent -> never proposed" posture
+                    # for a guard that must hold unconditionally, not just for the default tier).
+                    continue
+                age_hours = age_seconds / 3600.0
                 candidates.append(
                     RawCandidate(
                         path=child.path,
@@ -371,8 +392,10 @@ def detect_temp_and_browser_caches(
                         category_group=_GROUP_TEMP_AND_BROWSER_CACHES,
                         suggested_tier=Tier.A,
                         rationale=(
-                            f"Item in the Windows temp directory ('{root_record.path}') — temp "
-                            "files are transient by design and safe to remove."
+                            f"Item in the Windows temp directory ('{root_record.path}'), last "
+                            f"modified {age_hours:.0f}h ago (older than the "
+                            f"{min_temp_root_age_hours:.0f}h threshold) — temp files are "
+                            "transient by design and safe to remove."
                         ),
                         rebuild_instruction=None,
                     )
@@ -735,6 +758,8 @@ def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[Raw
             index,
             categories.temp_and_browser_caches.cache_paths,
             categories.temp_and_browser_caches.temp_roots,
+            min_temp_root_age_hours=categories.temp_and_browser_caches.min_temp_root_age_hours,
+            now=now,
         )
     )
     raw.extend(detect_crash_dumps(index, categories.crash_dumps.paths))
