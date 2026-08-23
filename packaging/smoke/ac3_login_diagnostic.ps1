@@ -41,10 +41,15 @@ missing.
 param(
     [string]$InstallerPath = "C:\Users\Public\reclaim_ac3\reclaim-setup.exe",
     [switch]$SkipInstall,
-    # AR3 (2026-08-23 audit): the repo checkout used to resolve "what does current origin/main
-    # actually build from" for the freshness check below. Defaults to this script's own repo --
-    # override only if running from a different checkout (e.g. a different account's clone).
-    [string]$RepoPath = (Resolve-Path "$PSScriptRoot\..\..").Path,
+    # AR3/AR5 (2026-08-23/24 audit): the repo checkout used to resolve "what does current
+    # origin/main actually build from" for the freshness check below. NOT derived from
+    # $PSScriptRoot -- this script's own docstring says it's meant to run from a STAGED COPY
+    # (C:\Users\Public\reclaim_ac3\, readable by any account) separately from the actual repo,
+    # so $PSScriptRoot\..\.. resolves to something else entirely once copied there (found live,
+    # AR5: it silently resolved to C:\Users and produced a useless "git invocation... threw" error
+    # instead of a clear diagnostic). Hardcoded to this machine's one known checkout location --
+    # override only if running from a different one.
+    [string]$RepoPath = "C:\Users\gaura\ml-projects\reclaim",
     # AR3: explicit, loud override for a deliberate stale-artifact run (e.g. re-verifying an
     # older release, or a git-less environment) -- the default is to refuse, matching rule 98a's
     # fail-closed posture for a guard whose entire purpose is catching exactly this.
@@ -100,6 +105,19 @@ if ($SkipInstall) {
         $recordedSha = (Get-Content -Path $buildShaPath -Raw).Trim()
         if ($recordedSha -eq "unknown") {
             $freshnessReason = "sidecar records 'unknown' -- built outside a git checkout"
+        } elseif (-not (Test-Path (Join-Path $RepoPath '.git'))) {
+            # AR5: check this explicitly, with a clear reason, BEFORE ever invoking git -- a git
+            # command against a non-repo path fails with a cryptic, unhelpful message (found
+            # live: "You cannot call a method on a null-valued expression" when $RepoPath had
+            # silently resolved to the wrong directory). This is also the expected, non-error
+            # case for ReclaimSmokeTest specifically: this script's own docstring already
+            # documents that account cannot read gaura's repo checkout at all -- freshness
+            # genuinely cannot be verified from there, and that's a real limitation to surface
+            # loudly (-AllowStaleBuild), not a bug to chase.
+            $freshnessReason = "no git checkout found at -RepoPath '$RepoPath' -- if running as a " +
+                "different account than the one that built this artifact, this check cannot " +
+                "verify freshness here by design; the operator should confirm freshness " +
+                "separately before staging, or pass -RepoPath explicitly"
         } else {
             try {
                 git -C $RepoPath fetch origin main --quiet 2>$null
