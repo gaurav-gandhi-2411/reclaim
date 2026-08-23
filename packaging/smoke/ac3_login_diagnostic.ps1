@@ -433,7 +433,12 @@ if ($serverReachable -and $csrfToken) {
     $body = @{ tier = 'both'; paths = @($outsideScopeFile); method = 'vault'; dry_run = $false } | ConvertTo-Json
     $headers = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 10
+        # 120s, not 10s: resolve_apply_selection's explicit-paths branch still calls
+        # generate_candidates against the FULL persisted index regardless of the requested path
+        # (confirmed live: 30-50s on a real ~956MB leftover index during this fix's own
+        # verification run) -- a large real account's index, exactly the shape AC3 is meant to
+        # exercise, can genuinely take this long even for a single explicit-path apply.
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 120
         Start-Sleep -Seconds 2
         $applyStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
         Write-Log "  apply status: $($applyStatus | ConvertTo-Json -Compress -Depth 5)"
@@ -465,44 +470,169 @@ if ($serverReachable) {
 # ===========================================================================
 Write-Log ""
 Write-Log "--- STEP 7: S2/U4 -- app-reported vs. measured free-space delta (AJ4) ---"
-Write-Log "    (blocked 3x earlier this session by the apply-warm-check hang, PR #62 -- now fixed)"
+Write-Log "    (blocked 3x earlier this session by the apply-warm-check hang, PR #62 -- now fixed;"
+Write-Log "    fully automated -- uses a synthetic disposable fixture, not real account data, so"
+Write-Log "    this needs no human selection step)"
 # ===========================================================================
 
-if (-not $serverReachable) {
-    Write-Log "[SKIPPED] Step 7 -- dashboard server unreachable (see Step 6)."
+if (-not $serverReachable -or -not $csrfToken) {
+    Write-Log "[SKIPPED] Step 7 -- dashboard server unreachable or no CSRF token (see Step 6)."
 } else {
-    $driveBefore = Get-PSDrive -Name C
-    Write-Log "[Measured BEFORE] C: free = $($driveBefore.Free) bytes"
-
-    Write-Log "[ACTION NEEDED] In the dashboard, scan a real path if you haven't already, then in"
-    Write-Log "  the Review Queue (or Simple mode Quick Clean) select a small, real, safe-to-delete"
-    Write-Log "  set of items and apply them for real (not dry-run, method=direct_delete for a"
-    Write-Log "  meaningful comparison -- recycle_bin/vault don't free space immediately, so a"
-    Write-Log "  same-instant OS measurement would legitimately show ~0 delta for those methods,"
-    Write-Log "  not a discrepancy). Keep it small and genuinely disposable."
-    Read-Host "Press Enter once a real apply has completed in the dashboard"
-
-    $driveAfter = Get-PSDrive -Name C
-    Write-Log "[Measured AFTER] C: free = $($driveAfter.Free) bytes"
-    $measuredDelta = $driveAfter.Free - $driveBefore.Free
-    Write-Log "[Measured delta] $measuredDelta bytes freed (OS-reported)"
-
-    $lastApply = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
-    if ($lastApply.status -ne 'completed') {
-        Write-Log "[ABORT] /api/apply/status reports '$($lastApply.status)', not 'completed' -- no real"
-        Write-Log "  apply was observed after the prompt above (pressed Enter too early, or the"
-        Write-Log "  dashboard apply is still running). The comparison below would be meaningless --"
-        Write-Log "  SKIPPING it rather than reporting a number against no real apply."
-    } else {
-        $appReported = $lastApply.result.bytes_freed
-        Write-Log "[App-reported] bytes_freed = $appReported (method: $($lastApply.result.method))"
-        if ($appReported -and $appReported -gt 0) {
-            $pctDiff = [math]::Abs(($measuredDelta - $appReported) / $appReported) * 100
-            Write-Log ("[Comparison] {0:N2}% difference between app-reported and OS-measured -- must be within 2% for a direct_delete apply" -f $pctDiff)
-        } else {
-            Write-Log "[Comparison] app reported no bytes_freed (0 or null) -- check the method used; recycle_bin/vault legitimately report 0 freed until emptied/purged."
+    # Only direct_delete gives an immediately-measurable OS-level delta -- recycle_bin/vault
+    # move the file but don't free space until emptied/purged, so a same-instant comparison
+    # against either of those would legitimately show ~0 either way, proving nothing about
+    # accuracy. Safe mode forces recycle_bin regardless of the requested method
+    # (resolve_apply_selection's own method-resolution line), so this step needs power mode.
+    $headers = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
+    $modeStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/mode" -TimeoutSec 5
+    $originalMode = $modeStatus.mode
+    Write-Log "[Mode] Currently: $originalMode"
+    $switchedMode = $false
+    if ($originalMode -ne 'power') {
+        Write-Log "[RUN] Switching to power mode for this synthetic-fixture-only measurement (required for direct_delete)..."
+        $confirmBody = @{ confirmation_text = $modeStatus.required_power_confirmation } | ConvertTo-Json
+        try {
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/mode/power" -Method Post -ContentType 'application/json' -Headers $headers -Body $confirmBody -TimeoutSec 10
+            $switchedMode = $true
+            Write-Log "[OK] Switched to power mode."
+        } catch {
+            Write-Log "[ABORT] Could not switch to power mode: $($_.Exception.Message) -- SKIPPING Step 7."
         }
     }
+
+    if ($originalMode -eq 'power' -or $switchedMode) {
+        # A real, sized fixture -- large enough (10MB) that its freed-space signal clearly
+        # exceeds ordinary OS background noise (other processes writing/deleting a few KB during
+        # the measurement window), so the 2% comparison gate means something.
+        $fixtureDir = 'C:\Users\Public\ac3_s2u4_fixture'
+        $fixtureFile = Join-Path $fixtureDir 'disposable_10mb.bin'
+        New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+        $fixtureBytes = New-Object byte[] (10 * 1MB)
+        [System.IO.File]::WriteAllBytes($fixtureFile, $fixtureBytes)
+        Write-Log "[OK] Created a real 10MB disposable fixture: $fixtureFile"
+
+        $driveBefore = Get-PSDrive -Name C
+        Write-Log "[Measured BEFORE] C: free = $($driveBefore.Free) bytes"
+
+        Write-Log "[RUN] POST /api/apply for the fixture, method=direct_delete, real (not dry-run):"
+        $body = @{ tier = 'both'; paths = @($fixtureFile); method = 'direct_delete'; dry_run = $false } | ConvertTo-Json
+        try {
+            # 120s: same reason as Step 6's apply call -- a real account's persisted index can
+            # make even an explicit-path apply's synchronous pre-flight take tens of seconds.
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 120
+            for ($i = 0; $i -lt 30; $i++) {
+                Start-Sleep -Seconds 2
+                $lastApply = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
+                if ($lastApply.status -eq 'completed') { break }
+            }
+
+            $driveAfter = Get-PSDrive -Name C
+            Write-Log "[Measured AFTER] C: free = $($driveAfter.Free) bytes"
+            $measuredDelta = $driveAfter.Free - $driveBefore.Free
+            Write-Log "[Measured delta] $measuredDelta bytes freed (OS-reported)"
+
+            if ($lastApply.status -ne 'completed') {
+                Write-Log "[ABORT] /api/apply/status never reached 'completed' after 60s (status: '$($lastApply.status)') -- the comparison below would be meaningless, SKIPPING it."
+            } else {
+                $appReported = $lastApply.result.bytes_freed
+                Write-Log "[App-reported] bytes_freed = $appReported (method: $($lastApply.result.method))"
+                if ($appReported -and $appReported -gt 0) {
+                    $pctDiff = [math]::Abs(($measuredDelta - $appReported) / $appReported) * 100
+                    Write-Log ("[Comparison] {0:N2}% difference between app-reported and OS-measured -- must be within 2%" -f $pctDiff)
+                    if ($pctDiff -le 2) {
+                        Write-Log "[PASS] Within the 2% gate."
+                    } else {
+                        Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] Outside the 2% gate. Report this, do not soften it."
+                    }
+                } else {
+                    Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] app reported no bytes_freed (0 or null) for a direct_delete apply -- expected a real positive number."
+                }
+            }
+        } catch {
+            Write-Log "  [ERROR] apply request failed: $($_.Exception.Message)"
+        }
+        Remove-Item -Path $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
+
+        if ($switchedMode) {
+            Write-Log "[RUN] Restoring original mode ($originalMode)..."
+            try {
+                $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/mode/safe" -Method Post -ContentType 'application/json' -Headers $headers -Body '{}' -TimeoutSec 10
+                Write-Log "[OK] Mode restored to safe."
+            } catch {
+                Write-Log "[WARNING] Could not restore original mode: $($_.Exception.Message) -- this account is now left in power mode, restore it manually."
+            }
+        }
+    }
+}
+
+# ===========================================================================
+Write-Log ""
+Write-Log "--- STEP 8: check 1e -- 8.3 short-name TEMP-cache detection (AM2) ---"
+Write-Log "    (scans the exact short-alias-triggering %TEMP% path itself and reports the real"
+Write-Log "    temp_and_browser_caches candidate count -- the original bug was zero, permanently,"
+Write-Log "    with no error, on exactly this account shape)"
+# ===========================================================================
+
+if (-not $serverReachable -or -not $csrfToken) {
+    Write-Log "[SKIPPED] Step 8 -- dashboard server unreachable or no CSRF token."
+} else {
+    $tempPath = $env:TEMP
+    Write-Log "[Scan target] `$env:TEMP = $tempPath (this IS the 8.3-aliased path, per Step 0's capture)"
+    Write-Log "[RUN] POST /api/scan for $tempPath ..."
+    try {
+        $scanHeaders = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan" -Method Post -ContentType 'application/json' -Headers $scanHeaders -Body (@{ path = $tempPath } | ConvertTo-Json) -TimeoutSec 10
+        $scanDone = $false
+        for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 500
+            $scanStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 10
+            if ($scanStatus.status -eq 'completed') { $scanDone = $true; break }
+            if ($scanStatus.status -eq 'failed') { break }
+        }
+        if (-not $scanDone) {
+            Write-Log "[ABORT] Scan of $tempPath did not reach 'completed' within 30s (status: '$($scanStatus.status)') -- SKIPPING the candidate-count check."
+        } else {
+            Write-Log "[OK] Scan completed: $($scanStatus | ConvertTo-Json -Compress)"
+            $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 10
+            $count = @($candResp.candidates).Count
+            Write-Log "[Result] temp_and_browser_caches candidates found: $count"
+            if ($count -gt 0) {
+                Write-Log "[PASS] Nonzero candidates under the 8.3-aliased TEMP path -- PR #50's fix holds on the real account shape it was written for."
+            } else {
+                Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG, UNLESS TEMP is genuinely empty] Zero candidates -- this is exactly the original bug's signature. Before treating this as a regression, manually confirm $tempPath actually contains real files/subdirectories (an empty TEMP would legitimately yield zero too, and would not be this bug)."
+            }
+        }
+    } catch {
+        Write-Log "  [ERROR] scan request failed: $($_.Exception.Message)"
+    }
+}
+
+# ===========================================================================
+Write-Log ""
+Write-Log "--- STEP 9: copy the app's own structured log to a readable location (AM2) ---"
+Write-Log "    (settles check 3's real question: does notifications.toast_failed appear anywhere,"
+Write-Log "    distinguishing 'send_disk_space_toast was called' from 'it actually succeeded"
+Write-Log "    internally' -- record_notified fires either way, so Step 5's notification_state.json"
+Write-Log "    alone can never answer this)"
+# ===========================================================================
+
+if ($appDir) {
+    $realLogFile = Join-Path $appDir 'data\logs\reclaim.log'
+    if (Test-Path $realLogFile) {
+        $destLogFile = Join-Path $logDir 'reclaim_app.log'
+        Copy-Item -Path $realLogFile -Destination $destLogFile -Force
+        Write-Log "[OK] Copied $realLogFile to $destLogFile"
+        $toastFailedLines = @(Get-Content $realLogFile | Select-String -Pattern 'toast_failed')
+        if ($toastFailedLines.Count -gt 0) {
+            Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] notifications.toast_failed appears $($toastFailedLines.Count) time(s) in the real log -- send_disk_space_toast raised internally at least once this run. See $destLogFile for the real exception."
+        } else {
+            Write-Log "[Result] No 'toast_failed' line in the real log -- send_disk_space_toast was called and did not raise. This is real evidence the call succeeded internally; it is still NOT proof a toast rendered on screen (Windows gives the sending process no delivery guarantee) -- that half of check 3 stays UNVERIFIED without a human 'yes/no, I saw it.'"
+        }
+    } else {
+        Write-Log "[ABORT] Real log not found at $realLogFile -- cannot settle check 3's toast_failed question this run."
+    }
+} else {
+    Write-Log "[SKIPPED] Step 9 -- APPDIR unresolved."
 }
 
 # ===========================================================================
