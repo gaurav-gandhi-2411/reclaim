@@ -1027,7 +1027,11 @@ async function startFullDriveScanConfirmed() {
   const container = simpleViewEl();
   container.innerHTML = "";
   try {
-    await api("/api/scan/full-drive", { method: "POST" });
+    // AN1 (2026-08-23 audit): a single-use token minted right here, at the moment of this real
+    // click -- not the general CSRF_TOKEN constant, which is valid for this whole page load and
+    // was, before this fix, the ONLY thing the server checked before starting a whole-drive scan.
+    const { token } = await api("/api/scan/full-drive/confirm-intent", { method: "POST" });
+    await api("/api/scan/full-drive", { method: "POST", body: JSON.stringify({ token }) });
   } catch (err) {
     renderState(container, "error", {
       title: "Could not start the scan",
