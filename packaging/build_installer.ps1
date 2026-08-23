@@ -647,10 +647,30 @@ $sha256Path = "$installerPath.sha256"
 $installerHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash.ToLower()
 [System.IO.File]::WriteAllText($sha256Path, "$installerHash  $installerFileName`n", [System.Text.UTF8Encoding]::new($false))
 
+# AR3 (2026-08-23 audit): a build-provenance sidecar recording the exact source commit this
+# installer was compiled from -- until this fix, that link only existed as a human's manual note
+# (see RELEASE_RUNBOOK.md / docs/RESUME.md's resume sequence, "re-confirm it was built from the
+# SHA"), which is exactly why four real AC3 trip runs on 2026-08-23 ran against a known-stale
+# artifact with nothing to catch it. `packaging/smoke/ac3_login_diagnostic.ps1` reads this file
+# and refuses to proceed if the installer's recorded source commit isn't an ancestor of (or equal
+# to) the repo's current `origin/main` tip. Falls back to "unknown" (never throws) if this isn't
+# a git checkout or `git` isn't on PATH -- a build must still succeed outside a git context (e.g.
+# a source tarball); the trip script treats "unknown" as a loud warning, not a silent pass.
+$buildShaPath = "$installerPath.buildsha"
+$buildSha = "unknown"
+try {
+    $gitOutput = & git -C $PSScriptRoot\.. rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $gitOutput) { $buildSha = $gitOutput.Trim() }
+} catch {
+    # git not on PATH or not a repo -- $buildSha stays "unknown", never throws the build itself.
+}
+[System.IO.File]::WriteAllText($buildShaPath, "$buildSha`n", [System.Text.UTF8Encoding]::new($false))
+
 Write-Output ""
 Write-Output "==> DONE."
 Write-Output ("    Dist folder (bundled AI layer + models): {0:N1} MB" -f ($distSizeBytes / 1MB))
 Write-Output ("    Final installer: {0:N1} MB -- $installerPath" -f ($installerSizeBytes / 1MB))
 Write-Output "    SHA-256: $installerHash  $installerFileName"
 Write-Output "    Checksum sidecar: $sha256Path"
+Write-Output "    Built from commit: $buildSha (sidecar: $buildShaPath)"
 Write-Output "    Build telemetry: $TelemetryPath"
