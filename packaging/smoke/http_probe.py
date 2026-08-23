@@ -37,6 +37,27 @@ _POLL_INTERVAL_SECONDS = 0.5
 _POLL_TIMEOUT_SECONDS = 60.0
 _POWER_MODE_CONFIRMATION = "I understand this can permanently delete files"
 _DISPOSABLE_TEST_KEY = "sk-smoke-test-disposable-value-never-a-real-key-000000"
+# AR5 (2026-08-24, real-machine finding): both get() and mutate() used to hardcode 15s/30s --
+# same class of bug docs/AUDIT-2026-08.md already found and fixed once in this repo's OTHER
+# trip script (ac3_login_diagnostic.ps1's apply-call timeout, "10s vs. an observed 30-50s"),
+# just never checked for a sibling here. `GET /api/candidates` and `POST /api/apply` (an
+# explicit-paths request, which re-derives candidates from the persisted index rather than a
+# warm cache) both scale with the persisted index's row count, not the caller's tiny scratch
+# fixture -- live-measured on a real dev machine, GET /api/candidates took 138s against a
+# ~985MB/36,844-row index (accumulated from unrelated earlier work, not this suite's own
+# fixture). 15s/30s reads as "this endpoint is slow/broken" on exactly the machine shape (a
+# real, long-used dev box) this suite exists to catch regressions on.
+#
+# 180s raised the ceiling but did NOT fully close the gap: because `reclaim.app_paths.
+# data_root()` for a frozen build anchors to the installed exe's own directory regardless of
+# this suite's own scratch WorkingDirectory (by design -- see PR #51/#52/#53's CWD-independence
+# fixes), every run of this suite on the SAME machine adds its own scan to the SAME shared,
+# persisted index, not an isolated one -- so the real cost keeps growing across repeated runs
+# and no fixed timeout is a permanent fix. Re-measured moments after the 138s figure above (one
+# additional scan/apply/restore cycle in between): 180s+ and still climbing. A durable fix needs
+# an isolated `--db`/data-root override for this suite specifically, not a bigger number here --
+# out of scope for this pass; disclosed rather than silently left as "should be enough now."
+_HTTP_TIMEOUT_SECONDS = 180.0
 
 
 def _emit(result: str, detail: str, **extra: Any) -> None:
@@ -56,7 +77,7 @@ class Client:
         # fixed and known-safe despite ruff's generic "audit URL open" warning.
         req = urllib.request.Request(self.base + path)  # noqa: S310
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310
                 return resp.status, resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8")
@@ -68,7 +89,7 @@ class Client:
         headers = {"Content-Type": "application/json", "x-reclaim-csrf-token": self.csrf}
         req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)  # noqa: S310
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 -- see get() above
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310 -- see get() above
                 return resp.status, resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8")
