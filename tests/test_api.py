@@ -561,6 +561,17 @@ def _build_small_tree(root: Path, *, file_count: int) -> None:
         (root / f"f{i}.txt").write_text("x" * (i + 1), encoding="utf-8")
 
 
+def _start_full_drive_scan(client: TestClient):
+    """AN1 (2026-08-23 audit): `POST /api/scan/full-drive` now requires a single-use token minted
+    by `POST /api/scan/full-drive/confirm-intent` in the same session -- every test below that
+    exercises the real scan orchestration goes through this helper instead of posting directly,
+    mirroring how app.js's `startFullDriveScanConfirmed` mints-then-uses the token."""
+    confirm = client.post("/api/scan/full-drive/confirm-intent")
+    assert confirm.status_code == 200, confirm.text
+    token = confirm.json()["token"]
+    return client.post("/api/scan/full-drive", json={"token": token})
+
+
 def test_full_drive_scan_orchestrates_sequentially_across_fixture_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,7 +591,7 @@ def test_full_drive_scan_orchestrates_sequentially_across_fixture_roots(
     monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
 
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 202, response.text
 
     status = client.get("/api/scan/status").json()
@@ -605,7 +616,7 @@ def test_full_drive_scan_with_exactly_one_fixed_drive_reports_it_as_root(
     monkeypatch.setattr(service, "list_fixed_drives", lambda: [only_drive])
 
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 202
 
     status = client.get("/api/scan/status").json()
@@ -627,7 +638,7 @@ def test_full_drive_scan_already_running_returns_409(
     with app_state.lock:
         app_state.scan_status = ScanStatus(status="running", root=tmp_path, started_at=time.time())
 
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 409
     assert "already running" in response.json()["detail"]
 
@@ -652,7 +663,7 @@ def test_full_drive_scan_completes_correctly_with_maximal_progress_callback_freq
     monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
 
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 202
 
     status = client.get("/api/scan/status").json()
@@ -685,7 +696,7 @@ def test_full_drive_scan_failure_on_one_root_aborts_the_whole_scan(
     monkeypatch.setattr(service, "count_entries_fast", fake_count_entries_fast)
 
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 202
 
     status = client.get("/api/scan/status").json()
@@ -707,9 +718,50 @@ def test_full_drive_scan_returns_500_when_no_fixed_drives_found(
     monkeypatch.setattr(service, "list_fixed_drives", fake_list_fixed_drives)
 
     client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
-    response = client.post("/api/scan/full-drive")
+    response = _start_full_drive_scan(client)
     assert response.status_code == 500
     assert "no fixed drives" in response.json()["detail"]
+
+
+# AN1 (2026-08-23 audit): a full-drive scan ran against a real account with no code path
+# identified that should have been able to trigger it -- found the general CSRF token (valid for
+# the whole process lifetime, reusable) was the ONLY server-side check POST /api/scan/full-drive
+# ever made; the confirmation dialog was purely a frontend affordance with nothing enforcing it
+# server-side. These tests prove the new single-use token requirement actually holds.
+
+
+def test_full_drive_scan_without_a_token_is_refused(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    response = client.post("/api/scan/full-drive", json={"token": "not-a-real-token"})
+    assert response.status_code == 403
+    assert "confirmation token" in response.json()["detail"]
+
+
+def test_full_drive_scan_token_is_single_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact gap this fix closes: a token minted once must not work twice, mirroring how the
+    old CSRF-token-only check let ANY number of full-drive scans through on one valid token."""
+    from reclaim.api import service
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [tmp_path / "drive_a"])
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    confirm = client.post("/api/scan/full-drive/confirm-intent")
+    token = confirm.json()["token"]
+
+    first = client.post("/api/scan/full-drive", json={"token": token})
+    assert first.status_code == 202, first.text
+
+    second = client.post("/api/scan/full-drive", json={"token": token})
+    assert second.status_code == 403, "a consumed token must not work a second time"
+
+
+def test_full_drive_scan_confirm_intent_mints_a_fresh_token_each_call(tmp_path: Path) -> None:
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    first = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    second = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    assert first != second
 
 
 def test_single_path_scan_status_carries_the_new_phase_and_eta_fields(tmp_path: Path) -> None:

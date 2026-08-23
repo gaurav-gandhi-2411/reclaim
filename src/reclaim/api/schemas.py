@@ -118,6 +118,21 @@ class ScanRequest(BaseModel):
     path: str
 
 
+class FullDriveScanConfirmIntentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+
+
+class FullDriveScanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # AN1 (2026-08-23 audit): must be a token minted by POST /api/scan/full-drive/confirm-intent
+    # in this same server process, consumed on use -- see AppState.full_drive_scan_confirmation_
+    # tokens's docstring for why the general CSRF token alone is no longer sufficient here.
+    token: str
+
+
 class SuggestedScanRootOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

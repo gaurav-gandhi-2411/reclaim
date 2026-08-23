@@ -201,6 +201,18 @@ class AppState:
     # silently wiped. Set by `POST /api/scan/cancel`. A plain `threading.Event` (not a
     # `Lock`-guarded bool) since setting/checking it must never block a poller or the walk itself.
     cancel_scan_event: threading.Event = field(default_factory=threading.Event)
+    # AN1 (2026-08-23 audit): a full-drive scan's confirmation dialog was, until this fix,
+    # enforced ONLY in the frontend -- POST /api/scan/full-drive accepted any request carrying a
+    # valid (session-lifetime, reusable) CSRF token, with no server-side proof the user had
+    # actually seen or clicked through the dialog. Found after an unexplained full-drive scan ran
+    # against a real account mid-session with no code path identified that should have been able
+    # to trigger it. `POST /api/scan/full-drive/confirm-intent` mints a token into this set
+    # (guarded by `lock`, same as `scan_status`) ONLY when called -- the frontend calls it
+    # exactly when the user clicks the dialog's confirm button, never before. `start_full_drive_
+    # scan` requires and consumes (single-use) a token from this set; the general CSRF token
+    # alone is no longer sufficient. Tokens are single-use and unbounded in count (no cap needed:
+    # each is consumed or replaced by a fresh mint, never accumulates across a normal session).
+    full_drive_scan_confirmation_tokens: set[str] = field(default_factory=set)
     # P0-2 fix (2026-08 audit): the exact path `config` above was loaded from (or would be
     # created at, if it didn't exist) — needed so `POST /api/settings/categories/{group}` can
     # persist a toggle to the same on-disk file the CLI/next server start will read, not just

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import secrets
 import time
 from pathlib import Path
 
+import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -20,6 +22,8 @@ from reclaim.api.schemas import (
     DuplicateClusterReviewResponse,
     FirstRunStatusResponse,
     FixedDrivesResponse,
+    FullDriveScanConfirmIntentResponse,
+    FullDriveScanRequest,
     ModeStatusResponse,
     OneClickCleanSummaryResponse,
     PowerModeRequest,
@@ -57,6 +61,7 @@ from reclaim.executor import (
 from reclaim.mode import ModeSwitchDeniedError
 
 router = APIRouter(prefix="/api")
+logger = structlog.get_logger(__name__)
 
 
 def get_state(request: Request) -> AppState:
@@ -101,6 +106,11 @@ def start_scan(
         )
         status_snapshot = state.scan_status
 
+    # AN4 (2026-08-23 audit): no scan-start route logged anything before this -- found only
+    # after a full-drive scan ran against a real account mid-session with no way to reconstruct
+    # afterward which endpoint/params actually initiated it. Every scan-start route now logs
+    # root + origin + confirmation-token presence unconditionally, regardless of outcome.
+    logger.info("api.scan_initiated", root=str(root), origin="POST /api/scan", token_present=False)
     background_tasks.add_task(service.run_scan, state, [root], started_at)
     return service.to_scan_status_out(status_snapshot)
 
@@ -186,12 +196,34 @@ def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> 
         )
         status_snapshot = state.scan_status
 
+    logger.info(
+        "api.scan_initiated", root=str(root), origin="POST /api/scan/my-files", token_present=False
+    )
     background_tasks.add_task(service.run_scan, state, roots, started_at)
     return service.to_scan_status_out(status_snapshot)
 
 
+@router.post("/scan/full-drive/confirm-intent", response_model=FullDriveScanConfirmIntentResponse)
+def confirm_full_drive_scan_intent(request: Request) -> FullDriveScanConfirmIntentResponse:
+    """AN1 (2026-08-23 audit): mints a fresh, single-use token proving the caller reached this
+    endpoint in this same server process -- called ONLY by app.js's full-drive confirm dialog's
+    "Yes, scan everything" button, never before. `POST /api/scan/full-drive` now requires and
+    consumes one of these; the general CSRF token alone (valid for the whole process lifetime,
+    reusable) is no longer sufficient on its own to start a whole-drive traversal. Closes the gap
+    found when a full-drive scan ran against a real account with no code path identified that
+    should have been able to trigger it -- the confirmation dialog was, until this fix, a
+    frontend-only affordance with no server-side enforcement behind it at all."""
+    state = get_state(request)
+    token = secrets.token_urlsafe(32)
+    with state.lock:
+        state.full_drive_scan_confirmation_tokens.add(token)
+    return FullDriveScanConfirmIntentResponse(token=token)
+
+
 @router.post("/scan/full-drive", response_model=ScanStatusOut, status_code=202)
-def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -> ScanStatusOut:
+def start_full_drive_scan(
+    payload: FullDriveScanRequest, background_tasks: BackgroundTasks, request: Request
+) -> ScanStatusOut:
     """Whole-drive scan (full-drive-scan-eta) -- every locally-attached fixed drive, from its
     volume root. P0 fix (2026-08-22, see `service.user_scan_roots`'s docstring): this is NO
     LONGER SIMPLE mode's default action -- `POST /api/scan/my-files` (the invoking user's own
@@ -202,8 +234,30 @@ def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -
     `openFullDriveConfirmDialog`). Same background-task + single-flight + polling shape as
     `POST /api/scan` (indeed the same background task, `service.run_scan`, just with
     `roots=service.fixed_drive_roots()` instead of a single user-supplied path), reusing
-    `GET /api/scan/status` for progress/ETA polling rather than a second status endpoint."""
+    `GET /api/scan/status` for progress/ETA polling rather than a second status endpoint.
+
+    AN1 (2026-08-23 audit): requires a single-use `token` minted by
+    `POST /api/scan/full-drive/confirm-intent` -- the general CSRF token alone (valid for this
+    entire process's lifetime, reusable across any number of requests) used to be the ONLY
+    server-side check here, meaning the confirmation dialog's "click to proceed" was purely a
+    frontend affordance with nothing enforcing it actually happened. Found after an unexplained
+    full-drive scan ran against a real account with no code path identified that should have been
+    able to reach this endpoint."""
     state = get_state(request)
+    with state.lock:
+        token_valid = payload.token in state.full_drive_scan_confirmation_tokens
+        if token_valid:
+            state.full_drive_scan_confirmation_tokens.discard(payload.token)
+    if not token_valid:
+        logger.info("api.full_drive_scan_denied", reason="missing_or_invalid_confirmation_token")
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "missing or invalid full-drive-scan confirmation token -- call "
+                "POST /api/scan/full-drive/confirm-intent first and pass its token here"
+            ),
+        )
+
     try:
         roots = service.fixed_drive_roots()
     except NoFixedDrivesFoundError as exc:
@@ -230,6 +284,13 @@ def start_full_drive_scan(background_tasks: BackgroundTasks, request: Request) -
         )
         status_snapshot = state.scan_status
 
+    logger.info(
+        "api.scan_initiated",
+        root=str(roots[0]),
+        origin="POST /api/scan/full-drive",
+        drives_total=len(roots),
+        token_present=True,
+    )
     background_tasks.add_task(service.run_scan, state, roots, started_at)
     return service.to_scan_status_out(status_snapshot)
 
