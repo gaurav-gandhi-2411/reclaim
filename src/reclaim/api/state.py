@@ -217,9 +217,19 @@ class AppState:
     # this same set whenever the resolved scan root is outside `Path.home()`; a within-home scan
     # (the common case for both routes) needs no token at all. The general CSRF token alone is
     # not sufficient for either route once the requested root leaves the user's own profile.
-    # Tokens are single-use and unbounded in count (no cap needed: each is consumed or replaced
-    # by a fresh mint, never accumulates across a normal session).
-    scan_outside_home_confirmation_tokens: set[str] = field(default_factory=set)
+    #
+    # Item-7 fix (2026-08-23, same audit): a token minted here used to live forever until
+    # consumed -- no timestamp was ever recorded, so a minted-but-never-used token stayed valid
+    # indefinitely for the rest of the process's lifetime. This is the residue of an unexplained
+    # full-drive scan that occurred during a prior session and was never conclusively attributed;
+    # closing this gap does not depend on ever identifying that incident's exact trigger. Maps
+    # token -> mint time now (`routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS`, currently 60s -- a
+    # real click-to-scan round trip is milliseconds) so a token past its TTL is rejected exactly
+    # like one that was never minted, whether or not it was ever consumed. Still single-use
+    # (removed on any check, valid or not) and still unbounded in count with no cap needed --
+    # `routes._prune_expired_scan_confirmation_tokens` sweeps stale entries on every mint, so an
+    # unconsumed token no longer accumulates past its own TTL either.
+    scan_outside_home_confirmation_tokens: dict[str, float] = field(default_factory=dict)
     # P0-2 fix (2026-08 audit): the exact path `config` above was loaded from (or would be
     # created at, if it didn't exist) — needed so `POST /api/settings/categories/{group}` can
     # persist a toggle to the same on-disk file the CLI/next server start will read, not just
