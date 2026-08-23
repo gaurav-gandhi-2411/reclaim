@@ -514,15 +514,22 @@ $aborts = $logLines | Select-String -Pattern '^\[ABORT'
 $fails = $logLines | Select-String -Pattern '^\[FAIL'
 $skips = $logLines | Select-String -Pattern '^\[SKIPPED\]'
 $warnings = $logLines | Select-String -Pattern '^\[WARNING\]'
+# AL5: a real run's own tally missed this exact gap -- a try/catch's "[ERROR] ... failed:
+# $($_.Exception.Message)" line (Steps 2/3/6's own request failures) doesn't start with any of
+# the four prefixes above, so a genuine failure could pass through this tally uncounted. Counted
+# separately, not folded into "aborts", since an [ERROR] line's exact meaning depends on which
+# step logged it -- rolling it into one number would lose that context the report needs anyway.
+$scriptErrors = $logLines | Select-String -Pattern '^\s*\[ERROR\]'
 Write-Log "  ABORT lines:   $($aborts.Count)"
 Write-Log "  FAIL lines:    $($fails.Count)"
 Write-Log "  WARNING lines: $($warnings.Count)"
 Write-Log "  SKIPPED lines: $($skips.Count)"
-if ($aborts.Count -eq 0 -and $fails.Count -eq 0 -and $skips.Count -eq 0) {
-    Write-Log "  Every step ran and reported a real result -- nothing was aborted, failed, or skipped."
+Write-Log "  ERROR lines:   $($scriptErrors.Count) (request/exception failures inside a try/catch -- read each one, they are not summarized further here)"
+if ($aborts.Count -eq 0 -and $fails.Count -eq 0 -and $skips.Count -eq 0 -and $scriptErrors.Count -eq 0) {
+    Write-Log "  Every step ran and reported a real result -- nothing was aborted, failed, skipped, or errored."
 } else {
     Write-Log "  This run did NOT complete cleanly -- do not treat it as a full pass. Review each"
-    Write-Log "  ABORT/FAIL/SKIPPED line above before concluding anything about the trip's outcome."
+    Write-Log "  ABORT/FAIL/SKIPPED/ERROR line above before concluding anything about the trip's outcome."
 }
 
 Write-Log "==================================================================="
