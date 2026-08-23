@@ -17,14 +17,20 @@ language (packaging/smoke/run_frozen_smoke_suite.ps1).
 Every lookup that can be missing (install dir, protocol handler, scheduled task) is checked
 explicitly and reported LOUDLY if absent -- no step is ever silently skipped.
 
-PARAMETERS: -InstallerPath defaults to a copy of the rebuild #4 artifact this session produced
-(SHA-256 3452ca017e339e92456955dd0db4501f630649bb3c41640e575ef980e34a378f, built from main
-@ 4c3521974865c444a4cdf23a01f0703b56f1f027) staged at C:\Users\Public\reclaim_ac3\ -- NOT under
-gaura's own profile, which a different Windows account cannot read (confirmed earlier this
+PARAMETERS: -InstallerPath defaults to whatever is staged at C:\Users\Public\reclaim_ac3\ -- NOT
+under gaura's own profile, which a different Windows account cannot read (confirmed earlier this
 session: direct filesystem access to another account's repo/venv is denied). -SkipInstall for
 a second run against an already-installed profile (skips Step -2 only; first-run in Step -1
 will then correctly show "already acknowledged" instead of the genuine first-run screen, which
 is expected and fine on a re-run).
+
+AR3 (2026-08-23 audit): Step -2 now refuses (ABORT, no install attempted) unless the installer's
+`.buildsha` sidecar (written by packaging/build_installer.ps1) records a source commit that
+matches -RepoPath's current `origin/main` tip exactly -- four real trip runs this same day
+proceeded against a known-stale rebuild #4 artifact with nothing stopping them; this is the fix.
+-RepoPath defaults to this script's own checkout (packaging/smoke/../..). -AllowStaleBuild
+overrides deliberately (warns instead of aborting) for a genuine stale-artifact run -- e.g.
+re-verifying an older release, or a git-less environment.
 
 LOG OUTPUT: always C:\Users\Public\reclaim_ac3\ac3_run_<timestamp>.txt -- world-writable so any
 account can write it, and readable from any other session (including a plain non-elevated one)
@@ -34,7 +40,15 @@ missing.
 
 param(
     [string]$InstallerPath = "C:\Users\Public\reclaim_ac3\reclaim-setup.exe",
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    # AR3 (2026-08-23 audit): the repo checkout used to resolve "what does current origin/main
+    # actually build from" for the freshness check below. Defaults to this script's own repo --
+    # override only if running from a different checkout (e.g. a different account's clone).
+    [string]$RepoPath = (Resolve-Path "$PSScriptRoot\..\..").Path,
+    # AR3: explicit, loud override for a deliberate stale-artifact run (e.g. re-verifying an
+    # older release, or a git-less environment) -- the default is to refuse, matching rule 98a's
+    # fail-closed posture for a guard whose entire purpose is catching exactly this.
+    [switch]$AllowStaleBuild
 )
 
 $ErrorActionPreference = 'Continue'
@@ -60,6 +74,7 @@ Write-Log ""
 Write-Log "--- STEP -2: Install rebuild #4 (AJ4) ---"
 # ===========================================================================
 
+$installSkippedByFreshnessCheck = $false
 if ($SkipInstall) {
     Write-Log "[SKIPPED] -SkipInstall passed -- using whatever is already installed."
 } elseif (-not (Test-Path $InstallerPath)) {
@@ -68,14 +83,58 @@ if ($SkipInstall) {
     $hash = (Get-FileHash -Path $InstallerPath -Algorithm SHA256).Hash
     Write-Log "[OK] Installer found: $InstallerPath"
     Write-Log "     SHA-256: $hash"
-    if ($hash -ne "3452CA017E339E92456955DD0DB4501F630649BB3C41640E575EF980E34A378F") {
-        Write-Log "[WARNING] Hash does not match the expected rebuild #4 artifact -- this is a DIFFERENT build than the one this session verified. Continuing, but note it in your report."
+
+    # AR3 (2026-08-23 audit): four real trip runs this same day proceeded against a known-stale
+    # rebuild #4 artifact -- the old check here only WARNED on a hash mismatch, never stopped
+    # anything, and compared against a hardcoded rebuild-specific hash rather than "is this the
+    # artifact current main actually builds today." Replaced with a real freshness check against
+    # build_installer.ps1's new .buildsha sidecar (rule 98a: an unverifiable state is a refusal,
+    # not a silent pass -- so a missing sidecar or unreachable git is treated the same as a
+    # confirmed mismatch, all three requiring -AllowStaleBuild to proceed past).
+    $buildShaPath = "$InstallerPath.buildsha"
+    $freshnessOk = $false
+    $freshnessReason = ""
+    if (-not (Test-Path $buildShaPath)) {
+        $freshnessReason = "no .buildsha sidecar next to the installer (pre-AR3 build, or a copy that lost it)"
+    } else {
+        $recordedSha = (Get-Content -Path $buildShaPath -Raw).Trim()
+        if ($recordedSha -eq "unknown") {
+            $freshnessReason = "sidecar records 'unknown' -- built outside a git checkout"
+        } else {
+            try {
+                git -C $RepoPath fetch origin main --quiet 2>$null
+                $mainSha = (git -C $RepoPath rev-parse origin/main 2>$null).Trim()
+                if ($LASTEXITCODE -ne 0 -or -not $mainSha) {
+                    $freshnessReason = "could not resolve origin/main from $RepoPath (git fetch/rev-parse failed)"
+                } elseif ($recordedSha -eq $mainSha) {
+                    $freshnessOk = $true
+                } else {
+                    $freshnessReason = "installer built from $recordedSha, but origin/main is currently $mainSha -- this is NOT today's main, it's a prior build"
+                }
+            } catch {
+                $freshnessReason = "git invocation against $RepoPath threw: $($_.Exception.Message)"
+            }
+        }
     }
-    Write-Log "[RUN] Installing silently (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART)..."
-    $installProc = Start-Process -FilePath $InstallerPath -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
-    Write-Log "  installer exit code: $($installProc.ExitCode)"
-    if ($installProc.ExitCode -ne 0) {
-        Write-Log "[ABORT] Installer did not exit 0 -- treat everything below as suspect until this is understood."
+
+    if ($freshnessOk) {
+        Write-Log "[OK] Freshness check: installer's recorded source commit matches current origin/main."
+    } elseif ($AllowStaleBuild) {
+        Write-Log "[WARNING] Freshness check failed ($freshnessReason) -- proceeding anyway because -AllowStaleBuild was passed. Every result below is against a build that may not reflect current main."
+    } else {
+        Write-Log "[ABORT] Freshness check failed ($freshnessReason). Refusing to install and run the trip against a build that cannot be confirmed current -- pass -AllowStaleBuild to override deliberately (e.g. re-verifying an older release)."
+        Write-Log "[SKIPPED] Every step below that needs a real install will be SKIPPED, loudly."
+        $SkipInstall = $true  # not a real -SkipInstall request -- reuses every downstream skip
+        $installSkippedByFreshnessCheck = $true  # gate below, but Step -1's message differs (see there)
+    }
+
+    if (-not $SkipInstall) {
+        Write-Log "[RUN] Installing silently (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART)..."
+        $installProc = Start-Process -FilePath $InstallerPath -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+        Write-Log "  installer exit code: $($installProc.ExitCode)"
+        if ($installProc.ExitCode -ne 0) {
+            Write-Log "[ABORT] Installer did not exit 0 -- treat everything below as suspect until this is understood."
+        }
     }
 }
 
@@ -85,7 +144,9 @@ Write-Log "--- STEP -1: Genuine first-run observation (AJ4 -- this is the ONLY c
 Write-Log "    THIS MUST HAPPEN BEFORE ANY OTHER STEP TOUCHES THIS PROFILE."
 # ===========================================================================
 
-if ($SkipInstall) {
+if ($installSkippedByFreshnessCheck) {
+    Write-Log "[SKIPPED] Freshness check aborted Step -2 -- no install attempted, so first-run state is whatever this profile already had, if anything."
+} elseif ($SkipInstall) {
     Write-Log "[SKIPPED] -SkipInstall passed -- first-run state was already consumed on a prior run, if any."
 } else {
     Write-Log "[WHAT TO DO] A browser window is about to open to the dashboard's first-run screen."
