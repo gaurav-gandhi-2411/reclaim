@@ -1,111 +1,94 @@
-# Resume checkpoint — 2026-08-23 (refreshed)
+# Resume checkpoint — 2026-08-24
 
-Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`
-(committed on `main` as of PR #68 — no longer draft, already merged).
-
-**This file supersedes its own earlier version from earlier today.** That version (still visible
-in this same PR's history) claimed `main` was at `34b1b9b` and that rebuild #5 had never been
-attempted — both were already stale by the time they were written down: PR #68 had merged minutes
-earlier, and (per filesystem evidence found this session, not git history) rebuild #5 *was*
-attempted once, and failed at the RAM preflight. Don't trust a checkpoint doc's claims about `main`
-without an actual `git fetch` + SHA compare — see rule 118a.
+Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`.
+This file has been rewritten twice today as state changed — trust this version, not memory of an
+earlier one. Always `git fetch origin` and compare SHAs before trusting ANY checkpoint doc's
+claims about `main`, including this one (rule 118a) — this exact file was already caught stale
+twice today.
 
 ## Where we are
 
-`main` is at `182365ba46aba1879b467f659853ed65b63537c7` (PR #68, the audit-doc checkpoint, merged
-2026-08-23T12:12:21Z). Confirmed via `git fetch origin` + `git rev-parse origin/main`, not assumed.
+`origin/main` is at `0d9e3e9253e0d61280be7774833526fb5c972abd` (PRs #69/#70/#71 merged). Confirm:
+`git fetch origin --quiet && git rev-parse origin/main`.
 
-**Two new draft PRs opened this session, both blocking everything below until merged:**
+**Rebuild #5 is done.** SHA-256 `79cae649b6321c67ce71e48f52f1d56c1ad5b491e1b5baba434bca16fccfc2b7`,
+built from `0d9e3e9253e0d61280be7774833526fb5c972abd` (confirmed matching `origin/main`). Staged at
+`C:\Users\Public\reclaim_ac3\reclaim-setup.exe` with its `.sha256`/`.buildsha` sidecars and the
+current trip script. Installed for real under gaura's own account.
 
-- **PR #70** — `fix/apply-scan-root-scope-ttl-and-membership`. A real, live-reproduced P0 found
-  during this session's own ground-truth verification (not part of the original instructions):
-  `resolve_allowed_apply_roots()` treated a confirmed outside-home scan's root as blanket,
-  indefinite apply authorization for the ENTIRE subtree — including content created *after* the
-  scan, never seen by it. Reproduced from source in isolation (real confirm-intent token, no
-  test-only bypass): a never-scanned file under a confirmed root was deleted. **This directly
-  contradicts this doc's own earlier "AE1 correctly skips outside-home paths" claim** — that
-  claim only exercised `scan_status.root is None`, which is not the case a long-lived, multiply-
-  reused server process is actually in. Fixed with two independent, teeth-proofed checks: (a) an
-  outside-home path must already be present in the confirming scan's persisted index, not merely
-  nested under its root; (b) the root's authorization expires 30 minutes after that scan
-  completes. `scripts/verify.py` clean: 1202 passed (+2), 94.49% coverage.
-- **PR #71** — `fix/scan-confirmation-token-ttl`. Item 7 (below), now fixed: confirm-intent
-  tokens are `dict[str, float]` (token → mint time), single-use either way, rejected past 60s,
-  swept on every mint so an unconsumed token doesn't accumulate forever. `scripts/verify.py`
-  clean: 1203 passed (+3), all safety-critical floors met.
+**PR #70's fix (the scan-root-scope P0) is now confirmed against the real frozen binary, three
+independent ways**: (1) source-level reproduction, (2) a manual HTTP round-trip against the frozen
+server, (3) the trip script's own Step 6 AE1 teeth-proof, run twice, second time clean
+(`[PASS] File outside user scope was NOT touched`). This closes the "not yet verified against the
+frozen binary" gap the audit doc flagged earlier today.
 
-Neither self-merged, per this repo's standing policy for auth/security-adjacent changes. **Human
-merge required before rebuild #5 or the AC3 trip proceed** — everything downstream depends on
-`origin/main` actually containing both fixes.
+**Five more draft PRs opened and pushed today, none merged yet, none self-merged (standing
+policy):**
 
-## What actually happened to the "blocked on RAM" state
+- **PR #72** — `docs/ar1-ar2-scan-scope-findings`. AR1 (what the AE1 proof actually established
+  vs. how it was read) + AR2 (sibling sweep for the same defect class — two real instances, both
+  already fixed in #70/#71; everything else checked and ruled out with file:line + reasoning).
+- **PR #73** — `fix/build-provenance-sidecar`. `build_installer.ps1` now writes a `.buildsha`
+  sidecar recording the exact source commit — the producing half of the fix below.
+- **PR #63** — `docs/ac3-login-diagnostic` (existing, updated twice today). The trip script's Step
+  -2 now refuses to install a build whose `.buildsha` doesn't match current `origin/main` exactly
+  (the consuming half of #73's fix) — closes the actual gap that let 4 stale trip runs proceed
+  yesterday. **Found and fixed a real bug in this same guard while dry-running it**: the default
+  `-RepoPath` resolved wrong when run from the script's own real deployment location
+  (`C:\Users\Public\reclaim_ac3\`, not the repo checkout) — fixed, re-verified live, freshness
+  check now shows `[OK]`.
+- **PR #74** — `fix/smoke-probe-timeout-too-short`. The frozen smoke suite's `http_probe.py` had
+  15s/30s timeouts, an order of magnitude too short for a real dev machine's persisted index (same
+  defect class already fixed once in the trip script — never checked for a sibling here). Raised
+  to 180s. **Disclosed as a partial fix**: the real issue is a shared, ever-growing persisted index
+  across repeated suite runs on the same machine (frozen builds' `data_root()` ignores the suite's
+  own scratch dir by design), for which no fixed timeout is fully durable — a real fix needs an
+  isolated `--db` override, out of scope for this pass.
+- **PR #75** — `docs/ar5-frozen-verification`. Records AR4 (rebuild #5, the scale-nightly flake
+  investigation, a `Get-FileHash`-in-nested-process build-script quirk worked around by hand) and
+  AR5 (the frozen-suite/trip-script re-verification above) in the audit doc.
 
-Not blocked anymore. Free RAM checked live this session: 21.69GB (floor is 8GB). One rebuild #5
-attempt already exists on disk (`packaging/build/nuitka_build_console5.log`) and failed at the
-preflight with 5.2GB free — consistent with the earlier session's `llama-server` blocker. That
-attempt predates PRs #70/#71 anyway, so it wouldn't have been a valid build regardless of RAM.
+**Merge order doesn't matter functionally** (no PR depends on another merging first), but #63/#73
+are a matched producer/consumer pair — merge together or #63 alone is inert until #73 lands too.
 
-## AC3 trip: already run four times today, against the STALE rebuild #4 artifact — before either fix above existed
+## Frozen smoke suite results (this session, against rebuild #5)
 
-`C:\Users\Public\reclaim_ac3\` holds 4 trip run logs from today (13:14–14:18), all against
-`reclaim-setup.exe` SHA-256 `3452ca01...` (rebuild #4, from `4c352197...`, predates #65/#66/#67
-*and* predates #70/#71). **This is exactly the "do not run the trip against these as-is" case the
-prior version of this doc warned about** — it happened anyway (not by this session; found as
-pre-existing filesystem state at session start). 3 of the 4 runs are inconclusive (CSRF omission →
-403, a timeout, an unreachable server — apparatus bugs, matching AN3's established pattern). The
-4th (`ac3_run_20260823_141414.txt`) is the one that surfaced the PR #70 finding above.
+8 PASS / 1 FAIL / 4 BLOCKED (first run), 7 PASS / 1 FAIL / 5 BLOCKED (second run, back-to-back —
+one PASS flipped to BLOCKED on notification debounce state from the first run, a known test-
+harness-contamination pattern, not a regression). The 4-5 BLOCKED are all pre-existing, documented
+gaps (3b visual toast, 5 task-scheduler elevation, 1d hardlink-probe seed data, 1e 8.3 short-name
+username length). The 1 FAIL (`7-scan-apply-undo`) is the shared-growing-index timeout above —
+**the underlying product behavior was directly proven correct** by manually re-running the same
+cycle with a generous timeout: a real file was vaulted then restored, byte-identical, zero data
+loss. See `docs/AUDIT-2026-08.md`'s AR5 section for full detail.
 
-**Do not treat any of these 4 runs as a completed AC3 trip.** Rebuild #5 (with #70 and #71 both
-merged) is still required before a real trip.
+## Trip-script dry run (this session, from gaura's own account)
+
+Completed, twice. Second run (after the `-RepoPath` fix): freshness check `[OK]`, Step 6 AE1
+`[PASS]`. 3 ABORTs, all pre-existing/environmental (Task Scheduler not registered — non-elevated
+install; two apply/scan calls that didn't finish within their poll windows — the same shared-index
+cost as check 7 above). 0 FAIL, 0 SKIPPED, every non-PASS line had a stated reason.
 
 ## Exact resume sequence
 
 ```powershell
-# 1. Confirm both PRs are merged
-gh pr view 70 --json state   # must be MERGED
-gh pr view 71 --json state   # must be MERGED
+# 1. Merge the 5 open PRs (63, 72, 73, 74, 75) in whatever order/batching you prefer -- none are
+#    self-merged, none block each other functionally.
 
-# 2. Confirm RAM is actually free (not just believed free — verify)
-[math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1MB, 2)  # need >= 8
-
-# 3. Confirm HEAD matches origin/main before building -- fetch first, always (rule 118a)
+# 2. If you want a rebuild #6 reflecting any NEW commits merged after 0d9e3e9 (not required --
+#    rebuild #5 already reflects everything through PR #71, and PRs #63/#72/#73/#74/#75 are
+#    docs/packaging-only, no product source changed):
 git fetch origin --quiet; git branch -f main origin/main; git checkout main
-git rev-parse HEAD  # must equal origin/main, must contain both #70 and #71
-
-# 4. Rebuild #5
+git rev-parse HEAD  # compare to origin/main
 nohup powershell -NoProfile -ExecutionPolicy Bypass -File packaging/build_installer.ps1 `
-  > packaging/build/nuitka_build_console6.log 2>&1 &
-# wait ~35-40 min; confirm "Successful compile" in the log; record SHA-256 from
-# packaging/dist/reclaim-setup.exe.sha256; re-confirm it was built from the SHA in step 3.
+  > packaging/build/nuitka_build_console7.log 2>&1 &
+# Launch from a PLAIN terminal, not nested inside another PowerShell process -- AR4 found
+# Get-FileHash unresolvable in that one specific invocation shape this session.
 
-# 5. AO4 — from your own account, before spending a login:
-#    - Frozen suite (needs pwsh, at C:\Program Files\PowerShell\7-preview\pwsh.exe, not on PATH):
-&"C:\Program Files\PowerShell\7-preview\pwsh.exe" -NoProfile -File packaging/smoke/run_frozen_smoke_suite.ps1 `
-  -InstallPath <fresh dist path>
-#    - Full dry run of the trip script end-to-end (real install, real dashboard, all 9 steps),
-#      report every step PASS/FAIL/ABORT/SKIPPED, confirm zero silent skips.
-#    - Re-verify PR #70's fix specifically against the frozen binary: the AE1 teeth-proof (Step 6)
-#      must now show either a clean skip (never-scanned path) or, if testing the legitimate case,
-#      a real vault/recycle_bin success for an ACTUALLY-scanned outside-home path. A repeat of the
-#      141414 log's result (silent success, skip_reason: null, on a never-scanned path) means the
-#      source fix didn't survive freezing -- treat that as a new P0, not a retry-blind situation.
-
-# 6. AO5 — only after AO4 is clean: the actual trip against ReclaimSmokeTest. Copy the fresh
-#    installer + current ac3_login_diagnostic.ps1 into C:\Users\Public\reclaim_ac3\ first.
+# 3. AO5 -- the actual trip against ReclaimSmokeTest. Everything AO4 (frozen suite + dry run)
+#    could verify without spending a login has been done -- see above. Only the two irreducible
+#    human steps remain.
 ```
-
-## Item 7 — FIXED (PR #71, pending merge)
-
-Was: full-drive-scan confirmation tokens single-use but no expiry. Now: 60s TTL, pruned on mint.
-Tests prove expiry at both consumption sites and that pruning actually removes (not just rejects)
-a stale token.
-
-## Test account state
-
-`ReclaimSmokeTest` exists, enabled, `LastLogon` 2026-08-23 13:12:10 (matches today's trip window).
-Credential believed still valid based on that successful logon — not independently re-tested this
-session to avoid side effects. **U6 (delete the account) is still deliberately deferred** until a
-real trip (post rebuild #5, on a clean artifact) comes back clean — do not delete it.
 
 ## The two irreducible human steps for the trip (everything else is scripted)
 
@@ -114,23 +97,22 @@ real trip (post rebuild #5, on a clean artifact) comes back clean — do not del
    screenshot if convenient) — the data-level acknowledgment is already confirmed real from an
    earlier trip; the visual description was never given.
 
+## Test account state
+
+`ReclaimSmokeTest` exists, enabled, `LastLogon` 2026-08-23 13:12:10. Credential believed still
+valid based on that successful logon — not independently re-tested this session to avoid side
+effects. **U6 (delete the account) is still deliberately deferred** until a real trip against
+ReclaimSmokeTest itself comes back clean — do not delete it.
+
 ## Open-items list
 
-**Blocking the trip:** PR #70 + PR #71 merge, then rebuild #5 (above).
-
-**New this session, not yet in a trip:** PR #70's fix needs to be re-proven against the frozen
-binary specifically (see step 5's note above) — the source-level fix is proven, but this whole
-engagement's headline lesson is that source-level proof isn't sufficient on its own.
-
-**Automated in the trip script, never yet run against the real ReclaimSmokeTest account (on a
-non-stale artifact):** AE1 teeth-proof against ReclaimSmokeTest's real persisted index; S2/U4
-app-reported-vs-measured free-space delta; check 1e's fix-effect (real `temp_and_browser_caches`
-candidate count under the 8.3-aliased path — the precondition itself is already confirmed real).
-
-**Requires you:** the two items above, plus merging PR #70 and PR #71.
+**Blocking the actual AC3 trip:** nothing left except the two human steps above and merging the 5
+open PRs (which don't block the trip functionally, only the audit trail / packaging-tooling being
+in its final state — the artifact and trip script already work against `origin/main` as-is).
 
 **Disclosed, not re-opened:** the original full-drive-scan incident's exact trigger was never
 conclusively identified; check 1b's PASS carries a caveat — real evidence, but from a harness
-that's already been wrong once this session.
+that's already been wrong more than once this engagement; check 7's shared-growing-index timeout
+issue (above) is a real, disclosed apparatus gap, not fully closed.
 
 **Deliberately deferred:** U6 (above); S5 (first-60-seconds report — blocked on human step 2).
