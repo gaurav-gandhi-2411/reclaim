@@ -29,6 +29,7 @@ from reclaim.mcp.selection import (
     compute_selection_hash,
 )
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
+from reclaim.preflight import check_within_allowed_scope
 from reclaim.safety import SafetyValidator
 
 # reclaim.mcp.server — the ONLY module in this package that talks to the outside world (stdio,
@@ -129,11 +130,27 @@ def build_mcp_server(state: AppState) -> FastMCP:
     def scan(path: str, ctx: Context[Any, Any, Any]) -> ScanTriggerResult:
         """Start scanning a directory tree to build/update Reclaim's inventory index. Returns
         immediately (the scan runs in the background) -- call scan_status() to poll progress and
-        learn the scan_id once it completes. Refuses if a scan is already running or `path`
-        isn't a directory that exists on this machine."""
+        learn the scan_id once it completes. Refuses if a scan is already running, `path` isn't a
+        directory that exists on this machine, or `path` is outside your home directory.
+
+        AO1 (2026-08-23 audit): found this tool accepted ANY path with zero restriction while
+        sweeping for siblings of a full-drive-scan confirmation bypass -- worse than the HTTP
+        API's own equivalent, since MCP has no browser session and so no way to go through the
+        confirmation-token flow `POST /api/scan`/`POST /api/scan/full-drive` now require for an
+        outside-home root (`reclaim.api.routes.confirm_full_drive_scan_intent`). Rather than give
+        MCP its own token-minting path, this tool is simply narrower than the HTTP surface here:
+        an MCP-driven agent can never scan outside home, full stop, matching least-privilege --
+        an autonomous surface should never reach a broader scope than a deliberate, human-
+        confirmed browser action can."""
         root = Path(path)
         if not root.is_dir():
             raise ValueError(f"scan path does not exist or is not a directory: {root}")
+        if not check_within_allowed_scope(root, allowed_roots=[Path.home()]):
+            raise ValueError(
+                f"{root} is outside your home directory -- this tool cannot scan outside "
+                "your own profile. Use the dashboard's manual-scan confirmation flow for a "
+                "genuinely intended outside-home scan."
+            )
 
         started_at = time.time()
         with state.lock:

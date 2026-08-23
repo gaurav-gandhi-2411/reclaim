@@ -116,6 +116,10 @@ class ScanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
+    # AO1 (2026-08-23 audit): only required when `path` resolves outside Path.home() -- see
+    # AppState.scan_outside_home_confirmation_tokens's docstring. None/omitted is fine for the
+    # common within-home case; the server enforces the requirement, not this schema.
+    token: str | None = None
 
 
 class FullDriveScanConfirmIntentResponse(BaseModel):
@@ -128,8 +132,9 @@ class FullDriveScanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # AN1 (2026-08-23 audit): must be a token minted by POST /api/scan/full-drive/confirm-intent
-    # in this same server process, consumed on use -- see AppState.full_drive_scan_confirmation_
-    # tokens's docstring for why the general CSRF token alone is no longer sufficient here.
+    # in this same server process, consumed on use -- see
+    # AppState.scan_outside_home_confirmation_tokens's docstring for why the general CSRF token
+    # alone is not sufficient here.
     token: str
 
 

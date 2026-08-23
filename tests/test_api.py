@@ -764,6 +764,66 @@ def test_full_drive_scan_confirm_intent_mints_a_fresh_token_each_call(tmp_path: 
     assert first != second
 
 
+# AO1 (2026-08-23 audit): POST /api/scan itself accepted ANY caller-supplied path with ZERO
+# restriction before this fix -- not even the weak CSRF-only check /full-drive used to have --
+# found while sweeping for siblings of that bug. These tests prove an outside-home path now needs
+# the same confirmation token, and a within-home path still needs none (unchanged, no regression
+# on the overwhelmingly common case).
+
+
+def test_scan_outside_home_without_a_token_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    outside_dir = tmp_path / "outside_home"
+    outside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    client = _make_app(tmp_path, config=_config(own_profile))
+    response = client.post("/api/scan", json={"path": str(outside_dir)})
+    assert response.status_code == 403
+    assert "outside your home directory" in response.json()["detail"]
+
+
+def test_scan_outside_home_with_a_valid_token_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    outside_dir = tmp_path / "outside_home"
+    outside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    client = _make_app(tmp_path, config=_config(own_profile))
+    token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    response = client.post("/api/scan", json={"path": str(outside_dir), "token": token})
+    assert response.status_code == 202, response.text
+
+    status = client.get("/api/scan/status").json()
+    assert status["status"] == "completed"
+
+
+def test_scan_within_home_needs_no_token_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    inside_dir = own_profile / "Downloads"
+    inside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    client = _make_app(tmp_path, config=_config(own_profile))
+    response = client.post("/api/scan", json={"path": str(inside_dir)})
+    assert response.status_code == 202, response.text
+
+
 def test_single_path_scan_status_carries_the_new_phase_and_eta_fields(tmp_path: Path) -> None:
     """`POST /api/scan`'s original contract (`status`/`root`/`entries_total`/...) is unchanged --
     this only proves the new full-drive-scan-eta fields are ALSO populated correctly for the

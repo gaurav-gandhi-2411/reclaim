@@ -325,7 +325,13 @@ async function startManualScan(path) {
   statusEl.dataset.tone = "";
   statusEl.textContent = "Starting scan…";
   try {
-    await api("/api/scan", { method: "POST", body: JSON.stringify({ path }) });
+    // AO1 (2026-08-23 audit): minted unconditionally, right at this confirmed click -- the
+    // server only requires/consumes it when `path` actually resolves outside home, but this
+    // function has no reliable way to know that in advance (short-name aliases, symlinks,
+    // relative segments -- exactly what the server's own resolve()-based check exists to get
+    // right), so it's simplest and safest to always mint one rather than guess client-side.
+    const { token } = await api("/api/scan/full-drive/confirm-intent", { method: "POST" });
+    await api("/api/scan", { method: "POST", body: JSON.stringify({ path, token }) });
     // refreshScanStatus (not pollScanStatus) — it's the one that arms the repeating
     // setInterval when it observes "running"; pollScanStatus alone only ever checks once,
     // so a scan caught mid-flight here would otherwise freeze the UI on "Scanning…" forever.

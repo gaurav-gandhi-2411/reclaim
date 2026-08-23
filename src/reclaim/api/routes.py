@@ -59,6 +59,7 @@ from reclaim.executor import (
     SafeModeViolationError,
 )
 from reclaim.mode import ModeSwitchDeniedError
+from reclaim.preflight import check_within_allowed_scope
 
 router = APIRouter(prefix="/api")
 logger = structlog.get_logger(__name__)
@@ -83,6 +84,34 @@ def start_scan(
             status_code=400,
             detail=f"scan path does not exist or is not a directory: {root}",
         )
+
+    # AO1 (2026-08-23 audit): this route accepted ANY caller-supplied path with zero
+    # restriction -- not even the weak CSRF-only check /full-drive used to have -- found while
+    # sweeping for siblings of that bug. A within-home path (the overwhelming common case: the
+    # manual-scan form's quick-root shortcuts, and any typed path a real user's own profile
+    # contains) needs no token, same as always. A path outside home needs the same single-use,
+    # session-minted confirmation /full-drive now requires -- see
+    # AppState.scan_outside_home_confirmation_tokens's docstring.
+    within_home = check_within_allowed_scope(root, allowed_roots=[Path.home()])
+    token_present = False
+    if not within_home:
+        token = payload.token
+        with state.lock:
+            token_valid = token is not None and token in state.scan_outside_home_confirmation_tokens
+            if token_valid and token is not None:
+                state.scan_outside_home_confirmation_tokens.discard(token)
+        if not token_valid:
+            logger.info(
+                "api.scan_denied", reason="missing_or_invalid_confirmation_token", root=str(root)
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"{root} is outside your home directory -- call "
+                    "POST /api/scan/full-drive/confirm-intent first and pass its token here"
+                ),
+            )
+        token_present = True
 
     started_at = time.time()
     with state.lock:
@@ -110,7 +139,9 @@ def start_scan(
     # after a full-drive scan ran against a real account mid-session with no way to reconstruct
     # afterward which endpoint/params actually initiated it. Every scan-start route now logs
     # root + origin + confirmation-token presence unconditionally, regardless of outcome.
-    logger.info("api.scan_initiated", root=str(root), origin="POST /api/scan", token_present=False)
+    logger.info(
+        "api.scan_initiated", root=str(root), origin="POST /api/scan", token_present=token_present
+    )
     background_tasks.add_task(service.run_scan, state, [root], started_at)
     return service.to_scan_status_out(status_snapshot)
 
@@ -206,17 +237,20 @@ def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> 
 @router.post("/scan/full-drive/confirm-intent", response_model=FullDriveScanConfirmIntentResponse)
 def confirm_full_drive_scan_intent(request: Request) -> FullDriveScanConfirmIntentResponse:
     """AN1 (2026-08-23 audit): mints a fresh, single-use token proving the caller reached this
-    endpoint in this same server process -- called ONLY by app.js's full-drive confirm dialog's
-    "Yes, scan everything" button, never before. `POST /api/scan/full-drive` now requires and
-    consumes one of these; the general CSRF token alone (valid for the whole process lifetime,
-    reusable) is no longer sufficient on its own to start a whole-drive traversal. Closes the gap
+    endpoint in this same server process -- called by app.js's full-drive confirm dialog's
+    "Yes, scan everything" button, and (AO1, same day) also by the manual-scan confirm dialog
+    right before a `POST /api/scan` call whose path might resolve outside home (harmless to mint
+    even when it turns out not to be needed -- the token is simply never consumed). Both
+    `POST /api/scan/full-drive` and `POST /api/scan` (for an outside-home root) now require and
+    consume one of these; the general CSRF token alone (valid for the whole process lifetime,
+    reusable) is not sufficient on its own to start a scan outside the user's home. Closes the gap
     found when a full-drive scan ran against a real account with no code path identified that
-    should have been able to trigger it -- the confirmation dialog was, until this fix, a
-    frontend-only affordance with no server-side enforcement behind it at all."""
+    should have been able to trigger it -- both confirmation dialogs were, until this fix,
+    frontend-only affordances with no server-side enforcement behind either of them at all."""
     state = get_state(request)
     token = secrets.token_urlsafe(32)
     with state.lock:
-        state.full_drive_scan_confirmation_tokens.add(token)
+        state.scan_outside_home_confirmation_tokens.add(token)
     return FullDriveScanConfirmIntentResponse(token=token)
 
 
@@ -245,9 +279,9 @@ def start_full_drive_scan(
     able to reach this endpoint."""
     state = get_state(request)
     with state.lock:
-        token_valid = payload.token in state.full_drive_scan_confirmation_tokens
+        token_valid = payload.token in state.scan_outside_home_confirmation_tokens
         if token_valid:
-            state.full_drive_scan_confirmation_tokens.discard(payload.token)
+            state.scan_outside_home_confirmation_tokens.discard(payload.token)
     if not token_valid:
         logger.info("api.full_drive_scan_denied", reason="missing_or_invalid_confirmation_token")
         raise HTTPException(

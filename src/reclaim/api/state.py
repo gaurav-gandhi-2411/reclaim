@@ -208,11 +208,18 @@ class AppState:
     # against a real account mid-session with no code path identified that should have been able
     # to trigger it. `POST /api/scan/full-drive/confirm-intent` mints a token into this set
     # (guarded by `lock`, same as `scan_status`) ONLY when called -- the frontend calls it
-    # exactly when the user clicks the dialog's confirm button, never before. `start_full_drive_
-    # scan` requires and consumes (single-use) a token from this set; the general CSRF token
-    # alone is no longer sufficient. Tokens are single-use and unbounded in count (no cap needed:
-    # each is consumed or replaced by a fresh mint, never accumulates across a normal session).
-    full_drive_scan_confirmation_tokens: set[str] = field(default_factory=set)
+    # exactly when the user clicks the dialog's confirm button, never before.
+    #
+    # AO1 (2026-08-23 audit, same day): widened to cover `POST /api/scan` too, not just
+    # `/full-drive` -- the plain scan endpoint accepted ANY caller-supplied path, including one
+    # outside the user's home, with zero restriction at all (not even the weak CSRF-only check
+    # `/full-drive` used to have). Both routes now require and consume (single-use) a token from
+    # this same set whenever the resolved scan root is outside `Path.home()`; a within-home scan
+    # (the common case for both routes) needs no token at all. The general CSRF token alone is
+    # not sufficient for either route once the requested root leaves the user's own profile.
+    # Tokens are single-use and unbounded in count (no cap needed: each is consumed or replaced
+    # by a fresh mint, never accumulates across a normal session).
+    scan_outside_home_confirmation_tokens: set[str] = field(default_factory=set)
     # P0-2 fix (2026-08 audit): the exact path `config` above was loaded from (or would be
     # created at, if it didn't exist) — needed so `POST /api/settings/categories/{group}` can
     # persist a toggle to the same on-disk file the CLI/next server start will read, not just
