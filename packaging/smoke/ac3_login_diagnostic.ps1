@@ -70,6 +70,21 @@ function Write-Log {
     Add-Content -Path $logPath -Value $Message
 }
 
+function Get-IndexSizeDetail {
+    # AT1 (2026-08-24 audit): a timeout ABORT with no size context is undiagnosable without
+    # asking -- this account's real, growing index has already outgrown one raised timeout
+    # (180s, PR #74) within hours of landing (docs/AUDIT-2026-08.md's AS3). Reporting the actual
+    # index size at the moment of the abort at least tells the next reader whether this is the
+    # same known cost class or something new, without a follow-up question.
+    param([string]$AppDir)
+    if (-not $AppDir) { return "index size: unknown (install directory not resolved)" }
+    $indexPath = Join-Path $AppDir 'data\reclaim_index.sqlite3'
+    if (-not (Test-Path $indexPath)) { return "index size: unknown (no index file at $indexPath)" }
+    $bytes = (Get-Item $indexPath).Length
+    $gb = [math]::Round($bytes / 1GB, 2)
+    return "index size: $bytes bytes (${gb}GB) at $indexPath"
+}
+
 Write-Log "==================================================================="
 Write-Log "Reclaim AC3 diagnostic run -- $ts"
 Write-Log "==================================================================="
@@ -512,20 +527,40 @@ if ($serverReachable -and $csrfToken) {
     $body = @{ tier = 'both'; paths = @($outsideScopeFile); method = 'vault'; dry_run = $false } | ConvertTo-Json
     $headers = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
     try {
-        # 120s, not 10s: resolve_apply_selection's explicit-paths branch still calls
-        # generate_candidates against the FULL persisted index regardless of the requested path
-        # (confirmed live: 30-50s on a real ~956MB leftover index during this fix's own
-        # verification run) -- a large real account's index, exactly the shape AC3 is meant to
-        # exercise, can genuinely take this long even for a single explicit-path apply.
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 120
-        Start-Sleep -Seconds 2
-        $applyStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
+        # AT1 (2026-08-24 audit): 600s, not 120s -- 120s (raised from an original 10s) was itself
+        # already re-outgrown: GET /api/candidates measured 225.8s against this account's real,
+        # ~1GB/1M+-row index (docs/AUDIT-2026-08.md's AS3), and resolve_apply_selection's explicit-
+        # paths branch pays a related, index-size-dependent generate_candidates cost. 600s is real
+        # headroom against the measured value, not another increment that gets outgrown again.
+        $applyCallStart = Get-Date
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 600
+
+        # AT1: this used to be a SINGLE status check after a fixed 2s sleep, with no poll loop and
+        # no check that status had actually reached 'completed' before drawing a PASS/FAIL
+        # conclusion -- a still-'running' apply would show the file still present (it hadn't been
+        # processed yet) and get logged as a false PASS, on exactly the one check this whole trip
+        # exists to prove. Real poll loop now, same pattern as Steps 7/8, with the same 600s window
+        # and diagnosable ABORT message when it's genuinely never reached.
+        $applyStatus = $null
+        $pollDeadline = (Get-Date).AddSeconds(600)
+        while ((Get-Date) -lt $pollDeadline) {
+            Start-Sleep -Seconds 2
+            $applyStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 30
+            if ($applyStatus.status -in @('completed', 'failed')) { break }
+        }
+        $elapsedSeconds = [math]::Round(((Get-Date) - $applyCallStart).TotalSeconds, 1)
         Write-Log "  apply status: $($applyStatus | ConvertTo-Json -Compress -Depth 5)"
-        Write-Log "  file still exists after apply attempt: $(Test-Path $outsideScopeFile)"
-        if (Test-Path $outsideScopeFile) {
-            Write-Log "[PASS] File outside user scope was NOT touched -- AE1's scope check held against the real frozen server."
+
+        if ($applyStatus.status -ne 'completed') {
+            $sizeDetail = Get-IndexSizeDetail -AppDir $appDir
+            Write-Log "[ABORT] /api/apply/status never reached 'completed' after ${elapsedSeconds}s (status: '$($applyStatus.status)'; $sizeDetail) -- cannot draw a PASS/FAIL conclusion, SKIPPING. This is Step 6, the trip's own AE1 proof -- do not treat an ABORT here as a pass by default."
         } else {
-            Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] File outside user scope was deleted/moved. Report this immediately, do not soften it."
+            Write-Log "  file still exists after apply attempt: $(Test-Path $outsideScopeFile)"
+            if (Test-Path $outsideScopeFile) {
+                Write-Log "[PASS] File outside user scope was NOT touched -- AE1's scope check held against the real frozen server."
+            } else {
+                Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] File outside user scope was deleted/moved. Report this immediately, do not soften it."
+            }
         }
     } catch {
         Write-Log "  [ERROR] apply request failed: $($_.Exception.Message)"
@@ -580,30 +615,79 @@ if (-not $serverReachable -or -not $csrfToken) {
     }
 
     if ($originalMode -eq 'power' -or $switchedMode) {
-        # A real, sized fixture -- large enough (10MB) that its freed-space signal clearly
-        # exceeds ordinary OS background noise (other processes writing/deleting a few KB during
-        # the measurement window), so the 2% comparison gate means something.
+        # AT2 (2026-08-24 audit): this fixture used to be an arbitrary standalone file requested
+        # with method='direct_delete' directly -- apply_batch REJECTS that outright ("method
+        # parameter must be 'vault' or 'recycle_bin' -- 'direct_delete' is only ever derived
+        # per-candidate from Candidate.retention_days, never requested for a whole batch"),
+        # confirmed live: every prior run of this step failed near-instantly on that validation
+        # error, which the old code misreported as a 60s timeout (the poll loop had no 'failed'
+        # break condition, so it just spun until the iteration count ran out). direct_delete can
+        # ONLY be reached by a candidate whose CATEGORY defaults to retention_days=None
+        # (dev_artifacts/temp_and_browser_caches/package_caches/crash_dumps -- see
+        # executor._effective_method_and_retention_days) -- an arbitrary user-selected path can
+        # never qualify, by design (ADR-0001: permanence is a property of the category, not a
+        # per-run request). A `__pycache__` directory is dev_artifacts' one unconditional match
+        # (no manifest-adjacency gate, no age guard, unlike temp_and_browser_caches' 7-day
+        # minimum) -- the simplest real category shape that actually reaches direct_delete.
         $fixtureDir = 'C:\Users\Public\ac3_s2u4_fixture'
-        $fixtureFile = Join-Path $fixtureDir 'disposable_10mb.bin'
-        New-Item -ItemType Directory -Path $fixtureDir -Force | Out-Null
+        $pycacheDir = Join-Path $fixtureDir '__pycache__'
+        $fixtureFile = Join-Path $pycacheDir 'disposable_10mb.pyc'
+        New-Item -ItemType Directory -Path $pycacheDir -Force | Out-Null
         $fixtureBytes = New-Object byte[] (10 * 1MB)
         [System.IO.File]::WriteAllBytes($fixtureFile, $fixtureBytes)
-        Write-Log "[OK] Created a real 10MB disposable fixture: $fixtureFile"
+        Write-Log "[OK] Created a real 10MB disposable fixture (dev_artifacts/__pycache__ shape): $fixtureFile"
 
+        # A scan is required first -- generate_candidates' explicit-paths branch only matches
+        # already-INDEXED directories (detect_dev_artifacts queries the persisted index, never a
+        # live filesystem check), so the __pycache__ dir must be scanned before it can be
+        # requested by path. Outside home (C:\Users\Public), so needs the same confirm-intent
+        # token AN1/AO1's fix (PR #65/#66) requires of any outside-home scan.
+        Write-Log "[RUN] Scanning $fixtureDir so the __pycache__ fixture is indexed..."
+        try {
+            $confirmIntentBody = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/full-drive/confirm-intent" -Method Post -ContentType 'application/json' -Headers $headers -Body '{}' -TimeoutSec 10
+            $scanToken = $confirmIntentBody.token
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan" -Method Post -ContentType 'application/json' -Headers $headers -Body (@{ path = $fixtureDir; token = $scanToken } | ConvertTo-Json) -TimeoutSec 30
+            $fixtureScanDone = $false
+            $fixturePollDeadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $fixturePollDeadline) {
+                Start-Sleep -Milliseconds 500
+                $fixtureScanStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 10
+                if ($fixtureScanStatus.status -in @('completed', 'failed')) { $fixtureScanDone = ($fixtureScanStatus.status -eq 'completed'); break }
+            }
+            if (-not $fixtureScanDone) {
+                Write-Log "[ABORT] Fixture scan of $fixtureDir did not complete (status: '$($fixtureScanStatus.status)') -- SKIPPING the rest of Step 7, the apply request would find no candidate."
+            }
+        } catch {
+            $fixtureScanDone = $false
+            Write-Log "[ABORT] Fixture scan request failed: $($_.Exception.Message) -- SKIPPING the rest of Step 7."
+        }
+
+        if ($fixtureScanDone) {
         $driveBefore = Get-PSDrive -Name C
         Write-Log "[Measured BEFORE] C: free = $($driveBefore.Free) bytes"
 
-        Write-Log "[RUN] POST /api/apply for the fixture, method=direct_delete, real (not dry-run):"
-        $body = @{ tier = 'both'; paths = @($fixtureFile); method = 'direct_delete'; dry_run = $false } | ConvertTo-Json
+        # method='recycle_bin' here is nominal, not a request that takes effect: dev_artifacts'
+        # retention_days=None means _effective_method_and_retention_days overrides it to
+        # direct_delete unconditionally for this candidate, regardless of what's requested here --
+        # see this block's own top comment. Requesting 'direct_delete' directly is what apply_batch
+        # itself refuses; this is the correct way to reach the same real effect.
+        Write-Log "[RUN] POST /api/apply for the __pycache__ fixture (retention_days=None -> auto-resolves to direct_delete), real (not dry-run):"
+        $body = @{ tier = 'both'; paths = @($pycacheDir); method = 'recycle_bin'; dry_run = $false } | ConvertTo-Json
         try {
-            # 120s: same reason as Step 6's apply call -- a real account's persisted index can
-            # make even an explicit-path apply's synchronous pre-flight take tens of seconds.
-            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 120
-            for ($i = 0; $i -lt 30; $i++) {
+            # AT1 (2026-08-24 audit): 600s, not 120s -- same measured cost as Step 6's own apply
+            # call (see that step's comment); 120s (itself already a raise from an original 10s)
+            # was re-outgrown by this account's real index growth. 600s is real headroom against
+            # the 225.8s GET /api/candidates measured this session (docs/AUDIT-2026-08.md's AS3).
+            $applyCallStart = Get-Date
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 600
+            $lastApply = $null
+            $pollDeadline = (Get-Date).AddSeconds(600)
+            while ((Get-Date) -lt $pollDeadline) {
                 Start-Sleep -Seconds 2
-                $lastApply = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
-                if ($lastApply.status -eq 'completed') { break }
+                $lastApply = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 30
+                if ($lastApply.status -in @('completed', 'failed')) { break }
             }
+            $elapsedSeconds = [math]::Round(((Get-Date) - $applyCallStart).TotalSeconds, 1)
 
             $driveAfter = Get-PSDrive -Name C
             Write-Log "[Measured AFTER] C: free = $($driveAfter.Free) bytes"
@@ -611,7 +695,8 @@ if (-not $serverReachable -or -not $csrfToken) {
             Write-Log "[Measured delta] $measuredDelta bytes freed (OS-reported)"
 
             if ($lastApply.status -ne 'completed') {
-                Write-Log "[ABORT] /api/apply/status never reached 'completed' after 60s (status: '$($lastApply.status)') -- the comparison below would be meaningless, SKIPPING it."
+                $sizeDetail = Get-IndexSizeDetail -AppDir $appDir
+                Write-Log "[ABORT] /api/apply/status never reached 'completed' after ${elapsedSeconds}s (status: '$($lastApply.status)'; $sizeDetail) -- the comparison below would be meaningless, SKIPPING it."
             } else {
                 $appReported = $lastApply.result.bytes_freed
                 Write-Log "[App-reported] bytes_freed = $appReported (method: $($lastApply.result.method))"
@@ -629,6 +714,9 @@ if (-not $serverReachable -or -not $csrfToken) {
             }
         } catch {
             Write-Log "  [ERROR] apply request failed: $($_.Exception.Message)"
+        }
+        } else {
+            Write-Log "[SKIPPED] Step 7's apply -- fixture scan never completed, see ABORT above."
         }
         Remove-Item -Path $fixtureDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -660,19 +748,34 @@ if (-not $serverReachable -or -not $csrfToken) {
     Write-Log "[RUN] POST /api/scan for $tempPath ..."
     try {
         $scanHeaders = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
+        $scanCallStart = Get-Date
+        # POST /api/scan itself is a background-task route (returns 202 immediately regardless of
+        # index size) -- 10s stays fine here. The POLL window below and the candidates fetch after
+        # it are the two calls that scale with real disk/index size; see AT1's comment on those.
         $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan" -Method Post -ContentType 'application/json' -Headers $scanHeaders -Body (@{ path = $tempPath } | ConvertTo-Json) -TimeoutSec 10
         $scanDone = $false
-        for ($i = 0; $i -lt 60; $i++) {
+        $scanStatus = $null
+        $pollDeadline = (Get-Date).AddSeconds(600)
+        while ((Get-Date) -lt $pollDeadline) {
             Start-Sleep -Milliseconds 500
-            $scanStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 10
+            $scanStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 30
             if ($scanStatus.status -eq 'completed') { $scanDone = $true; break }
             if ($scanStatus.status -eq 'failed') { break }
         }
+        $scanElapsedSeconds = [math]::Round(((Get-Date) - $scanCallStart).TotalSeconds, 1)
         if (-not $scanDone) {
-            Write-Log "[ABORT] Scan of $tempPath did not reach 'completed' within 30s (status: '$($scanStatus.status)') -- SKIPPING the candidate-count check."
+            # AT1 (2026-08-24 audit): 600s, not 30s -- TEMP on a real, long-used dev machine can
+            # genuinely hold many thousands of files; 30s was never sized against a real account,
+            # only ever tested against small fixtures. Reports elapsed time + index size so a
+            # future occurrence is diagnosable without a follow-up question.
+            $sizeDetail = Get-IndexSizeDetail -AppDir $appDir
+            Write-Log "[ABORT] Scan of $tempPath did not reach 'completed' after ${scanElapsedSeconds}s (status: '$($scanStatus.status)'; $sizeDetail) -- SKIPPING the candidate-count check."
         } else {
             Write-Log "[OK] Scan completed: $($scanStatus | ConvertTo-Json -Compress)"
-            $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 10
+            # AT1: 600s, not 10s -- GET /api/candidates (even category-filtered) still computes the
+            # FULL candidate set first (list_candidates -> _cached_all_candidates), the same
+            # measured 225.8s cost as Step 6/7's apply calls and the frozen smoke suite's check 7.
+            $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 600
             $count = @($candResp.candidates).Count
             Write-Log "[Result] temp_and_browser_caches candidates found: $count"
             if ($count -gt 0) {
