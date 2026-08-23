@@ -282,7 +282,7 @@ if (-not $task) {
     Write-Log "  Compare against BEFORE -- see the value-meaning legend at the end of this log."
 
     if ($appDir) {
-        $logFile = Join-Path $appDir 'data\reclaim.log'
+        $logFile = Join-Path $appDir 'data\logs\reclaim.log'
         if (Test-Path $logFile) {
             Write-Log "[Log file AFTER Trigger 1] last 20 lines of ${logFile}:"
             Add-Content -Path $logPath -Value (Get-Content $logFile -Tail 20)
@@ -386,6 +386,7 @@ Write-Log "    this is that same proof, against the real installed .exe's live s
 # ===========================================================================
 
 $serverReachable = $true
+$csrfToken = $null
 try {
     $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 5 -ErrorAction Stop
 } catch {
@@ -394,6 +395,29 @@ try {
 }
 
 if ($serverReachable) {
+    # POST /api/apply is a mutating request -- reclaim.api.security's local-origin guard requires
+    # a valid X-Reclaim-CSRF-Token header on every one, matching the per-process token minted in
+    # AppState.csrf_token and embedded in index.html's <meta name="reclaim-csrf-token"> tag (see
+    # app.js's own CSRF_TOKEN constant, which reads it the same way). A prior version of this
+    # step never fetched or sent this header at all and got a 403 for it -- indistinguishable at
+    # a glance from a real security-policy rejection, but it never even reached AE1's scope check;
+    # the request was refused by this unrelated CSRF guard first. Fetch the real page and pull the
+    # token out the same way a real browser tab would, rather than reasoning about the header from
+    # source alone.
+    try {
+        $indexHtml = Invoke-RestMethod -Uri "http://127.0.0.1:8420/" -TimeoutSec 5 -ErrorAction Stop
+        if ($indexHtml -match 'name="reclaim-csrf-token"\s+content="([^"]+)"') {
+            $csrfToken = $Matches[1]
+            Write-Log "[OK] Fetched CSRF token from the real page (first 8 chars: $($csrfToken.Substring(0, [Math]::Min(8, $csrfToken.Length)))...)"
+        } else {
+            Write-Log "[ABORT] Could not find the reclaim-csrf-token meta tag in the served page -- SKIPPING Step 6's apply attempt (it would 403)."
+        }
+    } catch {
+        Write-Log "[ABORT] Could not fetch / to extract the CSRF token: $($_.Exception.Message) -- SKIPPING Step 6's apply attempt."
+    }
+}
+
+if ($serverReachable -and $csrfToken) {
     # Uses an EXPLICIT paths list, not a blanket apply -- resolve_apply_selection's explicit-paths
     # branch calls generate_candidates directly and never touches the candidates cache/warm-up
     # lock, so this genuinely does not need any prior scan to have completed: an explicit path
@@ -407,8 +431,9 @@ if ($serverReachable) {
 
     Write-Log "[RUN] POST /api/apply for a real path outside this user's home ($outsideScopeFile):"
     $body = @{ tier = 'both'; paths = @($outsideScopeFile); method = 'vault'; dry_run = $false } | ConvertTo-Json
+    $headers = @{ 'X-Reclaim-CSRF-Token' = $csrfToken }
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 10
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply" -Method Post -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 10
         Start-Sleep -Seconds 2
         $applyStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/apply/status" -TimeoutSec 10
         Write-Log "  apply status: $($applyStatus | ConvertTo-Json -Compress -Depth 5)"
@@ -422,15 +447,19 @@ if ($serverReachable) {
         Write-Log "  [ERROR] apply request failed: $($_.Exception.Message)"
     }
     Remove-Item -Path $outsideScopeDir -Recurse -Force -ErrorAction SilentlyContinue
+} elseif ($serverReachable) {
+    Write-Log "[SKIPPED] Step 6 -- CSRF token unavailable, see ABORT above."
+} else {
+    Write-Log "[SKIPPED] Step 6 -- dashboard server unreachable."
+}
 
+if ($serverReachable) {
     Write-Log "[OPTIONAL, richer proof] If this account has a real persisted index with genuine"
     Write-Log "  cross-tenant-shaped rows (another user profile's files, scanned in a prior"
     Write-Log "  session), you can additionally point the dashboard's Review Queue at one of those"
     Write-Log "  and confirm it never appears as an applicable candidate at all -- not just that a"
     Write-Log "  synthetic outside-scope path gets skipped at apply time. Not required for Step 6"
     Write-Log "  to count as complete; the proof above already exercises the real choke point."
-} else {
-    Write-Log "[SKIPPED] Step 6 -- dashboard server unreachable."
 }
 
 # ===========================================================================
