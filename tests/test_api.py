@@ -519,6 +519,96 @@ def test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched(
     assert other_target.read_bytes() == b"y" * 4096  # byte-for-byte untouched
 
 
+def test_apply_excludes_a_never_scanned_file_under_a_confirmed_outside_home_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AN5 (2026-08-23 audit): the live-reproduced gap -- a confirmed outside-home scan used to
+    authorize its ENTIRE root indefinitely, including content that never existed at scan time
+    and was never part of any candidate the scan actually surfaced. Same setup shape as
+    `test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched` above (scan for real,
+    THEN retroactively narrow `Path.home()` to make the scanned root count as outside-home), but
+    deliberately does NOT reset `scan_status` afterward -- this is exactly the persisted,
+    process-lifetime state the real gap lived in."""
+    from reclaim.api import service
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    own_profile.mkdir(parents=True, exist_ok=True)
+
+    seed_file = broad_root / "seed.txt"
+    _write(seed_file, b"present at scan time")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    # Created AFTER the scan completed -- the scan's own index has no row for this path at all.
+    never_scanned = broad_root / "never_scanned_after_the_fact.bin"
+    _write(never_scanned, b"z" * 2048)
+
+    result = _apply_and_wait(
+        client, {"tier": "A", "paths": [never_scanned.as_posix()], "dry_run": False}
+    )
+
+    assert result["files_processed"] == 0
+    assert not any(i["path"] == never_scanned.as_posix() for i in result["items"])
+    assert never_scanned.exists()
+    assert never_scanned.read_bytes() == b"z" * 2048  # byte-for-byte untouched
+
+    # Counter-check: the file genuinely present at scan time, under the same root, must still
+    # be applicable -- the fix must not overcorrect into excluding real, scanned candidates.
+    seed_result = _apply_and_wait(
+        client, {"tier": "A", "paths": [seed_file.as_posix()], "dry_run": False}
+    )
+    seed_item = next(i for i in seed_result["items"] if i["path"] == seed_file.as_posix())
+    assert seed_item["succeeded"] is True
+    assert not seed_file.exists()
+
+
+def test_apply_excludes_an_outside_home_root_once_its_scan_is_past_the_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AN5: the time-bound half of the fix -- even a file genuinely present at scan time (passes
+    the index-membership check above) must stop being apply-eligible once the confirming scan is
+    old enough that treating it as "the user just opted in" is no longer a reasonable read.
+    Backdates `scan_status` directly (same technique the existing cross-tenant test uses to
+    manipulate `AppState` between scan and apply) rather than injecting a fake clock into the
+    route layer, which has no such override in production."""
+    from reclaim.api import service
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    own_profile.mkdir(parents=True, exist_ok=True)
+
+    seed_file = broad_root / "seed.txt"
+    _write(seed_file, b"present at scan time")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = service._OUTSIDE_HOME_SCAN_SCOPE_TTL_SECONDS + 60
+        app_state.scan_status.finished_at = time.time() - stale_ago
+        app_state.scan_status.started_at = time.time() - stale_ago
+        app_state.candidates_cache = None
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    result = _apply_and_wait(
+        client, {"tier": "A", "paths": [seed_file.as_posix()], "dry_run": False}
+    )
+
+    assert result["files_processed"] == 1
+    assert result["files_succeeded"] == 0
+    item = next(i for i in result["items"] if i["path"] == seed_file.as_posix())
+    assert item["succeeded"] is False
+    assert item["skip_reason"] == "outside_user_scope"
+    assert seed_file.exists()
+    assert seed_file.read_bytes() == b"present at scan time"  # byte-for-byte untouched
+
+
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
 # NOTE (P0 fix, 2026-08-22): `POST /api/scan/full-drive` is no longer SIMPLE mode's DEFAULT
 # action -- `POST /api/scan/my-files` (tests above) is. This endpoint remains as a deliberate,
@@ -762,6 +852,83 @@ def test_full_drive_scan_confirm_intent_mints_a_fresh_token_each_call(tmp_path: 
     first = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
     second = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
     assert first != second
+
+
+def test_full_drive_scan_token_expires_after_its_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 7 (2026-08-23 audit): a token minted but never immediately consumed used to stay
+    valid indefinitely -- a suspended/delayed fetch could fire a full-drive scan arbitrarily
+    later. Backdates the token's recorded mint time (no fake clock needed at the route layer,
+    same technique the AN5 TTL tests use for `scan_status`) to simulate a token that was minted,
+    then genuinely never used until well past its TTL."""
+    from reclaim.api import routes, service
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [tmp_path / "drive_a"])
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[token] = time.time() - stale_ago
+
+    response = client.post("/api/scan/full-drive", json={"token": token})
+    assert response.status_code == 403, response.text
+    assert "missing or invalid" in response.json()["detail"]
+
+    # Single-use applies to an expired token too -- it must not linger for a second attempt to
+    # find, whether that attempt happens before or after the TTL check itself changes.
+    with app_state.lock:
+        assert token not in app_state.scan_outside_home_confirmation_tokens
+
+
+def test_scan_outside_home_token_expires_after_its_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same TTL enforcement as the full-drive test above, exercised through `POST /api/scan`'s
+    own outside-home gate (AO1) -- both consumption sites share
+    `routes._consume_scan_confirmation_token`, but each is proven independently since that
+    sharing is an implementation detail, not a contract this test should assume."""
+    from reclaim.api import routes, service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    outside_dir = tmp_path / "outside_home"
+    outside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    client = _make_app(tmp_path, config=_config(own_profile))
+    token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[token] = time.time() - stale_ago
+
+    response = client.post("/api/scan", json={"path": str(outside_dir), "token": token})
+    assert response.status_code == 403
+    assert "outside your home directory" in response.json()["detail"]
+
+
+def test_full_drive_scan_confirm_intent_prunes_expired_tokens_on_mint(tmp_path: Path) -> None:
+    """Item 7: an unconsumed token no longer accumulates past its own TTL -- proven by
+    confirming a stale, never-used token is gone from the dict after the NEXT mint, not just
+    rejected the next time someone tries to use it."""
+    from reclaim.api import routes
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    stale_token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[stale_token] = time.time() - stale_ago
+        assert stale_token in app_state.scan_outside_home_confirmation_tokens  # sanity
+
+    client.post("/api/scan/full-drive/confirm-intent")
+
+    with app_state.lock:
+        assert stale_token not in app_state.scan_outside_home_confirmation_tokens
 
 
 # AO1 (2026-08-23 audit): POST /api/scan itself accepted ANY caller-supplied path with ZERO

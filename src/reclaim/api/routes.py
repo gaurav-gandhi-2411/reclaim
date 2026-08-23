@@ -95,11 +95,7 @@ def start_scan(
     within_home = check_within_allowed_scope(root, allowed_roots=[Path.home()])
     token_present = False
     if not within_home:
-        token = payload.token
-        with state.lock:
-            token_valid = token is not None and token in state.scan_outside_home_confirmation_tokens
-            if token_valid and token is not None:
-                state.scan_outside_home_confirmation_tokens.discard(token)
+        token_valid = _consume_scan_confirmation_token(state, payload.token)
         if not token_valid:
             logger.info(
                 "api.scan_denied", reason="missing_or_invalid_confirmation_token", root=str(root)
@@ -234,6 +230,41 @@ def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> 
     return service.to_scan_status_out(status_snapshot)
 
 
+# Item-7 fix (2026-08-23 audit): a real click-to-scan round trip (dialog confirm -> this token
+# used) is milliseconds; 60s is generous headroom for that real interaction while closing the
+# actual gap -- a token minted but never immediately consumed used to stay valid indefinitely,
+# so a suspended/delayed fetch (or a token leaked/logged somewhere) could fire a scan outside
+# home arbitrarily later, in a process that could stay alive for hours or days.
+_SCAN_CONFIRMATION_TOKEN_TTL_SECONDS = 60.0
+
+
+def _prune_expired_scan_confirmation_tokens(state: AppState, *, now: float) -> None:
+    """Called with `state.lock` already held. Bounds the token dict's size over a long-lived
+    process -- without this, a minted-but-never-consumed token would sit past its own TTL
+    forever (rejected correctly by `_consume_scan_confirmation_token` either way, but never
+    actually removed)."""
+    expired = [
+        token
+        for token, minted_at in state.scan_outside_home_confirmation_tokens.items()
+        if (now - minted_at) > _SCAN_CONFIRMATION_TOKEN_TTL_SECONDS
+    ]
+    for token in expired:
+        del state.scan_outside_home_confirmation_tokens[token]
+
+
+def _consume_scan_confirmation_token(state: AppState, token: str | None) -> bool:
+    """True iff `token` was minted and is still within its TTL -- single-use either way: an
+    expired token is removed here too, not left for the next prune pass to find."""
+    if token is None:
+        return False
+    now = time.time()
+    with state.lock:
+        minted_at = state.scan_outside_home_confirmation_tokens.pop(token, None)
+    if minted_at is None:
+        return False
+    return (now - minted_at) <= _SCAN_CONFIRMATION_TOKEN_TTL_SECONDS
+
+
 @router.post("/scan/full-drive/confirm-intent", response_model=FullDriveScanConfirmIntentResponse)
 def confirm_full_drive_scan_intent(request: Request) -> FullDriveScanConfirmIntentResponse:
     """AN1 (2026-08-23 audit): mints a fresh, single-use token proving the caller reached this
@@ -246,11 +277,18 @@ def confirm_full_drive_scan_intent(request: Request) -> FullDriveScanConfirmInte
     reusable) is not sufficient on its own to start a scan outside the user's home. Closes the gap
     found when a full-drive scan ran against a real account with no code path identified that
     should have been able to trigger it -- both confirmation dialogs were, until this fix,
-    frontend-only affordances with no server-side enforcement behind either of them at all."""
+    frontend-only affordances with no server-side enforcement behind either of them at all.
+
+    Item-7 fix (2026-08-23, same audit): also records the mint time now, so
+    `_consume_scan_confirmation_token` can reject a token that's still unused past
+    `_SCAN_CONFIRMATION_TOKEN_TTL_SECONDS` -- see that function's and the `AppState` field's
+    docstrings for why an unbounded-lifetime token was a real, disclosed gap."""
     state = get_state(request)
     token = secrets.token_urlsafe(32)
+    now = time.time()
     with state.lock:
-        state.scan_outside_home_confirmation_tokens.add(token)
+        _prune_expired_scan_confirmation_tokens(state, now=now)
+        state.scan_outside_home_confirmation_tokens[token] = now
     return FullDriveScanConfirmIntentResponse(token=token)
 
 
@@ -278,10 +316,7 @@ def start_full_drive_scan(
     full-drive scan ran against a real account with no code path identified that should have been
     able to reach this endpoint."""
     state = get_state(request)
-    with state.lock:
-        token_valid = payload.token in state.scan_outside_home_confirmation_tokens
-        if token_valid:
-            state.scan_outside_home_confirmation_tokens.discard(payload.token)
+    token_valid = _consume_scan_confirmation_token(state, payload.token)
     if not token_valid:
         logger.info("api.full_drive_scan_denied", reason="missing_or_invalid_confirmation_token")
         raise HTTPException(
