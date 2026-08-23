@@ -519,6 +519,96 @@ def test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched(
     assert other_target.read_bytes() == b"y" * 4096  # byte-for-byte untouched
 
 
+def test_apply_excludes_a_never_scanned_file_under_a_confirmed_outside_home_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AN5 (2026-08-23 audit): the live-reproduced gap -- a confirmed outside-home scan used to
+    authorize its ENTIRE root indefinitely, including content that never existed at scan time
+    and was never part of any candidate the scan actually surfaced. Same setup shape as
+    `test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched` above (scan for real,
+    THEN retroactively narrow `Path.home()` to make the scanned root count as outside-home), but
+    deliberately does NOT reset `scan_status` afterward -- this is exactly the persisted,
+    process-lifetime state the real gap lived in."""
+    from reclaim.api import service
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    own_profile.mkdir(parents=True, exist_ok=True)
+
+    seed_file = broad_root / "seed.txt"
+    _write(seed_file, b"present at scan time")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    # Created AFTER the scan completed -- the scan's own index has no row for this path at all.
+    never_scanned = broad_root / "never_scanned_after_the_fact.bin"
+    _write(never_scanned, b"z" * 2048)
+
+    result = _apply_and_wait(
+        client, {"tier": "A", "paths": [never_scanned.as_posix()], "dry_run": False}
+    )
+
+    assert result["files_processed"] == 0
+    assert not any(i["path"] == never_scanned.as_posix() for i in result["items"])
+    assert never_scanned.exists()
+    assert never_scanned.read_bytes() == b"z" * 2048  # byte-for-byte untouched
+
+    # Counter-check: the file genuinely present at scan time, under the same root, must still
+    # be applicable -- the fix must not overcorrect into excluding real, scanned candidates.
+    seed_result = _apply_and_wait(
+        client, {"tier": "A", "paths": [seed_file.as_posix()], "dry_run": False}
+    )
+    seed_item = next(i for i in seed_result["items"] if i["path"] == seed_file.as_posix())
+    assert seed_item["succeeded"] is True
+    assert not seed_file.exists()
+
+
+def test_apply_excludes_an_outside_home_root_once_its_scan_is_past_the_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AN5: the time-bound half of the fix -- even a file genuinely present at scan time (passes
+    the index-membership check above) must stop being apply-eligible once the confirming scan is
+    old enough that treating it as "the user just opted in" is no longer a reasonable read.
+    Backdates `scan_status` directly (same technique the existing cross-tenant test uses to
+    manipulate `AppState` between scan and apply) rather than injecting a fake clock into the
+    route layer, which has no such override in production."""
+    from reclaim.api import service
+
+    broad_root = tmp_path / "Users"
+    own_profile = broad_root / "ReclaimSmokeTest"
+    own_profile.mkdir(parents=True, exist_ok=True)
+
+    seed_file = broad_root / "seed.txt"
+    _write(seed_file, b"present at scan time")
+
+    client = _make_app(tmp_path, config=_config(broad_root))
+    _scan_and_wait(client, broad_root)
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = service._OUTSIDE_HOME_SCAN_SCOPE_TTL_SECONDS + 60
+        app_state.scan_status.finished_at = time.time() - stale_ago
+        app_state.scan_status.started_at = time.time() - stale_ago
+        app_state.candidates_cache = None
+
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    result = _apply_and_wait(
+        client, {"tier": "A", "paths": [seed_file.as_posix()], "dry_run": False}
+    )
+
+    assert result["files_processed"] == 1
+    assert result["files_succeeded"] == 0
+    item = next(i for i in result["items"] if i["path"] == seed_file.as_posix())
+    assert item["succeeded"] is False
+    assert item["skip_reason"] == "outside_user_scope"
+    assert seed_file.exists()
+    assert seed_file.read_bytes() == b"present at scan time"  # byte-for-byte untouched
+
+
 # --- full-drive-scan-eta: fixed-drive enumeration + full-drive orchestration -------------------
 # NOTE (P0 fix, 2026-08-22): `POST /api/scan/full-drive` is no longer SIMPLE mode's DEFAULT
 # action -- `POST /api/scan/my-files` (tests above) is. This endpoint remains as a deliberate,
