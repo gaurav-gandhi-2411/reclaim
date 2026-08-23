@@ -412,6 +412,93 @@ def test_concurrent_delete_calls_for_the_identical_selection_do_not_both_execute
     assert len(list((tmp_path / "vault").rglob("index.js"))) == 1
 
 
+# AP1 (2026-08-23 audit): re-confirming the AO1 lens specifically for delete -- not "does a
+# LEGITIMATELY-obtained value later go stale" (the tests below this one), but "can a caller
+# construct a valid-looking scan_id/selection_hash without ever calling preview_apply first, and
+# does that matter." Answer, proven directly here rather than argued from reading the code alone:
+# neither value is a capability/consent token analogous to AN1/AO1's scan-confirmation tokens.
+# scan_id is `f"scan-{state.scan_generation}"` -- a plain, sequential, non-secret counter, freely
+# obtainable via scan_status() by any caller regardless. selection_hash has no server-side secret
+# in it at all (compute_selection_hash takes only public inputs) -- it is a commitment/integrity
+# check the server independently RE-DERIVES and compares against ground truth on every call, not
+# proof the caller went through a specific prior endpoint. A caller that predicts a hash correctly
+# is, by construction, correct about the current real selection -- that is success, not a bypass;
+# a caller that predicts wrong is caught by the same re-derivation regardless of intent.
+
+
+async def test_delete_succeeds_with_an_independently_computed_hash_never_calling_preview_apply(
+    tmp_path: Path,
+) -> None:
+    """The concrete proof: skip preview_apply entirely, compute selection_hash client-side using
+    the exact same (public, non-secret) function the server uses, and call delete directly. This
+    must succeed -- proving the hash is an integrity check on the TRUE current selection, not a
+    capability token that only the "correct" endpoint sequence can produce."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+
+        # Never called preview_apply. select_candidates_for_selector is the exact function
+        # preview_apply/delete themselves call server-side to build the true selection -- it is
+        # plain, public, non-secret Python logic any MCP client could independently replicate
+        # (in any language), not something requiring a prior call to a specific endpoint.
+        selected = service.select_candidates_for_selector(
+            state, tier="A", rule_id_or_category="dev_artifact_node_modules"
+        )
+        predicted_paths = sorted(c.path.as_posix() for c in selected)
+        predicted_hash = compute_selection_hash(
+            scan_id=scan_id,
+            tier="A",
+            rule_id_or_category="dev_artifact_node_modules",
+            paths=predicted_paths,
+        )
+
+        delete_result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id,
+                "rule_id_or_category": "dev_artifact_node_modules",
+                "tier": "A",
+                "selection_hash": predicted_hash,
+            },
+        )
+        assert delete_result.isError is False, delete_result.content
+        assert delete_result.structuredContent["files_succeeded"] == 1
+
+    assert not paths["node_modules_dir"].exists()  # real, disk-mutating proof
+
+
+async def test_delete_refuses_a_guessed_hash_that_does_not_match_the_real_selection(
+    tmp_path: Path,
+) -> None:
+    """The other half: a caller that never called preview_apply AND whose guessed hash does not
+    match reality is refused exactly the same as a stale one -- the server's own re-derivation is
+    what protects this, not trust in how the caller arrived at the value."""
+    root = tmp_path / "tree"
+    _build_tree(root)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+
+        delete_result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id,
+                "rule_id_or_category": "dev_artifact_node_modules",
+                "tier": "A",
+                "selection_hash": "0" * 64,  # a plausible-looking but wrong guess
+            },
+        )
+        assert delete_result.isError is True
+
+
 async def test_delete_refuses_a_stale_scan_id(tmp_path: Path) -> None:
     """A newer scan completing between `preview_apply` and `delete` must refuse, not execute
     against the (possibly now-wrong) old selection."""
