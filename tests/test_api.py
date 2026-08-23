@@ -854,6 +854,83 @@ def test_full_drive_scan_confirm_intent_mints_a_fresh_token_each_call(tmp_path: 
     assert first != second
 
 
+def test_full_drive_scan_token_expires_after_its_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 7 (2026-08-23 audit): a token minted but never immediately consumed used to stay
+    valid indefinitely -- a suspended/delayed fetch could fire a full-drive scan arbitrarily
+    later. Backdates the token's recorded mint time (no fake clock needed at the route layer,
+    same technique the AN5 TTL tests use for `scan_status`) to simulate a token that was minted,
+    then genuinely never used until well past its TTL."""
+    from reclaim.api import routes, service
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [tmp_path / "drive_a"])
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+
+    token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[token] = time.time() - stale_ago
+
+    response = client.post("/api/scan/full-drive", json={"token": token})
+    assert response.status_code == 403, response.text
+    assert "missing or invalid" in response.json()["detail"]
+
+    # Single-use applies to an expired token too -- it must not linger for a second attempt to
+    # find, whether that attempt happens before or after the TTL check itself changes.
+    with app_state.lock:
+        assert token not in app_state.scan_outside_home_confirmation_tokens
+
+
+def test_scan_outside_home_token_expires_after_its_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same TTL enforcement as the full-drive test above, exercised through `POST /api/scan`'s
+    own outside-home gate (AO1) -- both consumption sites share
+    `routes._consume_scan_confirmation_token`, but each is proven independently since that
+    sharing is an implementation detail, not a contract this test should assume."""
+    from reclaim.api import routes, service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    outside_dir = tmp_path / "outside_home"
+    outside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    client = _make_app(tmp_path, config=_config(own_profile))
+    token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[token] = time.time() - stale_ago
+
+    response = client.post("/api/scan", json={"path": str(outside_dir), "token": token})
+    assert response.status_code == 403
+    assert "outside your home directory" in response.json()["detail"]
+
+
+def test_full_drive_scan_confirm_intent_prunes_expired_tokens_on_mint(tmp_path: Path) -> None:
+    """Item 7: an unconsumed token no longer accumulates past its own TTL -- proven by
+    confirming a stale, never-used token is gone from the dict after the NEXT mint, not just
+    rejected the next time someone tries to use it."""
+    from reclaim.api import routes
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    stale_token = client.post("/api/scan/full-drive/confirm-intent").json()["token"]
+
+    app_state = client.app.state.reclaim
+    with app_state.lock:
+        stale_ago = routes._SCAN_CONFIRMATION_TOKEN_TTL_SECONDS + 30
+        app_state.scan_outside_home_confirmation_tokens[stale_token] = time.time() - stale_ago
+        assert stale_token in app_state.scan_outside_home_confirmation_tokens  # sanity
+
+    client.post("/api/scan/full-drive/confirm-intent")
+
+    with app_state.lock:
+        assert stale_token not in app_state.scan_outside_home_confirmation_tokens
+
+
 # AO1 (2026-08-23 audit): POST /api/scan itself accepted ANY caller-supplied path with ZERO
 # restriction before this fix -- not even the weak CSRF-only check /full-drive used to have --
 # found while sweeping for siblings of that bug. These tests prove an outside-home path now needs
