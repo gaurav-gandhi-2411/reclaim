@@ -17,24 +17,31 @@ language (packaging/smoke/run_frozen_smoke_suite.ps1).
 Every lookup that can be missing (install dir, protocol handler, scheduled task) is checked
 explicitly and reported LOUDLY if absent -- no step is ever silently skipped.
 
-PARAMETERS: -InstallerPath defaults to the rebuild #4 artifact this session produced
+PARAMETERS: -InstallerPath defaults to a copy of the rebuild #4 artifact this session produced
 (SHA-256 3452ca017e339e92456955dd0db4501f630649bb3c41640e575ef980e34a378f, built from main
-@ 4c3521974865c444a4cdf23a01f0703b56f1f027). -SkipInstall for a second run against an
-already-installed profile (skips Step -2 only; first-run in Step -1 will then correctly show
-"already acknowledged" instead of the genuine first-run screen, which is expected and fine on
-a re-run).
+@ 4c3521974865c444a4cdf23a01f0703b56f1f027) staged at C:\Users\Public\reclaim_ac3\ -- NOT under
+gaura's own profile, which a different Windows account cannot read (confirmed earlier this
+session: direct filesystem access to another account's repo/venv is denied). -SkipInstall for
+a second run against an already-installed profile (skips Step -2 only; first-run in Step -1
+will then correctly show "already acknowledged" instead of the genuine first-run screen, which
+is expected and fine on a re-run).
+
+LOG OUTPUT: always C:\Users\Public\reclaim_ac3\ac3_run_<timestamp>.txt -- world-writable so any
+account can write it, and readable from any other session (including a plain non-elevated one)
+without needing access to whatever profile actually ran this script. Directory is created if
+missing.
 #>
 
 param(
-    [string]$InstallerPath = "C:\Users\gaura\ml-projects\reclaim\packaging\dist\reclaim-setup.exe",
+    [string]$InstallerPath = "C:\Users\Public\reclaim_ac3\reclaim-setup.exe",
     [switch]$SkipInstall
 )
 
 $ErrorActionPreference = 'Continue'
 
 $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
-$logDir = Join-Path $PSScriptRoot 'reclaim_ac3_logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+$logDir = 'C:\Users\Public\reclaim_ac3'
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $logPath = Join-Path $logDir "ac3_run_$ts.txt"
 New-Item -ItemType File -Path $logPath -Force | Out-Null
 
