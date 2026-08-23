@@ -126,14 +126,39 @@ _TIER_SELECTIONS: dict[str, frozenset[Tier]] = {
 }
 
 
-def resolve_allowed_apply_roots(state: AppState, *, home: Path | None = None) -> list[Path]:
-    """AE1: the invoking user's own profile, plus -- when the CURRENT scan's tracked root is set
-    and sits outside it -- that root too. This IS the "explicitly opted-in" signal
-    `preflight.check_within_allowed_scope`'s module comment refers to: `user_scan_roots` (PR #47)
-    already requires an explicit confirmation dialog before any scan reaches outside
-    `Path.home()`, so `state.scan_status.root` being a non-home root at all only happens when the
-    invoking user already went through that confirmation for THIS session's scan -- no separate
-    flag needed.
+# AN5 (2026-08-23 audit): live-reproduced against a real running server -- a confirmed outside-
+# home scan used to authorize its ENTIRE root, indefinitely, for the rest of that server
+# process's lifetime: a file created under that root minutes (or hours) after the scan
+# completed, never seen by the scan and never part of any candidate the user reviewed, was
+# still treated as in-scope for a later apply. `state.scan_status.root` is a standing signal
+# with no natural expiry of its own (it's cleared only by another scan starting/completing, not
+# by time passing), so a long-lived process that did one legitimate outside-home scan hours ago
+# kept blanket apply access to that whole subtree ever since. This TTL is the time-bound half of
+# the fix; `_build_user_selected_candidate`'s scan-index-membership check is the breadth-bound
+# half (a fresh-but-never-scanned file under the same root still isn't authorized).
+#
+# 30 minutes is a judgment call, not a measurement: generous enough to cover a real scan-review-
+# select-apply workflow (a human reading through AI Suggestions/Review Queue results before
+# committing to an apply), short enough that the window closes well within a single sitting
+# rather than surviving to an unrelated visit hours later. Revisit if real usage shows either
+# edge is wrong.
+_OUTSIDE_HOME_SCAN_SCOPE_TTL_SECONDS = 30 * 60
+
+
+def resolve_allowed_apply_roots(
+    state: AppState, *, home: Path | None = None, now: float | None = None
+) -> list[Path]:
+    """AE1: the invoking user's own profile, plus -- when the CURRENT scan's tracked root is set,
+    sits outside it, and completed within `_OUTSIDE_HOME_SCAN_SCOPE_TTL_SECONDS` (AN5) -- that
+    root too. This IS the "explicitly opted-in" signal `preflight.check_within_allowed_scope`'s
+    module comment refers to: `user_scan_roots` (PR #47) already requires an explicit
+    confirmation dialog before any scan reaches outside `Path.home()`, so `state.scan_status.root`
+    being a non-home root at all only happens when the invoking user already went through that
+    confirmation for THIS session's scan -- no separate flag needed. AN5 narrows how long that
+    opt-in stays live: root-containment alone was proven (live, against a real server) to grant
+    apply access to arbitrary later content under that root, not just what the scan actually
+    found -- see this function's own module-level comment above and
+    `_build_user_selected_candidate`'s scan-index-membership check for the other half of the fix.
 
     Deliberately does NOT look at anything persisted (an old scan's root, a config default) --
     only the live, current-process `state.scan_status.root`, which is `None` on a fresh server
@@ -143,14 +168,23 @@ def resolve_allowed_apply_roots(state: AppState, *, home: Path | None = None) ->
     still persisted has `scan_status.root is None` on every fresh server start, so its
     out-of-home candidates are excluded here regardless of how they got into the index.
 
-    `home` is injectable for tests, same convention `user_scan_roots`/`suggested_scan_roots`
+    `home`/`now` are injectable for tests, same convention `user_scan_roots`/`suggested_scan_roots`
     already use.
     """
     resolved_home = home if home is not None else Path.home()
+    resolved_now = now if now is not None else time.time()
     roots = [resolved_home]
     scan_root = state.scan_status.root
-    if scan_root is not None and not check_within_allowed_scope(
-        scan_root, allowed_roots=[resolved_home]
+    # `finished_at` is `None` while a scan is still running -- fall back to `started_at` so an
+    # in-progress scan's root is still usable (a real mid-scan Review Queue apply against partial
+    # results), while an abnormally long-running scan still eventually ages out rather than
+    # granting an unbounded window just by never finishing.
+    scan_reference_time = state.scan_status.finished_at or state.scan_status.started_at
+    if (
+        scan_root is not None
+        and scan_reference_time is not None
+        and (resolved_now - scan_reference_time) <= _OUTSIDE_HOME_SCAN_SCOPE_TTL_SECONDS
+        and not check_within_allowed_scope(scan_root, allowed_roots=[resolved_home])
     ):
         roots.append(scan_root)
     return roots
@@ -1167,7 +1201,12 @@ _USER_SELECTED_RETENTION_DAYS = 30
 
 
 def _build_user_selected_candidate(
-    path_str: str, *, safety: SafetyValidator, git_cache: GitRepoCache
+    path_str: str,
+    *,
+    safety: SafetyValidator,
+    git_cache: GitRepoCache,
+    home: Path,
+    scan_index: ScanIndex,
 ) -> Candidate | None:
     """ADR-0025 decision 6: builds a fresh, independently `SafetyValidator`-evaluated `Candidate`
     for a path the caller explicitly named that ISN'T already part of the deterministic
@@ -1178,10 +1217,22 @@ def _build_user_selected_candidate(
     `reclaim.ai.safety.filter_paths_through_safety_validator` and `detectors.generate_candidates`
     already use. Always `Tier.B` (never A -- this path was never auto-quarantine-eligible) and
     a real, disclosed `retention_days` so a power-mode vault apply gets a genuine restore
-    window."""
+    window.
+
+    AN5 (2026-08-23 audit): a path outside `home` is excluded here (same silent-exclusion
+    posture as the checks above) unless it's already present in `scan_index` -- live-reproduced
+    finding: `resolve_allowed_apply_roots`' root-containment check alone treats ANY path under a
+    confirmed-but-broad scan root as authorized, including a file created after that scan ran
+    and never actually surfaced as a candidate. This is the breadth-bound half of the fix;
+    `resolve_allowed_apply_roots`' own TTL is the time-bound half. A within-home path needs
+    neither check -- unchanged, matches every other apply path in this codebase."""
     path = Path(path_str)
     record = build_record_for_path(path, git_cache)
     if record is None or record.is_dir:
+        return None
+    if not check_within_allowed_scope(path, allowed_roots=[home]) and not scan_index.record_exists(
+        path
+    ):
         return None
     result = safety.evaluate(record)
     if result.verdict != Verdict.ELIGIBLE:
@@ -1348,12 +1399,22 @@ def resolve_apply_selection(
         unmatched_paths = wanted - already_matched
         if unmatched_paths:
             git_cache = GitRepoCache()
-            for path_str in unmatched_paths:
-                user_selected = _build_user_selected_candidate(
-                    path_str, safety=state.safety, git_cache=git_cache
-                )
-                if user_selected is not None:
-                    selected.append(user_selected)
+            # AN5: a fresh `ScanIndex` handle for the outside-home membership check below --
+            # the one opened above (for `generate_candidates`) has already closed by this point,
+            # and reopening only here (not unconditionally) keeps the common, all-matched case
+            # free of the extra open/close, same P0-3 perf discipline the block above already
+            # follows.
+            with ScanIndex(state.db_path) as membership_index:
+                for path_str in unmatched_paths:
+                    user_selected = _build_user_selected_candidate(
+                        path_str,
+                        safety=state.safety,
+                        git_cache=git_cache,
+                        home=Path.home(),
+                        scan_index=membership_index,
+                    )
+                    if user_selected is not None:
+                        selected.append(user_selected)
 
     # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally
     # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its
