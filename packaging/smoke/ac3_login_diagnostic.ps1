@@ -772,20 +772,46 @@ if (-not $serverReachable -or -not $csrfToken) {
             Write-Log "[ABORT] Scan of $tempPath did not reach 'completed' after ${scanElapsedSeconds}s (status: '$($scanStatus.status)'; $sizeDetail) -- SKIPPING the candidate-count check."
         } else {
             Write-Log "[OK] Scan completed: $($scanStatus | ConvertTo-Json -Compress)"
-            # AT1: 600s, not 10s -- GET /api/candidates (even category-filtered) still computes the
-            # FULL candidate set first (list_candidates -> _cached_all_candidates), the same
-            # measured 225.8s cost as Step 6/7's apply calls and the frozen smoke suite's check 7.
-            $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 600
-            $count = @($candResp.candidates).Count
-            Write-Log "[Result] temp_and_browser_caches candidates found: $count"
-            if ($count -gt 0) {
-                Write-Log "[PASS] Nonzero candidates under the 8.3-aliased TEMP path -- PR #50's fix holds on the real account shape it was written for."
+
+            # AT2 (2026-08-24 audit): GET /api/candidates directly, even at a 600s timeout, is not
+            # enough -- live-reproduced: it exceeded 600s against this exact scan's real result
+            # (589,120 TEMP entries, many same-sized cache/scratch files -- exact-duplicate
+            # clustering's cost scales with size-collision density, not just row count, and a
+            # real TEMP directory is close to a worst case for that). A direct query issued
+            # MINUTES later, once the background computation had actually finished and cached,
+            # returned in 0.08s -- proving the real fix isn't a bigger timeout number (the
+            # AT1-style fix already outgrown once), it's using the warm-up endpoint this codebase
+            # already built for exactly this cost (PR #56/AE3, "non-blocking candidates-cache
+            # warm-up + progress feedback") instead of blocking one HTTP call on it.
+            Write-Log "[RUN] POST /api/candidates/warm (non-blocking; polling warm-status instead of blocking one GET on the full computation)..."
+            $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates/warm" -Method Post -ContentType 'application/json' -Headers $scanHeaders -Body '{}' -TimeoutSec 10
+            $warmCallStart = Get-Date
+            $warmReady = $false
+            $warmStatus = $null
+            $warmPollDeadline = (Get-Date).AddSeconds(1200)
+            while ((Get-Date) -lt $warmPollDeadline) {
+                Start-Sleep -Seconds 3
+                $warmStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates/warm-status" -TimeoutSec 15
+                if ($warmStatus.status -in @('ready', 'failed')) { $warmReady = ($warmStatus.status -eq 'ready'); break }
+            }
+            $warmElapsedSeconds = [math]::Round(((Get-Date) - $warmCallStart).TotalSeconds, 1)
+            if (-not $warmReady) {
+                $sizeDetail = Get-IndexSizeDetail -AppDir $appDir
+                Write-Log "[ABORT] Candidates warm-up did not reach 'ready' after ${warmElapsedSeconds}s (status: '$($warmStatus.status)'; $sizeDetail) -- SKIPPING the candidate-count check. This is a real, disclosed cost on a real TEMP directory (docs/AUDIT-2026-08.md's AS3/AT2), not a script bug -- if this keeps happening, the real fix is a warm-status-aware dashboard UI wait, not a bigger number here."
             } else {
-                Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG, UNLESS TEMP is genuinely empty] Zero candidates -- this is exactly the original bug's signature. Before treating this as a regression, manually confirm $tempPath actually contains real files/subdirectories (an empty TEMP would legitimately yield zero too, and would not be this bug)."
+                Write-Log "[OK] Candidates warm-up ready after ${warmElapsedSeconds}s."
+                $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 30
+                $count = @($candResp.candidates).Count
+                Write-Log "[Result] temp_and_browser_caches candidates found: $count"
+                if ($count -gt 0) {
+                    Write-Log "[PASS] Nonzero candidates under the 8.3-aliased TEMP path -- PR #50's fix holds on the real account shape it was written for."
+                } else {
+                    Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG, UNLESS TEMP is genuinely empty] Zero candidates -- this is exactly the original bug's signature. Before treating this as a regression, manually confirm $tempPath actually contains real files/subdirectories (an empty TEMP would legitimately yield zero too, and would not be this bug)."
+                }
             }
         }
     } catch {
-        Write-Log "  [ERROR] scan request failed: $($_.Exception.Message)"
+        Write-Log "  [ERROR] Step 8 request failed: $($_.Exception.Message)"
     }
 }
 
