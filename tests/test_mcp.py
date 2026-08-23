@@ -268,6 +268,30 @@ async def test_full_workflow_scan_list_preview_delete_actually_quarantines(
     assert any((tmp_path / "vault").rglob("index.js"))  # landed in the real vault
 
 
+async def test_scan_tool_refuses_a_path_outside_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AO1 (2026-08-23 audit): found the MCP scan tool accepted ANY path with zero restriction,
+    worse than the HTTP API's own equivalent since MCP has no way to go through the confirmation-
+    token flow an outside-home HTTP scan now requires. This tool is simply narrower here instead
+    -- an MCP-driven agent can never scan outside home, full stop."""
+    from reclaim.api import service
+
+    own_profile = tmp_path / "own_profile"
+    own_profile.mkdir()
+    outside_dir = tmp_path / "outside_home"
+    outside_dir.mkdir()
+    monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
+
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        scan_result = await session.call_tool("scan", {"path": str(outside_dir)})
+        assert scan_result.isError is True
+        assert "outside your home directory" in str(scan_result.content)
+
+
 def test_concurrent_delete_calls_for_the_identical_selection_do_not_both_execute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
