@@ -227,26 +227,36 @@ if ($looksFrozen) {
 
 # --- Check 1b: Nuitka bundle completeness (structural proxy, winrt only) -----------------------
 # `winrt` ships native `.pyd` modules Nuitka's static import-following can miss (PR #49's root
-# cause) -- directory presence IS a meaningful signal for it. The SAME heuristic is NOT reliable
-# for pure-Python packages (confirmed directly while building this suite: the `mcp` package has
-# no on-disk directory in this dist at all -- Nuitka compiled it straight into the binary's
-# module store -- yet `reclaim mcp-serve` works correctly; see check 2). So this check covers
-# ONLY the native-import risk class, not "is every package bundled" in general.
+# cause) -- these specific .pyd files' presence IS a meaningful signal for it. Directory presence
+# is NOT reliable, corrected 2026-08-23 after this exact assumption produced a false FAIL against
+# a real trip's build (rebuild #4): confirmed by direct inspection of the actual dist tree that
+# NEITHER `winrt\windows\` (the PEP 420 namespace-package subdirectory) NOR `windows_toasts\`
+# exist as on-disk directories in this Nuitka version's output, even though the real native
+# extensions are genuinely present directly under `winrt\`, and check 3's functional call (plus
+# this session's own real toast-triggering trip) both prove the capability actually works.
+# `windows_toasts` itself compiles straight into the binary's module store, same as `mcp` (see
+# check 2's own precedent below) -- its directory absence was never a reliable signal to begin
+# with, exactly per this check's own prior caveat about pure-Python packages; it just hadn't been
+# applied to windows_toasts itself until this correction. Checking for the specific .pyd files
+# PR #49's exact bug (ModuleNotFoundError: winrt.windows.foundation) needed is the structural
+# signal that's actually reliable here.
 
-$winrtNamespaceDir = Join-Path $InstallPath 'winrt\windows'
-$windowsToastsDir = Join-Path $InstallPath 'windows_toasts'
-$winrtOk = (Test-Path $winrtNamespaceDir) -and (Test-Path $windowsToastsDir)
-if ($winrtOk) {
-    Add-Result -Id '1b-winrt-bundle-structural' -Name 'winrt/windows_toasts bundled (structural)' `
-        -Result 'PASS' -Detail "Both winrt\windows (PEP 420 namespace pkg) and windows_toasts are present in the dist."
+$requiredWinrtPyd = @(
+    'winrt\_winrt.pyd',
+    'winrt\_winrt_windows_foundation.pyd',
+    'winrt\_winrt_windows_foundation_collections.pyd',
+    'winrt\_winrt_windows_data_xml_dom.pyd',
+    'winrt\_winrt_windows_ui_notifications.pyd'
+)
+$missingPyd = @($requiredWinrtPyd | Where-Object { -not (Test-Path (Join-Path $InstallPath $_)) })
+if ($missingPyd.Count -eq 0) {
+    Add-Result -Id '1b-winrt-bundle-structural' -Name 'winrt native extensions bundled (structural)' `
+        -Result 'PASS' -Detail "All required winrt native .pyd modules ($($requiredWinrtPyd -join ', ')) are present in the dist."
 } else {
-    $missing = @()
-    if (-not (Test-Path $winrtNamespaceDir)) { $missing += 'winrt\windows' }
-    if (-not (Test-Path $windowsToastsDir)) { $missing += 'windows_toasts' }
     $detail = ("Missing from dist: {0} -- this is PR #49's exact bug " +
         "(ModuleNotFoundError: winrt.windows.foundation). Check 3 (toast) proves the " +
-        "functional consequence; this check proves the structural cause.") -f ($missing -join ', ')
-    Add-Result -Id '1b-winrt-bundle-structural' -Name 'winrt/windows_toasts bundled (structural)' `
+        "functional consequence; this check proves the structural cause.") -f ($missingPyd -join ', ')
+    Add-Result -Id '1b-winrt-bundle-structural' -Name 'winrt native extensions bundled (structural)' `
         -Result 'FAIL' -Detail $detail
 }
 
@@ -522,9 +532,9 @@ Add-Result -Id '1f-screenshot-burst-windll' -Name 'screenshot_burst.py _current_
 
 Write-Host ""
 Write-Host "=== Summary ===" -ForegroundColor Cyan
-$passCount = ($script:Results | Where-Object { $_.result -eq 'PASS' }).Count
-$failCount = ($script:Results | Where-Object { $_.result -eq 'FAIL' }).Count
-$blockedCount = ($script:Results | Where-Object { $_.result -eq 'BLOCKED' }).Count
+$passCount = @($script:Results | Where-Object { $_.result -eq 'PASS' }).Count
+$failCount = @($script:Results | Where-Object { $_.result -eq 'FAIL' }).Count
+$blockedCount = @($script:Results | Where-Object { $_.result -eq 'BLOCKED' }).Count
 Write-Host "PASS: $passCount   FAIL: $failCount   BLOCKED: $blockedCount   (total: $($script:Results.Count))"
 
 $script:Results | ConvertTo-Json -Depth 10 | Set-Content -Path $ResultsJsonPath -Encoding utf8
