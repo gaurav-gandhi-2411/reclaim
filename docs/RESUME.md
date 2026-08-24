@@ -1,138 +1,113 @@
-# Resume checkpoint — 2026-08-24 (refreshed, supersedes this file's own prior version)
+# Resume checkpoint — 2026-08-25 (trip-ready)
 
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`.
+Always `git fetch origin` + `gh pr list` and re-check `C:\Users\Public\reclaim_ac3\` for what has
+actually run before trusting any claim below, including this one (rule 118a) — this file has
+gone stale mid-engagement more than once already.
 
-**The version of this file committed on `main` going into this refresh was itself already
-stale** — it claimed "no rebuild #6 needed" (true when written, before PR #76 existed) and "only
-PR #75 still open, everything else already verified clean, just the two human steps left." Both
-were wrong by the time this refresh started: PR #76 (a real `src/reclaim/detectors.py` change)
-had merged after that claim was written, and PRs #77/#78 merged after that. This is the exact
-failure this file's own opening line warns about — always `git fetch origin` and compare SHAs
-(and re-check `C:\Users\Public\reclaim_ac3\` for what's actually run) before trusting ANY
-checkpoint doc's claims, including this one (rule 118a).
+## Where we are — the dry run is genuinely clean for the first time this engagement
 
-## Where we are
+Rebuild #7 (SHA-256 `d34b55f340a57e3df1ab48eaf0f3a0efdc0878f2769943508d728e6c67d48505`, built from
+`e63ca72` = `origin/main`'s tip at build time) plus a series of trip-script/smoke-suite fixes
+(PRs #82–#86, three still open as drafts pending your merge — see below) produced a full dry run
+with **0 ABORT, 0 FAIL, 0 SKIPPED, 0 ERROR** — the frozen smoke suite separately: **10 PASS, 0
+FAIL, 3 BLOCKED** (all three genuinely structural: toast visual confirmation needs a human,
+hardlink probes need a dedicated fixture, 8.3 short-name needs a long-username account this
+machine doesn't have).
 
-`main` is at `289de71` (PR #78, merged). Confirmed via `git fetch origin` + `git rev-parse
-origin/main`, local `main` fast-forwarded to match, working tree clean. No PRs open.
+**Open draft PRs, not yet merged — merge these before the actual trip:**
+- **#85** — AY1 promoted to a headline audit-doc finding, plus the AZ4 addendum (second instance
+  of AN1's unexplained-scan-trigger shape) and this file's own refresh.
+- **#86** — every fix found while getting to a clean dry run (see below). CI green on both.
 
-**Everything that was open going into this refresh is now resolved:**
-- PR #70 (AN5 apply-scope fix), #71 (item-7 TTL fix), #72 (AR1/AR2 docs), #73 (build provenance
-  sidecar), #74 (smoke probe timeouts), #75 (AR4/AR5/AS1-AS4 docs) — all merged, as the prior
-  checkpoint already recorded.
-- PR #76 (AU1 — `temp_and_browser_caches` returned zero candidates when the scan root IS the temp
-  directory itself; a real `src/reclaim/detectors.py` change) — merged. **This is what makes the
-  prior checkpoint's "no rebuild #6 needed" claim stale** — AS2's "zero `src/reclaim/` diff"
-  check was true against the commits that existed when it ran, not against what merged next.
-- PR #77 (AT1/AT2 — Step 6/7/8 timeouts raised to 600s, Step 6's false-pass risk closed, Step 7's
-  fixture redesigned to a real dev_artifacts/`__pycache__` shape, Step 8 uses the warm-up
-  endpoint) — merged.
-- PR #78 (AU2 — Step 7's own measurement code had two bugs: a reference-equal, live-backed
-  `PSDriveInfo` object read twice made the OS-measured delta always read `0` regardless of what
-  was actually freed; the log read the batch-level nominal method instead of the per-item
-  resolved one) — merged. Full mechanism in `AUDIT-2026-08.md`'s AU2/AV1/AV2.
+## What was fixed to get here (this session, in order found)
 
-## Rebuild artifact — STALE, rebuild #6 required before any further trip run
-
-`packaging/dist/reclaim-setup.exe`, SHA-256 `79cae649b6321c67ce71e48f52f1d56c1ad5b491e1b5baba434
-bca16fccfc2b7`, built from source commit `0d9e3e9` (`reclaim-setup.exe.buildsha`, PR #73's
-sidecar). `0d9e3e9` is confirmed **after** PR #70/#71 (`git merge-base --is-ancestor` plus local-
-timezone commit timestamps — the build genuinely contains the AN5 apply-scope fix and the item-7
-TTL fix) but **before** #76, #77, and #78. The staged copy at `C:\Users\Public\reclaim_ac3\` is
-the same stale artifact. **Rebuild #6 off current `main` (`289de71`) is required** — this
-directly contradicts the just-superseded checkpoint's "no rebuild #6 needed" claim; see above for
-why that claim went stale.
-
-## What the trip runs against the stale artifact actually showed (useful signal, not wasted)
-
-8 full trip-script runs happened today against this stale artifact (`ac3_run_20260824_*.txt` in
-the staging dir, 01:28 through 05:08) before this refresh, plus 4 more the prior day against an
-even earlier artifact. Not wasted — they're still real evidence for what they actually tested:
-
-- **Step 6 (AE1 teeth-proof)**: PASS, and genuinely real evidence — `mode_log.jsonl` timestamps
-  independently confirm the server was in the exact state the check exercises when it ran.
-  Nothing in #76/#77/#78 touches this code path, so this result should carry forward to rebuild
-  #6, though it should still be re-run there rather than assumed (AR1's discipline: a proof is
-  evidence for its tested configuration, not a standing guarantee).
-- **Step 7 (S2/U4 free-space delta)**: reported FAIL every run before PR #78, "100% difference...
-  NOT A SCRIPT BUG." **That framing was itself wrong** — see PR #78 above. Hand-recomputing the
-  last pre-fix run's own logged numbers gives an exact 0.00% difference against the app-reported
-  figure. **BELIEVED, not yet VERIFIED** — this is a recomputation from a log the unfixed script
-  produced, not a clean run of the fixed script. Task 4's dry run must confirm this once,
-  instrumented, before it's written up as VERIFIED (AV1); report the instrumented agreement %
-  as its own explicit line when that happens (AV5).
-- **Step 8 (8.3 short-name / temp-root-is-scan-root)**: reported FAIL (0 candidates) every run —
-  correctly consistent with, and expected from, an artifact predating PR #76's fix. Not a new
-  finding; just confirms the artifact needs replacing, which rebuild #6 does.
+- **AY1**: the disk-space-check scheduled task had never actually registered, on any real
+  install, since the feature shipped (PR #38, 2026-08-21) — an XML-encoding mismatch in
+  `packaging/reclaim.iss` (`SaveStringToFile`'s `AnsiString` parameter silently narrowed the
+  declared-`UTF-16` content to single-byte bytes). Fixed in PR #83 (merged). This session also
+  found and cleared a *separate*, machine-local corruption of the exact task name on this dev box
+  (11+ create/delete cycles had left it in an `Access is denied` state for both query and
+  create) — confirmed gone before starting this refresh.
+- **AZ2**: Step 7's measurement design was wrong, not just noisy — comparing app-reported bytes
+  against whole-drive free space over a multi-second window on a machine under real concurrent
+  use cannot resolve to 2%. Redesigned: primary assertion is now exact equality against the
+  fixture's own known byte size; OS free-space delta is a secondary, drift-relative sanity check
+  only. **Now PASSes cleanly**, real number: app-reported `10485760` bytes exactly matches the
+  known fixture size.
+- **AZ3**: Step 8's `POST /api/candidates/warm` 409 was PR #62's own single-flight guard working
+  correctly (a warm-up genuinely was already in flight, most likely the dashboard browser tab
+  Step -1 opens) — the bug was letting that 409 abort the whole step instead of polling the
+  existing warm-up. Fixed.
+- **AZ4 (four more, found chasing the dry run to genuinely clean)**:
+  1. The frozen suite's own check 7 hit AR5's predicted timeout recurrence again (the shared,
+     ever-growing index this machine's whole testing history writes to). Implemented the durable
+     fix AR5/AY2 both disclosed as out of scope: `run_frozen_smoke_suite.ps1`'s server now gets
+     an isolated `--db`/`--vault-dir`/`--manifest`/`--mode-log`/`--first-run-state`/`--log-path`,
+     never touching the shared index again. Check 7 now PASSes deterministically.
+  2. Step 7's fixture scan hit a 409 from a REAL, unrelated whole-home-directory scan already
+     running (`origin: POST /api/scan/my-files`, confirmed a real button click via `app.js`, not
+     a frontend auto-scan) — a second instance of AN1's "unexplained scan trigger" shape, fixed
+     pragmatically (cancel-then-scan) per AN1's own precedent, not re-investigated to a root
+     cause.
+  3. Step -2's install hit Inno Setup exit code 5 on a second trip run in the same session — a
+     leftover `reclaim.exe` process from the prior run held a file lock. `reclaim.iss`'s own
+     `InitializeUninstall` already guards this for uninstall; the trip script's install step had
+     no equivalent — added.
+  4. Step 8's final `GET /api/candidates` call was the one remaining 30s timeout in the whole
+     script (the warm-up cache being ready doesn't make serializing the real candidate list
+     free) — raised to 600s, matching this script's own established convention everywhere else.
 
 ## Exact resume sequence
 
 ```powershell
-# 1. Confirm origin/main and local main agree, work happens on the real tip
+# 1. Merge PRs #85 and #86 (both CI-green drafts) in the web UI, then:
 git fetch origin --quiet; git branch -f main origin/main; git checkout main
 git rev-parse HEAD  # must equal origin/main
 
-# 2. Task 2 (structural floor test): for each default-enabled category, a realistic seeded
-#    fixture must produce a non-zero candidate count. Not a regression test for AU1/the 8.3 bug
-#    specifically -- a floor that catches the NEXT silent-zero-yield mechanism before it ships.
+# 2. Re-stage the merged trip script + current artifact (SHA above still matches origin/main
+#    unless something merges into src/ after this checkpoint -- if so, rebuild #8 first):
+Copy-Item packaging\dist\reclaim-setup.exe,packaging\dist\reclaim-setup.exe.sha256,`
+  packaging\dist\reclaim-setup.exe.buildsha,packaging\smoke\ac3_login_diagnostic.ps1 `
+  C:\Users\Public\reclaim_ac3\ -Force
 
-# 3. Full scripts/verify.py run, clean, before rebuilding.
+# 3. One more dry run to confirm the merged state is still clean (frozen suite + trip script),
+#    same bar: 0 ABORT / 0 FAIL / 0 SKIPPED / 0 ERROR.
 
-# 4. Confirm RAM free >= 8GB, then rebuild #6:
-[math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1MB, 2)
-nohup powershell -NoProfile -ExecutionPolicy Bypass -File packaging/build_installer.ps1 `
-  > packaging/build/nuitka_build_console7.log 2>&1 &
-# wait for "Successful compile"; record SHA-256 + .buildsha; confirm buildsha == step 1's HEAD.
-
-# 5. Frozen suite + full trip-script dry run against the fresh artifact. Report Step 7's
-#    instrumented agreement % as its own explicit line (AV5) -- it's the gate on hands-on
-#    testing. Bar: every step PASS, zero ABORT, zero silent skip, Steps 7 and 8 produce real
-#    (not just non-timed-out) results.
-
-# 6. Only after a clean dry run: trip instructions to GG, human list capped at exactly two items
-#    (toasts across triggers, first-run screen description) unless something else genuinely
-#    can't be automated -- justify if so.
+# 4. Then the actual trip -- see the two-item human list below. Nothing else on it.
 ```
 
-## The two irreducible human steps for the trip (everything else is scripted)
+## The two irreducible human steps for the trip (everything else is now scripted AND verified clean)
 
 1. Watch for toasts across Triggers 1-4 in the trip script, note which (if any) rendered.
 2. Describe the first-run screen (headline/body copy, Simple-vs-Advanced landing view,
-   screenshot if convenient) — never yet directly observed this engagement (every
-   `ReclaimSmokeTest` session so far already shows `{"acknowledged": true}`).
+   screenshot if convenient) — never yet directly observed this engagement (every account
+   session so far already shows `{"acknowledged": true}` by the time this step runs).
 
-## Persisted-index growth (AS3, carried forward — real, not fixed, not new)
-
-The account's real index (`reclaim_index.sqlite3`) reached **1.02GB / 1,084,134 rows** as of the
-prior checkpoint, driven up by this engagement's own repeated verification cycles. `GET
-/api/candidates` against it measured **225.8s**, already past PR #74's 180s timeout at the time.
-This is why the trip script's Steps 7/8 exercise long real scans rather than something cheaper —
-the trip deliberately walks the real shared production data path, by design, not a fixture.
-Isolation (`--db`/`--vault-dir`, which `reclaim serve` already supports) would be cheap to add to
-the smoke suite specifically but hasn't been, per instruction (sized and documented, not
-implemented). Not re-measured this refresh.
+Nothing else belongs on this list — every other check (Task Scheduler registration and
+delivery, the CWD-independence fix, the Snooze protocol handler, AE1's teeth-proof, the
+free-space-delta measurement, the 8.3 short-name detection) is fully automated and, as of this
+checkpoint, passing for real, not just avoiding a timeout.
 
 ## Test account state
 
-`ReclaimSmokeTest` — not re-checked this refresh (no destructive/auth action taken). Last
-confirmed (2026-08-23): exists, enabled, `LastLogon` matching that day's trip window. **U6
-(delete the account) stays deferred** until a real trip against a fresh (rebuild #6) artifact
-comes back clean.
+`ReclaimSmokeTest` — not re-checked this session (no destructive/auth action taken). Last
+confirmed (2026-08-23): exists, enabled. **U6 (delete the account) stays deferred** until the
+actual trip (post-merge, post one more confirming dry run) comes back clean.
 
 ## Open-items list
 
-**Blocking the trip:** rebuild #6 (blocked on nothing now — every prerequisite PR is merged; RAM
-needs a live check; task 2's floor test and a `scripts/verify.py` run should land first per the
-resume sequence above).
+**Blocking the actual trip:** merging PRs #85/#86, then one more confirming dry run against the
+merged state (steps 1-3 above).
 
-**Not yet done:** task 2 (structural floor test), task 4's dry run (needed to promote AU2's Step 7
-finding from BELIEVED to VERIFIED with an instrumented figure), the human-required list
-finalization, S4 (this doc's own final state), S5 (first-60-seconds report, blocked on human step
-2), U6 (account cleanup, deferred per above).
+**Disclosed, not re-opened:** the original full-drive-scan incident's exact trigger (AN1) and
+this session's second instance of the same shape (AZ4 addendum) were both fixed without
+identifying the exact trigger, by design — a third instance is the point to actually chase it
+down, not another patch-around; every VERIFIED tag proven on one synthetic fixture rather than
+the full branch structure of the code under test should be read as "proven for that
+configuration" (AR1); the persisted-index growth this whole engagement caused is real and now
+structurally addressed for the frozen suite specifically (isolated data root), not for the trip
+script's own Steps 7/8 (which deliberately still walk the real shared account data, by design —
+see AS3).
 
-**Disclosed, not re-opened:** the original full-drive-scan incident's exact trigger was never
-conclusively identified (AN1); check 1b's PASS carries a caveat (AN3); every VERIFIED tag proven
-on one synthetic fixture rather than the full branch structure of the code under test should be
-read as "proven for that configuration," not "proven in general" (AR1) — the named list of such
-entries is in `AUDIT-2026-08.md`'s AR1 section, not repeated here; the persisted-index growth
-above is real and disclosed, not fully closed.
+**Deliberately deferred:** U6 (above); S5 (first-60-seconds report — blocked on human step 2).
