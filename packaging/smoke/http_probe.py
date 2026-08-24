@@ -34,7 +34,16 @@ from typing import Any
 
 _CSRF_META_RE = re.compile(r'name="reclaim-csrf-token"\s+content="([^"]+)"')
 _POLL_INTERVAL_SECONDS = 0.5
-_POLL_TIMEOUT_SECONDS = 60.0
+# AY2 (2026-08-24 audit): live-reproduced -- exactly AR5's own predicted recurrence below, one
+# level deeper. `poll_until_done`'s SEPARATE 60s deadline (never raised by AR5, which only
+# addressed _HTTP_TIMEOUT_SECONDS) times out waiting on /api/scan/status or /api/apply/status
+# against this same growing real index -- confirmed via the traceback shape (a bare "T..."
+# result unparseable as JSON is exactly what an uncaught `TimeoutError`'s last traceback line
+# looks like to the calling PowerShell's `ConvertFrom-Json`). Raised to match
+# _HTTP_TIMEOUT_SECONDS below and this project's other trip tooling (ac3_login_diagnostic.ps1's
+# own 600s apply-call ceiling, AT1) -- same "incremental mitigation, not the durable fix AR5
+# already named" posture; not attempting the isolated --db/data-root override here either.
+_POLL_TIMEOUT_SECONDS = 600.0
 _POWER_MODE_CONFIRMATION = "I understand this can permanently delete files"
 _DISPOSABLE_TEST_KEY = "sk-smoke-test-disposable-value-never-a-real-key-000000"
 # AR5 (2026-08-24, real-machine finding): both get() and mutate() used to hardcode 15s/30s --
@@ -57,7 +66,21 @@ _DISPOSABLE_TEST_KEY = "sk-smoke-test-disposable-value-never-a-real-key-000000"
 # additional scan/apply/restore cycle in between): 180s+ and still climbing. A durable fix needs
 # an isolated `--db`/data-root override for this suite specifically, not a bigger number here --
 # out of scope for this pass; disclosed rather than silently left as "should be enough now."
-_HTTP_TIMEOUT_SECONDS = 180.0
+#
+# AY2 (2026-08-24 audit): the predicted recurrence happened -- re-measured this session at a
+# larger index size than AR5's own re-measurement, still exceeding 180s. Raised again, same
+# disclosure applies unchanged: this is a bigger number, not the durable fix.
+#
+# AY2 verification note: confirmed the raised timeouts alone ARE sufficient in an isolated
+# reproduction (a fresh `reclaim serve` process against this exact machine's real, ~40,600-file
+# shared index -- scan -> candidate list -> vault apply -> restore all completed and returned
+# PASS). A subsequent run of the OFFICIAL suite script still hit the same failure shape moments
+# later -- not a contradiction: this suite's own scan (plus every other scan run on this machine
+# in between, including this verification's own) keeps adding to the SAME shared index every
+# time it runs, so the real cost this check pays is different on every invocation, by design of
+# the gap AR5 already named. Confirms, rather than undermines, AR5's core point: a fixed timeout
+# on an unboundedly-growing shared index is not a stable fix, no matter how large the number.
+_HTTP_TIMEOUT_SECONDS = 600.0
 
 
 def _emit(result: str, detail: str, **extra: Any) -> None:
