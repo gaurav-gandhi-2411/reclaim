@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -372,11 +372,30 @@ def detect_temp_and_browser_caches(
     min_age_seconds = min_temp_root_age_hours * 3600.0
     seen_roots: set[Path] = set()
     for pattern in temp_roots:
-        for root_record in index.files_matching_path_pattern(pattern, is_dir=True):
-            if root_record.path in seen_roots:
+        # AU1 (2026-08-24 audit): live-reproduced, silent zero-yield -- when a `temp_roots`
+        # entry is the LITERAL directory the user just scanned (the common case: the AC3 trip's
+        # own check 1e scans %TEMP% directly, and so would a real user's "just scan my temp
+        # folder" flow), it never matched here at all. `files_matching_path_pattern` can only
+        # find a root that has its OWN row in the index -- but a scan's root directory is never
+        # indexed as a row of itself (only its contents are), so a literal-path temp_root that
+        # happens to be exactly a scan's root produced zero `windows_temp` candidates,
+        # permanently, silently -- the same shape as PR #50's original 8.3-short-name bug, via a
+        # completely different mechanism. `direct_children` (below) queries by path PREFIX, not
+        # by requiring the parent to be indexed -- so a literal (non-glob) pattern needs no
+        # index lookup for the root at all; only a genuine glob pattern (matching more than one
+        # directory, e.g. a custom `"C:/Users/*/AppData/Local/Temp"` config) still needs the
+        # index search, since which directories it matches isn't known in advance.
+        if "*" in pattern or "?" in pattern:
+            matched_roots: Iterable[Path] = (
+                r.path for r in index.files_matching_path_pattern(pattern, is_dir=True)
+            )
+        else:
+            matched_roots = (Path(pattern),)
+        for root_path in matched_roots:
+            if root_path in seen_roots:
                 continue
-            seen_roots.add(root_record.path)
-            for child in index.direct_children(root_record.path):
+            seen_roots.add(root_path)
+            for child in index.direct_children(root_path):
                 age_seconds = now - child.mtime
                 if age_seconds < min_age_seconds:
                     # Younger than the age floor -- never proposed, not even Tier B (matches
@@ -392,7 +411,7 @@ def detect_temp_and_browser_caches(
                         category_group=_GROUP_TEMP_AND_BROWSER_CACHES,
                         suggested_tier=Tier.A,
                         rationale=(
-                            f"Item in the Windows temp directory ('{root_record.path}'), last "
+                            f"Item in the Windows temp directory ('{root_path}'), last "
                             f"modified {age_hours:.0f}h ago (older than the "
                             f"{min_temp_root_age_hours:.0f}h threshold) — temp files are "
                             "transient by design and safe to remove."
