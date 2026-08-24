@@ -663,8 +663,20 @@ if (-not $serverReachable -or -not $csrfToken) {
         }
 
         if ($fixtureScanDone) {
-        $driveBefore = Get-PSDrive -Name C
-        Write-Log "[Measured BEFORE] C: free = $($driveBefore.Free) bytes"
+        # AU2 (2026-08-24 audit): capture the scalar .Free VALUE here, not the PSDriveInfo
+        # object itself. `Get-PSDrive -Name C` returns the same cached, live-backed object on
+        # every call in one session (verified: [object]::ReferenceEquals returns True across
+        # calls) -- its .Free property re-queries the live filesystem on every access, it is
+        # NOT a snapshot taken at Get-PSDrive time. Holding the object in $driveBefore and
+        # reading .Free from it again AFTER the apply (further down) silently returns the
+        # POST-apply value, not the pre-apply one, making $driveAfter.Free - $driveBefore.Free
+        # always evaluate to 0 regardless of what the apply actually freed -- this produced a
+        # false FAIL on every real run despite the underlying apply/free-space accounting being
+        # correct (recomputed by hand from this same run's raw BEFORE/AFTER numbers: exact 0.00%
+        # difference, not 100%). Assigning the scalar immediately below is immune to this because
+        # a [long] is a value type in PowerShell, not a reference to the live object.
+        $driveBefore = (Get-PSDrive -Name C).Free
+        Write-Log "[Measured BEFORE] C: free = $driveBefore bytes"
 
         # method='recycle_bin' here is nominal, not a request that takes effect: dev_artifacts'
         # retention_days=None means _effective_method_and_retention_days overrides it to
@@ -689,9 +701,9 @@ if (-not $serverReachable -or -not $csrfToken) {
             }
             $elapsedSeconds = [math]::Round(((Get-Date) - $applyCallStart).TotalSeconds, 1)
 
-            $driveAfter = Get-PSDrive -Name C
-            Write-Log "[Measured AFTER] C: free = $($driveAfter.Free) bytes"
-            $measuredDelta = $driveAfter.Free - $driveBefore.Free
+            $driveAfter = (Get-PSDrive -Name C).Free
+            Write-Log "[Measured AFTER] C: free = $driveAfter bytes"
+            $measuredDelta = $driveAfter - $driveBefore
             Write-Log "[Measured delta] $measuredDelta bytes freed (OS-reported)"
 
             if ($lastApply.status -ne 'completed') {
@@ -699,7 +711,17 @@ if (-not $serverReachable -or -not $csrfToken) {
                 Write-Log "[ABORT] /api/apply/status never reached 'completed' after ${elapsedSeconds}s (status: '$($lastApply.status)'; $sizeDetail) -- the comparison below would be meaningless, SKIPPING it."
             } else {
                 $appReported = $lastApply.result.bytes_freed
-                Write-Log "[App-reported] bytes_freed = $appReported (method: $($lastApply.result.method))"
+                # AU2: `.result.method` is the BATCH-level nominal method echoed straight back
+                # from the request body ('recycle_bin', sent as a placeholder -- see this step's
+                # top comment) -- it is NOT what was actually used for this specific item.
+                # `.result.items[0].method` is the per-item resolved method (BatchApplyReport's
+                # top-level `method` field is set from apply_batch's own `method` PARAMETER,
+                # confirmed by reading executor.py; each ItemApplyResult carries its own real
+                # `item_method` from `_effective_method_and_retention_days`). Logging the batch
+                # field here made every run claim "method: recycle_bin" even when the item itself
+                # correctly direct-deleted.
+                $itemMethod = if ($lastApply.result.items -and $lastApply.result.items.Count -gt 0) { $lastApply.result.items[0].method } else { '<no items>' }
+                Write-Log "[App-reported] bytes_freed = $appReported (item method: $itemMethod; batch-nominal method: $($lastApply.result.method))"
                 if ($appReported -and $appReported -gt 0) {
                     $pctDiff = [math]::Abs(($measuredDelta - $appReported) / $appReported) * 100
                     Write-Log ("[Comparison] {0:N2}% difference between app-reported and OS-measured -- must be within 2%" -f $pctDiff)
