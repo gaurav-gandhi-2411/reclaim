@@ -426,6 +426,47 @@ def test_wer_root_children_proposed_but_never_the_root_itself(index: ScanIndex) 
     assert Path("C:/ProgramData/Microsoft/Windows/WER") not in paths
 
 
+def test_wer_root_children_found_even_when_the_root_itself_has_no_index_row(
+    index: ScanIndex,
+) -> None:
+    """AW1 (2026-08-24 audit): live-reproduced, silent zero-yield -- identical mechanism and
+    identical masking pattern to AU1 (`test_temp_root_children_found_even_when_the_root_itself_
+    has_no_index_row` above), just in `detect_crash_dumps`' WER-report surface instead of
+    `detect_temp_and_browser_caches`. The test above seeds an explicit index row for the WER root
+    itself, which is NOT what a real scan produces when that root IS the scan's own root (e.g. a
+    scan rooted directly at `%LOCALAPPDATA%\\CrashDumps`) -- a scan never indexes its own starting
+    directory as a row of itself. The original implementation required `files_matching_path_
+    pattern` to find a row matching the root before looking at its children at all, so scanning
+    the CrashDumps/WER root directly produced ZERO `crash_dump_wer_report` candidates,
+    permanently, silently -- live-reproduced this session (a real `.wer`-shaped file at exactly
+    that root, scanned as the root: 0 candidates before this fix, 1 after). Deliberately seeds NO
+    row for the root itself, unlike the test above -- that's the realistic shape this test exists
+    to cover."""
+    _seed(
+        index,
+        _record("C:/Users/gg/AppData/Local/CrashDumps/Report.wer"),
+    )
+    result = detect_crash_dumps(index, root_paths=["C:/Users/gg/AppData/Local/CrashDumps"])
+    paths = _paths(result)
+    assert Path("C:/Users/gg/AppData/Local/CrashDumps/Report.wer") in paths
+
+
+def test_wer_root_glob_pattern_still_requires_an_indexed_match(index: ScanIndex) -> None:
+    """The literal-path fast path above must not silently widen a genuine glob pattern's
+    semantics -- same regression proof as `test_temp_root_glob_pattern_still_requires_an_indexed_
+    match` above, applied to `detect_crash_dumps`."""
+    result_no_match = detect_crash_dumps(index, root_paths=["C:/Users/*/AppData/Local/CrashDumps"])
+    assert result_no_match == []
+
+    _seed(
+        index,
+        _record("C:/Users/alice/AppData/Local/CrashDumps", is_dir=True),
+        _record("C:/Users/alice/AppData/Local/CrashDumps/Report.wer"),
+    )
+    result_matched = detect_crash_dumps(index, root_paths=["C:/Users/*/AppData/Local/CrashDumps"])
+    assert Path("C:/Users/alice/AppData/Local/CrashDumps/Report.wer") in _paths(result_matched)
+
+
 # --- Old installers: age threshold ----------------------------------------------------------
 
 
