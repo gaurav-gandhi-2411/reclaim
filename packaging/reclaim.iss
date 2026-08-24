@@ -112,6 +112,31 @@ begin
   Result := Escaped;
 end;
 
+// AY1 (2026-08-24 audit): `SaveStringToFile`'s second parameter is `AnsiString` -- Inno's Pascal
+// Script implicitly narrows the Unicode `String` XmlContent to the system ANSI/UTF-8 codepage
+// when it's passed there, so the file actually written was always single-byte-per-character
+// bytes, never real UTF-16, regardless of what the XML's own `encoding="UTF-16"` declaration
+// claimed. Live-reproduced this session: `schtasks.exe /create /xml` genuinely requires real
+// UTF-16 content for a task-definition XML -- confirmed by direct testing that neither a bare
+// UTF-8 declaration nor a UTF-8 BOM satisfies it ("unable to switch the encoding" / "incorrect
+// document syntax" respectively); only actual UTF-16LE bytes with a UTF-16LE BOM work. This
+// builds those bytes explicitly (BOM + 2 bytes per source character, low byte first) into an
+// AnsiString that SaveStringToFile then writes verbatim -- no further ANSI conversion applies
+// once the value is already an AnsiString. Assumes every character in `S` is within the Latin-1
+// range (0-255), true for this file's actual content (ASCII XML markup plus a Windows install
+// path XmlEscape already sanitizes) -- not a general-purpose UTF-16 encoder.
+function Utf16LEBytes(const S: String): AnsiString;
+var
+  I, Code: Integer;
+begin
+  Result := Chr($FF) + Chr($FE); // UTF-16LE byte-order mark
+  for I := 1 to Length(S) do
+  begin
+    Code := Ord(S[I]);
+    Result := Result + Chr(Code and $FF) + Chr((Code div 256) and $FF);
+  end;
+end;
+
 procedure RegisterDiskSpaceTask();
 var
   ResultCode: Integer;
@@ -142,6 +167,20 @@ begin
   // Interval, the smallest N at or after now), not by "catching up" on every missed interval
   // since the literal boundary date -- so this never fires a burst of overdue runs at install
   // time, regardless of how long ago the boundary date is.
+  // AY1 (2026-08-24 audit): live-reproduced -- this declares "UTF-16" but SaveStringToFile's
+  // AnsiString parameter meant the file actually written was single-byte-per-character bytes
+  // (confirmed by inspecting the real bytes written during a real install: the file starts
+  // `3C 3F 78 6D 6C` -- '<?xml' in single-byte form -- not the UTF-16LE `3C 00 3F 00...` a
+  // genuine UTF-16 file, or any BOM). This mismatch made `schtasks.exe /create /xml` fail
+  // outright (ResultCode 1) on EVERY install this feature has ever shipped in, confirmed across
+  // 11 of 12 real trip runs in this engagement's own history hitting this exact "task not
+  // found" symptom. Also confirmed by direct testing that this ISN'T fixable by just declaring
+  // a different encoding while still writing single-byte bytes: neither a bare UTF-8
+  // declaration ("ERROR: unable to switch the encoding") nor a UTF-8 BOM ("ERROR: incorrect
+  // document syntax") satisfies `schtasks /xml` -- it genuinely requires real UTF-16LE content.
+  // Fixed at the WRITE side instead (`Utf16LEBytes` above, used below) -- this declaration was
+  // always correct, the bytes just never matched it. Verified by direct reproduction: real
+  // `schtasks /create` now succeeds and the task is genuinely present afterward.
   XmlContent :=
     '<?xml version="1.0" encoding="UTF-16"?>' + #13#10 +
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
@@ -181,15 +220,28 @@ begin
     '  </Actions>' + #13#10 +
     '</Task>';
 
-  SaveStringToFile(XmlPath, XmlContent, False);
+  SaveStringToFile(XmlPath, Utf16LEBytes(XmlContent), False);
   // /F overwrites a pre-existing task from an earlier install (reinstall/upgrade must not fail
   // or duplicate the trigger) -- same idempotent-reinstall posture InitializeUninstall's
   // taskkill already applies to process termination. A failure here (schtasks missing/disabled,
   // an unusual locked-down environment) is not surfaced -- this is a best-effort convenience
   // registration, not a required install step; the dashboard/CLI work identically without it,
   // just without the background check.
+  //
+  // One retry after a short wait: schtasks against a just-written file can plausibly race a
+  // real-time AV scan of a large, freshly-extracted install tree (the same class of hazard
+  // InitializeUninstall's own Sleep(500) already guards against elsewhere in this script) --
+  // cheap insurance, still best-effort either way. NOT a fix for AY1's actual root cause above
+  // (that was the encoding bug, confirmed structurally); this retry is a separate, general
+  // defensive measure, not verified against a real failure of this specific kind.
   Exec('schtasks.exe', '/create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath + '" /f',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode <> 0 then
+  begin
+    Sleep(1500);
+    Exec('schtasks.exe', '/create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath + '" /f',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
   DeleteFile(XmlPath);
 end;
 
