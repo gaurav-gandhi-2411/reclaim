@@ -261,6 +261,67 @@ def test_temp_root_children_proposed_but_never_the_root_itself(index: ScanIndex)
     assert Path("C:/Users/gg/AppData/Local/Temp") not in paths
 
 
+def test_temp_root_children_found_even_when_the_root_itself_has_no_index_row(
+    index: ScanIndex,
+) -> None:
+    """AU1 (2026-08-24 audit): live-reproduced, silent zero-yield -- the test above seeds an
+    explicit index row for the temp root itself (`_record(..., is_dir=True)`), which is NOT what
+    a real scan produces when the temp root IS the scan's own root: a scan never indexes its own
+    starting directory as a row of itself, only the directories/files reached by walking it. The
+    original implementation required `files_matching_path_pattern` to find a row matching the
+    root before it would look at that root's children at all -- so scanning `%TEMP%` directly
+    (the AC3 trip's own check 1e, and any real "just scan my temp folder" UI flow) produced ZERO
+    `windows_temp` candidates, permanently, silently, regardless of how much real eligible
+    content existed underneath -- live-reproduced against a real ~590k-entry account scan with
+    2,741 genuinely eligible files, found zero, before this fix. Deliberately seeds NO row for
+    the root itself, unlike the test above -- that's the realistic shape this test exists to
+    cover."""
+    _seed(
+        index,
+        _record("C:/Users/gg/AppData/Local/Temp/scratch.tmp", mtime=_NOW - 10 * _DAY),
+    )
+    result = detect_temp_and_browser_caches(
+        index,
+        cache_paths=[],
+        temp_roots=["C:/Users/gg/AppData/Local/Temp"],
+        min_temp_root_age_hours=0.0,
+        now=_NOW,
+    )
+    paths = _paths(result)
+    assert Path("C:/Users/gg/AppData/Local/Temp/scratch.tmp") in paths
+
+
+def test_temp_root_glob_pattern_still_requires_an_indexed_match(index: ScanIndex) -> None:
+    """The literal-path fast path above must not silently widen a genuine glob pattern's
+    semantics: a `temp_roots` entry containing `*`/`?` can match zero, one, or several real
+    directories, which isn't known without searching the index -- unlike a literal path, `Path(
+    pattern)` alone would be wrong here (it isn't a real, single directory). Confirms glob
+    patterns are unaffected by this fix: still zero candidates when nothing in the index matches
+    the glob, and still found when something does."""
+    result_no_match = detect_temp_and_browser_caches(
+        index,
+        cache_paths=[],
+        temp_roots=["C:/Users/*/AppData/Local/Temp"],
+        min_temp_root_age_hours=0.0,
+        now=_NOW,
+    )
+    assert result_no_match == []
+
+    _seed(
+        index,
+        _record("C:/Users/alice/AppData/Local/Temp", is_dir=True),
+        _record("C:/Users/alice/AppData/Local/Temp/scratch.tmp", mtime=_NOW - 10 * _DAY),
+    )
+    result_matched = detect_temp_and_browser_caches(
+        index,
+        cache_paths=[],
+        temp_roots=["C:/Users/*/AppData/Local/Temp"],
+        min_temp_root_age_hours=0.0,
+        now=_NOW,
+    )
+    assert Path("C:/Users/alice/AppData/Local/Temp/scratch.tmp") in _paths(result_matched)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Win32-only: GetLongPathNameW/GetShortPathNameW")
 def test_windows_temp_candidates_proposed_when_temp_env_var_was_short_form(
     index: ScanIndex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
