@@ -162,6 +162,23 @@ if ($SkipInstall) {
     }
 
     if (-not $SkipInstall) {
+        # AZ4 (2026-08-25 audit): live-reproduced -- a second trip run in the same session, with
+        # a previous run's `reclaim.exe serve` (or a scan/apply worker it spawned) still holding
+        # a lock, made the installer exit 5 ("user clicked Cancel/Abort during the actual
+        # installation" -- Inno Setup's documented meaning, even under /SUPPRESSMSGBOXES: a
+        # locked file during [Files] copy resolves to that same code, not a hang). reclaim.iss's
+        # own InitializeUninstall already guards exactly this for the paired uninstall path
+        # (`taskkill /F /T /IM reclaim.exe` before touching any file) -- this trip script's own
+        # install step had no equivalent for a same-version reinstall over a still-running
+        # process, which is exactly what happens when this script runs more than once without an
+        # intervening clean shutdown. Mirrors the same fix here, at the one remaining call site
+        # that needed it.
+        Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Log "[WARNING] A reclaim.exe process (PID $($_.Id)) was still running before this install -- stopping it first, same as reclaim.iss's own InitializeUninstall does for the paired uninstall path."
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+
         Write-Log "[RUN] Installing silently (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART)..."
         $installProc = Start-Process -FilePath $InstallerPath -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
         Write-Log "  installer exit code: $($installProc.ExitCode)"
