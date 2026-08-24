@@ -449,11 +449,28 @@ def detect_crash_dumps(index: ScanIndex, root_paths: Sequence[str]) -> list[RawC
 
     seen_roots: set[Path] = set()
     for pattern in root_paths:
-        for root_record in index.files_matching_path_pattern(pattern, is_dir=True):
-            if root_record.path in seen_roots:
+        # AW1 (2026-08-24 audit): identical shape to AU1's temp_and_browser_caches fix
+        # (`detect_temp_and_browser_caches`, PR #76) -- live-reproduced: when a `root_paths`
+        # entry is the LITERAL directory the user just scanned (e.g. a scan rooted directly at
+        # `%LOCALAPPDATA%\CrashDumps`), `files_matching_path_pattern` never matched it, because a
+        # scan's root directory is never indexed as a row of itself, only its contents are. A real
+        # `.wer`-shaped fixture at that exact root produced zero `crash_dump_wer_report`
+        # candidates, silently, every time -- a third instance of the same defect class this audit
+        # has now found twice in `temp_and_browser_caches` alone (PR #50, PR #76). Same fix:
+        # `direct_children` queries by path PREFIX and needs no index row for the parent, so a
+        # literal (non-glob) pattern skips the index lookup for the root entirely; a genuine glob
+        # pattern still needs it, since which directories it matches isn't known in advance.
+        if "*" in pattern or "?" in pattern:
+            matched_roots: Iterable[Path] = (
+                r.path for r in index.files_matching_path_pattern(pattern, is_dir=True)
+            )
+        else:
+            matched_roots = (Path(pattern),)
+        for root_path in matched_roots:
+            if root_path in seen_roots:
                 continue
-            seen_roots.add(root_record.path)
-            for child in index.direct_children(root_record.path):
+            seen_roots.add(root_path)
+            for child in index.direct_children(root_path):
                 candidates.append(
                     RawCandidate(
                         path=child.path,
@@ -463,7 +480,7 @@ def detect_crash_dumps(index: ScanIndex, root_paths: Sequence[str]) -> list[RawC
                         suggested_tier=Tier.A,
                         rationale=(
                             "Windows Error Reporting artifact under "
-                            f"'{root_record.path}' — diagnostic data from a past crash, "
+                            f"'{root_path}' — diagnostic data from a past crash, "
                             "regenerated automatically as needed."
                         ),
                         rebuild_instruction=None,

@@ -141,51 +141,74 @@ def test_temp_and_browser_caches_floor(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
 
-def test_crash_dumps_floor(tmp_path: Path) -> None:
-    """`.dmp` files match anywhere in the inventory via `files_by_ext` (`detect_crash_dumps`'s
-    first, config-independent detection surface) -- no env var or configured root needed for
-    this shape, so this floor exercises the real scanner-to-extension-index path rather than an
-    env-resolution chain (the WER-report `direct_children` surface lower in the same detector
-    does depend on `%LOCALAPPDATA%`/CrashDumps and, per a straight reading of its code, appears
-    to have the identical "requires an index row for the root itself" shape AU1 fixed for
-    temp_and_browser_caches -- not exercised by this floor, flagged here rather than silently
-    left uncovered; see the module-level note at the bottom of this file)."""
+def _category_counts(candidates: list) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for c in candidates:
+        counts[c.category] = counts.get(c.category, 0) + 1
+    return counts
+
+
+def test_crash_dumps_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both of `detect_crash_dumps`' two independent detection surfaces, in one test, asserted
+    by CATEGORY (not just category_group) so a bug in either alone still fails this test even if
+    the other keeps the group count non-zero:
+
+    1. `.dmp` files anywhere (`files_by_ext`, config-independent) -- `crash_dump_file`.
+    2. The WER-report surface (`root_paths` + `direct_children`, gated on
+       `%LOCALAPPDATA%\\CrashDumps`) -- `crash_dump_wer_report`. AW1 (2026-08-24 audit):
+       live-reproduced this session -- this surface carried the IDENTICAL self-indexing bug AU1
+       fixed for `temp_and_browser_caches` (`files_matching_path_pattern` requiring an index row
+       for the root itself before ever looking at `direct_children`, which a scan rooted exactly
+       AT that directory never produces). Fixed alongside this test. Scanning the CrashDumps
+       directory itself as the root (not a parent) is the exact shape that caught it -- an
+       earlier version of this test used only surface 1 and passed while surface 2's bug was
+       still live, which is itself the finding AW1 asked to record: a green floor test that only
+       exercises one of two surfaces under the same category_group provides no evidence about
+       the other. Asserting per-category, not per-group, is what closes that gap.
+    """
+    fake_local_appdata = tmp_path / "AppData" / "Local"
+    crashdumps_root = fake_local_appdata / "CrashDumps"
+    crashdumps_root.mkdir(parents=True)
+    (crashdumps_root / "Report.wer").write_bytes(b"\x00" * 512)
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_local_appdata))
+
     project = tmp_path / "some_project"
     project.mkdir(parents=True)
     (project / "app_crash.dmp").write_bytes(b"\x00" * 8192)
 
     db_path = tmp_path / "_index.sqlite3"
     with ScanIndex(db_path) as index:
+        # Scan root == CrashDumps itself (AU1/AW1's exact self-indexing shape) for surface 2;
+        # a separate scan of `project` for surface 1's unrelated .dmp fixture.
+        scan_tree(crashdumps_root, index, incremental=False)
         scan_tree(project, index, incremental=False)
         config = _config(protected_root=tmp_path)
         candidates = generate_candidates(index, config, SafetyValidator(config), now=time.time())
 
-    counts = _group_counts(candidates)
-    assert counts.get("crash_dumps", 0) > 0, (
+    counts = _category_counts(candidates)
+    assert counts.get("crash_dump_file", 0) > 0, (
         f"crash_dumps is default-enabled and a bare .dmp file anywhere in the index is its "
         f"simplest, config-independent match shape -- zero candidates means the real "
-        f"scanner-to-extension-index path is silently broken. Full group counts: {counts}"
+        f"scanner-to-extension-index path is silently broken. Full category counts: {counts}"
+    )
+    assert counts.get("crash_dump_wer_report", 0) > 0, (
+        f"crash_dumps is default-enabled and this is AU1's exact self-indexing shape applied to "
+        f"the WER-report surface (scan root == %LOCALAPPDATA%\\CrashDumps itself) -- zero "
+        f"candidates here is the AW1 mechanism, live-reproduced and fixed this session; a "
+        f"regression would reproduce it silently again. Full category counts: {counts}"
     )
 
 
 # --- What this floor does NOT cover, and why -------------------------------------------------
 #
 # All four default-enabled categories (dev_artifacts, package_caches, temp_and_browser_caches,
-# crash_dumps) ARE covered above -- every category in `models.REBUILDABLE_CATEGORY_GROUPS`. Two
-# residual gaps, disclosed rather than silently left out:
+# crash_dumps) ARE covered above -- every category in `models.REBUILDABLE_CATEGORY_GROUPS`, and
+# both of crash_dumps' own independent detection surfaces are each asserted by category (AW1).
 #
-# 1. `detect_crash_dumps`'s WER-report surface (`root_paths` + `direct_children`, the second half
-#    of that detector, gated on `%LOCALAPPDATA%\CrashDumps`/`C:\ProgramData\...\WER`) is not
-#    exercised here -- the `.dmp`-anywhere surface above already gives crash_dumps a non-zero
-#    floor, so adding a second fixture wasn't necessary to satisfy this task's requirement, but a
-#    straight reading of that surface's code (`files_matching_path_pattern(pattern, is_dir=True)`
-#    before `direct_children`, structurally identical to what AU1 fixed) suggests it may carry
-#    the same latent self-indexing bug if `root_paths` ever equals a scan root exactly. Not
-#    reproduced or fixed here -- this task is the floor test, not a new investigation; flagged for
-#    a follow-up.
-# 2. `model_caches`, `old_installers`, `archive_pairs`, `large_logs`, `duplicates` are excluded on
-#    purpose: none of them default to `enabled=True` (confirmed via `config.py`'s five remaining
-#    `enabled: bool = False` class defaults), so "silently finds zero on a default install" isn't
-#    a meaningful failure mode for them -- zero is the correct, expected result until a user
-#    explicitly opts in. This floor is scoped to what a user can hit with zero configuration, which
-#    is exactly the shape both real bugs it guards against had.
+# One residual, intentional exclusion: `model_caches`, `old_installers`, `archive_pairs`,
+# `large_logs`, `duplicates` are excluded on purpose -- none of them default to `enabled=True`
+# (confirmed via `config.py`'s five remaining `enabled: bool = False` class defaults), so
+# "silently finds zero on a default install" isn't a meaningful failure mode for them -- zero is
+# the correct, expected result until a user explicitly opts in. This floor is scoped to what a
+# user can hit with zero configuration, which is exactly the shape every real bug it guards
+# against had.
