@@ -101,8 +101,15 @@ jobs:
       # ten-module generalization) is added here up front too, for the same reason: an AST-based
       # structural gate proving no module under src/reclaim/ builds a bare CWD-relative
       # Path("data/...") literal. Zero deps beyond stdlib `ast`, no [ai] extra needed.
-      - name: Safety gates -- deterministic, adversarial, AI recommend-only, MCP recommend/rule-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, hardlink-aware reclaimable-bytes, default scan-scope boundary, config env-var normalization, and data-path CWD independence
-        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py evals/test_mcp_safety_gate.py evals/test_scan_scope_gate.py evals/test_config_env_var_normalization_gate.py evals/test_data_path_cwd_independence_gate.py -v --junitxml=pytest-results.xml
+      #
+      # test_default_enabled_category_floor_gate.py (AV4, 2026-08-24) is added here up front too,
+      # for the same reason: a structural floor against a default-enabled category silently
+      # finding zero candidates forever (the shape both PR #50 and PR #76/AU1 hit, via two
+      # different mechanisms) is exactly the kind of safety/correctness gate this job exists to
+      # run remotely, not just locally via scripts/verify.py. Exercises real `Config()` defaults
+      # (real env-var resolution) + a real scanner walk, no [ai] extra needed.
+      - name: Safety gates -- deterministic, adversarial, AI recommend-only, MCP recommend/rule-only, safe-mode structural boundary, apply-time pre-flight probes, mutation call-graph confinement, hardlink-aware reclaimable-bytes, default scan-scope boundary, config env-var normalization, data-path CWD independence, and default-enabled-category floor
+        run: uv run pytest evals/test_safety_gate.py evals/test_safety_adversarial.py evals/test_ai_safety_gate.py evals/test_safe_mode_gate.py evals/test_apply_safety_preflight.py evals/test_apply_batch_call_graph_gate.py evals/test_reclaimable_bytes_link_aware_gate.py evals/test_cache_reclaimable_bytes_gate.py evals/test_mcp_safety_gate.py evals/test_scan_scope_gate.py evals/test_config_env_var_normalization_gate.py evals/test_data_path_cwd_independence_gate.py evals/test_default_enabled_category_floor_gate.py -v --junitxml=pytest-results.xml
 
       - name: Fail if this job collected/ran zero tests
         run: uv run python scripts/check_junit_nonzero.py pytest-results.xml
