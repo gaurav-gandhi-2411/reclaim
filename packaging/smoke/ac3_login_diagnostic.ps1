@@ -943,7 +943,14 @@ if (-not $serverReachable -or -not $csrfToken) {
                 Write-Log "[ABORT] Candidates warm-up did not reach 'ready' after ${warmElapsedSeconds}s (status: '$($warmStatus.status)'; $sizeDetail) -- SKIPPING the candidate-count check. This is a real, disclosed cost on a real TEMP directory (docs/AUDIT-2026-08.md's AS3/AT2), not a script bug -- if this keeps happening, the real fix is a warm-status-aware dashboard UI wait, not a bigger number here."
             } else {
                 Write-Log "[OK] Candidates warm-up ready after ${warmElapsedSeconds}s."
-                $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 30
+                # AZ4 (2026-08-25 audit): live-reproduced -- 30s was the one remaining short
+                # timeout in this script. The warm-up cache being "ready" does not make the
+                # follow-up GET itself free: serializing/filtering the real candidate list over
+                # HTTP for this account's real index size still took longer than 30s (the warm-up
+                # call above needed 96.3s on this same run). Same class of bug as AT1/AT2/AY2,
+                # missed at this one remaining call site -- raised to match this script's own
+                # established 600s convention rather than left as the one outlier.
+                $candResp = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/candidates?tier=both&category=temp_and_browser_caches" -TimeoutSec 600
                 $count = @($candResp.candidates).Count
                 Write-Log "[Result] temp_and_browser_caches candidates found: $count"
                 if ($count -gt 0) {
