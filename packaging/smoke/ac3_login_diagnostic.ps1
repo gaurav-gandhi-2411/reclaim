@@ -643,8 +643,43 @@ if (-not $serverReachable -or -not $csrfToken) {
         # live filesystem check), so the __pycache__ dir must be scanned before it can be
         # requested by path. Outside home (C:\Users\Public), so needs the same confirm-intent
         # token AN1/AO1's fix (PR #65/#66) requires of any outside-home scan.
+        #
+        # AZ4 (2026-08-25 audit): live-reproduced -- POST /api/scan for the fixture hit
+        # routes.py's own scan_status.status == "running" single-flight guard (409), because a
+        # REAL scan of C:\Users\<account> was already in flight, initiated via POST
+        # /api/scan/my-files (SIMPLE mode's "Clean My Computer" button) -- confirmed in the real
+        # app log (api.scan_initiated, origin "POST /api/scan/my-files"). app.js only fires that
+        # endpoint from an explicit button click (startSimpleScan, wired to scanBtn's click
+        # listener) -- it is never triggered on page load -- so this was a REAL click somewhere,
+        # not a frontend auto-scan. Not run to ground further: this is the same unexplained-
+        # trigger shape as AN1's own "stale browser tab replaying an already-confirmed click"
+        # finding (docs/AUDIT-2026-08.md), and that investigation's own precedent is "fixed
+        # regardless of whether the exact trigger was ever identified" -- applied the same way
+        # here rather than reopening a full forensic pass. This step is a synthetic-fixture-only
+        # measurement with no dependency on whatever that other scan was doing, so it cancels any
+        # in-flight scan before starting its own rather than waiting out an unrelated, possibly
+        # very long (a real home-directory scan on this machine) background job.
         Write-Log "[RUN] Scanning $fixtureDir so the __pycache__ fixture is indexed..."
         try {
+            $preScanStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 10
+            if ($preScanStatus.status -eq 'running') {
+                Write-Log "[WARNING] A scan was already running (root: '$($preScanStatus.root)') when Step 7 tried to start its own -- cancelling it. This step's fixture scan does not depend on it; see AZ4 for why the trigger is not further investigated here."
+                $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/cancel" -Method Post -ContentType 'application/json' -Headers $headers -Body '{}' -TimeoutSec 10
+                # Cooperative cancel (routes.py's own docstring: "stops at the next safe point, a
+                # batch boundary") -- not instant, so poll for the terminal state rather than a
+                # flat sleep, which could race the fixture scan request below into the same 409.
+                $cancelDeadline = (Get-Date).AddSeconds(30)
+                while ((Get-Date) -lt $cancelDeadline) {
+                    Start-Sleep -Milliseconds 500
+                    $cancelPollStatus = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/status" -TimeoutSec 10
+                    if ($cancelPollStatus.status -ne 'running') { break }
+                }
+                if ($cancelPollStatus.status -eq 'running') {
+                    Write-Log "[ABORT] The other scan did not stop within 30s of cancellation -- SKIPPING the rest of Step 7 rather than racing it."
+                    $fixtureScanDone = $false
+                    throw "other scan still running after cancel"
+                }
+            }
             $confirmIntentBody = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan/full-drive/confirm-intent" -Method Post -ContentType 'application/json' -Headers $headers -Body '{}' -TimeoutSec 10
             $scanToken = $confirmIntentBody.token
             $null = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/scan" -Method Post -ContentType 'application/json' -Headers $headers -Body (@{ path = $fixtureDir; token = $scanToken } | ConvertTo-Json) -TimeoutSec 30
