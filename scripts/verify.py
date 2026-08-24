@@ -103,6 +103,17 @@ _JUNIT_PATH = "pytest-results.xml"
 # src/reclaim/ builds a bare CWD-relative `Path("data/...")` literal -- every default must route
 # through `reclaim.app_paths.data_root()` instead. Zero deps beyond stdlib `ast`, no [ai] extra
 # needed -- same "no excuse to skip" bar as every file above.
+#
+# test_default_enabled_category_floor_gate.py added 2026-08-24 (AV4, docs/AUDIT-2026-08.md's
+# AU2/AV2): a structural floor against the "default-enabled category silently finds zero
+# candidates, forever, with no error" defect class -- two independent mechanisms (PR #50's 8.3
+# short-name TEMP resolution, PR #76/AU1's temp-root-is-scan-root self-indexing gap) have already
+# produced this exact shape, and this is not a regression test for either -- it exercises real
+# `Config()` env-var-driven defaults against a real scanner walk of a real fixture tree (not a
+# synthetic `ScanIndex.upsert_records` seed, which cannot see a scanner/index-shape bug) for
+# every category that defaults to `enabled=True`. No [ai] extra, no network -- same "no excuse to
+# skip" bar as every file above. Confirmed to have teeth: fails against the pre-PR-#76 detector
+# code (verified this session by swapping in that commit's `detectors.py` and re-running).
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -120,6 +131,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_scan_scope_gate.py",
     "evals/test_config_env_var_normalization_gate.py",
     "evals/test_data_path_cwd_independence_gate.py",
+    "evals/test_default_enabled_category_floor_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
