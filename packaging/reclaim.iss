@@ -94,8 +94,22 @@ Root: HKCU; Subkey: "Software\Classes\reclaim-notify\shell\open\command"; ValueT
 // UnregisterDiskSpaceTask (called from CurUninstallStepChanged below). See
 // src/reclaim/notifications.py's module docstring for the feature's own reliability posture
 // (opt-in via config.toml, never raises, debounced/snoozable).
+//
+// BE1 (2026-08-26 audit): BD1 only made the machine-wide-namespace collision this name caused
+// LOUD (a diagnostic log file), not fixed -- on a real multi-account PC the second, non-admin
+// account's alert would still silently never register, permanently, unless that user happened
+// to go looking for a diagnostic file they have no reason to expect exists. Fixed for real:
+// LegacyDiskSpaceTaskName is kept only so RegisterDiskSpaceTask can clean up a pre-BE1 install's
+// task (best-effort, see below) -- every NEW registration uses GetDiskSpaceTaskName() instead,
+// which embeds the current Windows username, so two accounts can never collide in the shared
+// machine-wide Task Scheduler namespace again, by construction, regardless of install order.
 const
-  DiskSpaceTaskName = 'Reclaim Disk Space Check';
+  LegacyDiskSpaceTaskName = 'Reclaim Disk Space Check';
+
+function GetDiskSpaceTaskName(): String;
+begin
+  Result := 'Reclaim Disk Space Check (' + ExpandConstant('{username}') + ')';
+end;
 
 // Minimal escaping for the handful of XML-significant characters that could in principle appear
 // in an install path (a username containing '&', for instance) -- {app} and {#MyAppExeName} are
@@ -166,14 +180,14 @@ const
 // a bare exit code -- redirection is the only way to capture the text a human (or a future
 // diagnostic reader) needs to distinguish "access denied by another account's task" from any
 // other failure shape.
-function RunSchtasksCreateCaptured(const XmlPath: String; var ResultCode: Integer): String;
+function RunSchtasksCreateCaptured(const TaskName, XmlPath: String; var ResultCode: Integer): String;
 var
   CmdLine, CapturePath, Output: String;
   Lines: TArrayOfString;
   I: Integer;
 begin
   CapturePath := ExpandConstant('{tmp}\schtasks_create_output.txt');
-  CmdLine := '/c schtasks.exe /create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath +
+  CmdLine := '/c schtasks.exe /create /tn "' + TaskName + '" /xml "' + XmlPath +
     '" /f > "' + CapturePath + '" 2>&1';
   Exec('cmd.exe', CmdLine, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Output := '';
@@ -189,12 +203,27 @@ end;
 procedure RegisterDiskSpaceTask();
 var
   ResultCode: Integer;
-  ExePath, AppDir, XmlPath, XmlContent, DiagPath, Output, Summary: String;
+  ExePath, AppDir, XmlPath, XmlContent, DiagPath, Output, Summary, TaskName, MigrationNote: String;
   Attempt: Integer;
 begin
+  TaskName := GetDiskSpaceTaskName();
   ExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
   AppDir := XmlEscape(ExpandConstant('{app}'));
   XmlPath := ExpandConstant('{tmp}\reclaim_disk_space_task.xml');
+
+  // BE1: best-effort cleanup of a pre-BE1 install's task under the old shared fixed name --
+  // succeeds (and removes the duplicate/orphan) when THIS account created it on an earlier
+  // install; silently fails (does nothing, harmlessly) when it doesn't exist or belongs to a
+  // different account, exactly the same posture as every other best-effort step in this
+  // procedure. Not gated on ResultCode -- deleting something that isn't there, or that this
+  // account doesn't own, is not a failure worth reacting to.
+  Exec('schtasks.exe', '/delete /tn "' + LegacyDiskSpaceTaskName + '" /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
+    MigrationNote := 'Removed a pre-existing legacy-named task ("' + LegacyDiskSpaceTaskName +
+      '") owned by this account -- migrated to the per-account name below.' + #13#10
+  else
+    MigrationNote := '';
 
   // Registered via `/xml`, not the simpler `/tr` flag: schtasks caps a plain `/tr` value at 261
   // characters (confirmed by direct reproduction against a real install-path-length command
@@ -285,36 +314,41 @@ begin
   // cheap insurance. NOT a fix for AY1's original root cause (the encoding bug, confirmed
   // structurally) or for BD1's ACL-collision root cause above (a retry changes nothing about a
   // permissions denial) -- kept only because it's free and does catch a genuine transient race.
-  Output := RunSchtasksCreateCaptured(XmlPath, ResultCode);
+  Output := RunSchtasksCreateCaptured(TaskName, XmlPath, ResultCode);
   Attempt := 1;
   if ResultCode <> 0 then
   begin
     Sleep(1500);
     Attempt := 2;
-    Output := RunSchtasksCreateCaptured(XmlPath, ResultCode);
+    Output := RunSchtasksCreateCaptured(TaskName, XmlPath, ResultCode);
   end;
   DeleteFile(XmlPath);
 
   DiagPath := ExpandConstant('{app}\data\') + TaskDiagLogName;
   ForceDirectories(ExpandConstant('{app}\data'));
   if ResultCode = 0 then
-    Summary := 'RESULT: SUCCESS (attempt ' + IntToStr(Attempt) + ', exit code 0)' + #13#10
+    Summary := 'RESULT: SUCCESS (attempt ' + IntToStr(Attempt) + ', exit code 0), task name "' +
+      TaskName + '"' + #13#10
   else if Pos('Access is denied', Output) > 0 then
+    // BE1: per-account task naming (below) is designed to make this branch unreachable for the
+    // ORIGINAL BD1 cause (two different accounts can no longer target the same task name) --
+    // retained, not deleted, because "access is denied" from schtasks can still have other
+    // causes (a locked-down/managed environment restricting Task Scheduler outright) and this
+    // message is still the right shape for those, just no longer able to name BD1 specifically
+    // as the likely cause the way it used to.
     Summary := 'RESULT: FAILED (attempt ' + IntToStr(Attempt) + ', exit code ' +
-      IntToStr(ResultCode) + ') -- ACCESS DENIED. Most likely cause (see BD1, 2026-08-26 audit): ' +
-      'a task named "' + DiskSpaceTaskName + '" already exists on this machine, registered under ' +
-      'a DIFFERENT Windows account. Task Scheduler''s root folder is one machine-wide namespace ' +
-      '(task names are unique per machine, not per user) -- a non-admin account has no rights to ' +
-      'overwrite a task it did not create. The background disk-space alert is disabled for THIS ' +
-      'account until an administrator deletes the conflicting task (schtasks /delete /tn "' +
-      DiskSpaceTaskName + '" /f, elevated) or manually re-registers it for this account.' + #13#10
+      IntToStr(ResultCode) + ') -- ACCESS DENIED registering "' + TaskName + '". This is no ' +
+      'longer expected to be a same-name collision with another account (BE1, 2026-08-26 audit: ' +
+      'the task name now embeds this account''s own username) -- more likely a locked-down or ' +
+      'managed environment restricting Task Scheduler access outright. The background disk-space ' +
+      'alert is disabled for this account; everything else in Reclaim works normally.' + #13#10
   else
     Summary := 'RESULT: FAILED (attempt ' + IntToStr(Attempt) + ', exit code ' +
       IntToStr(ResultCode) + ') -- see captured output below. The background disk-space alert ' +
       'is disabled for this account; everything else in Reclaim works normally.' + #13#10;
   SaveStringToFile(DiagPath,
     'Reclaim disk-space task registration -- ' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + #13#10 +
-    Summary + #13#10 + 'Captured schtasks output:' + #13#10 + Output, False);
+    MigrationNote + Summary + #13#10 + 'Captured schtasks output:' + #13#10 + Output, False);
 end;
 
 procedure UnregisterDiskSpaceTask();
@@ -323,8 +357,13 @@ var
 begin
   // A nonzero exit (task never existed -- e.g. an install that predates this feature, or a user
   // who manually removed it) is not surfaced -- same "don't fail the uninstall over a
-  // best-effort cleanup step" posture as the rest of this script.
-  Exec('schtasks.exe', '/delete /tn "' + DiskSpaceTaskName + '" /f',
+  // best-effort cleanup step" posture as the rest of this script. Deletes both names: the
+  // current per-account name (BE1) and, defensively, the pre-BE1 legacy shared name in case
+  // RegisterDiskSpaceTask's own migration cleanup never ran for this account (e.g. an install
+  // that was interrupted between registering and a later uninstall).
+  Exec('schtasks.exe', '/delete /tn "' + GetDiskSpaceTaskName() + '" /f',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('schtasks.exe', '/delete /tn "' + LegacyDiskSpaceTaskName + '" /f',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
