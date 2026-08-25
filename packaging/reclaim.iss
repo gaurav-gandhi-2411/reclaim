@@ -137,10 +137,60 @@ begin
   end;
 end;
 
+// BD1 (2026-08-26 audit): live-reproduced -- root-caused why a real ReclaimSmokeTest trip hit
+// "Task 'Reclaim Disk Space Check' not found" even though this exact binary's AY1 fix (the
+// UTF-16 encoding above) is confirmed present and confirmed WORKING when the identical install
+// runs under a different account (gaura's own dev account: task registered, LastResult=0, a
+// real scheduled fire succeeded). The difference is not the binary -- it's that Task Scheduler's
+// root folder is one machine-wide namespace: a task NAME is unique per machine, not per user.
+// This dev machine already had "Reclaim Disk Space Check" registered under gaura (a prior
+// verification install), and `icacls "C:\Windows\System32\Tasks\Reclaim Disk Space Check"`
+// confirms its DACL grants write/delete only to gaura, Administrators, and SYSTEM -- a second,
+// different, non-admin account (ReclaimSmokeTest) has ZERO rights on that task object, so its own
+// `/create ... /f` cannot overwrite it and fails with access denied, silently, every time,
+// deterministically -- not a race, not machine-local corruption of the kind AY1's original retry
+// logic was written to tolerate. This is a real product-facing gap too, not just a test-rig
+// artifact: any real multi-account Windows PC where a second (non-admin) user installs Reclaim
+// after a first user already did will hit the identical silent failure. Not fixed at the
+// namespace level in this pass (a per-user task name would be a larger behavior change, e.g.
+// losing the single predictable task name UnregisterDiskSpaceTask/support docs rely on) --
+// fixed by making the failure loud instead of swallowed, per the actual ask: every attempt now
+// writes its real exit code and captured schtasks output to a durable, always-present log file
+// (success or failure), so this stops being invisible.
+const
+  TaskDiagLogName = 'task_registration_diagnostic.log';
+
+// Runs `schtasks.exe /create /xml ... /f` via cmd.exe with real stdout+stderr redirection --
+// Inno's own `Exec` gives only a process exit code, never captured output, and schtasks writes
+// its actual error text ("ERROR: Access is denied", "ERROR: Invalid Xml...") to stdout, not just
+// a bare exit code -- redirection is the only way to capture the text a human (or a future
+// diagnostic reader) needs to distinguish "access denied by another account's task" from any
+// other failure shape.
+function RunSchtasksCreateCaptured(const XmlPath: String; var ResultCode: Integer): String;
+var
+  CmdLine, CapturePath, Output: String;
+  Lines: TArrayOfString;
+  I: Integer;
+begin
+  CapturePath := ExpandConstant('{tmp}\schtasks_create_output.txt');
+  CmdLine := '/c schtasks.exe /create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath +
+    '" /f > "' + CapturePath + '" 2>&1';
+  Exec('cmd.exe', CmdLine, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Output := '';
+  if LoadStringsFromFile(CapturePath, Lines) then
+  begin
+    for I := 0 to GetArrayLength(Lines) - 1 do
+      Output := Output + Lines[I] + #13#10;
+  end;
+  DeleteFile(CapturePath);
+  Result := Output;
+end;
+
 procedure RegisterDiskSpaceTask();
 var
   ResultCode: Integer;
-  ExePath, AppDir, XmlPath, XmlContent: String;
+  ExePath, AppDir, XmlPath, XmlContent, DiagPath, Output, Summary: String;
+  Attempt: Integer;
 begin
   ExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
   AppDir := XmlEscape(ExpandConstant('{app}'));
@@ -223,26 +273,48 @@ begin
   SaveStringToFile(XmlPath, Utf16LEBytes(XmlContent), False);
   // /F overwrites a pre-existing task from an earlier install (reinstall/upgrade must not fail
   // or duplicate the trigger) -- same idempotent-reinstall posture InitializeUninstall's
-  // taskkill already applies to process termination. A failure here (schtasks missing/disabled,
-  // an unusual locked-down environment) is not surfaced -- this is a best-effort convenience
-  // registration, not a required install step; the dashboard/CLI work identically without it,
-  // just without the background check.
+  // taskkill already applies to process termination. This is still a best-effort convenience
+  // registration, not a required install step -- the dashboard/CLI work identically without it,
+  // just without the background check -- but as of BD1 (2026-08-26 audit) a failure is no longer
+  // silently discarded: the real exit code and captured schtasks output are always written to
+  // {app}\data\task_registration_diagnostic.log below, success or failure.
   //
   // One retry after a short wait: schtasks against a just-written file can plausibly race a
   // real-time AV scan of a large, freshly-extracted install tree (the same class of hazard
   // InitializeUninstall's own Sleep(500) already guards against elsewhere in this script) --
-  // cheap insurance, still best-effort either way. NOT a fix for AY1's actual root cause above
-  // (that was the encoding bug, confirmed structurally); this retry is a separate, general
-  // defensive measure, not verified against a real failure of this specific kind.
-  Exec('schtasks.exe', '/create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath + '" /f',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // cheap insurance. NOT a fix for AY1's original root cause (the encoding bug, confirmed
+  // structurally) or for BD1's ACL-collision root cause above (a retry changes nothing about a
+  // permissions denial) -- kept only because it's free and does catch a genuine transient race.
+  Output := RunSchtasksCreateCaptured(XmlPath, ResultCode);
+  Attempt := 1;
   if ResultCode <> 0 then
   begin
     Sleep(1500);
-    Exec('schtasks.exe', '/create /tn "' + DiskSpaceTaskName + '" /xml "' + XmlPath + '" /f',
-      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Attempt := 2;
+    Output := RunSchtasksCreateCaptured(XmlPath, ResultCode);
   end;
   DeleteFile(XmlPath);
+
+  DiagPath := ExpandConstant('{app}\data\') + TaskDiagLogName;
+  ForceDirectories(ExpandConstant('{app}\data'));
+  if ResultCode = 0 then
+    Summary := 'RESULT: SUCCESS (attempt ' + IntToStr(Attempt) + ', exit code 0)' + #13#10
+  else if Pos('Access is denied', Output) > 0 then
+    Summary := 'RESULT: FAILED (attempt ' + IntToStr(Attempt) + ', exit code ' +
+      IntToStr(ResultCode) + ') -- ACCESS DENIED. Most likely cause (see BD1, 2026-08-26 audit): ' +
+      'a task named "' + DiskSpaceTaskName + '" already exists on this machine, registered under ' +
+      'a DIFFERENT Windows account. Task Scheduler''s root folder is one machine-wide namespace ' +
+      '(task names are unique per machine, not per user) -- a non-admin account has no rights to ' +
+      'overwrite a task it did not create. The background disk-space alert is disabled for THIS ' +
+      'account until an administrator deletes the conflicting task (schtasks /delete /tn "' +
+      DiskSpaceTaskName + '" /f, elevated) or manually re-registers it for this account.' + #13#10
+  else
+    Summary := 'RESULT: FAILED (attempt ' + IntToStr(Attempt) + ', exit code ' +
+      IntToStr(ResultCode) + ') -- see captured output below. The background disk-space alert ' +
+      'is disabled for this account; everything else in Reclaim works normally.' + #13#10;
+  SaveStringToFile(DiagPath,
+    'Reclaim disk-space task registration -- ' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + #13#10 +
+    Summary + #13#10 + 'Captured schtasks output:' + #13#10 + Output, False);
 end;
 
 procedure UnregisterDiskSpaceTask();
