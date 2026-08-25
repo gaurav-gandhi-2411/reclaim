@@ -47,6 +47,24 @@ DEFAULT_LOG_PATH = data_root() / "data" / "logs" / "reclaim.log"
 _MAX_BYTES = 5 * 1024 * 1024
 _BACKUP_COUNT = 5
 
+# BE2 (2026-08-26 audit): the main log's own rotation is exactly right for its purpose (routine
+# debug volume, capped so a disk-cleanup tool doesn't grow its own footprint unbounded) but wrong
+# for a handful of rare, security-relevant events that need to survive regardless of how much
+# routine logging happens around them -- live-reproduced this session: a single heavy dedup
+# computation (one candidates/warm call against a real ~1M-entry index) filled and rotated the
+# ENTIRE 5MB active file within ~20 seconds, evicting every earlier event including the one
+# api.scan_initiated line (AN4) that would have named an unexplained scan's origin and
+# confirmation-token presence -- the exact evidence AN4 exists to preserve. A 5MB/5-backup budget
+# under a SUSTAINED burst at that ~115KB/s observed rate empties in about 4-5 minutes; a single
+# ~50s warm-up call is enough to evict everything on its own. That is not a retention window an
+# audit trail can rely on. Routed instead to its own small, isolated, append-only-in-spirit log
+# (get_audit_logger below) that never competes with debug volume for space: one JSON line per
+# scan-initiation is on the order of 150-250 bytes, so even this modest cap holds on the order of
+# tens of thousands of real audit events -- orders of magnitude beyond any realistic personal-tool
+# usage pattern, and completely immune to being crowded out by an unrelated dedup/scan burst.
+_AUDIT_MAX_BYTES = 1 * 1024 * 1024
+_AUDIT_BACKUP_COUNT = 10
+
 # The exact log path handlers were last attached for, or `None` before the first call. Compared
 # by value (not a bare "already ran once" bool) so a second call with a *different* path (e.g.
 # each pytest test building its own `create_app()` against its own `tmp_path`) reconfigures
@@ -55,6 +73,23 @@ _BACKUP_COUNT = 5
 # configures once, then `_run_serve` -> `create_app()` calls in again with the same default) is
 # a cheap no-op rather than a duplicate pair of handlers double-emitting every line.
 _configured_for_path: Path | None = None
+
+# BE2: the audit logger's own last-configured path, tracked separately from _configured_for_path
+# so reconfiguring (a different log_path, e.g. each pytest test's own tmp_path) correctly tears
+# down and reattaches the audit handler too, the same reasoning _configured_for_path's own
+# docstring gives for the main handler.
+_audit_configured_for_path: Path | None = None
+
+AUDIT_LOGGER_NAME = "reclaim.audit"
+
+
+def get_audit_logger() -> structlog.stdlib.BoundLogger:
+    """The logger for rare, security-relevant events that must survive regardless of how much
+    routine debug volume happens around them (BE2) -- currently just api.scan_initiated (AN4).
+    Events logged here still propagate to the main log/console (this is a stdlib child logger
+    under the root logger, propagation is on by default) -- this is purely an ADDITIONAL,
+    isolated, long-retention sink, not a replacement for the main log stream."""
+    return structlog.get_logger(AUDIT_LOGGER_NAME)  # type: ignore[no-any-return]
 
 
 def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO) -> None:
@@ -138,3 +173,30 @@ def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO
     root_logger.setLevel(level)
 
     _configured_for_path = resolved_path
+
+    # BE2: a sibling of the main log, not a hardcoded separate default -- following whatever
+    # log_path override the caller passed (e.g. run_frozen_smoke_suite.ps1's isolated --log-path,
+    # AZ4) means this respects the exact same test-isolation posture the main log already does,
+    # with no new CLI flag needed.
+    global _audit_configured_for_path
+    audit_path = resolved_path.parent / "reclaim_audit.log"
+    if _audit_configured_for_path != audit_path:
+        audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        for handler in list(audit_logger.handlers):
+            audit_logger.removeHandler(handler)
+            handler.close()
+        audit_file_handler = logging.handlers.RotatingFileHandler(
+            audit_path, maxBytes=_AUDIT_MAX_BYTES, backupCount=_AUDIT_BACKUP_COUNT, encoding="utf-8"
+        )
+        audit_file_handler.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processor=structlog.processors.JSONRenderer(),
+                foreign_pre_chain=shared_processors,
+            )
+        )
+        audit_logger.addHandler(audit_file_handler)
+        # propagate stays True (the default) -- audit events still flow to the main log/console
+        # too; this handler is a pure ADDITION for isolated, long-retention durability, not a
+        # redirection away from the normal stream.
+        audit_logger.setLevel(level)
+        _audit_configured_for_path = audit_path
