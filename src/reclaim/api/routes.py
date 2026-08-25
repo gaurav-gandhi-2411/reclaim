@@ -58,11 +58,18 @@ from reclaim.executor import (
     RestoreIntegrityError,
     SafeModeViolationError,
 )
+from reclaim.logging_config import get_audit_logger
 from reclaim.mode import ModeSwitchDeniedError
 from reclaim.preflight import check_within_allowed_scope
 
 router = APIRouter(prefix="/api")
 logger = structlog.get_logger(__name__)
+# BE2 (2026-08-26 audit): every api.scan_initiated call below logs through this instead of the
+# plain `logger` above -- see logging_config.get_audit_logger's docstring. Still reaches the main
+# log/console too (propagation is on), this is a pure addition for isolated, long-retention
+# durability against exactly the kind of debug-volume eviction that made AN4's original fix
+# unreliable in practice (BD4, 2026-08-26 audit).
+audit_logger = get_audit_logger()
 
 
 def get_state(request: Request) -> AppState:
@@ -135,7 +142,7 @@ def start_scan(
     # after a full-drive scan ran against a real account mid-session with no way to reconstruct
     # afterward which endpoint/params actually initiated it. Every scan-start route now logs
     # root + origin + confirmation-token presence unconditionally, regardless of outcome.
-    logger.info(
+    audit_logger.info(
         "api.scan_initiated", root=str(root), origin="POST /api/scan", token_present=token_present
     )
     background_tasks.add_task(service.run_scan, state, [root], started_at)
@@ -223,7 +230,7 @@ def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> 
         )
         status_snapshot = state.scan_status
 
-    logger.info(
+    audit_logger.info(
         "api.scan_initiated", root=str(root), origin="POST /api/scan/my-files", token_present=False
     )
     background_tasks.add_task(service.run_scan, state, roots, started_at)
@@ -353,7 +360,7 @@ def start_full_drive_scan(
         )
         status_snapshot = state.scan_status
 
-    logger.info(
+    audit_logger.info(
         "api.scan_initiated",
         root=str(roots[0]),
         origin="POST /api/scan/full-drive",
