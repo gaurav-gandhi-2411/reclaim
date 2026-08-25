@@ -450,10 +450,31 @@ $patched = foreach ($line in $configLines) {
 Set-Content -Path (Join-Path $serverScratch 'config.toml') -Value $patched -Encoding utf8
 Set-Content -Path (Join-Path $seedDir 'smoketest.log') -Value ('y' * 2048) -Encoding utf8 -NoNewline
 
+# AZ4 (2026-08-25 audit): the durable fix AR5/AY2 both disclosed as "out of scope" -- an
+# isolated --db/data-root for this suite's own server, so checks 6/7 never touch the SAME
+# shared, ever-growing index every real install/trip-script run on this machine also writes to.
+# Previously this server ran with no storage overrides at all, so `reclaim.app_paths.
+# data_root()` (frozen-build default: anchored to the installed exe's own directory, by design --
+# PR #51/#52/#53's CWD-independence fixes) resolved to the SAME shared location regardless of
+# `-WorkingDirectory` above -- meaning every run of this suite silently grew the identical index
+# real trip-script runs and real manual testing also grow, so its own cost kept climbing across
+# every run, on a purely accumulating basis, forever. Explicit overrides here give this suite a
+# genuinely fresh, empty-at-start index every time, so its own checks measure THIS suite's own
+# tiny seed data, not this machine's entire accumulated testing history.
+$serverDataDir = Join-Path $serverScratch 'data'
+New-Item -ItemType Directory -Force -Path (Join-Path $serverDataDir 'quarantine') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $serverDataDir 'logs') | Out-Null
+
 $serverProc = $null
 try {
     $serverProc = Invoke-FrozenExeBackground -WorkingDirectory $serverScratch -ArgumentList @(
-        'serve', '--port', "$Port"
+        'serve', '--port', "$Port",
+        '--db', (Join-Path $serverDataDir 'reclaim_index.sqlite3'),
+        '--vault-dir', (Join-Path $serverDataDir 'quarantine'),
+        '--manifest', (Join-Path $serverDataDir 'quarantine\manifest.jsonl'),
+        '--mode-log', (Join-Path $serverDataDir 'mode_log.jsonl'),
+        '--first-run-state', (Join-Path $serverDataDir 'first_run_state.json'),
+        '--log-path', (Join-Path $serverDataDir 'logs\reclaim.log')
     )
     $baseUrl = "http://127.0.0.1:$Port"
     $serverUp = Wait-ForHttp -Url $baseUrl -TimeoutSeconds 20
