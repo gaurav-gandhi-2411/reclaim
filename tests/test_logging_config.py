@@ -7,9 +7,10 @@ from pathlib import Path
 
 import structlog
 
-from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
+from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging, get_audit_logger
 
 _EVENT_NAME = "test_logging_config.sample_event"
+_AUDIT_EVENT_NAME = "test_logging_config.sample_audit_event"
 
 
 def _root_handlers() -> list[logging.Handler]:
@@ -144,3 +145,88 @@ def test_default_log_path_is_built_from_data_root() -> None:
 # `data_root()`/`compiled_exe_dir()` themselves now live in reclaim.app_paths (generalized to
 # every `data/`-relative default in the app, not just this module's) -- see
 # tests/test_app_paths.py for their own dedicated coverage.
+
+
+# --- BE2 (2026-08-26 audit): a small, isolated, long-retention sink for rare security-relevant
+# events (currently api.scan_initiated, AN4) that must survive regardless of routine debug
+# volume -- live-reproduced this session: a single heavy dedup computation filled and rotated
+# the ENTIRE 5MB main log within ~20 seconds, evicting the one event that would have named an
+# unexplained scan's origin. ------------------------------------------------------------------
+
+
+def test_get_audit_logger_writes_to_a_separate_file_from_the_main_log(tmp_path: Path) -> None:
+    """The audit logger must not just be a differently-named structlog logger that still funnels
+    into the same rotating file handler -- it needs its own handler pointed at its own file, or
+    it inherits the exact eviction risk this feature exists to avoid."""
+    log_path = tmp_path / "reclaim.log"
+    configure_logging(log_path)
+
+    audit_logger = get_audit_logger()
+    audit_logger.info(_AUDIT_EVENT_NAME, root="C:/example")
+
+    audit_path = tmp_path / "reclaim_audit.log"
+    assert audit_path.exists()
+    assert audit_path != log_path
+    lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line]
+    assert any(json.loads(line).get("event") == _AUDIT_EVENT_NAME for line in lines)
+
+
+def test_audit_events_also_reach_the_main_log(tmp_path: Path) -> None:
+    """The audit file is an ADDITION, not a redirection -- an audit event must still show up in
+    the main log stream too (propagation), so a human reading the regular log in order still
+    sees it in context."""
+    log_path = tmp_path / "reclaim.log"
+    configure_logging(log_path)
+
+    get_audit_logger().info(_AUDIT_EVENT_NAME, root="C:/example")
+
+    main_lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line]
+    assert any(json.loads(line).get("event") == _AUDIT_EVENT_NAME for line in main_lines)
+
+
+def test_audit_log_survives_main_log_rotation_from_unrelated_volume(tmp_path: Path) -> None:
+    """The actual regression this feature fixes: flood the main log past its own rotation
+    threshold with unrelated noise (simulating the real dedup-computation burst that evicted
+    AN4's evidence this session), then confirm an audit event logged BEFORE the flood is still
+    readable afterward -- proving the audit file's own, isolated rotation budget was never
+    touched by the main log's rotation at all."""
+    log_path = tmp_path / "reclaim.log"
+    configure_logging(log_path)
+
+    get_audit_logger().info(_AUDIT_EVENT_NAME, root="C:/example", marker="before_flood")
+
+    noise_logger = structlog.get_logger("test_logging_config.noise")
+    # Comfortably past the main log's 5MB cap -- forces at least one real rotation of reclaim.log.
+    for _ in range(20_000):
+        noise_logger.info("test_logging_config.noise_event", padding="x" * 300)
+
+    audit_path = tmp_path / "reclaim_audit.log"
+    audit_lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line]
+    assert any(json.loads(line).get("marker") == "before_flood" for line in audit_lines), (
+        "the pre-flood audit event must still be present -- the whole point of a separate handler"
+    )
+    # And confirm the main log genuinely did rotate, so this test would have caught the bug it's
+    # written against (a flood that never actually rotated anything proves nothing).
+    assert (tmp_path / "reclaim.log.1").exists()
+
+
+def test_configure_logging_reconfigures_audit_handler_for_a_different_path(tmp_path: Path) -> None:
+    """Same reasoning as the main log's own reconfigure-for-a-different-path test: a second
+    `configure_logging` call with a different path (each test building its own tmp_path) must
+    redirect the audit sink too, not leave it writing to a torn-down prior test's file."""
+    first_path = tmp_path / "first" / "reclaim.log"
+    second_path = tmp_path / "second" / "reclaim.log"
+
+    configure_logging(first_path)
+    get_audit_logger().info(_AUDIT_EVENT_NAME, marker="first")
+
+    configure_logging(second_path)
+    get_audit_logger().info(_AUDIT_EVENT_NAME, marker="second")
+
+    second_audit_path = tmp_path / "second" / "reclaim_audit.log"
+    assert second_audit_path.exists()
+    second_lines = [
+        line for line in second_audit_path.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert any(json.loads(line).get("marker") == "second" for line in second_lines)
+    assert not any(json.loads(line).get("marker") == "first" for line in second_lines)
