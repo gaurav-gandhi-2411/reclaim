@@ -190,6 +190,37 @@ if ($SkipInstall) {
 
 # ===========================================================================
 Write-Log ""
+Write-Log "--- STEP -1.5: Reset first-run acknowledgment (BD3, 2026-08-26 audit) ---"
+Write-Log "    (first_run_state.json lives at {app}\data\, which Inno Setup's uninstaller never"
+Write-Log "    removes -- it only tracks/removes files it installed via [Files], never runtime-"
+Write-Log "    created data -- so a fresh install over the same {app} path leaves a prior"
+Write-Log "    acknowledgment in place. This is very likely why the genuine first-run screen has"
+Write-Log "    never been observed this entire engagement: 'reinstall' was never actually a clean"
+Write-Log "    profile for this one file. Deleting the marker explicitly is the real reset.)"
+# ===========================================================================
+if ($installSkippedByFreshnessCheck -or $SkipInstall) {
+    Write-Log "[SKIPPED] No fresh install this run -- nothing to reset."
+} else {
+    $resetUninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{B6C1B6C7-6B6A-4E3B-9B7B-2B7E1E7C6A21}_is1'
+    $resetAppDir = $null
+    try {
+        $resetAppDir = (Get-ItemProperty -Path $resetUninstallKey -Name InstallLocation -ErrorAction Stop).InstallLocation
+    } catch { $resetAppDir = $null }
+    if (-not $resetAppDir) {
+        Write-Log "[ABORT] Could not resolve install location to reset first_run_state.json -- Step -1 below will very likely observe a stale acknowledgment, not the genuine screen."
+    } else {
+        $firstRunStatePath = Join-Path $resetAppDir 'data\first_run_state.json'
+        if (Test-Path $firstRunStatePath) {
+            Remove-Item -Path $firstRunStatePath -Force
+            Write-Log "[OK] Deleted pre-existing $firstRunStatePath -- Step -1 will now observe a genuine first-run state."
+        } else {
+            Write-Log "[OK] $firstRunStatePath did not exist -- already a clean first-run state."
+        }
+    }
+}
+
+# ===========================================================================
+Write-Log ""
 Write-Log "--- STEP -1: Genuine first-run observation (AJ4 -- this is the ONLY chance) ---"
 Write-Log "    THIS MUST HAPPEN BEFORE ANY OTHER STEP TOUCHES THIS PROFILE."
 # ===========================================================================
@@ -967,30 +998,110 @@ if (-not $serverReachable -or -not $csrfToken) {
 
 # ===========================================================================
 Write-Log ""
-Write-Log "--- STEP 9: copy the app's own structured log to a readable location (AM2) ---"
-Write-Log "    (settles check 3's real question: does notifications.toast_failed appear anywhere,"
-Write-Log "    distinguishing 'send_disk_space_toast was called' from 'it actually succeeded"
-Write-Log "    internally' -- record_notified fires either way, so Step 5's notification_state.json"
-Write-Log "    alone can never answer this)"
+Write-Log "--- STEP 9: copy the app's own structured log to a readable location (AM2/BD4) ---"
+Write-Log "    (BD4, 2026-08-26 audit: copies the ACTIVE log plus every rotated backup --"
+Write-Log "    reclaim.log.1 .. reclaim.log.5 -- not just reclaim.log. logging_config.py's"
+Write-Log "    RotatingFileHandler caps the active file at 5MB; a single heavy dedup computation"
+Write-Log "    (Step 8's candidates/warm on a large index) was directly confirmed capable of"
+Write-Log "    producing enough log volume to rotate the active file within ~20 seconds, evicting"
+Write-Log "    everything from earlier steps -- including any api.scan_initiated line that would"
+Write-Log "    explain a Step 7-style unexplained-scan-trigger instance. Copying only the active"
+Write-Log "    file, as this step used to, is very likely why AN1/AZ4's prior instances of that"
+Write-Log "    shape were never root-caused either.)"
 # ===========================================================================
 
 if ($appDir) {
-    $realLogFile = Join-Path $appDir 'data\logs\reclaim.log'
-    if (Test-Path $realLogFile) {
-        $destLogFile = Join-Path $logDir 'reclaim_app.log'
-        Copy-Item -Path $realLogFile -Destination $destLogFile -Force
-        Write-Log "[OK] Copied $realLogFile to $destLogFile"
-        $toastFailedLines = @(Get-Content $realLogFile | Select-String -Pattern 'toast_failed')
+    $realLogDir = Join-Path $appDir 'data\logs'
+    $realLogFiles = @(Get-ChildItem -Path $realLogDir -Filter 'reclaim.log*' -ErrorAction SilentlyContinue)
+    if ($realLogFiles.Count -gt 0) {
+        $allCopiedText = @()
+        foreach ($f in $realLogFiles) {
+            $destLogFile = Join-Path $logDir "reclaim_app_$($f.Name).log"
+            Copy-Item -Path $f.FullName -Destination $destLogFile -Force
+            Write-Log "[OK] Copied $($f.FullName) ($([math]::Round($f.Length/1MB, 2)) MB) to $destLogFile"
+            $allCopiedText += Get-Content $f.FullName
+        }
+        $toastFailedLines = @($allCopiedText | Select-String -Pattern 'toast_failed')
         if ($toastFailedLines.Count -gt 0) {
-            Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] notifications.toast_failed appears $($toastFailedLines.Count) time(s) in the real log -- send_disk_space_toast raised internally at least once this run. See $destLogFile for the real exception."
+            Write-Log "[FAIL -- REAL FINDING, NOT A SCRIPT BUG] notifications.toast_failed appears $($toastFailedLines.Count) time(s) across the active log + rotated backups -- send_disk_space_toast raised internally at least once this run."
         } else {
-            Write-Log "[Result] No 'toast_failed' line in the real log -- send_disk_space_toast was called and did not raise. This is real evidence the call succeeded internally; it is still NOT proof a toast rendered on screen (Windows gives the sending process no delivery guarantee) -- that half of check 3 stays UNVERIFIED without a human 'yes/no, I saw it.'"
+            Write-Log "[Result] No 'toast_failed' line across the active log + rotated backups. BD2 (2026-08-26 audit): send_disk_space_toast never logs anything on SUCCESS, only on exception -- this absence does NOT by itself mean the call succeeded, or was even made. Steps 2/3/4 above all pass --apply-snooze, which returns before ever reaching check_disk_space/send_disk_space_toast (src/reclaim/cli.py's _run_check_disk_space, apply_snooze branch returns early) -- they structurally cannot exercise this codepath. Step 1 is the only step that reaches it, and it aborts whenever the Task Scheduler task is absent. See Step 10 below for the one trigger that actually forces this codepath and checks for it directly."
         }
     } else {
-        Write-Log "[ABORT] Real log not found at $realLogFile -- cannot settle check 3's toast_failed question this run."
+        Write-Log "[ABORT] No reclaim.log* files found at $realLogDir -- cannot settle check 3's toast_failed question this run."
     }
 } else {
     Write-Log "[SKIPPED] Step 9 -- APPDIR unresolved."
+}
+
+# ===========================================================================
+Write-Log ""
+Write-Log "--- STEP 10: BD2 -- dedicated toast-codepath trigger (2026-08-26 audit) ---"
+Write-Log "    (Steps 2/3/4 all pass --apply-snooze, which src/reclaim/cli.py's"
+Write-Log "    _run_check_disk_space returns from BEFORE ever calling check_disk_space/"
+Write-Log "    send_disk_space_toast -- they cannot exercise this codepath, structurally, not"
+Write-Log "    just weakly. This step is the one that actually can: clears snooze state, then"
+Write-Log "    invokes plain 'check-disk-space' with no flags -- the same call Step 1's Task"
+Write-Log "    Scheduler task makes, without depending on that task existing.)"
+# ===========================================================================
+
+if (-not $appDir) {
+    Write-Log "[SKIPPED] Step 10 -- APPDIR unresolved."
+} else {
+    $step10Exe = Join-Path $appDir 'reclaim.exe'
+    $step10Config = Join-Path $appDir 'config.toml'
+    $step10State = Join-Path $appDir 'data\notification_state.json'
+
+    if (Test-Path $step10State) {
+        Write-Log "[BEFORE] $step10State exists -- deleting to clear any snooze/debounce state (NotificationState.load() treats a missing file identically to {last_notified_at: null, snoozed_until: null}, per notifications.py's own docstring)."
+        Remove-Item -Path $step10State -Force
+    } else {
+        Write-Log "[BEFORE] $step10State already absent -- already a clean snooze/debounce state."
+    }
+
+    $step10Out = Join-Path $env:TEMP "ac3_step10_stdout_$ts.txt"
+    Write-Log "[RUN] `"$step10Exe`" check-disk-space --config `"$step10Config`" --state `"$step10State`"  (no --apply-snooze)"
+    $step10Proc = Start-Process -FilePath $step10Exe `
+        -ArgumentList @('check-disk-space', '--config', $step10Config, '--state', $step10State) `
+        -WorkingDirectory $appDir -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $step10Out -RedirectStandardError "$step10Out.err"
+    $step10Stdout = if (Test-Path $step10Out) { Get-Content $step10Out -Raw } else { '' }
+    $step10Stderr = if (Test-Path "$step10Out.err") { Get-Content "$step10Out.err" -Raw } else { '' }
+    Write-Log "  exit code: $($step10Proc.ExitCode)"
+    Write-Log "  stdout: $step10Stdout"
+    if ($step10Stderr) { Write-Log "  stderr: $step10Stderr" }
+    Remove-Item -Path $step10Out, "$step10Out.err" -Force -ErrorAction SilentlyContinue
+
+    $step10AfterState = $null
+    if (Test-Path $step10State) {
+        try { $step10AfterState = Get-Content $step10State -Raw | ConvertFrom-Json } catch {}
+    }
+    $step10Notified = $step10AfterState -and $null -ne $step10AfterState.last_notified_at
+
+    if ($step10Stdout -match 'reason=would_notify' -and $step10Notified) {
+        Write-Log "[PASS] reason=would_notify AND notification_state.json's last_notified_at is now set -- send_disk_space_toast was genuinely invoked this run, not inferred from log absence."
+    } elseif ($step10Stdout -match 'reason=(disabled|below_threshold|snoozed|debounced)') {
+        Write-Log "[SKIPPED -- real, not a bug] reason=$($Matches[1]) -- this machine's real disk usage/config did not cross the threshold (or state wasn't actually cleared). Not evidence the toast codepath is broken, but also not evidence it works: re-run once the real condition (percent_used >= threshold) holds, or lower disk_threshold_percent in config.toml temporarily."
+    } else {
+        Write-Log "[INCONCLUSIVE] Could not parse an expected reason= from stdout, or last_notified_at did not update as expected -- read the raw stdout/state above directly."
+    }
+
+    Write-Log "[RUN] Re-copying reclaim.log* immediately (minimizing rotation-eviction risk) to check toast_failed for THIS specific invocation..."
+    $step10LogFiles = @(Get-ChildItem -Path (Join-Path $appDir 'data\logs') -Filter 'reclaim.log*' -ErrorAction SilentlyContinue)
+    $step10AllText = @()
+    foreach ($f in $step10LogFiles) {
+        $dest = Join-Path $logDir "reclaim_app_step10_$($f.Name).log"
+        Copy-Item -Path $f.FullName -Destination $dest -Force
+        $step10AllText += Get-Content $f.FullName
+    }
+    $step10ToastFailed = @($step10AllText | Select-String -Pattern 'toast_failed')
+    if ($step10ToastFailed.Count -gt 0) {
+        Write-Log "[FAIL -- REAL FINDING] notifications.toast_failed appears $($step10ToastFailed.Count) time(s) immediately after this specific, confirmed-invoked call."
+    } elseif ($step10Notified) {
+        Write-Log "[Result] No toast_failed after a confirmed-invoked call (last_notified_at updated) -- real evidence send_disk_space_toast did not raise this time. Still not proof of on-screen delivery (Windows gives no such guarantee) -- that half needs a human 'yes/no, I saw it.'"
+    } else {
+        Write-Log "[Result] No toast_failed, but the call was not confirmed-invoked above either -- this absence is not meaningful evidence (see BD2 finding: no-log-line is trivially true when the codepath was never reached)."
+    }
 }
 
 # ===========================================================================
