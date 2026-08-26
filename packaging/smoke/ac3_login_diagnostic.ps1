@@ -125,6 +125,40 @@ Write-Log "==================================================================="
 
 # ===========================================================================
 Write-Log ""
+Write-Log "--- STEP -3: self-integrity check (BM1, 2026-08-26 audit) ---"
+# BL7 (2026-08-26 audit): the trip that produced ac3_run_20260826_181912.txt ran against a
+# pre-#98 copy of THIS FILE, staged from a locally-stale git checkout -- the resulting log gave
+# no direct indication anything was wrong; it took reverse-engineering indirect signals (an
+# "aumid" grep count, a registry-output message shape) to even notice. Same class as the
+# STALE-BASE VERIFICATION GAP (this doc's own third headline finding, 2026-08-20/21): a claim
+# verified true against a snapshot, silently no longer true by the time it was acted on. Fixed
+# structurally: packaging/smoke/Stage-AC3Trip.ps1 now writes a "<content-sha256>\n<commit-sha>\n"
+# sidecar next to this file at stage time (refusing to stage at all unless local main is freshly
+# confirmed == origin/main), and this check reads it back at the top of every run, before
+# anything else -- so a trip log now either states plainly which commit actually ran, or refuses
+# to run at all rather than silently producing conclusions about code it doesn't contain.
+# ===========================================================================
+$stageHashPath = "$PSCommandPath.stagehash"
+if (-not (Test-Path $stageHashPath)) {
+    Write-Log "[WARNING] No stage-time record found at $stageHashPath -- this script was not staged via Stage-AC3Trip.ps1 (e.g. running directly from a repo checkout for local testing). Freshness cannot be verified; this is expected and fine for a non-staged dev run, but a real trip should always go through Stage-AC3Trip.ps1 first."
+} else {
+    $stageHashLines = Get-Content -Path $stageHashPath
+    $recordedHash = if ($stageHashLines.Count -ge 1) { $stageHashLines[0].Trim() } else { "" }
+    $recordedCommit = if ($stageHashLines.Count -ge 2) { $stageHashLines[1].Trim() } else { "unknown" }
+    $actualHash = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash
+    if ($actualHash -eq $recordedHash) {
+        Write-Log "[OK] Self-integrity check: this file's content matches its stage-time record exactly. Staged from commit: $recordedCommit"
+    } else {
+        Write-Log "[ABORT] Self-integrity check FAILED: this file's actual hash ($actualHash) does not match its stage-time record ($recordedHash, staged from commit $recordedCommit). This file was modified, corrupted, or replaced with a different version after staging -- refusing to run and produce conclusions about code that may not be what this log claims it is. Re-run packaging\smoke\Stage-AC3Trip.ps1 from a freshly-fetched origin/main and try again."
+        Write-Log "==================================================================="
+        Write-Log "Run aborted at Step -3. No further steps executed."
+        Write-Log "==================================================================="
+        exit 1
+    }
+}
+
+# ===========================================================================
+Write-Log ""
 Write-Log "--- STEP -2: Install (AJ4) ---"
 # ===========================================================================
 
