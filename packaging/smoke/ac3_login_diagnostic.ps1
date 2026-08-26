@@ -91,7 +91,7 @@ Write-Log "==================================================================="
 
 # ===========================================================================
 Write-Log ""
-Write-Log "--- STEP -2: Install rebuild #4 (AJ4) ---"
+Write-Log "--- STEP -2: Install (AJ4) ---"
 # ===========================================================================
 
 $installSkippedByFreshnessCheck = $false
@@ -104,20 +104,20 @@ if ($SkipInstall) {
     Write-Log "[OK] Installer found: $InstallerPath"
     Write-Log "     SHA-256: $hash"
 
-    # AR3 (2026-08-23 audit): four real trip runs this same day proceeded against a known-stale
-    # rebuild #4 artifact -- the old check here only WARNED on a hash mismatch, never stopped
-    # anything, and compared against a hardcoded rebuild-specific hash rather than "is this the
-    # artifact current main actually builds today." Replaced with a real freshness check against
-    # build_installer.ps1's new .buildsha sidecar (rule 98a: an unverifiable state is a refusal,
-    # not a silent pass -- so a missing sidecar or unreachable git is treated the same as a
-    # confirmed mismatch, all three requiring -AllowStaleBuild to proceed past).
+    # BE4 (2026-08-26 audit): this used to be a hardcoded "rebuild #4" label in the section
+    # header above, silently going stale with every rebuild since (this trip ran rebuild #7
+    # under a "#4" banner) -- now reads the actual .buildsha sidecar and prints the real source
+    # commit here instead, so the log is honest about what it tested regardless of how many
+    # rebuilds have happened since anyone last remembered to update a hardcoded number.
     $buildShaPath = "$InstallerPath.buildsha"
     $freshnessOk = $false
     $freshnessReason = ""
     if (-not (Test-Path $buildShaPath)) {
+        Write-Log "     Build source commit: unknown (no .buildsha sidecar next to the installer)"
         $freshnessReason = "no .buildsha sidecar next to the installer (pre-AR3 build, or a copy that lost it)"
     } else {
         $recordedSha = (Get-Content -Path $buildShaPath -Raw).Trim()
+        Write-Log "     Build source commit: $recordedSha"
         if ($recordedSha -eq "unknown") {
             $freshnessReason = "sidecar records 'unknown' -- built outside a git checkout"
         } elseif (-not (Test-Path (Join-Path $RepoPath '.git'))) {
