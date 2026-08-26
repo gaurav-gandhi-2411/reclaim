@@ -67,21 +67,19 @@ git fetch origin --quiet; git branch -f main origin/main; git checkout main
 git rev-parse HEAD  # must equal origin/main -- DO NOT skip this. BL7 (this session) is the
                      # documented cost of skipping it: a real trip's own script silently ran stale.
 
-# 2. Re-stage from the merged origin/main (no rebuild needed -- BL1/BL2/BL4/BL6/BL7 are trip-script
-#    + docs only, zero src/ changes; the existing installer artifact already reflects everything
-#    merged so far):
-Copy-Item packaging\dist\reclaim-setup.exe,packaging\dist\reclaim-setup.exe.sha256,`
-  packaging\dist\reclaim-setup.exe.buildsha,packaging\smoke\ac3_login_diagnostic.ps1 `
-  C:\Users\Public\reclaim_ac3\ -Force
-# Then confirm byte-identical before trusting the copy -- do not skip this either:
-Compare-Object (Get-FileHash packaging\smoke\ac3_login_diagnostic.ps1).Hash `
-  (Get-FileHash C:\Users\Public\reclaim_ac3\ac3_login_diagnostic.ps1).Hash
+# 2. Re-stage using packaging\smoke\Stage-AC3Trip.ps1 -- BM1 (2026-08-26 audit): NOT a manual
+#    Copy-Item anymore. That manual step is what let BL7 happen (and, before it, the original
+#    STALE-BASE VERIFICATION GAP) -- a script that structurally cannot stage without first,
+#    freshly, re-verifying local main == origin/main (no override; no cached/remembered state):
+.\packaging\smoke\Stage-AC3Trip.ps1
+# Aborts loudly and refuses to stage if local main isn't confirmed current -- if it does, that IS
+# the correct behavior: fetch/fast-forward (step 1 above) and re-run this, don't work around it.
 
-# 3. NOTE: U6 (delete ReclaimSmokeTest + its profile) was found satisfied this session (a clean
-#    trip landed) but NOT executed -- account/profile deletion needs admin rights this session does
-#    not have (confirmed: IsInRole(Administrator) = False) and is irreversible, so it is routed to
-#    the user as exact numbered steps rather than attempted. See the final session report for those
-#    steps, or "Test account state" below once they've been run.
+# 3. U6 (delete ReclaimSmokeTest + its profile): DEFERRED per this session's explicit instruction
+#    -- do NOT run it. The account is the only profile on this machine with the 8.3 short-name
+#    condition, and BL7 means one more trip is still needed before the account's job here is done.
+#    Re-evaluate only after a trip against a Stage-AC3Trip.ps1-staged script produces real [BI3]
+#    evidence for the toast question -- see "Test account state" below.
 ```
 
 ## The two irreducible human steps for the trip
@@ -106,12 +104,21 @@ positively-verified-fresh server, and passing for real.
 
 ## Test account state
 
-`ReclaimSmokeTest` — last used for the real, clean trip on 2026-08-26 (`181912`). **U6's deferral
-gate is now satisfied** (the deferred condition was explicitly "until the next real trip against the
-merged state comes back clean," and it has) — deletion itself needs admin rights this session
-doesn't hold, so it's queued as an exact numbered step for the user rather than deferred further or
-attempted unelevated. Once run, a new disposable non-admin test account will be needed before the
-next trip.
+`ReclaimSmokeTest` — last used for the real, clean trip on 2026-08-26 (`181912`). **U6 (account
+deletion) is explicitly DEFERRED — read this before deleting it, this session or a future one.**
+Two independent reasons, both from the user directly, both current as of this checkpoint:
+1. `ReclaimSmokeTest`'s profile is the only one on this machine confirmed to exhibit the 8.3
+   short-name condition (`$env:TEMP` resolving as `RECLAI~1`) that the TEMP-cache detection fix
+   (rebuild #8.3-short-name work) depends on for its own regression coverage — deleting it loses
+   that fixture, not just a disposable account.
+2. BL7 means the `181912` trip's own toast/AUMID evidence doesn't actually count — `#98`'s `[BI3]`
+   diagnostic never ran on it. **One more trip, against a `Stage-AC3Trip.ps1`-staged script, is
+   still required** before this account's job here is done. A session that sees "the last trip was
+   clean" and reasons U6's gate is therefore satisfied would be repeating exactly the mistake this
+   note exists to prevent — the gate is "a trip whose toast evidence is trustworthy," which
+   `181912` was NOT, not merely "a trip with 0 ABORT/FAIL/ERROR."
+Do not run U6 until a session confirms, freshly, that a trip run against a properly
+`Stage-AC3Trip.ps1`-staged script produced real `[BI3]` lines in its log.
 
 ## Open-items list (flat, everything outstanding)
 
