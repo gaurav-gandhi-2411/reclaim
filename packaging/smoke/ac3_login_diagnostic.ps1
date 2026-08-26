@@ -347,8 +347,10 @@ if ($staleProcessKillFailed) {
     if ($preLaunchRemediationFailed) {
         # Deliberately not launching anything here -- Step 6's own probe (GET /api/scan/status)
         # will naturally fail against an empty port 8420 and set $serverReachable=$false itself,
-        # correctly gating Steps 6/7/8/10 below through the existing mechanism.
-        Write-Log "[SKIPPED] Not launching a new dashboard -- see the ABORT above. Every HTTP-based step below (6, 7, 8, 10) will report SKIPPED for the same reason."
+        # correctly gating Steps 6/7/8 below through the existing mechanism. Step 10 is NOT
+        # gated by this (BI1, 2026-08-26 audit: it's a direct reclaim.exe invocation, never
+        # touches port 8420) -- it will still attempt to run on its own merits.
+        Write-Log "[SKIPPED] Not launching a new dashboard -- see the ABORT above. Every HTTP-based step below (6, 7, 8) will report SKIPPED for the same reason. Step 10 is unaffected (direct invocation, not HTTP-based) and will still run."
     } else {
     Write-Log "[RUN] Launching 'reclaim dashboard' (opens your default browser automatically)..."
     $exePath = $null
@@ -374,7 +376,11 @@ if ($staleProcessKillFailed) {
         if ($portOwners -contains $freshDashboardPid) {
             Write-Log "[OK -- BH2] Confirmed: port 8420 is owned by PID $freshDashboardPid, the process this step just launched -- every HTTP-based step below is genuinely against this freshly-installed binary, not a survivor."
         } elseif ($portOwners.Count -gt 0) {
-            Write-Log "[WARNING -- BH2] Port 8420 is owned by PID(s) $($portOwners -join ',') -- NOT PID $freshDashboardPid, the process this step just launched. Every HTTP-based step below (6, 7, 8, 10) is running against a DIFFERENT process than the one just installed -- treat their results as scoped to an unconfirmed binary, exactly the 2026-08-26 BH2 finding. This can legitimately happen if the freshly-launched process exited immediately after a child re-exec'd under a new PID -- not necessarily still a stale survivor, but not verified fresh either."
+            # BI1 (2026-08-26 audit) correction: Step 10 does NOT go through port 8420 at all --
+            # it invokes reclaim.exe directly via Start-Process (same shape as Steps 2/3/4), so
+            # it was never affected by BH2 in the first place and does not belong in this list.
+            # Only Steps 6/7/8 are HTTP-mediated against this dashboard server.
+            Write-Log "[WARNING -- BH2] Port 8420 is owned by PID(s) $($portOwners -join ',') -- NOT PID $freshDashboardPid, the process this step just launched. Every HTTP-based step below (6, 7, 8) is running against a DIFFERENT process than the one just installed -- treat their results as scoped to an unconfirmed binary, exactly the 2026-08-26 BH2 finding. This can legitimately happen if the freshly-launched process exited immediately after a child re-exec'd under a new PID -- not necessarily still a stale survivor, but not verified fresh either."
         } else {
             Write-Log "[WARNING -- BH2] Could not determine which PID owns port 8420 (Get-NetTCPConnection returned nothing despite a successful HTTP response) -- cannot positively confirm the server is PID $freshDashboardPid. Treat downstream HTTP-based results as unconfirmed."
         }
@@ -482,12 +488,41 @@ Write-Log "  own pre-registered AUMID ({1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cm
 Write-Log "  passes no explicit notifierAUMID. Searching for any Notifications\Settings subkey tied"
 Write-Log "  to that AUMID (a fresh profile that never showed this toast may legitimately have NO"
 Write-Log "  matching entry yet -- that absence is itself AH1's data point, not a probe error):"
-$notifSettings = Get-ChildItem -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings' -ErrorAction SilentlyContinue
-$matched = $notifSettings | Where-Object { $_.PSChildName -match '1AC14E77|cmd\.exe' }
-if ($matched) {
-    foreach ($m in $matched) { Write-Log "  MATCH: $($m.PSPath)" }
+# BI3 (2026-08-26 audit): a real trip's send_disk_space_toast call succeeded internally (no
+# exception, notification_state.json updated) but no toast was visibly seen -- the empirical
+# answer to this engagement's AH1 question ("does the call succeeding mean it renders?" -- no).
+# The OLD code here only checked whether the PARENT key
+# (...\Settings\{1AC14E77-...}) exists, never the VALUE-BEARING key one level deeper
+# (...\Settings\{1AC14E77-...}\cmd.exe), which is where Windows actually stores the real
+# per-app `Enabled` gate (confirmed live: other apps this session show
+# Enabled=0 REG_DWORD exactly there when a user has explicitly disabled them) and
+# PeriodicNotificationCount/LastNotificationAddedTime (confirmed live on gaura's own account:
+# PeriodicNotificationCount=17, proving toasts under this exact AUMID HAVE been successfully
+# queued into the OS notification pipeline on this machine at least once, before this session
+# even started -- so the AUMID-fallback mechanism itself is not obviously broken in general,
+# narrowing the question to whether THIS account's copy of that key differs). The parent key's
+# mere existence was never informative either way -- fixed to read the real nested key/values.
+$aumidNestedPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe'
+function Get-AumidNotificationState {
+    $props = Get-ItemProperty -Path $aumidNestedPath -ErrorAction SilentlyContinue
+    if (-not $props) { return $null }
+    return [PSCustomObject]@{
+        # $null (not present) means "never explicitly toggled" -- Windows treats an app with no
+        # Enabled value as enabled by default, confirmed by the reference apps checked live this
+        # session that DO carry an explicit value (Enabled=0 when a user disabled them).
+        Enabled                   = if ($props.PSObject.Properties.Name -contains 'Enabled') { $props.Enabled } else { $null }
+        PeriodicNotificationCount = $props.PeriodicNotificationCount
+        LastNotificationAddedTime = $props.LastNotificationAddedTime
+    }
+}
+$aumidStateAtStep0 = Get-AumidNotificationState
+if ($aumidStateAtStep0) {
+    Write-Log "  MATCH: $aumidNestedPath"
+    Write-Log "    Enabled = $(if ($null -eq $aumidStateAtStep0.Enabled) { '(not set -- Windows default is enabled, not evidence of suppression)' } else { $aumidStateAtStep0.Enabled })"
+    Write-Log "    PeriodicNotificationCount = $($aumidStateAtStep0.PeriodicNotificationCount) (baseline -- compare against Step 10's own before/after capture below; an increase after Step 10's real invocation is direct proof the OS notification pipeline queued it, narrowing 'nothing rendered' to a display-layer question, not a permission/registration one)"
+    Write-Log "    LastNotificationAddedTime = $($aumidStateAtStep0.LastNotificationAddedTime)"
 } else {
-    Write-Log "  No matching subkey found -- see caveat above: unestablished permission state, not a probe error."
+    Write-Log "  No nested $aumidNestedPath key found -- this account's cmd.exe AUMID has never queued any notification at all yet (a real, informative absence, not a probe error)."
 }
 
 if ($appDir) {
@@ -1252,6 +1287,13 @@ if (-not $appDir) {
         Write-Log "[BEFORE] $step10State already absent -- already a clean snooze/debounce state."
     }
 
+    # BI3 (2026-08-26 audit): capture the real AUMID notification-pipeline count immediately
+    # around this specific invocation -- see Step 0's own Get-AumidNotificationState definition
+    # and comment for why the parent-key-existence check this used to rely on was never
+    # informative. An increase here is direct OS-level proof the toast was queued into the
+    # notification pipeline for real, narrowing "nothing rendered" to Focus Assist/display
+    # suppression specifically, not a permission or AUMID-registration failure.
+    $aumidBeforeStep10 = Get-AumidNotificationState
     $step10Out = Join-Path $env:TEMP "ac3_step10_stdout_$ts.txt"
     Write-Log "[RUN] `"$step10Exe`" check-disk-space --config `"$step10Config`" --state `"$step10State`"  (no --apply-snooze)"
     $step10Proc = Start-Process -FilePath $step10Exe `
@@ -1273,6 +1315,19 @@ if (-not $appDir) {
 
     if ($step10Stdout -match 'reason=would_notify' -and $step10Notified) {
         Write-Log "[PASS] reason=would_notify AND notification_state.json's last_notified_at is now set -- send_disk_space_toast was genuinely invoked this run, not inferred from log absence."
+        $aumidAfterStep10 = Get-AumidNotificationState
+        $beforeCount = if ($aumidBeforeStep10) { $aumidBeforeStep10.PeriodicNotificationCount } else { 0 }
+        $afterCount = if ($aumidAfterStep10) { $aumidAfterStep10.PeriodicNotificationCount } else { $null }
+        if ($null -eq $afterCount) {
+            Write-Log "[BI3] AUMID notification-pipeline count: no nested key found even after this confirmed-invoked call -- the OS never queued anything for this AUMID at all. Worth reporting explicitly: this points AWAY from a display-layer (Focus Assist) explanation and TOWARD the call never actually reaching the OS toast pipeline despite reporting no exception -- windows_toasts library internals, not this script, would need tracing next."
+        } elseif ($afterCount -gt $beforeCount) {
+            Write-Log "[BI3 -- KEY EVIDENCE] AUMID PeriodicNotificationCount increased ($beforeCount -> $afterCount) -- the OS notification pipeline DID queue this toast for real. Combined with a human 'no toast seen', this narrows the cause to a DISPLAY-layer suppression (Focus Assist, or Notification Center settings for this specific AUMID/app), not a permission or AUMID-registration failure -- check Settings > System > Focus assist state at the exact moment this step ran, and Settings > Notifications for any per-app override on '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' / cmd.exe specifically."
+        } else {
+            Write-Log "[BI3] AUMID PeriodicNotificationCount did not increase ($beforeCount -> $afterCount) despite a confirmed-invoked call with no exception -- the OS pipeline itself may not have received it (a windows_toasts-internal issue, not Focus Assist/display suppression). Worth a closer look at the windows_toasts call itself, not just this diagnostic's own registry read timing (the registry write may lag the API call by a moment -- re-check a few seconds later if this result looks surprising)."
+        }
+        if ($aumidAfterStep10 -and $null -ne $aumidAfterStep10.Enabled -and $aumidAfterStep10.Enabled -eq 0) {
+            Write-Log "[BI3 -- REAL FINDING] Enabled=0 for this AUMID -- notifications are explicitly disabled for cmd.exe's identity on THIS account. This alone would fully explain 'call succeeds, nothing renders,' independent of Focus Assist. Fix: Settings > Notifications > cmd.exe (or the corresponding entry) > turn on, or register Reclaim under its own AUMID instead of falling back to cmd.exe's shared one (a real product fix, not just a test-account workaround -- a real end user hitting this would have the identical silent-failure experience)."
+        }
     } elseif ($step10Stdout -match 'reason=(disabled|below_threshold|snoozed|debounced)') {
         Write-Log "[SKIPPED -- real, not a bug] reason=$($Matches[1]) -- this machine's real disk usage/config did not cross the threshold (or state wasn't actually cleared). Not evidence the toast codepath is broken, but also not evidence it works: re-run once the real condition (percent_used >= threshold) holds, or lower disk_threshold_percent in config.toml temporarily."
     } else {
