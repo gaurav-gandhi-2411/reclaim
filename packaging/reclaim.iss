@@ -200,16 +200,83 @@ begin
   Result := Output;
 end;
 
+// BM3 (2026-08-26 audit) fix for BL6: reads a task's currently-registered <Command> element via
+// `schtasks /query /xml`, without any real XML parser -- a plain substring check against the
+// exact "<Command>...</Command>" shape RegisterDiskSpaceTask itself always writes is sufficient
+// for one well-known element. Returns '' if the task doesn't exist at all (nothing registered,
+// or query failed) -- callers treat that as "no owner to protect/match against", not an error.
+function GetRegisteredTaskCommandPath(const TaskName: String): String;
+var
+  ResultCode: Integer;
+  CmdLine, CapturePath, Output, StartTag, EndTag: String;
+  Lines: TArrayOfString;
+  I, StartPos, EndPos: Integer;
+begin
+  Result := '';
+  CapturePath := ExpandConstant('{tmp}\schtasks_query_output.txt');
+  CmdLine := '/c schtasks.exe /query /tn "' + TaskName + '" /xml > "' + CapturePath + '" 2>&1';
+  Exec('cmd.exe', CmdLine, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if ResultCode <> 0 then
+  begin
+    DeleteFile(CapturePath);
+    Exit;
+  end;
+  Output := '';
+  if LoadStringsFromFile(CapturePath, Lines) then
+  begin
+    for I := 0 to GetArrayLength(Lines) - 1 do
+      Output := Output + Lines[I] + #13#10;
+  end;
+  DeleteFile(CapturePath);
+  StartTag := '<Command>';
+  EndTag := '</Command>';
+  StartPos := Pos(StartTag, Output);
+  if StartPos = 0 then
+    Exit;
+  StartPos := StartPos + Length(StartTag);
+  EndPos := Pos(EndTag, Output);
+  if (EndPos = 0) or (EndPos <= StartPos) then
+    Exit;
+  Result := Copy(Output, StartPos, EndPos - StartPos);
+end;
+
 procedure RegisterDiskSpaceTask();
 var
   ResultCode: Integer;
   ExePath, AppDir, XmlPath, XmlContent, DiagPath, Output, Summary, TaskName, MigrationNote: String;
   Attempt: Integer;
+  ExistingOwnerPath: String;
 begin
   TaskName := GetDiskSpaceTaskName();
   ExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
   AppDir := XmlEscape(ExpandConstant('{app}'));
   XmlPath := ExpandConstant('{tmp}\reclaim_disk_space_task.xml');
+
+  // BM3 (2026-08-26 audit) fix for BL6: reproduced live, twice -- a second install for the same
+  // account (e.g. a scratch install to a different directory) used to silently OVERWRITE
+  // (schtasks /f) an existing, still-valid install's task registration, because the task name is
+  // per-account, not per-install-directory. If a task already exists under this name, points at
+  // a DIFFERENT exe path, and that other exe still exists on disk (i.e. that install is still
+  // genuinely present, not orphaned), skip registration here entirely rather than stealing it --
+  // the other install's alert keeps working, and this install simply doesn't get a background
+  // check registered (same "best-effort, not required" posture as every other failure path in
+  // this procedure). An orphaned reference (the other path no longer exists -- that install was
+  // removed some other way, e.g. a manual folder delete) is not "still remaining" and does not
+  // block this registration.
+  ExistingOwnerPath := GetRegisteredTaskCommandPath(TaskName);
+  if (ExistingOwnerPath <> '') and (ExistingOwnerPath <> ExePath) and FileExists(ExistingOwnerPath) then
+  begin
+    DiagPath := ExpandConstant('{app}\data\') + TaskDiagLogName;
+    ForceDirectories(ExpandConstant('{app}\data'));
+    SaveStringToFile(DiagPath,
+      'Reclaim disk-space task registration -- ' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', '-', ':') + #13#10 +
+      'RESULT: SKIPPED -- task "' + TaskName + '" is already registered and owned by a different, ' +
+      'still-present install at "' + ExistingOwnerPath + '". Not overwriting it (BM3, 2026-08-26 ' +
+      'audit -- overwriting used to silently steal the task from that install). This install''s ' +
+      'own background disk-space alert is not registered; the other install''s alert is unaffected ' +
+      'and continues to work.' + #13#10, False);
+    Exit;
+  end;
 
   // BE1: best-effort cleanup of a pre-BE1 install's task under the old shared fixed name --
   // succeeds (and removes the duplicate/orphan) when THIS account created it on an earlier
@@ -354,15 +421,28 @@ end;
 procedure UnregisterDiskSpaceTask();
 var
   ResultCode: Integer;
+  TaskName, ThisExePath, CurrentOwnerPath: String;
 begin
-  // A nonzero exit (task never existed -- e.g. an install that predates this feature, or a user
-  // who manually removed it) is not surfaced -- same "don't fail the uninstall over a
-  // best-effort cleanup step" posture as the rest of this script. Deletes both names: the
-  // current per-account name (BE1) and, defensively, the pre-BE1 legacy shared name in case
-  // RegisterDiskSpaceTask's own migration cleanup never ran for this account (e.g. an install
-  // that was interrupted between registering and a later uninstall).
-  Exec('schtasks.exe', '/delete /tn "' + GetDiskSpaceTaskName() + '" /f',
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // BM3 (2026-08-26 audit) fix for BL6: reproduced live, twice -- uninstalling ANY install under
+  // this account used to delete the account's ONE per-account task unconditionally, even when a
+  // DIFFERENT install directory currently owned it (e.g. a scratch install's own uninstall
+  // deleting gaura's real, unrelated, still-installed task). Fixed: only delete the per-account
+  // task if it is CURRENTLY registered against THIS install's own exe path -- if it points
+  // somewhere else, some other install owns it now and this uninstall must leave it alone
+  // entirely; there is nothing to "re-register" in that case, since the other install's own
+  // registration was never touched and is still fully functional.
+  TaskName := GetDiskSpaceTaskName();
+  ThisExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
+  CurrentOwnerPath := GetRegisteredTaskCommandPath(TaskName);
+  if (CurrentOwnerPath = '') or (CurrentOwnerPath = ThisExePath) then
+    // Empty means the task doesn't exist at all -- this delete is then a harmless no-op, same
+    // "don't fail the uninstall over a best-effort cleanup step" posture as before.
+    Exec('schtasks.exe', '/delete /tn "' + TaskName + '" /f',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Legacy shared-name cleanup: unchanged from before this fix. This name has no per-install
+  // ownership concept left to protect -- BE1 already treats it as pure migration dead weight from
+  // pre-BE1 installs, and Windows' own per-task ACL (only the account that created it can delete
+  // it) already makes this safe against a different account's uninstall touching it.
   Exec('schtasks.exe', '/delete /tn "' + LegacyDiskSpaceTaskName + '" /f',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
