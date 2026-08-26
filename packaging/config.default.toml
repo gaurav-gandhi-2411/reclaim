@@ -125,3 +125,21 @@ enabled = false
 # Default 30: the duplicate's bytes only survive in the kept copy elsewhere, so apply vaults +
 # allows restore for 30 days; `reclaim purge` then permanently deletes past that window.
 retention_days = 30
+
+# BH5 (2026-08-26 audit): R5's disk-threshold toast notification shipped with NO way for a real
+# user to turn it on -- this section never existed in this file at all before, and no Settings-tab
+# toggle existed either, so "opt-in, default off" (the deliberate design -- see
+# NotificationsConfig's own docstring in src/reclaim/config.py: a background Task-Scheduler-
+# triggered toast nobody asked for would be a surprise, not a feature) meant "permanently off,
+# for everyone, with no discoverable way to change it." enabled stays false here, unchanged from
+# that documented default -- this section's purpose is to make the setting exist and be
+# discoverable (both here, for anyone reading this file directly, and via the Settings tab's new
+# notifications toggle, which writes to this exact section), not to silently flip a privacy-
+# relevant default to on.
+[notifications]
+enabled = false
+# Percent of the drive used (not free) at or above which a crossing fires the toast -- matches
+# NotificationsConfig's own built-in default (80.0). Not exposed in the Settings tab (same scope
+# as old_installers.max_age_days above) -- edit this value directly if you want a different
+# threshold.
+disk_threshold_percent = 80.0

@@ -818,3 +818,58 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
     new_text = _set_category_enabled_in_toml_text(text, category, enabled=enabled)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
+
+
+# BH5 (2026-08-26 audit): R5's toast notification shipped with no way for a real user to turn it
+# on -- packaging/config.default.toml never wrote a `[notifications]` section at all (so a fresh
+# install's on-disk config.toml has none either), and no Settings-tab toggle existed to write one
+# in. `NotificationsConfig.enabled` correctly defaults to `False` (a background Task-Scheduler-
+# triggered toast nobody asked for would be a surprise -- see that class's own docstring), but
+# "opt-in" only means something if there's a real way to opt IN. The one account this trip's
+# result showed `enabled=true` got there from an undocumented manual TOML edit in an earlier
+# session, not any product-provided path -- confirmed directly: `disk_threshold_percent=50.0` in
+# that trip's Step 10 output matches no default anywhere in this codebase (the shipped default is
+# 80.0), which only a manual edit could have produced.
+#
+# Deliberate near-duplicate of `_set_category_enabled_in_toml_text`/`set_category_enabled` above,
+# not a shared/generalized helper: two call sites (categories, notifications) is this codebase's
+# own stated threshold for "duplicate, don't abstract yet" (see engineering defaults) -- and the
+# category version's docstring/tests are the working, tested contract this mirrors; refactoring it
+# to serve a second section wasn't asked for and would touch code this fix doesn't need to touch.
+def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
+    """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to the
+    single `[notifications]` section instead of a per-category one."""
+    section_header = "[notifications]"
+    value_literal = "true" if enabled else "false"
+    enabled_line = f"enabled = {value_literal}\n"
+
+    lines = text.splitlines(keepends=True)
+    start_idx = next((i for i, line in enumerate(lines) if line.strip() == section_header), None)
+
+    if start_idx is None:
+        if not text:
+            return f"{section_header}\n{enabled_line}"
+        prefix = text if text.endswith("\n") else text + "\n"
+        return f"{prefix}\n{section_header}\n{enabled_line}"
+
+    end_idx = next(
+        (i for i in range(start_idx + 1, len(lines)) if lines[i].strip().startswith("[")),
+        len(lines),
+    )
+    for i in range(start_idx + 1, end_idx):
+        if _ENABLED_LINE_RE.match(lines[i]):
+            lines[i] = enabled_line
+            return "".join(lines)
+
+    lines.insert(start_idx + 1, enabled_line)
+    return "".join(lines)
+
+
+def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
+    """Persists the `[notifications]` section's `enabled` flag to `config_path`'s on-disk TOML
+    text, creating the file (and its parent directory) if it doesn't exist yet -- the write side
+    of the Settings-tab notifications toggle (BH5)."""
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _set_notifications_enabled_in_toml_text(text, enabled=enabled)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_text, encoding="utf-8")

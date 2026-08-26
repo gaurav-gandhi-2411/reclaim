@@ -41,6 +41,7 @@ from reclaim.api.schemas import (
     FixedDrivesResponse,
     ItemApplyResultOut,
     ModeStatusResponse,
+    NotificationsSettingOut,
     OneClickCleanSummaryResponse,
     OneClickGroupOut,
     PowerModeRequest,
@@ -75,7 +76,7 @@ from reclaim.api.state import (
     RestoreStatus,
     ScanStatus,
 )
-from reclaim.config import CategoriesConfig, set_category_enabled
+from reclaim.config import CategoriesConfig, set_category_enabled, set_notifications_enabled
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -2114,6 +2115,30 @@ def update_category_setting(state: AppState, category: str, *, enabled: bool) ->
         state.candidates_cache = None
         state.candidates_cache_generation = None
     return settings_categories(state)
+
+
+# BH5 (2026-08-26 audit): the Settings-tab side of the fix -- see config.py's
+# set_notifications_enabled docstring for why this was missing and what it closes.
+
+
+def notifications_settings(state: AppState) -> NotificationsSettingOut:
+    with state.lock:
+        notifications = state.config.notifications
+    return NotificationsSettingOut(
+        enabled=notifications.enabled, disk_threshold_percent=notifications.disk_threshold_percent
+    )
+
+
+def update_notifications_setting(state: AppState, *, enabled: bool) -> NotificationsSettingOut:
+    """Toggles `[notifications] enabled`, both on disk (survives past this process, and is what
+    the Task-Scheduler-invoked `reclaim check-disk-space` actually reads) and in memory (so a
+    follow-up `GET /api/settings/notifications` in the same process reflects it immediately) --
+    same two-write posture as `update_category_setting` above."""
+    set_notifications_enabled(state.config_path, enabled=enabled)
+    with state.lock:
+        updated_notifications = state.config.notifications.model_copy(update={"enabled": enabled})
+        state.config = state.config.model_copy(update={"notifications": updated_notifications})
+    return notifications_settings(state)
 
 
 def first_run_status(state: AppState) -> FirstRunStatusResponse:

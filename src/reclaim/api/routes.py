@@ -25,6 +25,7 @@ from reclaim.api.schemas import (
     FullDriveScanConfirmIntentResponse,
     FullDriveScanRequest,
     ModeStatusResponse,
+    NotificationsSettingOut,
     OneClickCleanSummaryResponse,
     PowerModeRequest,
     QuarantineListResponse,
@@ -41,6 +42,7 @@ from reclaim.api.schemas import (
     TreemapResponse,
     UpdateCategorySettingRequest,
     UpdateCheckResponse,
+    UpdateNotificationsSettingRequest,
 )
 from reclaim.api.state import (
     AIAnalysisStatus,
@@ -657,6 +659,22 @@ def update_category_setting(
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# BH5 (2026-08-26 audit): the Settings-tab toggle R5 was always missing -- see config.py's
+# set_notifications_enabled docstring.
+
+
+@router.get("/settings/notifications", response_model=NotificationsSettingOut)
+def notifications_settings(request: Request) -> NotificationsSettingOut:
+    return service.notifications_settings(get_state(request))
+
+
+@router.post("/settings/notifications", response_model=NotificationsSettingOut)
+def update_notifications_setting(
+    payload: UpdateNotificationsSettingRequest, request: Request
+) -> NotificationsSettingOut:
+    return service.update_notifications_setting(get_state(request), enabled=payload.enabled)
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------

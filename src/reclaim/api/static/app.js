@@ -2281,6 +2281,62 @@ async function loadSettingsView() {
   // Independent of the category-toggle fetch above (separate endpoint, separate status element)
   // -- fire-and-forget, same "non-fatal status refresh" posture as loadModeStatus elsewhere.
   loadAnthropicKeyStatus();
+  loadNotificationsSettings();
+}
+
+// --- BH5 (2026-08-26 audit): low disk space alert toggle -- R5 shipped with no way for a real
+// user to turn this on at all (no config.default.toml section, no UI). Same
+// fetch/render/toggle-with-optimistic-rollback shape as the category cards above. ---------------
+
+async function loadNotificationsSettings() {
+  const checkbox = document.getElementById("notifications-enabled-checkbox");
+  const toggleText = document.getElementById("notifications-enabled-text");
+  const thresholdNote = document.getElementById("notifications-threshold-note");
+  const statusEl = document.getElementById("notifications-status");
+  if (!checkbox) return;
+  try {
+    const data = await api("/api/settings/notifications");
+    checkbox.checked = data.enabled;
+    toggleText.textContent = data.enabled ? "On" : "Off";
+    thresholdNote.textContent = `Fires when the system drive is at or above ${data.disk_threshold_percent}% used. Edit disk_threshold_percent in config.toml to change it.`;
+    checkbox.disabled = false;
+  } catch (err) {
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not load: ${err.message}`;
+  }
+  // loadSettingsView re-runs this on every Settings-tab activation. The category cards avoid a
+  // stale/duplicate listener by fully destroying and recreating their DOM nodes each load; this
+  // panel's checkbox is static markup instead, so attach the listener exactly once per element
+  // (a dataset flag, not `{once: true}` -- the latter would also strip the listener after the
+  // FIRST real user click, silently breaking every toggle after that within the same page load).
+  if (!checkbox.dataset.listenerAttached) {
+    checkbox.dataset.listenerAttached = "true";
+    checkbox.addEventListener("change", () => {
+      toggleText.textContent = checkbox.checked ? "On" : "Off";
+      updateNotificationsSetting(checkbox, toggleText, statusEl);
+    });
+  }
+}
+
+async function updateNotificationsSetting(checkbox, toggleText, statusEl) {
+  const nextEnabled = checkbox.checked;
+  checkbox.disabled = true;
+  statusEl.className = "rc-settings-card-status";
+  statusEl.textContent = "Saving…";
+  try {
+    await api("/api/settings/notifications", {
+      method: "POST",
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    statusEl.textContent = "";
+  } catch (err) {
+    checkbox.checked = !nextEnabled;
+    toggleText.textContent = checkbox.checked ? "On" : "Off";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not save: ${err.message}`;
+  } finally {
+    checkbox.disabled = false;
+  }
 }
 
 function renderSettingsCategories(categories) {
