@@ -85,6 +85,40 @@ function Get-IndexSizeDetail {
     return "index size: $bytes bytes (${gb}GB) at $indexPath"
 }
 
+# BH2 (2026-08-26 audit): live-reproduced -- a real trip's Step -2 logged "[WARNING] A reclaim.exe
+# process (PID 30144) was still running before this install -- stopping it first", then Step -1's
+# OWN "before launch" probe got a REAL, successful response from http://127.0.0.1:8420/api/first-run
+# -- BEFORE the script had launched anything. That is direct, unambiguous proof a server was
+# already live on port 8420 at that moment: the same PID 30144 was later sampled continuously
+# running throughout Step 1 (15s window). Every HTTP-based step in that trip (6, 7, 8, and the
+# browser dashboard itself) silently ran against this survivor, not the freshly-installed binary
+# -- and its activity never appeared anywhere in this account's own data\logs\reclaim.log* files,
+# confirmed by direct inspection of all 6 rotated/active copies (zero entries after the timestamp
+# Step 1's own tail-of-20-lines capture already showed). The root mechanism for WHY Stop-Process
+# didn't take is not conclusively established (Windows permits an installer to replace a running
+# .exe's on-disk bytes via delete+recreate while the old process keeps running against its own
+# now-orphaned handle -- consistent with the install itself reporting exit 0 even though the kill
+# silently failed) -- but the FIX doesn't depend on knowing the mechanism: verify the port is
+# actually free before ever trusting a fresh launch, every time, fail closed if it isn't.
+function Get-Port8420OwningProcessIds {
+    # -ErrorAction SilentlyContinue: Get-NetTCPConnection throws if literally nothing is listening
+    # on the port, which is the common/expected case, not an error.
+    @(Get-NetTCPConnection -LocalPort 8420 -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+}
+
+function Wait-Port8420Free {
+    param([int]$TimeoutSeconds = 15)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-Port8420OwningProcessIds).Count -eq 0 -and -not (Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 Write-Log "==================================================================="
 Write-Log "Reclaim AC3 diagnostic run -- $ts"
 Write-Log "==================================================================="
@@ -173,12 +207,26 @@ if ($SkipInstall) {
         # process, which is exactly what happens when this script runs more than once without an
         # intervening clean shutdown. Mirrors the same fix here, at the one remaining call site
         # that needed it.
-        Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Log "[WARNING] A reclaim.exe process (PID $($_.Id)) was still running before this install -- stopping it first, same as reclaim.iss's own InitializeUninstall does for the paired uninstall path."
-            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        $staleProcs = @(Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue)
+        foreach ($p in $staleProcs) {
+            Write-Log "[WARNING] A reclaim.exe process (PID $($p.Id)) was still running before this install -- stopping it first, same as reclaim.iss's own InitializeUninstall does for the paired uninstall path."
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         }
-        Start-Sleep -Milliseconds 500
+        # BH2: POLL until confirmed gone (both by process name AND by port-8420 ownership --
+        # belt-and-suspenders, since a process rename/handle-reuse edge case could in principle
+        # separate the two), not a fixed sleep-and-hope. A survivor here means every downstream
+        # HTTP-based step would silently run against it, not the fresh install -- fail closed.
+        if (-not (Wait-Port8420Free -TimeoutSeconds 15)) {
+            $stillAlive = @(Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue)
+            $stillOwningPort = Get-Port8420OwningProcessIds
+            Write-Log "[ABORT] Could not confirm a clean slate after 15s: reclaim.exe PID(s) still running: $(if ($stillAlive) { $stillAlive.Id -join ',' } else { '(none)' }); PID(s) still owning port 8420: $(if ($stillOwningPort) { $stillOwningPort -join ',' } else { '(none)' }). Refusing to install and run the trip on top of an unconfirmed-dead survivor -- this is the exact BH2 finding (2026-08-26 audit): a surviving server silently served an entire trip's HTTP-based steps once, undetected until traced after the fact. Investigate manually (a locked handle, a protected/elevated process, or a scan/apply worker that outlived its parent), then re-run."
+            $SkipInstall = $true  # reuses every downstream skip, same posture as the freshness-check ABORT
+            $installSkippedByFreshnessCheck = $true
+            $staleProcessKillFailed = $true
+        }
+    }
 
+    if (-not $SkipInstall) {
         Write-Log "[RUN] Installing silently (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART)..."
         $installProc = Start-Process -FilePath $InstallerPath -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
         Write-Log "  installer exit code: $($installProc.ExitCode)"
@@ -211,8 +259,25 @@ if ($installSkippedByFreshnessCheck -or $SkipInstall) {
     } else {
         $firstRunStatePath = Join-Path $resetAppDir 'data\first_run_state.json'
         if (Test-Path $firstRunStatePath) {
-            Remove-Item -Path $firstRunStatePath -Force
-            Write-Log "[OK] Deleted pre-existing $firstRunStatePath -- Step -1 will now observe a genuine first-run state."
+            # BH2 (2026-08-26 audit): live-reproduced -- a real trip logged "[OK] Deleted
+            # pre-existing ...first_run_state.json" here, yet /api/first-run returned
+            # {"acknowledged":true} at every single check in Step -1 that followed (before launch,
+            # after launch, after acknowledgment). The "[OK] Deleted" message was NEVER actually
+            # verified -- Remove-Item's own failure (if any -- e.g. the file locked by a survivor
+            # process, see the port-8420 checks above/below) would just write to the error stream
+            # under this script's global $ErrorActionPreference='Continue' and the very next line
+            # would still print "[OK] Deleted" regardless of whether it worked. Fixed: verify with
+            # a real post-delete Test-Path, and report the true outcome, not the attempt.
+            try {
+                Remove-Item -Path $firstRunStatePath -Force -ErrorAction Stop
+            } catch {
+                Write-Log "[WARNING] Remove-Item threw deleting $firstRunStatePath -- $($_.Exception.Message)"
+            }
+            if (Test-Path $firstRunStatePath) {
+                Write-Log "[ABORT] $firstRunStatePath still exists after a delete attempt -- Step -1 below will almost certainly observe a stale acknowledgment, not the genuine first-run screen. Likely a locked handle (see BH2 above) -- investigate before trusting Step -1's result this run."
+            } else {
+                Write-Log "[OK] Confirmed deleted (verified via a post-delete Test-Path, not just the attempt): $firstRunStatePath -- Step -1 will now observe a genuine first-run state."
+            }
         } else {
             Write-Log "[OK] $firstRunStatePath did not exist -- already a clean first-run state."
         }
@@ -225,7 +290,9 @@ Write-Log "--- STEP -1: Genuine first-run observation (AJ4 -- this is the ONLY c
 Write-Log "    THIS MUST HAPPEN BEFORE ANY OTHER STEP TOUCHES THIS PROFILE."
 # ===========================================================================
 
-if ($installSkippedByFreshnessCheck) {
+if ($staleProcessKillFailed) {
+    Write-Log "[SKIPPED] Step -2's stale-process kill-and-verify aborted -- no install attempted, so nothing below is safe to run against this profile until the survivor is cleared manually (see the ABORT line above)."
+} elseif ($installSkippedByFreshnessCheck) {
     Write-Log "[SKIPPED] Freshness check aborted Step -2 -- no install attempted, so first-run state is whatever this profile already had, if anything."
 } elseif ($SkipInstall) {
     Write-Log "[SKIPPED] -SkipInstall passed -- first-run state was already consumed on a prior run, if any."
@@ -244,20 +311,57 @@ if ($installSkippedByFreshnessCheck) {
     Write-Log "     return to this screen on a manual refresh, or stay dismissed?"
 
     Write-Log "[Raw state BEFORE launch] GET /api/first-run (server not started yet, expect a failure -- that's fine, this just confirms nothing has answered yet):"
+    $preLaunchServerAlreadyLive = $false
     try {
         $before = Invoke-RestMethod -Uri "http://127.0.0.1:8420/api/first-run" -TimeoutSec 2 -ErrorAction Stop
         Write-Log "  $($before | ConvertTo-Json -Compress)"
+        $preLaunchServerAlreadyLive = $true
     } catch {
         Write-Log "  (no response -- server not running yet, expected)"
     }
 
+    if ($preLaunchServerAlreadyLive) {
+        # BH2 (2026-08-26 audit): live-reproduced -- this EXACT check succeeding, right here,
+        # BEFORE "Launching 'reclaim dashboard'" ever ran, is the single most direct proof a
+        # stale server was already listening on port 8420 in a real trip -- it silently served
+        # every subsequent HTTP-based step (6/7/8, the browser itself), and its activity never
+        # once appeared in this account's own data\logs\reclaim.log* files afterward (confirmed
+        # by direct inspection: zero log lines postdate the point this exact probe was reached).
+        # The old code treated only a FAILURE here as expected and said nothing about a surprise
+        # SUCCESS. Fixed: attempt automatic remediation (identify + kill whatever owns port 8420,
+        # verify it's actually free) before launching on top of it -- fail closed if that doesn't
+        # work, rather than silently proceeding to serve the rest of the trip off a survivor.
+        $owningPids = Get-Port8420OwningProcessIds
+        Write-Log "[WARNING] A server is ALREADY responding on port 8420 before this script launched anything -- PID(s) owning the port: $(if ($owningPids) { $owningPids -join ',' } else { '(unknown -- Get-NetTCPConnection found none, but the HTTP probe above succeeded)' }). Attempting automatic remediation: killing and re-verifying."
+        foreach ($ownPid in $owningPids) { Stop-Process -Id $ownPid -Force -ErrorAction SilentlyContinue }
+        Get-Process -Name 'reclaim' -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+        if (-not (Wait-Port8420Free -TimeoutSeconds 15)) {
+            Write-Log "[ABORT] Automatic remediation failed -- port 8420 still owned after a 15s kill-and-wait. Refusing to launch a second dashboard on top of an unconfirmed-dead survivor (that is exactly how a prior trip's results got silently scoped to the wrong binary). Investigate manually: Get-NetTCPConnection -LocalPort 8420 | Select OwningProcess, kill it, confirm the port is free, then re-run from the top."
+            Read-Host "Press Enter to acknowledge (the rest of this trip's HTTP-based steps will be SKIPPED below) and continue anyway"
+            $preLaunchRemediationFailed = $true
+        } else {
+            Write-Log "[OK] Port 8420 confirmed free after remediation -- proceeding to launch a genuinely fresh dashboard."
+        }
+    }
+
+    if ($preLaunchRemediationFailed) {
+        # Deliberately not launching anything here -- Step 6's own probe (GET /api/scan/status)
+        # will naturally fail against an empty port 8420 and set $serverReachable=$false itself,
+        # correctly gating Steps 6/7/8/10 below through the existing mechanism.
+        Write-Log "[SKIPPED] Not launching a new dashboard -- see the ABORT above. Every HTTP-based step below (6, 7, 8, 10) will report SKIPPED for the same reason."
+    } else {
     Write-Log "[RUN] Launching 'reclaim dashboard' (opens your default browser automatically)..."
     $exePath = $null
     try {
         $exePath = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{B6C1B6C7-6B6A-4E3B-9B7B-2B7E1E7C6A21}_is1' -Name InstallLocation -ErrorAction Stop).InstallLocation
     } catch { $exePath = $null }
     if ($exePath) {
-        Start-Process -FilePath (Join-Path $exePath 'reclaim.exe') -ArgumentList 'dashboard'
+        # BH2/BH6: -PassThru captures the NEWLY launched process's own PID -- used below (both
+        # here and in Step 1) to positively confirm the server actually answering requests is
+        # THIS process, not merely "a server responded" (which is exactly what went undetected
+        # in a real trip: the responding server was a leftover, not the one just launched).
+        $dashboardProc = Start-Process -FilePath (Join-Path $exePath 'reclaim.exe') -ArgumentList 'dashboard' -PassThru
+        $script:freshDashboardPid = $dashboardProc.Id
         Start-Sleep -Seconds 3
         Write-Log "[Raw state AFTER launch, BEFORE you acknowledge] GET /api/first-run:"
         try {
@@ -266,11 +370,20 @@ if ($installSkippedByFreshnessCheck) {
         } catch {
             Write-Log "  (no response yet -- server may still be starting; wait a moment and check the browser)"
         }
+        $portOwners = Get-Port8420OwningProcessIds
+        if ($portOwners -contains $freshDashboardPid) {
+            Write-Log "[OK -- BH2] Confirmed: port 8420 is owned by PID $freshDashboardPid, the process this step just launched -- every HTTP-based step below is genuinely against this freshly-installed binary, not a survivor."
+        } elseif ($portOwners.Count -gt 0) {
+            Write-Log "[WARNING -- BH2] Port 8420 is owned by PID(s) $($portOwners -join ',') -- NOT PID $freshDashboardPid, the process this step just launched. Every HTTP-based step below (6, 7, 8, 10) is running against a DIFFERENT process than the one just installed -- treat their results as scoped to an unconfirmed binary, exactly the 2026-08-26 BH2 finding. This can legitimately happen if the freshly-launched process exited immediately after a child re-exec'd under a new PID -- not necessarily still a stale survivor, but not verified fresh either."
+        } else {
+            Write-Log "[WARNING -- BH2] Could not determine which PID owns port 8420 (Get-NetTCPConnection returned nothing despite a successful HTTP response) -- cannot positively confirm the server is PID $freshDashboardPid. Treat downstream HTTP-based results as unconfirmed."
+        }
     } else {
         Write-Log "[ABORT] Could not resolve install location to launch reclaim.exe -- launch it yourself: Start Menu > Reclaim, or the Reclaim desktop shortcut."
     }
 
     Read-Host "Press Enter once you have observed and captured the first-run screen (per points 1-4 above) and are ready to continue with the rest of this script"
+    }
 
     Write-Log "[Raw state AFTER you acknowledged] GET /api/first-run:"
     try {
@@ -432,20 +545,41 @@ if (-not $task) {
     $infoBefore = Get-ScheduledTaskInfo -TaskName $taskName
     Write-Log "[BEFORE] LastRunTime=$($infoBefore.LastRunTime) LastTaskResult=$($infoBefore.LastTaskResult)"
 
+    # BH6 (2026-08-26 audit): live-reproduced -- a real trip sampled the SAME pid across the
+    # entire 15s window and reported it as "reclaim.exe RUNNING", but that pid was independently
+    # confirmed (BH2, same trip) to be a long-lived dashboard survivor that predated this task
+    # even being started -- the old code could not and did not distinguish that from a genuine
+    # task-spawned check-disk-space process, because it just listed EVERY reclaim.exe running,
+    # not specifically the one Start-ScheduledTask above just caused to exist. Snapshot the
+    # baseline PID set immediately BEFORE starting the task, then report only NEW pids at each
+    # sample -- that is the actual task-spawned process (or its correct, honest absence).
+    $basePids = @((Get-Process -Name reclaim -ErrorAction SilentlyContinue) | Select-Object -ExpandProperty Id)
+    Write-Log "[Process evidence] Baseline reclaim.exe pid(s) already running before Start-ScheduledTask: $(if ($basePids) { $basePids -join ',' } else { '(none)' })"
+
     Write-Log "[RUN] Start-ScheduledTask -TaskName '$taskName'"
     Start-ScheduledTask -TaskName $taskName
 
     Write-Log "[Process evidence] Sampling for reclaim.exe every 3s for 15s (AI3: distinguishes"
     Write-Log "  'task fired, process ran to completion' from 'task fired, process crashed before"
-    Write-Log "  reaching toast code' -- both look identical from LastRunTime alone):"
+    Write-Log "  reaching toast code' -- both look identical from LastRunTime alone; BH6: only pids"
+    Write-Log "  NOT in the baseline above count as evidence of the task's OWN process, not a"
+    Write-Log "  pre-existing survivor that happened to already be running):"
+    $sawNewPid = $false
     for ($i = 1; $i -le 5; $i++) {
         Start-Sleep -Seconds 3
-        $procs = Get-Process -Name reclaim -ErrorAction SilentlyContinue
-        if ($procs) {
-            Write-Log "  [t+$($i*3)s] reclaim.exe RUNNING: pid(s) $($procs.Id -join ',')"
+        $procs = @((Get-Process -Name reclaim -ErrorAction SilentlyContinue) | Select-Object -ExpandProperty Id)
+        $newPids = @($procs | Where-Object { $_ -notin $basePids })
+        if ($newPids) {
+            $sawNewPid = $true
+            Write-Log "  [t+$($i*3)s] NEW reclaim.exe pid(s) (not in baseline, this IS the task's own process): $($newPids -join ',')"
+        } elseif ($procs) {
+            Write-Log "  [t+$($i*3)s] reclaim.exe running, but only baseline pid(s) $($procs -join ',') -- NOT evidence the task's own process is still alive (it may have already exited, or the task never actually spawned a distinct process this sampling could catch)."
         } else {
-            Write-Log "  [t+$($i*3)s] reclaim.exe not present in process list"
+            Write-Log "  [t+$($i*3)s] reclaim.exe not present in process list at all (neither baseline nor new)."
         }
+    }
+    if (-not $sawNewPid) {
+        Write-Log "[WARNING -- BH6] No NEW reclaim.exe pid was ever observed distinct from the pre-task baseline across all 5 samples -- this run's process evidence does NOT positively confirm the task actually spawned its own process (it may have run and exited faster than this 3s sampling granularity can catch, which is a real, known limitation, not necessarily a failure)."
     }
 
     $infoAfter = Get-ScheduledTaskInfo -TaskName $taskName
@@ -886,7 +1020,17 @@ if (-not $serverReachable -or -not $csrfToken) {
                     # estimate of the true drift rate, not a precise ceiling.
                     $noiseConsistentThresholdBytes = [math]::Max([math]::Abs($baselineDriftBytes) * 2, 1MB)
                     if ([math]::Abs($measuredVsReportedGapBytes) -le $noiseConsistentThresholdBytes) {
-                        Write-Log "[Secondary check: consistent with noise] The OS-measured gap is within the same order of magnitude as this machine's own idle background drift -- NOT independent evidence of an app-level bug. The primary check above is authoritative for this step's PASS/FAIL."
+                        # BH7 (2026-08-26 audit): live-reproduced -- a real run had a 5.98% gap
+                        # against a 0.31% measured drift (~19x, genuinely not "the same order of
+                        # magnitude" by any normal reading of that phrase) and still correctly
+                        # PASSed here, because the actual gate is 2x-drift-OR-1MB-floor
+                        # (whichever is larger), not literal proximity to the drift rate -- on a
+                        # small idle-drift sample, the 1MB floor is what usually does the work,
+                        # not the drift multiple. The gate's own math was never wrong; only the
+                        # printed message overclaimed what tripped it. State the real threshold
+                        # honestly instead of a comparison the numbers don't actually support.
+                        $thresholdReason = if ($noiseConsistentThresholdBytes -eq 1MB) { "the 1MB floor, not the drift multiple, is what qualified this" } else { "the measured-drift multiple qualified this" }
+                        Write-Log "[Secondary check: within threshold] The OS-measured gap ($([math]::Abs($measuredVsReportedGapBytes)) bytes) is within this step's own noise-consistent threshold ($noiseConsistentThresholdBytes bytes = max(2x measured drift, 1MB floor); $thresholdReason) -- NOT independent evidence of an app-level bug. The primary check above is authoritative for this step's PASS/FAIL."
                     } else {
                         Write-Log "[Secondary check: WORTH INVESTIGATING] The OS-measured gap is substantially larger than this machine's own measured idle drift -- report this explicitly, do not dismiss it as noise without looking. (Does not change the primary check's PASS/FAIL verdict above, which is authoritative.)"
                     }
@@ -1022,6 +1166,17 @@ if (-not $serverReachable -or -not $csrfToken) {
         }
     } catch {
         Write-Log "  [ERROR] Step 8 request failed: $($_.Exception.Message)"
+        # BH3 (2026-08-26 audit): the exception message alone ("(500) Internal Server Error") is
+        # not enough to diagnose a real server-side failure -- $_.ErrorDetails.Message carries the
+        # actual HTTP response body (Invoke-RestMethod populates it in PS 5.1+/7+ when the server
+        # returned one), which may hold a FastAPI-rendered detail message even in non-debug mode.
+        # Captured here for the next occurrence; a NULL/empty value here is itself informative
+        # (means the server returned no body at all, not that this script failed to look).
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            Write-Log "  [ERROR -- response body] $($_.ErrorDetails.Message)"
+        } else {
+            Write-Log "  [ERROR -- response body] (none captured -- server returned no body, or it wasn't retrievable from this exception)"
+        }
     }
 }
 
@@ -1037,11 +1192,20 @@ Write-Log "    everything from earlier steps -- including any api.scan_initiated
 Write-Log "    explain a Step 7-style unexplained-scan-trigger instance. Copying only the active"
 Write-Log "    file, as this step used to, is very likely why AN1/AZ4's prior instances of that"
 Write-Log "    shape were never root-caused either.)"
+Write-Log "    BH4 (2026-08-26 audit): the filter below also missed reclaim_audit.log* -- BE2's"
+Write-Log "    dedicated audit sink for api.scan_initiated, added the same session, sitting"
+Write-Log "    right next to reclaim.log in the same directory. A real trip's own scan-trigger"
+Write-Log "    mystery (a 4th instance) could not be root-caused this run BECAUSE that file was"
+Write-Log "    never captured -- 'reclaim.log*' does not match a name starting 'reclaim_audit'."
 # ===========================================================================
 
 if ($appDir) {
     $realLogDir = Join-Path $appDir 'data\logs'
-    $realLogFiles = @(Get-ChildItem -Path $realLogDir -Filter 'reclaim.log*' -ErrorAction SilentlyContinue)
+    # BH4: 'reclaim*.log*' (not 'reclaim.log*') so this also catches reclaim_audit.log and its
+    # own rotated backups (reclaim_audit.log.1 .. .10, BE2's 10-backup budget) -- both prefixes
+    # live in the same directory and nothing else does, so the wider glob is still exact, not
+    # a shotgun.
+    $realLogFiles = @(Get-ChildItem -Path $realLogDir -Filter 'reclaim*.log*' -ErrorAction SilentlyContinue)
     if ($realLogFiles.Count -gt 0) {
         $allCopiedText = @()
         foreach ($f in $realLogFiles) {
@@ -1115,8 +1279,10 @@ if (-not $appDir) {
         Write-Log "[INCONCLUSIVE] Could not parse an expected reason= from stdout, or last_notified_at did not update as expected -- read the raw stdout/state above directly."
     }
 
-    Write-Log "[RUN] Re-copying reclaim.log* immediately (minimizing rotation-eviction risk) to check toast_failed for THIS specific invocation..."
-    $step10LogFiles = @(Get-ChildItem -Path (Join-Path $appDir 'data\logs') -Filter 'reclaim.log*' -ErrorAction SilentlyContinue)
+    Write-Log "[RUN] Re-copying reclaim*.log* immediately (minimizing rotation-eviction risk) to check toast_failed for THIS specific invocation..."
+    # BH4: same 'reclaim*.log*' widening as Step 9 above, so this re-copy also catches
+    # reclaim_audit.log* rather than silently missing it a second time in the same run.
+    $step10LogFiles = @(Get-ChildItem -Path (Join-Path $appDir 'data\logs') -Filter 'reclaim*.log*' -ErrorAction SilentlyContinue)
     $step10AllText = @()
     foreach ($f in $step10LogFiles) {
         $dest = Join-Path $logDir "reclaim_app_step10_$($f.Name).log"
