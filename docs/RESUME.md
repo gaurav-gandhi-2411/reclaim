@@ -1,118 +1,124 @@
-# Resume checkpoint — 2026-08-26 (post-AC3-trip, BD1-BD5 fixes drafted)
+# Resume checkpoint — 2026-08-26 (rebuild #8 dry-run clean, one PR from the real trip)
 
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`.
 Always `git fetch origin` + `gh pr list` and re-check `C:\Users\Public\reclaim_ac3\` for what has
-actually run before trusting any claim below, including this one (rule 118a) — this file has
-gone stale mid-engagement more than once already, including between the last checkpoint and this
-one (it claimed PRs #85/#86 were still open drafts; both had already merged by the time the real
-trip ran).
+actually run before trusting any claim below, including this one (rule 118a) — this file has gone
+stale mid-engagement multiple times already this week.
 
-## Where we are — the real AC3 trip ran, artifact was product-current, four real findings
+## Where we are — rebuild #8 dry-run clean under gaura's own account; one PR left before the real trip
 
-The interactive AC3 trip ran for real against rebuild #7
-(`d34b55f340a57e3df1ab48eaf0f3a0efdc0878f2769943508d728e6c67d48505`, buildsha `e63ca72`). That
-build's buildsha is 2 commits behind `origin/main`'s tip at trip time (`97675ad`, PRs #85/#86) but
-those 2 commits touch only `docs/` and `packaging/smoke/*.ps1` — zero `src/` changes, confirmed via
-`git diff --stat` and ancestry checks. **The trip tested product-current code**, including PRs
-#76/#81/#83 (confirmed ancestors of the build basis).
+**Merged this session**: BD1-BD5 (#88-#90), BE1/BE2/BE4 (#91-#93), BA1 (#87). **Still open**:
+**#94** — BF1/BF2 (trip script asserts the per-account task name, real second-account collision
+groundwork) + BF3-BF5's dry-run findings (a real SUMMARY tally bug found and fixed) + the manual
+toast-codepath verification writeup. CI was still running on #94 as of this checkpoint — verify
+green before merging.
 
-**Real trip results** (`ac3_run_20260826_012613.txt` + user's own direct observations): 1 ABORT
-(Step 1, Task Scheduler), 0 FAIL, 2 WARNING, Steps 2/3/4/6/7/8 PASS, first-run screen never
-observed (contaminated again), toast codepath never actually exercised (structural gap, not weak
-evidence). Four real findings opened and fixed this session (BD1-BD4), one investigated with a
-plausible-but-unproven explanation (BD5) — see `docs/AUDIT-2026-08.md`'s BD1-BD5 sections for full
-detail. Summary:
+**Rebuild #8**: SHA-256 `e670a0480e1221d740834d3196cad6529919a53119892f1e1631903f10d5e2d0`, built
+from `04a49a849e25fc89fbd9e2c43b6cb3dba4271635` (= `origin/main`'s tip, CI green, confirmed via
+`git log origin/main -1` immediately before AND after the build — a first attempt accidentally
+built from an unmerged branch and was discarded before staging, see AUDIT's BF3 section). Staged
+to `C:\Users\Public\reclaim_ac3\` and confirmed byte-identical. **The staged trip script is
+sourced from PR #94's branch content, not `origin/main`** — needed for Step 1's per-account task
+query to work at all post-BE1; re-stage from `origin/main` once #94 merges (should be a no-op,
+content is identical).
 
-- **BD1**: Task Scheduler ABORT root-caused — NOT AY1 recurring. Task names are a machine-wide
-  namespace; this dev machine's own prior gaura-account install already owns
-  `"Reclaim Disk Space Check"` in `C:\Windows\System32\Tasks\`, and `ReclaimSmokeTest` (a
-  different, non-admin account) has zero ACL rights to overwrite it — confirmed via `icacls`,
-  deterministic, not a race. Real product-facing gap on any real multi-account PC, not just this
-  test rig. Fixed: `reclaim.iss` now captures the real `schtasks` exit code + stderr into
-  `{app}\data\task_registration_diagnostic.log`, always, with a specific "access denied by another
-  account's task" message when that's the cause. Verified: `packaging\reclaim.iss` recompiles
-  clean via `ISCC.exe` (exit 0) against the existing dist tree. Namespace collision itself and a
-  UI surface for the diagnostic are explicitly out of scope for this pass.
-- **BD2**: the toast evidence chain was never valid, not just incomplete — `--apply-snooze`
-  (which every one of Steps 2/3/4 pass) returns from `cli.py`'s `_run_check_disk_space` before
-  `send_disk_space_toast` is ever reached; only Step 1 (which keeps aborting, see BD1) reaches it.
-  Every prior "no toast_failed line" conclusion in this document was trivially true because the
-  call was never made. Fixed: new Step 10 clears snooze state and invokes plain `check-disk-space`
-  directly, checking `reason=`, `last_notified_at` mutation, and a fresh log re-copy as three
-  independent signals — not yet run against a real account.
-- **BD3**: first-run ack (`{app}\data\first_run_state.json`) survives reinstall because Inno's
-  uninstaller never removes runtime-created files under `{app}\data\` — confirmed via source +
-  the user's own direct observation this trip (no overlay, straight to Simple-mode dashboard).
-  Fixed: a new step deletes the marker before every real install.
-- **BD4**: AN1/AZ4's "unexplained scan trigger" recurred a third time, and this session found
-  *why* it's been unroot-causable all three times: `logging_config.py`'s 5MB rotating log gets
-  filled and rotated by a single heavy dedup computation within ~20 seconds, evicting the
-  `api.scan_initiated` evidence before Step 9 (which only ever copied the active log file) runs.
-  This instance's specific origin/token is genuinely unrecoverable now. Fixed: Steps 9/10 now copy
-  every `reclaim.log*` file, active and rotated, so a fourth instance has a real chance.
-  **Not fixed**: the scan trigger itself, by design (same posture as AN1/AZ4).
-- **BD5**: the same in-flight full-drive scan BD4 covers was running *during* Step 7's free-space
-  measurement window — a plausible (BELIEVED, not VERIFIED — direct evidence is gone, same
-  rotation gap) explanation for the 52.11% secondary-check gap. No code fix; a future
-  wait-for-cancellation-to-settle improvement to Step 7 noted, not implemented.
-
-**Open draft PRs from this session, not yet merged:**
-- **#88** — BD1 (`packaging/reclaim.iss` diagnostic capture).
-- **#89** — BD2/BD3/BD4/BD5 (trip-script apparatus fixes).
-- This PR — RESUME.md refresh only.
+**Full dry run, gaura's own account, rebuild #8**: 0 ABORT, 0 FAIL, 0 WARNING, 0 ERROR. Every step
+real PASS or correctly-explained non-failure — see `docs/AUDIT-2026-08.md`'s BF3/BF4/BF5 section
+for the complete walk. Highlights:
+- Step 1 (BF1): `"Reclaim Disk Space Check (gaura)"` confirmed registered and `Ready`; old
+  shared-name task confirmed migrated away.
+- Step -1.5/-1 (BD3): first-run marker confirmed deleted; raw `/api/first-run` read
+  `{"acknowledged":false}` both before and after the unattended run — genuinely fresh state,
+  first time this engagement, though still not a human's visual observation.
+- Step 10 (BD2): SKIPPED (`reason=disabled`) in the scripted run — `gaura`'s dev `config.toml`
+  has no `[notifications]` section (predates that section, never touched by the installer's
+  `onlyifdoesntexist` upgrade-preservation logic). **Not a defect** — verified separately by hand:
+  with notifications temporarily enabled, `check-disk-space` reached
+  `reason=would_notify percent_used=87.9% threshold=50.0`, updated `notification_state.json`, and
+  logged no `toast_failed` — **the actual `send_disk_space_toast` call chain confirmed firing for
+  real on the frozen binary for the first time this entire engagement.** Config was restored
+  immediately after.
+- A real apparatus bug found in the same pass: the SUMMARY's `SKIPPED` tally required an exact
+  `[SKIPPED]` close-bracket, undercounting Step 10's own `[SKIPPED -- real, not a bug]` line as 0
+  instead of 1. Fixed to match the same bare-prefix pattern `$aborts`/`$fails` already used.
 
 ## Exact resume sequence
 
 ```powershell
-# 1. Merge #88, #89, and this PR (draft, CI-pending/green -- check before merging; #88 and #89
-#    both touch docs/AUDIT-2026-08.md at the same append point, so the second one merged will
-#    likely need a trivial conflict resolution in the web UI) in the web UI, then:
+# 1. Merge #94 (verify CI green first) in the web UI, then:
 git fetch origin --quiet; git branch -f main origin/main; git checkout main
 git rev-parse HEAD  # must equal origin/main
 
-# 2. A REAL rebuild is now needed before the next trip -- BD1's fix changed packaging/reclaim.iss,
-#    which IS compiled into the installer (unlike PRs #85/#86's docs/trip-script-only changes).
-#    Run packaging/build_installer.ps1 in full (~50 min), producing rebuild #8 with correctly
-#    regenerated .sha256/.buildsha sidecars. Do NOT reuse rebuild #7's artifact -- this is the
-#    first rebuild this session where source actually changed since the last one.
-
-# 3. Re-stage the merged trip script + rebuild #8 artifact:
+# 2. Re-stage from the now-merged origin/main (should be byte-identical to what's already staged,
+#    since #94 only touched packaging/smoke/*.ps1 + docs/ -- no rebuild needed):
 Copy-Item packaging\dist\reclaim-setup.exe,packaging\dist\reclaim-setup.exe.sha256,`
   packaging\dist\reclaim-setup.exe.buildsha,packaging\smoke\ac3_login_diagnostic.ps1 `
   C:\Users\Public\reclaim_ac3\ -Force
 
-# 4. One more dry run (frozen suite + trip script) to confirm rebuild #8 is clean before the next
-#    real interactive trip.
-
-# 5. The next real trip should specifically verify: BD1's diagnostic file appears and reads
-#    correctly on a real ReclaimSmokeTest install (the access-denied message, specifically);
-#    BD2's new Step 10 actually reaches reason=would_notify and updates last_notified_at; BD3's
-#    reset actually produces a genuine first-run observation this time.
+# 3. Then the actual trip under ReclaimSmokeTest -- see the two-item human list below.
 ```
 
-## The two irreducible human steps for the trip (unchanged)
+## The two irreducible human steps for the trip
 
-1. Watch for toasts across Triggers 1-4 (now also Step 10) in the trip script, note which (if any)
-   rendered. **Last trip: 0 toasts** (consistent with BD2's finding that the codepath was never
-   reached).
-2. Describe the first-run screen. **Last trip: no overlay appeared, went straight to Simple-mode
-   dashboard** — now known to be BD3's contamination, not a real "no first-run screen" product
-   fact. Re-attempt after BD3's fix ships in a real rebuild.
+1. **First-run screen** — now genuinely observable for the first time this engagement (BD3's
+   fix, confirmed working under gaura's own account). Note headline/body copy, Simple-vs-Advanced
+   landing view, screenshot if convenient.
+2. **Toast count from Step 10** specifically (not Steps 1-4, which structurally cannot fire one,
+   per BD2) — Step 10 will only reach `reason=would_notify` if `ReclaimSmokeTest`'s fresh-install
+   `config.toml` actually has `[notifications] enabled = true` and real disk usage crosses
+   `disk_threshold_percent` (a fresh install's `config.default.toml` DOES ship this section
+   enabled at 50% — unlike gaura's stale dev config — so this should fire for real on the actual
+   trip without any manual config edit). Watch for a real toast and report whether it rendered.
+
+Nothing else belongs on this list — Task Scheduler registration (BE1, live-verified for one
+account, structurally guaranteed for any second), the CWD-independence fix, the Snooze protocol
+handler, AE1's teeth-proof, the free-space-delta measurement, and 8.3 short-name detection are all
+automated and passing for real as of this checkpoint.
 
 ## Test account state
 
-`ReclaimSmokeTest` — used for a real interactive trip this session (2026-08-26). Exists, enabled,
-was reachable this time (unlike the AC2 unreachable episode). **U6 (delete the account) stays
-deferred** until a clean trip against rebuild #8 comes back clean on BD1/BD2/BD3's fixes.
+`ReclaimSmokeTest` — last used for the real trip on 2026-08-25/26 (the run BD1-BD5 were found
+against). Not re-touched this session (all verification since was under gaura's own account).
+**U6 (delete the account) stays deferred** until the next real trip against the merged state
+comes back clean, per the two-item list above.
 
-## Open-items list
+## Open-items list (flat, everything outstanding — BF6)
 
-**Blocking the next real trip:** merge this session's PR batch, run a real `build_installer.ps1`
-rebuild (rebuild #8 — first source-affecting rebuild since #7), re-stage, one confirming dry run.
+**Blocking the next real trip:**
+- Merge #94 (CI status unconfirmed as of this checkpoint — check before merging).
+- Re-stage from merged `origin/main` (step 2 above, should be a no-op).
+- Run the actual trip under `ReclaimSmokeTest` — this is what finally collects BE1's true
+  cross-account live data point (BF1's assertions are wired and ready but have only run under a
+  single-account upgrade scenario so far, not a genuine second-account install).
 
-**Disclosed, not re-opened:** BD4's specific scan-trigger origin for this trip (unrecoverable, see
-above); the machine-wide Task Scheduler namespace collision itself (BD1, scoped out of this pass);
-a UI surface for the task-registration diagnostic (BD1, scoped out); Step 7 waiting for scan
-cancellation to fully settle before baseline sampling (BD5, noted not implemented).
+**Disclosed, not re-opened (won't be fixed without a specific reason to revisit):**
+- The machine-wide Task Scheduler namespace collision's underlying cause (task names are global)
+  is not restructured — BE1 works around it (per-account naming), doesn't eliminate the shared
+  namespace itself. A UI surface for `task_registration_diagnostic.log` (BD1) is not built.
+- BD4's specific scan-trigger instance from the 2026-08-25/26 trip: origin/token permanently
+  unrecoverable (evidence rotated out before capture). The scan-trigger mechanism itself (AN1/AZ4/
+  this instance) has never been root-caused across three occurrences — fixed pragmatically each
+  time (cancel-then-proceed), by design, not chased further.
+- BD5's 52.11% secondary free-space gap: BELIEVED (not VERIFIED) to correlate with a concurrent
+  scan; direct evidence gone. Step 7 waiting for scan-cancellation to fully settle before baseline
+  sampling — noted, not implemented.
+- BE2's audit-log treatment (dedicated `reclaim_audit.log`) covers only `api.scan_initiated`'s
+  three call sites, matching exactly what was asked. Other rare security-relevant events (e.g.
+  scan-confirmation-token consumption/denial) were not swept for the same treatment.
+- Check 1d (preflight hardlink/lock probes, frozen smoke suite) — last confirmed BLOCKED earlier
+  in this engagement, needs a dedicated two-hardlinked-file fixture; not re-verified this session.
+- Check 3b (toast visual confirmation) — permanently human-only by nature, no headless harness can
+  close this regardless of how many other toast-related checks pass.
+- Dozens of stale `.claude/worktrees/agent-*` directories from earlier in this engagement — real
+  disk usage, flagged historically, never actioned since cleanup wasn't requested.
 
-**Deliberately deferred:** U6 (above).
+**Believed, not verified (explicitly tagged as such in the record):**
+- BD5's scan-during-Step-7-measurement-window correlation (above).
+- BE1's structural "any second account is collision-safe by construction" claim — now backed by
+  one additional real data point (this session's gaura-account re-registration/migration) but
+  still not a live cross-account (two DIFFERENT accounts, same machine, same moment) confirmation.
+
+**Deliberately deferred:**
+- U6 (`ReclaimSmokeTest` account deletion) — until the next clean trip.
+- Task Scheduler subfolder organization for R5 — considered and rejected in favor of per-account
+  naming (BE1), not merely postponed.
