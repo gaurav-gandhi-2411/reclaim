@@ -725,6 +725,23 @@ class UpdateCategorySettingRequest(BaseModel):
     enabled: bool
 
 
+# BH5 (2026-08-26 audit): the Settings-tab toggle R5 was always missing -- see config.py's
+# set_notifications_enabled docstring. `disk_threshold_percent` is read-only here, same scope
+# decision as every other category's non-`enabled` fields (e.g. `old_installers.max_age_days`):
+# stays a config.toml-only, power-user setting, not exposed for in-UI editing by this pass.
+class NotificationsSettingOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    disk_threshold_percent: float
+
+
+class UpdateNotificationsSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------
 
 

@@ -117,3 +117,13 @@ enabled = false
 # Default 30: the duplicate's bytes only survive in the kept copy elsewhere, so apply vaults +
 # allows restore for 30 days; `reclaim purge` then permanently deletes past that window.
 retention_days = 30
+
+# BH5 (2026-08-26 audit): kept in lockstep with packaging/config.default.toml -- see that file's
+# own comment for why this section exists now (it never did before) and why enabled stays false.
+[notifications]
+enabled = false
+# Percent of the drive used (not free) at or above which a crossing fires the toast -- matches
+# NotificationsConfig's own built-in default (80.0). Not exposed in the Settings tab (same scope
+# as old_installers.max_age_days above) -- edit this value directly if you want a different
+# threshold.
+disk_threshold_percent = 80.0

@@ -265,6 +265,20 @@
         <div id="settings-category-grid" class="rc-card-grid"></div>
       </div>
 
+      <!-- BH5 (2026-08-26 audit): R5's disk-space toast notification shipped with no way to turn
+           it on -- no config.default.toml section, no toggle here. This closes the second half
+           (the config.default.toml section is packaging/config.default.toml's own fix). -->
+      <section class="rc-settings-panel" aria-labelledby="notifications-heading">
+        <h2 id="notifications-heading">Low disk space alert</h2>
+        <p>A native Windows notification when your system drive crosses a usage threshold — checked a few times a day by a background task. Off by default; nothing is sent anywhere, and no scan or file access is involved.</p>
+        <label class="rc-checkbox-row">
+          <input id="notifications-enabled-checkbox" type="checkbox" aria-label="Turn the low disk space alert on or off" />
+          <span id="notifications-enabled-text">Off</span>
+        </label>
+        <p id="notifications-threshold-note" class="rc-meta"></p>
+        <p id="notifications-status" class="rc-settings-card-status" role="status" aria-live="polite"></p>
+      </section>
+
       <section class="rc-settings-panel" aria-labelledby="anthropic-key-heading">
         <h2 id="anthropic-key-heading">Anthropic API key</h2>
         <p>Adds an optional "Explain this category" button to each category card in Overview — a plain-language summary of what a category of files generally is, the pros/cons of deleting it, and what it costs to regenerate. Recommend-only: this can never select or delete anything on its own.</p>

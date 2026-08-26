@@ -2381,6 +2381,71 @@ def test_post_settings_category_invalidates_a_warmed_candidates_cache(tmp_path: 
     )
 
 
+# --- BH5 (2026-08-26 audit): the Settings-tab notifications toggle -- R5 shipped with no way for
+# a real user to enable it (no config.default.toml section, no UI). See config.py's
+# set_notifications_enabled docstring for the finding this closes. -------------------------------
+
+
+def test_get_settings_notifications_reflects_real_defaults(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.get("/api/settings/notifications")
+
+    assert response.status_code == 200
+    body = response.json()
+    # NotificationsConfig's own real defaults (config.py) -- opt-in, off by default.
+    assert body["enabled"] is False
+    assert body["disk_threshold_percent"] == 80.0
+
+
+def test_post_settings_notifications_persists_to_disk_and_takes_effect_without_restart(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/notifications", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+
+    from reclaim.config import load_config
+
+    on_disk = load_config(config_path)
+    assert on_disk.notifications.enabled is True
+
+    after = client.get("/api/settings/notifications").json()
+    assert after["enabled"] is True
+
+
+def test_post_settings_notifications_without_csrf_token_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.post("/api/settings/notifications", json={"enabled": True})
+
+    assert response.status_code == 403
+    assert not config_path.exists()
+
+
 # --- perf/dedup-cache (docs/AUDIT-2026-08.md P0-3): cached, concurrency-guarded
 # `_cached_all_candidates` -----------------------------------------------------------------------
 

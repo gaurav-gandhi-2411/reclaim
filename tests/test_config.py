@@ -476,6 +476,94 @@ def test_set_category_enabled_rejects_unknown_category(tmp_path: Path) -> None:
     assert not config_path.exists()
 
 
+# --- BH5 (2026-08-26 audit): persisting the notifications toggle from the in-app Settings tab --
+#
+# `set_notifications_enabled`/`_set_notifications_enabled_in_toml_text` back `POST
+# /api/settings/notifications` -- same text-patch shape and same round-trip-through-load_config
+# discipline as the category-setting tests above, applied to the single `[notifications]` section.
+
+
+def test_set_notifications_enabled_flips_existing_enabled_line(tmp_path: Path) -> None:
+    from reclaim.config import set_notifications_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[safety]
+deny = ["C:/protected/*"]
+
+[notifications]
+enabled = false
+# a user comment that must survive
+disk_threshold_percent = 50.0
+""",
+        encoding="utf-8",
+    )
+
+    set_notifications_enabled(config_path, enabled=True)
+
+    text = config_path.read_text(encoding="utf-8")
+    assert "# a user comment that must survive" in text
+    assert 'deny = ["C:/protected/*"]' in text
+
+    config = load_config(config_path)
+    assert config.notifications.enabled is True
+    # Untouched field stays exactly as it was.
+    assert config.notifications.disk_threshold_percent == 50.0
+    assert config.safety.deny == ["C:/protected/*"]
+
+
+def test_set_notifications_enabled_inserts_missing_enabled_line(tmp_path: Path) -> None:
+    from reclaim.config import set_notifications_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[notifications]
+disk_threshold_percent = 60.0
+""",
+        encoding="utf-8",
+    )
+
+    set_notifications_enabled(config_path, enabled=True)
+
+    config = load_config(config_path)
+    assert config.notifications.enabled is True
+    assert config.notifications.disk_threshold_percent == 60.0
+
+
+def test_set_notifications_enabled_appends_new_section_when_absent(tmp_path: Path) -> None:
+    from reclaim.config import set_notifications_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[safety]
+deny = ["C:/protected/*"]
+""",
+        encoding="utf-8",
+    )
+
+    set_notifications_enabled(config_path, enabled=True)
+
+    config = load_config(config_path)
+    assert config.notifications.enabled is True
+    assert config.safety.deny == ["C:/protected/*"]
+
+
+def test_set_notifications_enabled_creates_file_when_missing(tmp_path: Path) -> None:
+    from reclaim.config import set_notifications_enabled
+
+    config_path = tmp_path / "config.toml"
+    assert not config_path.exists()
+
+    set_notifications_enabled(config_path, enabled=True)
+
+    assert config_path.exists()
+    config = load_config(config_path)
+    assert config.notifications.enabled is True
+
+
 def test_load_config_logs_warning_on_unknown_top_level_and_category_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
