@@ -1140,7 +1140,13 @@ Write-Log "--- SUMMARY (AK4: an explicit signal, not something to infer from scr
 $logLines = Get-Content -Path $logPath
 $aborts = $logLines | Select-String -Pattern '^\[ABORT'
 $fails = $logLines | Select-String -Pattern '^\[FAIL'
-$skips = $logLines | Select-String -Pattern '^\[SKIPPED\]'
+$skips = $logLines | Select-String -Pattern '^\[SKIPPED'
+# BF-followup (2026-08-26 audit): this run's own SUMMARY reported "SKIPPED lines: 0" while Step
+# 10 had actually logged "[SKIPPED -- real, not a bug] reason=disabled..." -- the old pattern
+# required an exact "[SKIPPED]" close bracket immediately, which ABORT/FAIL never did (both use
+# a bare '^\[ABORT'/'^\[FAIL' prefix match), so any SKIPPED line with explanatory suffix text
+# (like Step 10's own) silently evaded the tally. Same AN3/AL5 pattern as before: the harness's
+# own counting logic, not the product, undercounting a real signal.
 $warnings = $logLines | Select-String -Pattern '^\[WARNING\]'
 # AL5: a real run's own tally missed this exact gap -- a try/catch's "[ERROR] ... failed:
 # $($_.Exception.Message)" line (Steps 2/3/6's own request failures) doesn't start with any of
