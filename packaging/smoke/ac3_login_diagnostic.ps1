@@ -395,11 +395,40 @@ Write-Log "    (this is check 5; the task's own XML sets WorkingDirectory={app},
 Write-Log "    exercises 'does Task Scheduler fire it at all', NOT the CWD-independence fix)"
 # ===========================================================================
 
-$taskName = 'Reclaim Disk Space Check'
+# BF1/BF2 (2026-08-26 audit): BE1 renamed the task per-account ("Reclaim Disk Space Check
+# (<username>)") specifically so a second account installing on a machine that already has a
+# first account's task can no longer collide with it -- this machine's own gaura account holds
+# exactly that first, older-format task from BE1's own live teeth-proof, so THIS install (a
+# different account, $env:USERNAME) landing on the same machine is a real, live multi-account
+# collision scenario, not a synthetic one. Asserting on it here converts BE1's previously
+# structural-only claim ("a different username produces a different task name, so no two
+# accounts can ever collide, by construction") into an actual second live data point.
+$taskName = "Reclaim Disk Space Check ($env:USERNAME)"
+Write-Log "[BF1] Expecting task name '$taskName' (per-account, BE1) -- NOT the old shared"
+Write-Log "  'Reclaim Disk Space Check' name, which BE1's install-time migration should have"
+Write-Log "  removed if this account ever held it."
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if (-not $task) {
     Write-Log "[ABORT] Task '$taskName' not found -- SKIPPING /run + process sampling below, loudly."
 } else {
+    Write-Log "[PASS -- BF1] Task '$taskName' exists, registered under this account -- BE1's"
+    Write-Log "  per-account naming worked for a REAL second account on a machine where a first"
+    Write-Log "  account's task already occupied the old shared name."
+
+    $legacyTask = Get-ScheduledTask -TaskName 'Reclaim Disk Space Check' -ErrorAction SilentlyContinue
+    if ($legacyTask) {
+        Write-Log "[WARNING -- BF1] The old shared-name task 'Reclaim Disk Space Check' still exists and is visible from this account -- BE1's migration should have removed it if THIS account ever held it under the old name; a fresh account was never expected to see it at all unless Task Scheduler grants broader read access than expected. Not a collision (the names differ), but worth a look."
+    } else {
+        Write-Log "[OK -- BF1] No old shared-name task visible from this account (either never existed here, or this account cannot see another account's tasks at all -- see the gaura-task check below for which)."
+    }
+
+    $gauraTask = Get-ScheduledTask -TaskName 'Reclaim Disk Space Check (gaura)' -ErrorAction SilentlyContinue
+    if ($gauraTask) {
+        Write-Log "[PASS -- BF1] gaura's own per-account task 'Reclaim Disk Space Check (gaura)' is ALSO visible from this account and reports State=$($gauraTask.State) -- both accounts' tasks coexist on this machine with zero collision, directly confirmed, not inferred."
+    } else {
+        Write-Log "[INCONCLUSIVE -- BF1] gaura's task is not visible from this account (Task Scheduler may restrict cross-account task listing, or icacls' earlier finding that only gaura/Administrators/SYSTEM hold rights on it extends to read/list too) -- this does not indicate a collision (this account's own task above already exists and is Ready, which is the actual proof no collision occurred), just that this account can't independently confirm gaura's task's state from here."
+    }
+
     $infoBefore = Get-ScheduledTaskInfo -TaskName $taskName
     Write-Log "[BEFORE] LastRunTime=$($infoBefore.LastRunTime) LastTaskResult=$($infoBefore.LastTaskResult)"
 
@@ -1111,7 +1140,13 @@ Write-Log "--- SUMMARY (AK4: an explicit signal, not something to infer from scr
 $logLines = Get-Content -Path $logPath
 $aborts = $logLines | Select-String -Pattern '^\[ABORT'
 $fails = $logLines | Select-String -Pattern '^\[FAIL'
-$skips = $logLines | Select-String -Pattern '^\[SKIPPED\]'
+$skips = $logLines | Select-String -Pattern '^\[SKIPPED'
+# BF-followup (2026-08-26 audit): this run's own SUMMARY reported "SKIPPED lines: 0" while Step
+# 10 had actually logged "[SKIPPED -- real, not a bug] reason=disabled..." -- the old pattern
+# required an exact "[SKIPPED]" close bracket immediately, which ABORT/FAIL never did (both use
+# a bare '^\[ABORT'/'^\[FAIL' prefix match), so any SKIPPED line with explanatory suffix text
+# (like Step 10's own) silently evaded the tally. Same AN3/AL5 pattern as before: the harness's
+# own counting logic, not the product, undercounting a real signal.
 $warnings = $logLines | Select-String -Pattern '^\[WARNING\]'
 # AL5: a real run's own tally missed this exact gap -- a try/catch's "[ERROR] ... failed:
 # $($_.Exception.Message)" line (Steps 2/3/6's own request failures) doesn't start with any of
