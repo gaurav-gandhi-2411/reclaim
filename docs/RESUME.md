@@ -1,35 +1,53 @@
-# Resume checkpoint — 2026-08-26 (rebuild #9 dry-run clean, stale-server defect fixed, one investigation open)
+# Resume checkpoint — 2026-08-26 (BL1-BL7 -- audit-log display bug, tally bug, stale-config root cause, tight process polling, AND a real trip-apparatus staleness incident)
 
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`.
 Always `git fetch origin` + `gh pr list` and re-check `C:\Users\Public\reclaim_ac3\` for what has
 actually run before trusting any claim below, including this one (rule 118a) — this file has gone
-stale mid-engagement multiple times already this week.
+stale mid-engagement multiple times already this week, **and this round is the first time that
+staleness actually corrupted a real trip's own evidence, not just a doc — see BL7, read it before
+trusting any AUMID/toast conclusion below.**
 
-## Where we are — the real 130328 trip's Steps 6/7/8 were invalid (stale server), now fixed and re-confirmed clean
+## Where we are — BL1-BL6 fixed/closed from a real clean trip; BL7 found the trip script itself was stale
 
 **Merged this session**: BD1-BD5 (#88-#90), BE1/BE2/BE4 (#91-#93), BA1 (#87), BF1/BF2/BF3-BF5
-(#94), a RESUME checkpoint (#95), BH1-BH7 (#96, #97 — BH5's notifications toggle). **One more PR
-about to be drafted**: BI1-BI3 (see below) — trip-script fixes + audit-doc corrections found while
-investigating the real `ReclaimSmokeTest` trip's results.
+(#94), a RESUME checkpoint (#95), BH1-BH7 (#96, #97), BI1-BI3 (#98). **One more PR about to be
+drafted this session**: BL1/BL2/BL4/BL6/BL7 + S5 (see `docs/AUDIT-2026-08.md`'s BL sections) — found
+while investigating a real, clean `ReclaimSmokeTest` trip (`ac3_run_20260826_181912.txt`, 0
+ABORT/FAIL/ERROR).
 
-**The real trip (`ac3_run_20260826_130328.txt`) had a serious, now-understood problem.** A stale
-dashboard server (never actually killed by an earlier trip's own install step) silently served
-Steps 6, 7, and 8's HTTP-based results — not the freshly-installed rebuild #8 binary. This was
-caught via a single piece of direct evidence: the "BEFORE launch" `GET /api/first-run` probe got a
-real response *before* the script had launched anything. Full root-cause, retroactive sweep of
-every historical trip (only 2 other instances found, both already-disclaimed gaura-account trips
-from before this session — no other trusted result is retroactively invalidated), and the fix
-(poll-verified kill + pre-launch remediation + post-launch PID confirmation) are in
-`docs/AUDIT-2026-08.md`'s BH2/BI1/BI2 sections.
+**Real findings from that trip, closed**:
+- **BL1**: `reclaim_audit.log` showing "0 MB" was a Step 9 display-rounding bug, not a broken audit
+  sink — the sink was proven correctly wired via 3 independent live tests. Fixed the display; the
+  file actually held 3 real `api.scan_initiated` events.
+- **BL2**: SUMMARY undercounted WARNING (1 reported, 2 real) — the same tally-bug class BF4 already
+  fixed for SKIPPED, now generalized to all 5 severities via one shared function, with a real Pester
+  regression test (`SeverityTally.Tests.ps1`, 6/6 passing).
+- **BL3**: Step 10's `threshold=50.0` (vs BH5's shipped `80.0` default) was `ReclaimSmokeTest`'s own
+  surviving hand-edited config, not a fresh-install defect — confirmed via a real scratch install
+  that BH5's actual defaults write correctly.
+- **BL4**: Step 1's 3s/5-sample process polling replaced with a 100ms poll (measured real
+  `check-disk-space` runtime: ~0.51s; validated 5/5 live). The originally-requested Task Scheduler
+  Operational event log is confirmed infeasible without elevation (`wevtutil sl .../e:true` →
+  Access is denied unelevated) — reported as a substitution, not silently swapped.
+- **BL6**: residual, not fixed — uninstalling ANY Reclaim install on an account deletes that
+  account's per-account Task Scheduler task regardless of which install directory registered it.
+  Hit and repaired twice this session (gaura's own task). Flagged for a future design pass.
+- **S5**: the first-run overlay was directly observed by a human for the first time this entire
+  engagement — closes the presence/absence question BD3+BH2 existed to enable.
 
-**Also found this pass**: the toast call succeeding internally (Step 10, confirmed via
-`notification_state.json` updating) but never rendering on screen — the user directly observed
-zero toasts during the trip. Investigated (BI3): a real apparatus gap (the per-app-notification-
-permission check only verified a registry key's mere existence, never its actual `Enabled`/
-`PeriodicNotificationCount` values) is now fixed, and live-tested on gaura's own account (a real
-toast increment 17→18 confirmed the OS pipeline itself works on this machine in general). **Root
-cause on `ReclaimSmokeTest` specifically is NOT yet determined** — the next trip's Step 10 will
-capture the real evidence needed, IF it reaches `reason=would_notify` (see the human list below).
+**BL7 — a real process defect in this session's own work, corrected before it shipped**: the
+`ac3_run_20260826_181912.txt` trip that BL1-BL3/S5 above are based on ran against a **pre-#98**
+trip script — this session's own local `main` was one commit behind `origin/main` (rule 118a) when
+the prior turn re-staged the script, so the stale local file got copied instead of `origin/main`'s
+actual content. Consequence: `#98`'s AUMID diagnostic (`Get-AumidNotificationState`,
+`[BI3]`-tagged `PeriodicNotificationCount` evidence) never ran on this trip — zero `[BI3]` lines
+exist anywhere in that log. **The toast question is therefore still open, not closed**: Step 10 DID
+reach `reason=would_notify` (percent_used 89.46% > threshold 50.0, `last_notified_at` updated) and
+the human observer still saw no toast — the exact AH1 shape recurring, now with `#98`'s diagnostic
+still unexercised on `ReclaimSmokeTest`. Fixed this session: local `main` fast-forwarded to
+`origin/main`, script re-staged fresh (confirmed byte-identical, 27 case-insensitive "aumid" matches
+present), BL1/BL2/BL4 correctly layered back on top. **The next trip is the first one that will
+actually produce real `[BI3]` evidence for `ReclaimSmokeTest`.**
 
 **Rebuild #9**: SHA-256 `d9ff12552187ff8751457a4f623a0db5f33c3822950ca2d2cf140dfb065a1975`, built
 from `157be80e0bfc6270a75be7df3fc199f26d7e12bf` (= `origin/main`'s tip after #96/#97 merged, CI
@@ -44,59 +62,77 @@ re-closed** for this run specifically — see BI1 for why it was reopened in the
 ## Exact resume sequence
 
 ```powershell
-# 1. Merge the BI1-BI3 PR (draft, about to be created) in the web UI, then:
+# 1. Merge the BL1/BL2/BL4/BL6/BL7 PR (draft, about to be created) in the web UI, then:
 git fetch origin --quiet; git branch -f main origin/main; git checkout main
-git rev-parse HEAD  # must equal origin/main
+git rev-parse HEAD  # must equal origin/main -- DO NOT skip this. BL7 (this session) is the
+                     # documented cost of skipping it: a real trip's own script silently ran stale.
 
-# 2. Re-stage from the merged origin/main (no rebuild needed -- that PR is trip-script + docs
-#    only, zero src/ changes; rebuild #9 already reflects everything merged so far):
-Copy-Item packaging\dist\reclaim-setup.exe,packaging\dist\reclaim-setup.exe.sha256,`
-  packaging\dist\reclaim-setup.exe.buildsha,packaging\smoke\ac3_login_diagnostic.ps1 `
-  C:\Users\Public\reclaim_ac3\ -Force
+# 2. Re-stage using packaging\smoke\Stage-AC3Trip.ps1 -- BM1 (2026-08-26 audit): NOT a manual
+#    Copy-Item anymore. That manual step is what let BL7 happen (and, before it, the original
+#    STALE-BASE VERIFICATION GAP) -- a script that structurally cannot stage without first,
+#    freshly, re-verifying local main == origin/main (no override; no cached/remembered state):
+.\packaging\smoke\Stage-AC3Trip.ps1
+# Aborts loudly and refuses to stage if local main isn't confirmed current -- if it does, that IS
+# the correct behavior: fetch/fast-forward (step 1 above) and re-run this, don't work around it.
 
-# 3. Then the actual trip under ReclaimSmokeTest -- see the two-item human list below.
+# 3. U6 (delete ReclaimSmokeTest + its profile): DEFERRED per this session's explicit instruction
+#    -- do NOT run it. The account is the only profile on this machine with the 8.3 short-name
+#    condition, and BL7 means one more trip is still needed before the account's job here is done.
+#    Re-evaluate only after a trip against a Stage-AC3Trip.ps1-staged script produces real [BI3]
+#    evidence for the toast question -- see "Test account state" below.
 ```
 
 ## The two irreducible human steps for the trip
 
-1. **First-run overlay** — should finally appear for real this time. Last trip: none appeared,
-   went straight to Simple-mode dashboard — now understood as BH2's stale server answering
-   `{"acknowledged":true}` from its own already-consumed state, not a BD3 failure (BD3's own
-   marker-deletion fix is confirmed working correctly under gaura's account this session,
-   `{"acknowledged":false}` both before and after). With BH2's fresh-server guarantee now active,
-   there is no known second storage location left to explain a recurrence — if the overlay still
-   doesn't appear on the next trip, that would be a new, real finding, not the same one recurring.
-2. **Toast from Step 10** — a fresh `ReclaimSmokeTest` install's `config.default.toml` ships
-   `[notifications] enabled = false` (BH5's real, deliberately-kept default) — Step 10 will
-   correctly SKIP (`reason=disabled`) unless notifications are explicitly turned on first, either
-   via the new Settings-tab toggle (BH5) or by hand-editing `config.toml`. **If you want Step 10
-   to actually attempt firing a toast this trip, turn the toggle on before running the script** (or
-   accept a SKIP and treat this as a separate, later verification). If it does reach
-   `reason=would_notify`, watch for a real toast and report whether it rendered — the script's own
-   new AUMID diagnostic (BI3) will independently report whether the OS notification pipeline
-   queued it, which narrows the cause either way regardless of what you personally observe.
+1. **First-run overlay** — confirmed appearing for real on the last trip (S5, closed this session):
+   a human directly observed it on a genuinely fresh `ReclaimSmokeTest` profile, BD3 + BH2's
+   guarantees both active. No longer an open question for a NEW test account unless it recurs, in
+   which case that is a new, real finding.
+2. **Toast from Step 10 — still genuinely open, read BL7 above before doing this.** The next trip
+   is the first one where `#98`'s `[BI3]` AUMID diagnostic will actually run (BL7 found and fixed
+   the staging gap that silently skipped it last time). Turn the Settings-tab notifications toggle
+   on before running the script (BH5's fresh-install default is `enabled = false`), so Step 10 has
+   a real chance to reach `reason=would_notify` rather than `SKIPPED`. If it does, watch for a real
+   toast AND read the trip log afterward for `[BI3]`-tagged lines — those narrow the cause (OS
+   pipeline queued it vs. never reached the pipeline vs. `Enabled=0` for this AUMID) independent of
+   what you personally observed on screen.
 
-Nothing else belongs on this list — Task Scheduler registration (BE1, now live-verified for two
-real accounts, not just structurally argued — see BF1/BH1), the CWD-independence fix, the Snooze
-protocol handler, AE1's teeth-proof, the free-space-delta measurement, and 8.3 short-name detection
-are all automated, confirmed against a positively-verified-fresh server this session, and passing
-for real.
+Nothing else belongs on this list — Task Scheduler registration (BE1, live-verified for two real
+accounts), the CWD-independence fix, the Snooze protocol handler, AE1's teeth-proof, the
+free-space-delta measurement, and 8.3 short-name detection are all automated, confirmed against a
+positively-verified-fresh server, and passing for real.
 
 ## Test account state
 
-`ReclaimSmokeTest` — last used for the real trip on 2026-08-26 (`130328`, the run BH1-BH7 were
-found against). Not re-touched since (all verification this pass was under gaura's own account).
-**U6 (delete the account) stays deferred** until the next real trip against the merged state comes
-back clean, per the two-item list above.
+`ReclaimSmokeTest` — last used for the real, clean trip on 2026-08-26 (`181912`). **U6 (account
+deletion) is explicitly DEFERRED — read this before deleting it, this session or a future one.**
+Two independent reasons, both from the user directly, both current as of this checkpoint:
+1. `ReclaimSmokeTest`'s profile is the only one on this machine confirmed to exhibit the 8.3
+   short-name condition (`$env:TEMP` resolving as `RECLAI~1`) that the TEMP-cache detection fix
+   (rebuild #8.3-short-name work) depends on for its own regression coverage — deleting it loses
+   that fixture, not just a disposable account.
+2. BL7 means the `181912` trip's own toast/AUMID evidence doesn't actually count — `#98`'s `[BI3]`
+   diagnostic never ran on it. **One more trip, against a `Stage-AC3Trip.ps1`-staged script, is
+   still required** before this account's job here is done. A session that sees "the last trip was
+   clean" and reasons U6's gate is therefore satisfied would be repeating exactly the mistake this
+   note exists to prevent — the gate is "a trip whose toast evidence is trustworthy," which
+   `181912` was NOT, not merely "a trip with 0 ABORT/FAIL/ERROR."
+Do not run U6 until a session confirms, freshly, that a trip run against a properly
+`Stage-AC3Trip.ps1`-staged script produced real `[BI3]` lines in its log.
 
 ## Open-items list (flat, everything outstanding)
 
 **Blocking the next real trip:**
-- Draft and merge the BI1-BI3 PR (trip-script + audit-doc fixes from this investigation).
-- Re-stage from merged `origin/main` (step 2 above, no rebuild needed).
-- Run the actual trip under `ReclaimSmokeTest` — this is what determines BI3's real root cause
-  (does `ReclaimSmokeTest`'s own AUMID key show `Enabled=0`? does `PeriodicNotificationCount`
-  increment there?) and gives BD3/BH2's first-run fix its first real cross-account test.
+- Draft and merge this session's PR (BL1/BL2/BL4/BL6/BL7 — trip-script fixes + audit-doc
+  corrections, including BL7's own staging-staleness fix).
+- Run U6 (`ReclaimSmokeTest` deletion, exact steps in the session report) as admin, then create a
+  fresh disposable test account.
+- Re-stage from merged `origin/main` (step 2 above, no rebuild needed) — **verify byte-identical
+  AND verify `git rev-parse HEAD` equals `origin/main` immediately before copying**, per BL7.
+- Run the actual trip under the new test account — this is what determines BI3's real root cause
+  (does the account's own AUMID key show `Enabled=0`? does `PeriodicNotificationCount` increment
+  there?) for the first time, since BL7 found the prior trip never actually exercised this
+  diagnostic despite appearing to.
 
 **Disclosed, not re-opened (won't be fixed without a specific reason to revisit):**
 - The machine-wide Task Scheduler namespace collision's underlying cause (task names are global)
@@ -124,12 +160,15 @@ back clean, per the two-item list above.
 - Whether the SAME literal OS process persisted from trip `012613` through to `130328` (BI2) —
   plausible reconstruction from evidence, not proven; `auditpol` (the one thing that could settle
   it) requires elevation this project's own invariant forbids requesting, confirmed blocked.
-- BI3's root cause on `ReclaimSmokeTest` specifically — genuinely unknown pending the next trip's
-  real data, not guessed at.
+- BI3's root cause on `ReclaimSmokeTest` (or its successor account) — genuinely unknown, now
+  pending a trip that actually runs the diagnostic (BL7 found the last one didn't), not guessed at.
+- BL6's per-account Task Scheduler task deletion on any uninstall — real, reproduced twice, exposure
+  believed narrow (concurrent same-account installs), not independently verified as narrow.
 
 **Deliberately deferred:**
-- U6 (`ReclaimSmokeTest` account deletion) — until the next clean trip.
 - Task Scheduler subfolder organization for R5 — considered and rejected in favor of per-account
   naming (BE1), not merely postponed.
 - `disk_threshold_percent` Settings-tab editing (BH5) — stays config.toml-only by design, same
   scope as every other category's non-`enabled` field.
+- BL6's fix (task-deletion-on-uninstall keyed to install-directory identity) — needs its own design
+  pass, not a reactive patch under an unrelated fix.
