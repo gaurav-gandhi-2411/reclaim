@@ -125,6 +125,40 @@ Write-Log "==================================================================="
 
 # ===========================================================================
 Write-Log ""
+Write-Log "--- STEP -3: self-integrity check (BM1, 2026-08-26 audit) ---"
+# BL7 (2026-08-26 audit): the trip that produced ac3_run_20260826_181912.txt ran against a
+# pre-#98 copy of THIS FILE, staged from a locally-stale git checkout -- the resulting log gave
+# no direct indication anything was wrong; it took reverse-engineering indirect signals (an
+# "aumid" grep count, a registry-output message shape) to even notice. Same class as the
+# STALE-BASE VERIFICATION GAP (this doc's own third headline finding, 2026-08-20/21): a claim
+# verified true against a snapshot, silently no longer true by the time it was acted on. Fixed
+# structurally: packaging/smoke/Stage-AC3Trip.ps1 now writes a "<content-sha256>\n<commit-sha>\n"
+# sidecar next to this file at stage time (refusing to stage at all unless local main is freshly
+# confirmed == origin/main), and this check reads it back at the top of every run, before
+# anything else -- so a trip log now either states plainly which commit actually ran, or refuses
+# to run at all rather than silently producing conclusions about code it doesn't contain.
+# ===========================================================================
+$stageHashPath = "$PSCommandPath.stagehash"
+if (-not (Test-Path $stageHashPath)) {
+    Write-Log "[WARNING] No stage-time record found at $stageHashPath -- this script was not staged via Stage-AC3Trip.ps1 (e.g. running directly from a repo checkout for local testing). Freshness cannot be verified; this is expected and fine for a non-staged dev run, but a real trip should always go through Stage-AC3Trip.ps1 first."
+} else {
+    $stageHashLines = Get-Content -Path $stageHashPath
+    $recordedHash = if ($stageHashLines.Count -ge 1) { $stageHashLines[0].Trim() } else { "" }
+    $recordedCommit = if ($stageHashLines.Count -ge 2) { $stageHashLines[1].Trim() } else { "unknown" }
+    $actualHash = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash
+    if ($actualHash -eq $recordedHash) {
+        Write-Log "[OK] Self-integrity check: this file's content matches its stage-time record exactly. Staged from commit: $recordedCommit"
+    } else {
+        Write-Log "[ABORT] Self-integrity check FAILED: this file's actual hash ($actualHash) does not match its stage-time record ($recordedHash, staged from commit $recordedCommit). This file was modified, corrupted, or replaced with a different version after staging -- refusing to run and produce conclusions about code that may not be what this log claims it is. Re-run packaging\smoke\Stage-AC3Trip.ps1 from a freshly-fetched origin/main and try again."
+        Write-Log "==================================================================="
+        Write-Log "Run aborted at Step -3. No further steps executed."
+        Write-Log "==================================================================="
+        exit 1
+    }
+}
+
+# ===========================================================================
+Write-Log ""
 Write-Log "--- STEP -2: Install (AJ4) ---"
 # ===========================================================================
 
@@ -588,33 +622,52 @@ if (-not $task) {
     # not specifically the one Start-ScheduledTask above just caused to exist. Snapshot the
     # baseline PID set immediately BEFORE starting the task, then report only NEW pids at each
     # sample -- that is the actual task-spawned process (or its correct, honest absence).
+    #
+    # BL4 (2026-08-26 audit): the fix above worked exactly as designed and honestly reported
+    # "could not confirm" on a real trip, because 3s polling genuinely cannot catch a process
+    # this short-lived -- measured directly this session: a real `reclaim.exe check-disk-space`
+    # invocation completes in ~0.51s wall-clock. Considered and rejected: the Task Scheduler
+    # Operational event log (Event IDs 129/201) would give positive proof without any polling
+    # race at all, but its channel is DISABLED by default on this machine (confirmed directly:
+    # `Get-WinEvent -ListLog ...TaskScheduler/Operational` reports IsEnabled=False) and enabling
+    # it requires elevation (`wevtutil sl ... /e:true` confirmed failing with "Access is denied"
+    # unelevated) -- a real end user's machine almost certainly has this same default, and this
+    # project's own invariant (reclaim.elevation.assert_not_elevated) forbids requiring UAC for
+    # anything. Also tried an unelevated WMI process-creation event subscription
+    # (__InstanceCreationEvent on Win32_Process) as a non-polling alternative -- timed out in a
+    # real test, no more reliable than polling against a sub-second process. The actual fix that
+    # IS achievable unelevated: poll fast enough to reliably land inside a ~0.5s window instead
+    # of a 3s one. Live-tested 5/5 real runs at a 50ms interval, caught on the first sample every
+    # time -- widened slightly to 100ms here for a comfortable margin over the measured 0.51s
+    # runtime without hammering Get-Process, still ~5 sampling opportunities within that window.
     $basePids = @((Get-Process -Name reclaim -ErrorAction SilentlyContinue) | Select-Object -ExpandProperty Id)
     Write-Log "[Process evidence] Baseline reclaim.exe pid(s) already running before Start-ScheduledTask: $(if ($basePids) { $basePids -join ',' } else { '(none)' })"
 
     Write-Log "[RUN] Start-ScheduledTask -TaskName '$taskName'"
     Start-ScheduledTask -TaskName $taskName
 
-    Write-Log "[Process evidence] Sampling for reclaim.exe every 3s for 15s (AI3: distinguishes"
-    Write-Log "  'task fired, process ran to completion' from 'task fired, process crashed before"
-    Write-Log "  reaching toast code' -- both look identical from LastRunTime alone; BH6: only pids"
-    Write-Log "  NOT in the baseline above count as evidence of the task's OWN process, not a"
-    Write-Log "  pre-existing survivor that happened to already be running):"
+    Write-Log "[Process evidence] Polling for reclaim.exe every 100ms for up to 5s (BL4: tight"
+    Write-Log "  enough to reliably land inside a real check-disk-space invocation's measured"
+    Write-Log "  ~0.51s runtime, unlike the old 3s interval; only pids NOT in the baseline above"
+    Write-Log "  count as evidence of the task's OWN process, not a pre-existing survivor):"
     $sawNewPid = $false
-    for ($i = 1; $i -le 5; $i++) {
-        Start-Sleep -Seconds 3
+    $pollDeadline = (Get-Date).AddSeconds(5)
+    $sampleCount = 0
+    while ((Get-Date) -lt $pollDeadline) {
+        $sampleCount++
         $procs = @((Get-Process -Name reclaim -ErrorAction SilentlyContinue) | Select-Object -ExpandProperty Id)
         $newPids = @($procs | Where-Object { $_ -notin $basePids })
         if ($newPids) {
             $sawNewPid = $true
-            Write-Log "  [t+$($i*3)s] NEW reclaim.exe pid(s) (not in baseline, this IS the task's own process): $($newPids -join ',')"
-        } elseif ($procs) {
-            Write-Log "  [t+$($i*3)s] reclaim.exe running, but only baseline pid(s) $($procs -join ',') -- NOT evidence the task's own process is still alive (it may have already exited, or the task never actually spawned a distinct process this sampling could catch)."
-        } else {
-            Write-Log "  [t+$($i*3)s] reclaim.exe not present in process list at all (neither baseline nor new)."
+            Write-Log "  [sample $sampleCount, t+$([math]::Round(((Get-Date) - $pollDeadline).TotalSeconds + 5, 2))s] NEW reclaim.exe pid(s) (not in baseline, this IS the task's own process): $($newPids -join ',')"
+            break
         }
+        Start-Sleep -Milliseconds 100
     }
-    if (-not $sawNewPid) {
-        Write-Log "[WARNING -- BH6] No NEW reclaim.exe pid was ever observed distinct from the pre-task baseline across all 5 samples -- this run's process evidence does NOT positively confirm the task actually spawned its own process (it may have run and exited faster than this 3s sampling granularity can catch, which is a real, known limitation, not necessarily a failure)."
+    if ($sawNewPid) {
+        Write-Log "[PASS -- BL4] Positively confirmed the task's own process, distinct from any pre-existing baseline pid, within $sampleCount sample(s) at 100ms intervals."
+    } else {
+        Write-Log "[WARNING -- BH6] No NEW reclaim.exe pid was ever observed distinct from the pre-task baseline across $sampleCount samples at 100ms intervals over 5s -- this is now a genuinely surprising result (BL4's own live testing this session caught it on 1 sample, 5/5 real runs), worth investigating rather than assuming it's just sampling granularity this time."
     }
 
     $infoAfter = Get-ScheduledTaskInfo -TaskName $taskName
@@ -1246,7 +1299,21 @@ if ($appDir) {
         foreach ($f in $realLogFiles) {
             $destLogFile = Join-Path $logDir "reclaim_app_$($f.Name).log"
             Copy-Item -Path $f.FullName -Destination $destLogFile -Force
-            Write-Log "[OK] Copied $($f.FullName) ($([math]::Round($f.Length/1MB, 2)) MB) to $destLogFile"
+            # BL1 (2026-08-26 audit) correction: a real trip's own reclaim_audit.log genuinely
+            # contained 3 real api.scan_initiated events (585 bytes total) -- the audit SINK was
+            # never broken -- but this line's own "([math]::Round($f.Length/1MB, 2)) MB" display
+            # rounds anything under ~5KB to "0 MB", reading as empty/broken when it wasn't. A
+            # small-but-real audit file misreported as "(0 MB)" is exactly the false-negative
+            # BL1 was rightly worried an audit log could produce; fixed to show real byte counts
+            # for small files instead of a rounding artifact that erases them.
+            $sizeLabel = if ($f.Length -lt 1MB) { "$($f.Length) bytes" } else { "$([math]::Round($f.Length/1MB, 2)) MB" }
+            Write-Log "[OK] Copied $($f.FullName) ($sizeLabel) to $destLogFile"
+            if ($f.Name -like 'reclaim_audit.log*') {
+                # The actual signal worth stating explicitly, not left for a reader to infer
+                # from a byte count: how many real scan-initiation events this file holds.
+                $scanInitiatedCount = @(Get-Content $f.FullName | Select-String -Pattern 'api\.scan_initiated').Count
+                Write-Log "    api.scan_initiated events in this file: $scanInitiatedCount"
+            }
             $allCopiedText += Get-Content $f.FullName
         }
         $toastFailedLines = @($allCopiedText | Select-String -Pattern 'toast_failed')
@@ -1314,19 +1381,19 @@ if (-not $appDir) {
     $step10Notified = $step10AfterState -and $null -ne $step10AfterState.last_notified_at
 
     if ($step10Stdout -match 'reason=would_notify' -and $step10Notified) {
-        Write-Log "[PASS] reason=would_notify AND notification_state.json's last_notified_at is now set -- send_disk_space_toast was genuinely invoked this run, not inferred from log absence."
+        Write-Log "[Result] reason=would_notify AND notification_state.json's last_notified_at is now set -- send_disk_space_toast was genuinely invoked this run, not inferred from log absence. This is NOT itself the verdict (BM2, 2026-08-26 audit: a live-reproduced experiment on gaura's own account set Enabled=0 on the AUMID key and called send_disk_space_toast() directly -- it returned True, no exception, and PeriodicNotificationCount did not move; a non-throwing call is proof only that the WinRT submission didn't fail outright, not that the OS accepted or queued the notification). The AUMID pipeline count below is what actually decides PASS/FAIL for this step."
         $aumidAfterStep10 = Get-AumidNotificationState
         $beforeCount = if ($aumidBeforeStep10) { $aumidBeforeStep10.PeriodicNotificationCount } else { 0 }
         $afterCount = if ($aumidAfterStep10) { $aumidAfterStep10.PeriodicNotificationCount } else { $null }
-        if ($null -eq $afterCount) {
-            Write-Log "[BI3] AUMID notification-pipeline count: no nested key found even after this confirmed-invoked call -- the OS never queued anything for this AUMID at all. Worth reporting explicitly: this points AWAY from a display-layer (Focus Assist) explanation and TOWARD the call never actually reaching the OS toast pipeline despite reporting no exception -- windows_toasts library internals, not this script, would need tracing next."
-        } elseif ($afterCount -gt $beforeCount) {
-            Write-Log "[BI3 -- KEY EVIDENCE] AUMID PeriodicNotificationCount increased ($beforeCount -> $afterCount) -- the OS notification pipeline DID queue this toast for real. Combined with a human 'no toast seen', this narrows the cause to a DISPLAY-layer suppression (Focus Assist, or Notification Center settings for this specific AUMID/app), not a permission or AUMID-registration failure -- check Settings > System > Focus assist state at the exact moment this step ran, and Settings > Notifications for any per-app override on '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' / cmd.exe specifically."
+        if ($null -ne $afterCount -and $afterCount -gt $beforeCount) {
+            Write-Log "[PASS -- BM3-VERDICT] AUMID PeriodicNotificationCount increased ($beforeCount -> $afterCount) -- the OS notification pipeline actually queued this toast, not just a non-throwing call. If a human separately reports no toast seen, that narrows the remaining gap to DISPLAY-layer suppression (Focus Assist, or a per-app Notification Center override), not a permission or AUMID-registration failure -- check Settings > System > Focus assist state at the exact moment this step ran, and Settings > Notifications for any per-app override on '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' / cmd.exe specifically."
+        } elseif ($null -eq $afterCount) {
+            Write-Log "[FAIL -- BM3-VERDICT] AUMID notification-pipeline count: no nested key found even after this confirmed-invoked call (before=$beforeCount, after=none). Points AWAY from a display-layer (Focus Assist) explanation and TOWARD the call never actually reaching the OS toast pipeline despite reporting no exception -- windows_toasts library internals, not this script, would need tracing next."
         } else {
-            Write-Log "[BI3] AUMID PeriodicNotificationCount did not increase ($beforeCount -> $afterCount) despite a confirmed-invoked call with no exception -- the OS pipeline itself may not have received it (a windows_toasts-internal issue, not Focus Assist/display suppression). Worth a closer look at the windows_toasts call itself, not just this diagnostic's own registry read timing (the registry write may lag the API call by a moment -- re-check a few seconds later if this result looks surprising)."
+            Write-Log "[FAIL -- BM3-VERDICT] AUMID PeriodicNotificationCount did not increase ($beforeCount -> $afterCount) despite a confirmed-invoked call with no exception. Per BM2's own live-reproduced experiment this exact signature (no exception, count unchanged) is what an Enabled=0-blocked AUMID looks like -- treated as a real FAIL, not a soft/inconclusive result. Re-check a few seconds later only if you suspect a registry-write lag; do not read the count's absence as ambiguous."
         }
         if ($aumidAfterStep10 -and $null -ne $aumidAfterStep10.Enabled -and $aumidAfterStep10.Enabled -eq 0) {
-            Write-Log "[BI3 -- REAL FINDING] Enabled=0 for this AUMID -- notifications are explicitly disabled for cmd.exe's identity on THIS account. This alone would fully explain 'call succeeds, nothing renders,' independent of Focus Assist. Fix: Settings > Notifications > cmd.exe (or the corresponding entry) > turn on, or register Reclaim under its own AUMID instead of falling back to cmd.exe's shared one (a real product fix, not just a test-account workaround -- a real end user hitting this would have the identical silent-failure experience)."
+            Write-Log "[BI3 -- REAL FINDING] Enabled=0 for this AUMID -- notifications are explicitly disabled for cmd.exe's identity on THIS account. This alone would fully explain the FAIL verdict above, independent of Focus Assist. Fix: Settings > Notifications > cmd.exe (or the corresponding entry) > turn on, or register Reclaim under its own AUMID instead of falling back to cmd.exe's shared one (a real product fix, not just a test-account workaround -- a real end user hitting this would have the identical silent-failure experience)."
         }
     } elseif ($step10Stdout -match 'reason=(disabled|below_threshold|snoozed|debounced)') {
         Write-Log "[SKIPPED -- real, not a bug] reason=$($Matches[1]) -- this machine's real disk usage/config did not cross the threshold (or state wasn't actually cleared). Not evidence the toast codepath is broken, but also not evidence it works: re-run once the real condition (percent_used >= threshold) holds, or lower disk_threshold_percent in config.toml temporarily."
@@ -1359,22 +1426,38 @@ Write-Log ""
 Write-Log "--- SUMMARY (AK4: an explicit signal, not something to infer from scrolling) ---"
 # ===========================================================================
 $logLines = Get-Content -Path $logPath
-$aborts = $logLines | Select-String -Pattern '^\[ABORT'
-$fails = $logLines | Select-String -Pattern '^\[FAIL'
-$skips = $logLines | Select-String -Pattern '^\[SKIPPED'
-# BF-followup (2026-08-26 audit): this run's own SUMMARY reported "SKIPPED lines: 0" while Step
-# 10 had actually logged "[SKIPPED -- real, not a bug] reason=disabled..." -- the old pattern
-# required an exact "[SKIPPED]" close bracket immediately, which ABORT/FAIL never did (both use
-# a bare '^\[ABORT'/'^\[FAIL' prefix match), so any SKIPPED line with explanatory suffix text
-# (like Step 10's own) silently evaded the tally. Same AN3/AL5 pattern as before: the harness's
-# own counting logic, not the product, undercounting a real signal.
-$warnings = $logLines | Select-String -Pattern '^\[WARNING\]'
+# BL2 (2026-08-26 audit): a real trip's own SUMMARY reported "WARNING lines: 1" when 2 real
+# WARNING lines existed -- the freshness-check warning (exact "[WARNING]") counted, but
+# "[WARNING -- BH6] No NEW reclaim.exe pid was ever observed..." didn't. This is the THIRD time
+# this exact bug shape has recurred (SKIPPED -- BF-followup; WARNING -- this fix), always the
+# same root cause: an exact "[<SEVERITY>]" close-bracket match misses any suffixed tag like
+# "[<SEVERITY> -- <context>]". Fixed generally this time, not per-instance -- Get-SeverityTallyCount
+# is the ONE place every severity's counting logic now lives, bare-prefix with optional leading
+# whitespace (matching ERROR's own already-correct pattern), so a future "[<SEVERITY> -- <tag>]"
+# suffix -- on ANY severity, not just the ones already caught -- can never silently evade this
+# tally again. Kept as a named function INLINE (not extracted to a separate file, which would
+# have needed staging changes -- $PSScriptRoot resolves to wherever this script was COPIED to
+# for a real trip, per this file's own docstring, and no existing staging command copies a
+# subdirectory) specifically so packaging/smoke/SeverityTally.Tests.ps1 can extract and test
+# this exact function's real source via AST parsing, without executing the rest of this script's
+# real side effects (installs, scans, Task Scheduler triggers).
+function Get-SeverityTallyCount {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][string]$Severity
+    )
+    @($Lines | Select-String -Pattern "^\s*\[$Severity")
+}
+$aborts = Get-SeverityTallyCount -Lines $logLines -Severity 'ABORT'
+$fails = Get-SeverityTallyCount -Lines $logLines -Severity 'FAIL'
+$skips = Get-SeverityTallyCount -Lines $logLines -Severity 'SKIPPED'
+$warnings = Get-SeverityTallyCount -Lines $logLines -Severity 'WARNING'
 # AL5: a real run's own tally missed this exact gap -- a try/catch's "[ERROR] ... failed:
 # $($_.Exception.Message)" line (Steps 2/3/6's own request failures) doesn't start with any of
 # the four prefixes above, so a genuine failure could pass through this tally uncounted. Counted
 # separately, not folded into "aborts", since an [ERROR] line's exact meaning depends on which
 # step logged it -- rolling it into one number would lose that context the report needs anyway.
-$scriptErrors = $logLines | Select-String -Pattern '^\s*\[ERROR\]'
+$scriptErrors = Get-SeverityTallyCount -Lines $logLines -Severity 'ERROR'
 Write-Log "  ABORT lines:   $($aborts.Count)"
 Write-Log "  FAIL lines:    $($fails.Count)"
 Write-Log "  WARNING lines: $($warnings.Count)"
