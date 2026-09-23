@@ -227,6 +227,26 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Output "    OK: mypy/pytest/ruff confirmed unimportable in the build venv."
 
+Write-Output "    Checking packaging/nofollow_allowlist.txt against the build venv's actual imports..."
+# Named test-suite exclusions (numpy/scipy tests measured at ~40% of C-compile time -- see
+# reports/build-timing/2026-09-23-attempt2-partial/summary.md). Gate runs HERE, against the exact
+# site-packages Nuitka is about to compile, so a dependency upgrade that starts importing an
+# excluded package from runtime code fails the build in seconds instead of shipping an exe that
+# crashes on first use (what the old *.tests/*.testing glob did -- RELEASE_RUNBOOK.md).
+$nofollowAllowlistPath = "$PSScriptRoot\nofollow_allowlist.txt"
+& "$BuildVenvPath\Scripts\python.exe" "$RepoRoot\scripts\check_nofollow_allowlist.py" `
+    --allowlist $nofollowAllowlistPath --root "$BuildVenvPath\Lib\site-packages" --root "$RepoRoot\src"
+if ($LASTEXITCODE -ne 0) {
+    throw ("nofollow allow-list check failed (exit $LASTEXITCODE) -- an excluded package is " +
+        "imported by non-test code, or an entry no longer exists. Fix the list; never bypass.")
+}
+$nofollowEntries = @(Get-Content $nofollowAllowlistPath |
+    ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ -and -not $_.StartsWith('@') })
+foreach ($entry in $nofollowEntries) {
+    # Belt-and-braces with the Python check: never hand Nuitka a wildcard from this file.
+    if ($entry -match '[\*\?\[\]]') { throw "Glob in nofollow allow-list: '$entry'" }
+}
+
 Write-Output "    Patching bundled Nuitka: -O3 -> -O2 for the gcc backend compile..."
 # On Windows, Nuitka's SconsCompilerSettings.py unconditionally picks -O3 for every gcc-compiled
 # file ("if env.monolithpy or os.name == 'nt' or ..." -- os.name is always 'nt' here), with no
@@ -388,8 +408,10 @@ $nuitkaArgs = @(
     # forces intermediate compiler state to disk instead of an in-memory buffer. That's exactly
     # what a single, huge, generated-C translation unit (faiss's swigfaiss.c) needs to not OOM.
     "--jobs=$NuitkaJobs",
-    # NOT excluding *.tests/*.testing modules at all, despite the compile-time/size cost of
-    # bundling real test-suite directories. Both wildcards were tried and both hid a genuine,
+    # Test suites ARE excluded again (2026-09-23), but only by the NAMED entries in
+    # packaging/nofollow_allowlist.txt, each gated by scripts/check_nofollow_allowlist.py above,
+    # and appended to this array below. Never re-introduce a wildcard. History of why:
+    # *.tests/*.testing wildcards were tried and both hid a genuine,
     # unconditionally-imported runtime dependency behind an innocent-looking "test" name --
     # confirmed independently for THREE separate packages, not a one-off: structlog/__init__.py
     # does `from structlog.testing import ReturnLogger, ReturnLoggerFactory` (public API, listed
@@ -404,9 +426,9 @@ $nuitkaArgs = @(
     # collection). A 4th, `numpy.testing`, WAS confirmed safe (only reachable via numpy's own
     # lazy `__getattr__` in numpy/__init__.py, never imported at module-load time) -- but three
     # false negatives out of four checked is not good enough odds to keep guessing package by
-    # package. Losing the exclusion costs a real but bounded amount of dist-folder size and
-    # compile time (each test-suite dir Nuitka would otherwise skip); shipping a CLI/server that
-    # crashes on startup for a data-safety tool is not an acceptable trade for that saving.
+    # package -- hence a named list plus a mechanical import check instead of guessing, and the
+    # frozen serve/scan/AI smoke test (packaging/test_packaged_serve.ps1) for the .pyd-level
+    # imports that no static Python-source check can see.
     "--company-name=Gaurav Gandhi", "--product-name=Reclaim", "--product-version=1.3.0",
     "--windows-icon-from-ico=packaging/reclaim.ico",
     "--windows-console-mode=attach",
@@ -446,9 +468,15 @@ $nuitkaArgs = @(
     "--include-data-dir=src/reclaim/api/static=reclaim/api/static",
     "--include-data-dir=src/reclaim/api/templates=reclaim/api/templates",
     "--include-data-dir=src/reclaim/ai/models=reclaim/ai/models",
+    # Compilation report (module list, per-module Python-level timing, included DLLs/data). Does
+    # NOT carry per-file gcc time -- nuitka_compile_breakdown.py after the build covers that.
+    "--report=packaging/build/nuitka-report.xml",
     "--output-dir=packaging/build", "--output-filename=reclaim.exe",
     "packaging/entry_point.py"
 )
+# Inserted before the positional entry-point script, which must stay last.
+$nuitkaArgs = $nuitkaArgs[0..($nuitkaArgs.Count - 2)] +
+    @($nofollowEntries | ForEach-Object { "--nofollow-import-to=$_" }) + $nuitkaArgs[-1]
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "$BuildVenvPath\Scripts\python.exe"
@@ -616,6 +644,18 @@ if ($proc.ExitCode -ne 0) {
 }
 $buildMinutes = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
 Write-Output "    Nuitka build succeeded in $buildMinutes minutes."
+
+# Per-package C-compile breakdown from the ccache log -- every build emits it, so build-time
+# claims always have a measured source. Measurement only: a failure here warns, never fails a
+# build whose artifact is already good.
+$breakdownDir = "$PSScriptRoot\build\compile_breakdown"
+& "$BuildVenvPath\Scripts\python.exe" "$RepoRoot\scripts\nuitka_compile_breakdown.py" `
+    "$PSScriptRoot\build\entry_point.build" --out-dir $breakdownDir | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Output "    Compile breakdown: $breakdownDir\summary.md"
+} else {
+    Write-Output "    WARNING: compile breakdown failed (exit $LASTEXITCODE) -- build itself is fine."
+}
 
 $distDir = "$PSScriptRoot\build\entry_point.dist"
 $distSizeBytes = (Get-ChildItem $distDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
