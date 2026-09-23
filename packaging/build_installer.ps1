@@ -658,6 +658,42 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 $distDir = "$PSScriptRoot\build\entry_point.dist"
+
+# MSVC runtime: ship ONE consistent app-local set, then prove every binary's runtime imports are
+# satisfied. 2026-09-23: Nuitka's DLL resolution put winrt's vendored msvcp140.dll (14.29) at the
+# dist root and dropped msvcp140_1.dll/vcomp140.dll. onnxruntime then loaded the 14.29 msvcp140
+# next to System32's 14.50 msvcp140_1 and `import onnxruntime` failed in the frozen exe. The
+# previous build had carried a matching 14.50 set only because of DLL resolution order. The copy
+# below overwrites whatever Nuitka picked with this machine's installed VC++ redistributable (a
+# Microsoft-redistributable set, one version), so the result no longer depends on which package
+# Nuitka happened to take a copy from. Both checks after it fail closed.
+$vcRuntimeDlls = @(
+    'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll',
+    'vcomp140.dll', 'concrt140.dll'
+)
+foreach ($dll in $vcRuntimeDlls) {
+    $src = Join-Path "$env:SystemRoot\System32" $dll
+    if (-not (Test-Path $src)) {
+        throw ("VC++ runtime DLL $src not found -- install the current Microsoft Visual C++ " +
+            "Redistributable (x64) on the build machine; the dist must ship a complete, " +
+            "single-version runtime set.")
+    }
+    Copy-Item -Path $src -Destination (Join-Path $distDir $dll) -Force
+}
+$rootRuntime = Get-ChildItem $distDir -File |
+    Where-Object { $_.Name -match '^(msvcp140(_\w+)?|vcruntime140(_\w+)?|vcomp140|concrt140)\.dll$' }
+$runtimeVersions = @($rootRuntime | ForEach-Object { $_.VersionInfo.FileVersion.Split(' ')[0] } |
+    Sort-Object -Unique)
+if ($runtimeVersions.Count -ne 1) {
+    throw ("Dist root carries mixed MSVC runtime versions: " + (($rootRuntime | ForEach-Object {
+        "$($_.Name)=$($_.VersionInfo.FileVersion)" }) -join ', '))
+}
+Write-Output "    MSVC runtime at dist root: $($rootRuntime.Count) DLLs, all $($runtimeVersions[0])"
+& "$BuildVenvPath\Scripts\python.exe" "$RepoRoot\scripts\check_dist_dll_closure.py" $distDir
+if ($LASTEXITCODE -ne 0) {
+    throw "DLL closure check failed (exit $LASTEXITCODE) -- a shipped binary imports a VC runtime DLL the dist does not ship."
+}
+
 $distSizeBytes = (Get-ChildItem $distDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output ("    Dist folder size: {0:N1} MB" -f ($distSizeBytes / 1MB))
 
