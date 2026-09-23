@@ -58,6 +58,22 @@ foreach ($i in 1..2) {
     $bmp.Save((Join-Path $fixture "photo_$i.png"), [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
 }
+# Two visually distinct images the near-identical pass will NOT cluster. semantic_image (CLIP via
+# onnxruntime) only embeds residual images, so without these it "ran" with nothing to embed.
+# That is how the 2026-09-23 broken build still reported semantic_image in tracks_run while
+# onnxruntime could not load at all.
+foreach ($spec in @(@{ Name = "stripes"; Mod = 16 }, @{ Name = "checks"; Mod = 64 })) {
+    $bmp = New-Object System.Drawing.Bitmap 256, 256
+    for ($x = 0; $x -lt 256; $x++) {
+        for ($y = 0; $y -lt 256; $y += 2) {
+            $on = if ($spec.Name -eq "stripes") { ($x % $spec.Mod) -lt ($spec.Mod / 2) } else { ((($x / $spec.Mod) -bxor ($y / $spec.Mod)) -band 1) -eq 1 }
+            $c = if ($on) { [System.Drawing.Color]::FromArgb(255, 200, 30, 30) } else { [System.Drawing.Color]::FromArgb(255, 20, 20, 220) }
+            $bmp.SetPixel($x, $y, $c); $bmp.SetPixel($x, $y + 1, $c)
+        }
+    }
+    $bmp.Save((Join-Path $fixture "$($spec.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
 $para = ("The quarterly storage review covers every shared drive, archive volume, and backup " +
     "target the team maintains. Each section lists current usage, growth over the last period, " +
     "and the retention rule that applies. ") * 12
@@ -96,7 +112,7 @@ try {
         $scan = Invoke-RestMethod -Uri "$base/api/scan/status"
     } while ($scan.status -eq "running" -and (Get-Date) -lt $deadline)
     Check "scan completed (status=$($scan.status), error=$($scan.error))" ($scan.status -eq "completed")
-    Check "scan indexed the fixture files (files_written=$($scan.files_written))" ($scan.files_written -ge 4)
+    Check "scan indexed the fixture files (files_written=$($scan.files_written))" ($scan.files_written -ge 6)
 
     # --- 3. one AI analysis completes, no import-shaped skips ----------------------------------------
     $ai = Invoke-RestMethod -Method Post -Uri "$base/api/ai/analyze" -Headers $headers
@@ -121,7 +137,7 @@ try {
     # show up, so that wording is a failure here, not an expected degraded mode.
     # "is missing" = AIModelMissingError (a bundled ONNX model absent), also a packaging defect.
     $badSkips = @($ai.tracks_skipped | Where-Object {
-        $_.reason -match "unexpected error|No module named|ImportError|DLL load failed|isn't installed|is missing" })
+        $_.reason -match "unexpected error|No module named|ImportError|DLL load failed|isn't installed|is missing|failed to import" })
     Check "no AI pipeline skipped for an unexpected/import/missing-model error ($($badSkips.Count) found)" `
         ($badSkips.Count -eq 0)
     # Fresh installs ship no trained clutter_ranker.txt, so the ranker normally skips with
@@ -134,7 +150,8 @@ try {
         (($ai.tracks_run -contains "ranked_clutter_ordering") -or $rankerSkip.Count -eq 1)
     $trackImports = @{
         "near_identical_image"                = "imagehash -> scipy.fftpack"
-        "near_dup_document_and_version_chain" = "datasketch -> scipy.integrate"
+        "near_dup_document_and_version_chain" = "datasketch -> scipy.integrate; MiniLM via onnxruntime"
+        "semantic_image"                      = "CLIP via onnxruntime + faiss, on 2 residual images"
     }
     foreach ($track in $trackImports.Keys) {
         Check "AI track ran: $track ($($trackImports[$track]))" ($ai.tracks_run -contains $track)
@@ -143,7 +160,13 @@ try {
     if (-not $server.HasExited) { & taskkill.exe /PID $server.Id /T /F | Out-Null }
 }
 
-$serverOutput = (Get-Content "$work\serve_stdout.txt", "$work\serve_stderr.txt" -Raw -ErrorAction SilentlyContinue) -join "`n"
+# faiss's loader probes for optional CPU-specific builds (faiss.swigfaiss_avx2/_avx512) and logs a
+# ModuleNotFoundError before falling back to the generic build. The faiss-cpu Windows wheel ships
+# neither variant (only _swigfaiss.pyd; verified 2026-09-23 against the build venv and the
+# 2026-08-26 dist), so that exact probe is expected and is filtered out. Every other import
+# error still fails this check.
+$serverOutput = ((Get-Content "$work\serve_stdout.txt", "$work\serve_stderr.txt" -ErrorAction SilentlyContinue) |
+    Where-Object { $_ -notmatch "No module named 'faiss\.swigfaiss_avx(2|512)'" }) -join "`n"
 Check "server output has no ModuleNotFoundError/ImportError" `
     ($serverOutput -notmatch 'ModuleNotFoundError|ImportError|No module named')
 
