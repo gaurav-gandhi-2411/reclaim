@@ -12,6 +12,16 @@ class AIExtraNotInstalledError(ImportError):
     instead of a stack trace pointing at some third-party import line."""
 
 
+class AIPackageLoadError(AIExtraNotInstalledError):
+    """The optional package IS present but failed to import, e.g. a DLL load failure or a
+    missing module inside it. In a packaged (setup.exe) install this means a packaging defect,
+    not a missing extra, so it must not be reported as "isn't installed". Subclasses
+    `AIExtraNotInstalledError` so every existing skip/degrade handler keeps working unchanged;
+    only the message and the class are more precise. Found 2026-09-23: a build that shipped a
+    mismatched msvcp140.dll made `import onnxruntime` fail, and the app told users onnxruntime
+    "isn't installed" with no way to add it."""
+
+
 class AIModelMissingError(RuntimeError):
     """Raised when a bundled ONNX AI model file (CLIP/MiniLM, under `reclaim/ai/models/`) is
     missing or fails its pinned SHA256 integrity check — Wave 1 P0-B's replacement for the
@@ -64,6 +74,17 @@ def require_bundled_model(path: Path, *, expected_sha256: str, feature: str) -> 
 _MAX_IMAGE_PIXELS = 64_000_000
 
 
+def _is_package_absent(exc: ImportError, module_name: str) -> bool:
+    """True only when the requested module itself (or one of its parent packages) is missing.
+    Anything else, such as a DLL load failure or a *different* module missing inside the
+    package, means the package is present but broken. A ModuleNotFoundError without `name` is
+    treated as absent, since there is nothing to show it is anything else."""
+    if not isinstance(exc, ModuleNotFoundError):
+        return False
+    missing = exc.name
+    return missing is None or module_name == missing or module_name.startswith(missing + ".")
+
+
 def require(module_name: str, *, feature: str) -> ModuleType:
     """Imports `module_name` lazily, inside the function that actually needs it — never at
     module load time, so `import reclaim.ai.<anything>` always succeeds regardless of
@@ -79,6 +100,13 @@ def require(module_name: str, *, feature: str) -> ModuleType:
     try:
         module = importlib.import_module(module_name)
     except ImportError as exc:
+        if not _is_package_absent(exc, module_name):
+            raise AIPackageLoadError(
+                f"{feature} could not load the '{module_name}' package: it is present but "
+                f"failed to import ({type(exc).__name__}: {exc}). In an installed copy of "
+                "Reclaim this is a packaging defect (a missing or mismatched DLL/module), "
+                "not a missing extra -- please report it."
+            ) from exc
         raise AIExtraNotInstalledError(
             f"{feature} needs the optional '{module_name}' package, which isn't installed. "
             "From a source checkout: `uv sync --extra ai`. There is no way to add this to an "

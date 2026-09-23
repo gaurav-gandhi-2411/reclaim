@@ -30,6 +30,50 @@ def test_require_error_is_an_import_error_subclass() -> None:
     assert issubclass(AIExtraNotInstalledError, ImportError)
 
 
+@pytest.mark.parametrize(
+    "raised",
+    [
+        ImportError("DLL load failed while importing onnxruntime_pybind11_state"),
+        ModuleNotFoundError("No module named 'scipy.integrate'", name="scipy.integrate"),
+    ],
+)
+def test_require_reports_present_but_broken_package_as_load_error(
+    monkeypatch: pytest.MonkeyPatch, raised: ImportError
+) -> None:
+    """2026-09-23: a packaged build whose onnxruntime failed to load (mismatched msvcp140.dll)
+    told users onnxruntime "isn't installed". A package that is present but fails to import
+    must say so, with the real cause, and must still be an AIExtraNotInstalledError so every
+    existing skip handler keeps working."""
+
+    def _boom(name: str, *args: object, **kwargs: object) -> object:
+        raise raised
+
+    monkeypatch.setattr(importlib, "import_module", _boom)
+    with pytest.raises(_optional.AIPackageLoadError) as info:
+        require("onnxruntime", feature="CLIP semantic image embeddings")
+    message = str(info.value)
+    assert "failed to import" in message
+    assert str(raised) in message
+    assert "isn't installed" not in message
+    assert isinstance(info.value, AIExtraNotInstalledError)
+
+
+@pytest.mark.parametrize(
+    ("requested", "missing_name"),
+    [("cv2", "cv2"), ("PIL.Image", "PIL"), ("cv2", None)],
+)
+def test_require_reports_genuinely_absent_package_as_not_installed(
+    monkeypatch: pytest.MonkeyPatch, requested: str, missing_name: str | None
+) -> None:
+    def _absent(name: str, *args: object, **kwargs: object) -> object:
+        raise ModuleNotFoundError(f"No module named {missing_name!r}", name=missing_name)
+
+    monkeypatch.setattr(importlib, "import_module", _absent)
+    with pytest.raises(AIExtraNotInstalledError, match="isn't installed") as info:
+        require(requested, feature="x")
+    assert not isinstance(info.value, _optional.AIPackageLoadError)
+
+
 def test_require_returns_the_real_module_when_present() -> None:
     module = require("os", feature="a stdlib sanity check")
     assert module is __import__("os")
