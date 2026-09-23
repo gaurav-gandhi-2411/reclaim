@@ -69,6 +69,23 @@ investigate before retrying, don't just re-run.
 2. **Run `packaging/test_packaged_safe_mode.ps1`** against the fresh dist folder — the existing
    safe-mode-survives-packaging proof, unaffected by this change but still the right gate before
    calling a build releasable.
+2a. **Run `packaging/test_packaged_serve.ps1`** against the same dist folder: `reclaim.exe serve`
+   starts, one scan completes through `POST /api/scan`, and one AI analysis completes with no
+   import-shaped pipeline skip (imagehash → scipy.fftpack, datasketch → scipy.integrate,
+   lightgbm → scipy.sparse/narwhals). **Required since 2026-09-23**, because the build again
+   excludes named numpy/scipy test suites (`packaging/nofollow_allowlist.txt`). The static
+   `scripts/check_nofollow_allowlist.py` gate (run automatically in build Step 2) sees Python
+   source only, so this frozen run is the half that catches an import made from inside a
+   `.pyd`. A failure here means the allow-list broke a runtime import: fix the list, never
+   the test. Negative control (2026-09-23): with `scipy\integrate\_quadpack.pyd` removed from a
+   copy of the dist, this script fails. Without its skip-reason checks it would have passed,
+   because `ai_orchestration` reports the import failure as an "isn't installed" skip and still
+   finishes with status `completed`.
+2b. **Read `packaging\build\compile_breakdown\summary.md`** (written by the build script from the
+   ccache log): per-package gcc minutes, cache hits vs misses. Copy it under
+   `reports/build-timing/<date>-<label>/` if the build is the one being shipped, so build-time
+   claims have a committed source. `packaging\build\nuitka-report.xml` is Nuitka's own
+   compilation report (module list, DLLs, Python-level timing; no per-file gcc time).
 3. **Run the fresh-Windows-VM gate** (a real machine/VM only GG can do, per the standing
    AUTONOMY MANDATE's escalation list — needs a clean Windows install with no Python, no dev
    tools, nothing this session's own testing already touched). This is the actual bar for
