@@ -1,0 +1,89 @@
+# Named packages/modules excluded from the Nuitka build via --nofollow-import-to=<name>.
+#
+# One dotted name per line; `#` starts a comment. NEVER a glob -- build_installer.ps1 and
+# scripts/check_nofollow_allowlist.py both reject `*`/`?`/`[`. The last blanket
+# `*.tests`/`*.testing` exclusion also caught structlog.testing, jinja2.tests, and
+# scipy._external.array_api_extra.testing, which runtime code imports unconditionally, and
+# the packaged app crashed on every invocation (packaging/RELEASE_RUNBOOK.md).
+#
+# Admission rule, enforced before every build by scripts/check_nofollow_allowlist.py against
+# the build venv's site-packages: nothing outside this list (other than test code: conftest.py,
+# test_*.py) may import an entry, statically or as a dotted string literal. Every entry must
+# also exist, so a numpy/scipy upgrade that moves a test dir fails loudly instead of the
+# exclusion silently no longer applying.
+#
+# Why these: reports/build-timing/2026-09-23-attempt2-partial/summary.md -- numpy/scipy test
+# suites measured at 84.3 min of the first 279.6 min of C compile (204 numpy + 117 scipy test
+# modules), plus 270 not-yet-compiled scipy test modules (411.6 MB of generated C).
+#
+# Deliberately NOT listed: numpy.testing (numpy/__init__.py's lazy __getattr__ imports it),
+# scipy._lib._testutils, structlog.testing, jinja2.tests, scipy._external.array_api_extra.testing
+# -- all imported by runtime code.
+
+# Reviewed dynamic (f-string) sites whose static prefix could build an excluded name. Keyed by
+# module + prefix, not line number. Reviewed 2026-09-23 against the build venv:
+#   scipy/__init__.py, scipy/sparse/__init__.py: __getattr__ imports f'<pkg>.{name}' only for
+#     name in a fixed `submodules` list (no 'tests').
+#   numpy/lib/__init__.py: f'numpy.lib.{attr} is now private...' is an error message, not an
+#     import.
+#   scipy/_lib/deprecation.py: sub_package/module come from scipy's own deprecated-namespace
+#     shims (literal arguments such as "linalg"), never a tests package.
+@reviewed-dynamic scipy scipy.
+@reviewed-dynamic scipy.sparse scipy.sparse.
+@reviewed-dynamic numpy.lib numpy.lib.
+@reviewed-dynamic scipy._lib.deprecation scipy.
+
+numpy.conftest
+numpy._core.tests
+numpy._pyinstaller.tests
+numpy.f2py.tests
+numpy.fft.tests
+numpy.lib.tests
+numpy.linalg.tests
+numpy.ma.tests
+numpy.matrixlib.tests
+numpy.polynomial.tests
+numpy.random.tests
+numpy.testing.tests
+numpy.tests
+numpy.typing.tests
+
+scipy.conftest
+scipy._lib.tests
+scipy.cluster.hierarchy.tests
+scipy.cluster.vq.tests
+scipy.constants.tests
+scipy.datasets.tests
+scipy.differentiate.tests
+scipy.fft._duccfft.tests
+scipy.fft.tests
+scipy.fftpack.tests
+scipy.integrate._ivp.tests
+scipy.integrate.tests
+scipy.interpolate.tests
+scipy.io._harwell_boeing.tests
+scipy.io.arff.tests
+scipy.io.matlab.tests
+scipy.io.tests
+scipy.linalg.tests
+scipy.ndimage.tests
+scipy.odr.tests
+scipy.optimize._trustregion_constr.tests
+scipy.optimize.tests
+scipy.signal.tests
+scipy.sparse.csgraph.tests
+scipy.sparse.linalg._dsolve.tests
+scipy.sparse.linalg._eigen.arpack.tests
+scipy.sparse.linalg._eigen.lobpcg.tests
+scipy.sparse.linalg._eigen.tests
+scipy.sparse.linalg._isolve.tests
+scipy.sparse.linalg.tests
+scipy.sparse.tests
+scipy.spatial.tests
+scipy.spatial.transform.tests
+scipy.special.tests
+# Not a test suite: scipy's offline script that regenerates special-function tables. Listed
+# because hyp2f1_data.py imports scipy.special.tests.test_hyp2f1; nothing at runtime imports it
+# (only scipy/conftest.py and scipy tests reference it).
+scipy.special._precompute
+scipy.stats.tests
