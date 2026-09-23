@@ -81,6 +81,14 @@ investigate before retrying, don't just re-run.
    copy of the dist, this script fails. Without its skip-reason checks it would have passed,
    because `ai_orchestration` reports the import failure as an "isn't installed" skip and still
    finishes with status `completed`.
+   **2026-09-23 finding, caught by this step:** the first allow-list build shipped winrt's 14.29
+   `msvcp140.dll` at the dist root and no `msvcp140_1.dll`, so `import onnxruntime` failed in the
+   frozen exe and both CLIP and MiniLM tracks were dead (reported as "onnxruntime isn't
+   installed"). The build now copies one consistent VC++ runtime set (msvcp140/_1/_2,
+   vcruntime140/_1, vcomp140, concrt140) from System32 into the dist root, fails on mixed
+   versions, and runs `scripts/check_dist_dll_closure.py`, which fails if any shipped binary
+   imports a VC runtime DLL missing from the root. The build machine therefore needs a current
+   Microsoft Visual C++ Redistributable (x64) installed.
 2b. **Read `packaging\build\compile_breakdown\summary.md`** (written by the build script from the
    ccache log): per-package gcc minutes, cache hits vs misses. Copy it under
    `reports/build-timing/<date>-<label>/` if the build is the one being shipped, so build-time
