@@ -64,6 +64,56 @@ def test_upsert_and_full_inventory_roundtrip(index: ScanIndex) -> None:
     assert by_path[Path("C:/Data/b.txt")].is_dir is True
 
 
+def test_close_checkpoints_wal_even_when_not_the_last_connection(tmp_path: Path) -> None:
+    """Regression test for a real, month-old 4.85GB WAL found stuck against a 3GB index
+    (2026-09-23 audit): a concurrent reader (e.g. the dashboard's `/api/scan/status` poll)
+    holding a snapshot open while a scan writes pins the WAL at whatever size accumulated during
+    that window. SQLite automatically checkpoints when the *last* connection to a database
+    closes, which is why a naive test (only ever one connection open) passes regardless of
+    whether `close()` does anything itself. That's not the shape of the real incident: this app
+    opens many short-lived `ScanIndex` connections concurrently (dashboard polls, scan writer),
+    so a given `close()` frequently is *not* the last one open, and SQLite's automatic
+    last-close checkpoint never fires for it at all. This test holds a second, unrelated
+    connection open across `idx.close()` to rule that automatic behavior out, isolating what
+    `close()` itself is responsible for.
+    """
+    db_path = tmp_path / "index.sqlite3"
+    idx = ScanIndex(db_path)
+    wal_path = db_path.with_name(db_path.name + "-wal")
+
+    blocking_reader = sqlite3.connect(db_path)
+    blocking_reader.execute("BEGIN")
+    blocking_reader.execute("SELECT * FROM files LIMIT 1").fetchall()
+
+    for batch in range(20):
+        records = [_record(f"C:/Data/batch{batch}/file{i}.txt", size_bytes=i) for i in range(500)]
+        idx.upsert_records(records, scanned_at=float(batch))
+
+    grown_wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    assert grown_wal_size > 1_000_000, (
+        "test setup didn't reproduce WAL growth -- blocking reader isn't pinning the checkpoint"
+    )
+
+    # Release the read-blocking transaction, but keep *a* connection open (a second, unrelated
+    # one) so idx.close() below is never the last connection to this database -- SQLite's own
+    # automatic checkpoint-on-last-close can't be what does the reclaiming.
+    blocking_reader.execute("COMMIT")
+    keep_alive = sqlite3.connect(db_path)
+    keep_alive.execute("SELECT 1").fetchall()
+
+    idx.close()
+
+    wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    assert wal_size < grown_wal_size // 2, (
+        f"WAL file still {wal_size} bytes (grew to {grown_wal_size}) after idx.close() -- "
+        "expected close() to checkpoint it itself, independent of SQLite's last-connection-"
+        "closes auto-checkpoint (ruled out by keep_alive staying open)"
+    )
+
+    blocking_reader.close()
+    keep_alive.close()
+
+
 def test_upsert_overwrites_on_conflict(index: ScanIndex) -> None:
     index.upsert_records([_record("C:/Data/a.txt", size_bytes=10)], scanned_at=1.0)
     index.upsert_records([_record("C:/Data/a.txt", size_bytes=999)], scanned_at=2.0)

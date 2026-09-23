@@ -29,6 +29,34 @@ from reclaim.safety import SafetyValidator
 _CRASH_EXIT_CODE = 9
 _NO_CRASH_FIRED_EXIT_CODE = 2
 
+# BO2 (2026-09-23 audit): a handful of known Windows NTSTATUS codes the OS itself uses to
+# terminate a child process before it ever runs the harness's own code -- distinct from both a
+# genuine crash-hook fire (_CRASH_EXIT_CODE) and an in-process Python failure (typically 1).
+# Measured directly: 0/50 in isolation for the specific test that surfaced this, with every
+# real occurrence coinciding with heavy concurrent process creation elsewhere on the machine --
+# not reproducible from this harness or from reclaim's own code (neither uses a Win32 thread
+# pool anywhere on this call path). Decoded here so a recurrence reads as "the OS killed the
+# child" rather than looking like a crash-safety product defect -- see docs/AUDIT-2026-08.md's
+# BO2 section for the full investigation.
+_KNOWN_OS_TERMINATION_CODES: dict[int, str] = {
+    0xC000070A: (
+        "STATUS_THREADPOOL_HANDLE_EXCEPTION -- a Win32 thread-pool wait callback threw and the "
+        "OS terminated the process before it ran. Not raised by this harness or by reclaim's "
+        "own code on this call path. Re-run this test alone, away from other concurrent "
+        "process-heavy work, before treating this as a real regression."
+    ),
+}
+
+
+def _decode_returncode(returncode: int) -> str:
+    """Renders a raw subprocess return code for a failure message, expanding any known
+    OS-level termination code (see `_KNOWN_OS_TERMINATION_CODES`) instead of leaving it as an
+    unexplained large integer."""
+    unsigned = returncode & 0xFFFFFFFF
+    known = _KNOWN_OS_TERMINATION_CODES.get(unsigned)
+    return f"{returncode} (0x{unsigned:08X} -- {known})" if known else str(returncode)
+
+
 _HARNESS_PATH = Path(__file__).parent / "_recovery_crash_harness.py"
 _NOW = 1_700_000_000.0
 _DAY = 86400.0
@@ -63,7 +91,7 @@ def _assert_hard_crash(result: subprocess.CompletedProcess[str]) -> None:
     """
     assert result.returncode == _CRASH_EXIT_CODE, (
         f"expected the crash hook to fire (exit {_CRASH_EXIT_CODE}), got "
-        f"{result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        f"{_decode_returncode(result.returncode)}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
 
 
@@ -122,6 +150,24 @@ def _apply_items(tmp_path: Path, count: int) -> list[dict[str, object]]:
         path.write_bytes(content)
         items.append({"path": str(path), "size_bytes": len(content)})
     return items
+
+
+def test_decode_returncode_expands_known_os_termination_code() -> None:
+    decoded = _decode_returncode(3221227274)  # 0xC000070A, unsigned
+    assert "0xC000070A" in decoded
+    assert "STATUS_THREADPOOL_HANDLE_EXCEPTION" in decoded
+
+
+def test_decode_returncode_handles_signed_representation_of_same_code() -> None:
+    # Some platforms/paths may surface this as the signed 32-bit two's-complement value instead
+    # of the unsigned NTSTATUS -- both must decode identically.
+    decoded = _decode_returncode(-1073740022)
+    assert "STATUS_THREADPOOL_HANDLE_EXCEPTION" in decoded
+
+
+def test_decode_returncode_passes_through_unknown_code_unexpanded() -> None:
+    decoded = _decode_returncode(9)
+    assert decoded == "9"
 
 
 # --- apply: crash simulated via a genuine child-process hard kill ------------------------------
@@ -1104,7 +1150,7 @@ def test_second_batch_blocked_on_lock_during_hard_crash_writes_nothing_and_unblo
 
     assert proc.returncode == _CRASH_EXIT_CODE, (
         f"expected the crash hook to fire (exit {_CRASH_EXIT_CODE}), got "
-        f"{proc.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        f"{_decode_returncode(proc.returncode)}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     )
 
     assert second_batch_thread is not None
