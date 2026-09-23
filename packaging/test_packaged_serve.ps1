@@ -137,7 +137,7 @@ try {
     # show up, so that wording is a failure here, not an expected degraded mode.
     # "is missing" = AIModelMissingError (a bundled ONNX model absent), also a packaging defect.
     $badSkips = @($ai.tracks_skipped | Where-Object {
-        $_.reason -match "unexpected error|No module named|ImportError|DLL load failed|isn't installed|is missing" })
+        $_.reason -match "unexpected error|No module named|ImportError|DLL load failed|isn't installed|is missing|failed to import" })
     Check "no AI pipeline skipped for an unexpected/import/missing-model error ($($badSkips.Count) found)" `
         ($badSkips.Count -eq 0)
     # Fresh installs ship no trained clutter_ranker.txt, so the ranker normally skips with
