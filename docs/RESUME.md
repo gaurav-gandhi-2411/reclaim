@@ -3,7 +3,48 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## PAUSED 2026-09-23 15:12 IST — read this first, it supersedes the sections below where they differ
+## WAITING ON MERGE 2026-09-23 ~18:50 IST — read this first, it supersedes everything below
+
+**State at this checkpoint (VERIFIED unless marked):** `origin/main` = `e6d6c3f` (#105), CI green
+on it (ci, eval, scale-nightly, pages all success). `verify.py` on
+`e6d6c3f`: 1228 passed, 9 skipped, 94.56% coverage. Installer is still the stale 2026-08-26 build
+(`packaging\dist\reclaim-setup.exe.buildsha` = `157be80`).
+
+**Done this session:**
+1. **Step 1 (measure before the build dir is wiped):** the stopped attempt-2 build's ccache log was
+   parsed into `reports/build-timing/2026-09-23-attempt2-partial/` (summary, per-file CSV,
+   PROVENANCE). First 279.6 min of C compile: scipy 80.1, numpy 58.2, onnxruntime 30.1, narwhals
+   16.2, pydantic 14.5. numpy+scipy test suites account for 84.1 min of that. Projected full cold
+   C stage: ~494 min (ESTIMATED; 862 files were never compiled). This supersedes the unsourced
+   "~150 of ~197 min is scipy" figure.
+2. **Step 2: PR #106 (draft)** `fix/nuitka-build-test-allowlist`. Named allow-list of 50 test
+   packages, a static import gate (with an f-string review mechanism added after an adversarial
+   verifier found that gap), `--report`, a post-build breakdown step, and a new frozen smoke test
+   `packaging/test_packaged_serve.ps1` (serve + scan + AI). Expected saving ~199 min cold (84
+   measured + 115 estimated). scipy **cannot be dropped**: imagehash.phash → `scipy.fftpack`,
+   datasketch (top-level `lsh.py`) → `scipy.integrate`, lightgbm.basic → `scipy.sparse`
+   (+ narwhals). Narrowing `--include-package=scipy` to those subpackages is a possible follow-up,
+   not done (riskier: scipy's C extensions import each other in ways static follow may miss).
+3. **Step 5 cleanup:** uv prune 1.6 GiB, pip purge 2.19 GB, npm 1.31 GB, conda 0.38 GB, HF
+   detached revisions 2.14 GB (0 left; all 70 HF repos were accessed within the last 3 days, so
+   the rest were only listed), %TEMP% >7d ~0.1 GB (1,941 items; guarded venvs/.git kept),
+   orphaned worktree `agent-ad5d7026940ab1ee3` removed (0.39 GiB; every file's content matched git
+   history or the LFS oids except a generated pytest-results.xml). Docker builder prune was
+   skipped because the daemon was not running.
+   **Open, needs GG:** C: free fell from 70.17 GiB (18:07) to ~34.9 GiB (~18:25) and then
+   stabilized, from something that is not this session's work and could not be attributed. Ruled
+   out: WSL (only active 17:56-17:57), pagefile/hiberfil, the Reclaim vault, and every >200 MB
+   file written anywhere readable. Candidates that need admin to inspect: Windows Search index
+   (SearchIndexer.exe wrote 29.6 GB since boot) and VSS shadow storage.
+
+**Next, after GG merges #106:** fast-forward main, confirm HEAD == origin/main with CI green, then
+rebuild with `pwsh packaging/build_installer.ps1`. It's a warm-ccache build, but the allow-list may
+change compile flags and invalidate the cache (BELIEVED), so budget ~5h. Then
+`test_packaged_serve.ps1` + `test_packaged_safe_mode.ps1`, and the Step 4 items (fresh install, two
+scans with DB/WAL sizes, dogfood tier-1, HKCU uninstall key) and Step 6 (`Stage-AC3Trip.ps1`),
+all unchanged from the section below.
+
+## PAUSED 2026-09-23 15:12 IST — superseded by the section above where they differ
 
 **Merged since the sections below were written**: #102 (crash-harness, BO2/BO3), #103 (WAL fix),
 #104 (this file's previous revision). `main` = `7ac212c`, CI green on that SHA.
