@@ -322,6 +322,17 @@ class ScanIndex:
         # manifest/vault, which stay on their own separate, still-fsync-durable write paths).
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # 2026-09-23 audit finding: a single long scan session commits enough WAL traffic to
+        # cross `wal_autocheckpoint`'s default 1000-page threshold many times over, but a PASSIVE
+        # auto-checkpoint (what that threshold triggers) reclaims frames logically without ever
+        # shrinking the *file* back down -- so the WAL's on-disk size permanently reflects its
+        # all-time peak, not its current content. Found stuck at 4.85GB (vs. a 3GB main DB) on a
+        # real, month-old index from one big scan, long after every frame in it had already been
+        # checkpointed (confirmed: `wal_checkpoint(TRUNCATE)` against it returned 0 log_frames).
+        # `journal_size_limit` caps how large the file is allowed to remain after SQLite's own
+        # checkpoints; `close()` below adds an explicit TRUNCATE checkpoint so a session that
+        # never crosses the threshold still leaves a near-zero WAL on disk when it ends.
+        self._conn.execute("PRAGMA journal_size_limit=67108864")  # 64MB
         self._conn.execute(_SCHEMA)
         self._conn.execute(_INACCESSIBLE_SCHEMA)
         self._ensure_name_and_path_lower_columns()
@@ -375,6 +386,10 @@ class ScanIndex:
         self.close()
 
     def close(self) -> None:
+        # TRUNCATE checkpoint reclaims whatever the session's writes left in the WAL (see the
+        # `journal_size_limit` comment in __init__) -- without this, closing never shrinks the
+        # file, only SQLite's own automatic checkpoints do, and those don't truncate either.
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self._conn.close()
 
     def upsert_records(self, records: Iterable[FileRecord], *, scanned_at: float) -> int:

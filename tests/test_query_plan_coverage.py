@@ -245,6 +245,12 @@ _CASES: dict[str, Case] = {
         reason="PRAGMA table_info + ALTER TABLE ADD COLUMN — schema introspection/DDL, not a "
         "data query; no SEARCH/SCAN plan applies",
     ),
+    "close": Case(
+        action=None,
+        expect_index=False,
+        reason="PRAGMA wal_checkpoint(TRUNCATE) — a checkpoint operation, not a data query over "
+        "`files`; no SEARCH/SCAN plan applies (2026-09-23 WAL-size fix)",
+    ),
     # --- P0-5: inaccessible_paths -- a deliberately small, bounded table (a real scan skips a
     # handful to a few hundred paths, never millions -- see index.py's own module comment above
     # `_INACCESSIBLE_SCHEMA`), so its production call sites (`api.service.build_summary`,
