@@ -3,6 +3,75 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## PAUSED 2026-09-23 15:12 IST — read this first, it supersedes the sections below where they differ
+
+**Merged since the sections below were written**: #102 (crash-harness, BO2/BO3), #103 (WAL fix),
+#104 (this file's previous revision). `main` = `7ac212c`, CI green on that SHA.
+
+**Rebuild status: STOPPED deliberately, not finished.** Two attempts today:
+1. Attempt 1 (from pre-#103 `7003525`): killed on instruction — it lacked the WAL fix.
+2. Attempt 2 (from `7ac212c`, includes the WAL fix): started 10:12:34, stopped cleanly at 15:12:45
+   (~5h00m) because the laptop was being closed — a sleep would have frozen it mid-compile and made
+   its wall-clock meaningless. Still in Step 5 (Nuitka C compile) at stop; no `entry_point.dist`, no
+   new installer. `packaging\dist\reclaim-setup.exe` is still the stale 2026-08-26 build
+   (`157be80`). Process tree confirmed fully gone after stop.
+
+**Before restarting the build, do these two things, in order:**
+1. **Measure the per-package compile breakdown from the kept partial output.**
+   `packaging\build\entry_point.build\` holds 2,214 `.o` files covering ~5h of serial
+   (`--jobs=1`) compilation. With serial compile, sorting `.o` files by mtime and diffing gives
+   per-file compile time; group by module prefix (`module.scipy.*`, `module.faiss.*`, ...). Report
+   ccache hits separately (near-zero gaps). **The next build's Step 5 wipes this directory
+   unconditionally — measure first or the data is lost.** This supersedes the W2/V4 "~150 of ~197
+   min scipy" figure, which was a prior session's spot-sampled, never-committed chat number
+   (BELIEVED, not a sourced measurement).
+2. **Decide the ccache question for the timing comparison.** The ccache under
+   `%LOCALAPPDATA%\Nuitka` is now warm with ~5h of compiled objects, so a plain restart will be
+   faster for reasons unrelated to Defender. For a fair "what did the Defender exclusion buy"
+   number (vs. the runbook's 180.4 / 349.3 min cold builds), either clear the ccache first or
+   report the restart explicitly as a warm-cache build — not as a cold-build comparison.
+
+**Timing facts to carry into the report:**
+- Defender exclusions VERIFIED active by GG (Get-MpPreference lists
+  `C:\Users\gaura\AppData\Local\Nuitka` and `C:\Users\gaura\ml-projects\reclaim\packaging`). The
+  build script's own Step 4 still logs SKIPPED (it runs unelevated) — that's independent and
+  harmless.
+- Contention caveat: at attempt 2's start, another concurrent session had heavy processes running
+  (`pip install -e .[tes...]` in `oss-contrib\adk-python-verify`, and `find / -iname
+  merge_gate.py`) — not this session's, deliberately left untouched. Attempt 2 had already exceeded
+  ~3-3.5h without finishing; that is NOT evidence the exclusion bought nothing, given the
+  contention and an unfinished run.
+
+**Then resume BQ3/BQ4 unchanged** (all pre-approved by GG): rebuild from `origin/main` → fresh
+install to the gaura profile (not the stale `AppData\Local\Programs\Reclaim\` dir) → two
+consecutive scans with DB+WAL sizes after each (WAL must stay bounded, not merely checkpointed
+once) → dogfood scan/apply, tier-1 via recycle bin/vault only, found vs. applied, any wrong
+candidate = product PR → HKCU uninstall-registration check → `Stage-AC3Trip.ps1`, Step -3 ==
+`origin/main`, one-line ReclaimSmokeTest config check, trip instructions (human list: did a toast
+render). One final report: build wall-clock vs prior, C: free before/after, GiB per item C1/C2/C3,
+WAL sizes across scans, PRs in merge order, anything needing GG.
+
+**Queued AFTER BQ3/BQ4 — plan only, do not implement without GG's go-ahead:**
+- Build-time fix: exclude test packages from Nuitka's follow set via a **named allow-list proven
+  unused at runtime, never a glob** — `RELEASE_RUNBOOK.md` records that the earlier blanket
+  `--nofollow-import-to=*.tests`/`*.testing` broke `structlog.testing`, `jinja2.tests`, and
+  `scipy._external.array_api_extra.testing` (runtime imports) and crashed the packaged app on every
+  invocation. Plan must include: (a) a static check that fails the build if any excluded package is
+  imported by non-test code; (b) a frozen smoke test that starts `reclaim.exe serve` and exercises
+  one scan; (c) whether scipy is needed at runtime at all, and via which import chain; (d) expected
+  build-time impact, from the fresh per-package measurement above.
+- Add Nuitka's `--report=<path>.xml` to `build_installer.ps1` so the per-module breakdown is a
+  first-class build output. **Unverified**: the report may record only Python-level per-module
+  optimization time, not per-file gcc C-compile time (where the scipy/faiss hours are). Check the
+  first report it produces; if C-compile timing is absent, keep the `.o`-mtime method as a scripted
+  post-build step.
+
+**Other session outcomes (detail in the sections below):** C1 deleted top-level `dist/` (671MB) —
+nothing else qualified once measured; the orphaned `.claude\worktrees\agent-ad5d7026940ab1ee3`
+(412MB, no git metadata) left in place for manual review; all 96 `[gone]` branches refused
+`git branch -d` (squash-merge history; `-D` not used per instruction). Real vault's 4.85GB WAL
+checkpointed to 0 manually. C2 (native cache cleanup) not yet run.
+
 ## What happened before this checkpoint
 
 The machine restarted at 2026-09-23 06:47-06:50. **Corrected framing, VERIFIED**: this was a
