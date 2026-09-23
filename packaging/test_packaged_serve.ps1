@@ -107,6 +107,11 @@ try {
         Start-Sleep -Seconds 1
         $ai = Invoke-RestMethod -Uri "$base/api/ai/status"
     }
+    # A response missing these fields would make every skip/track assertion below vacuous
+    # (@($null | Where-Object ...) has Count 0), so assert the shape first.
+    $aiFields = $ai.PSObject.Properties.Name
+    Check "AI status response carries tracks_run and tracks_skipped" `
+        (($aiFields -contains "tracks_run") -and ($aiFields -contains "tracks_skipped"))
     Write-Host ("    tracks_run: " + ($ai.tracks_run -join ", "))
     foreach ($s in $ai.tracks_skipped) { Write-Host "    skipped: $($s.track) -- $($s.reason)" }
     Check "AI analysis completed (status=$($ai.status), error=$($ai.error))" ($ai.status -eq "completed")

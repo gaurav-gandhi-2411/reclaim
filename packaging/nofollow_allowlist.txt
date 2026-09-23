@@ -20,6 +20,19 @@
 # scipy._lib._testutils, structlog.testing, jinja2.tests, scipy._external.array_api_extra.testing
 # -- all imported by runtime code.
 
+# Reviewed dynamic (f-string) sites whose static prefix could build an excluded name. Keyed by
+# module + prefix, not line number. Reviewed 2026-09-23 against the build venv:
+#   scipy/__init__.py, scipy/sparse/__init__.py: __getattr__ imports f'<pkg>.{name}' only for
+#     name in a fixed `submodules` list (no 'tests').
+#   numpy/lib/__init__.py: f'numpy.lib.{attr} is now private...' is an error message, not an
+#     import.
+#   scipy/_lib/deprecation.py: sub_package/module come from scipy's own deprecated-namespace
+#     shims (literal arguments such as "linalg"), never a tests package.
+@reviewed-dynamic scipy scipy.
+@reviewed-dynamic scipy.sparse scipy.sparse.
+@reviewed-dynamic numpy.lib numpy.lib.
+@reviewed-dynamic scipy._lib.deprecation scipy.
+
 numpy.conftest
 numpy._core.tests
 numpy._pyinstaller.tests

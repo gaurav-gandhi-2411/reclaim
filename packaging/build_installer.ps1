@@ -241,7 +241,7 @@ if ($LASTEXITCODE -ne 0) {
         "imported by non-test code, or an entry no longer exists. Fix the list; never bypass.")
 }
 $nofollowEntries = @(Get-Content $nofollowAllowlistPath |
-    ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ })
+    ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_ -and -not $_.StartsWith('@') })
 foreach ($entry in $nofollowEntries) {
     # Belt-and-braces with the Python check: never hand Nuitka a wildcard from this file.
     if ($entry -match '[\*\?\[\]]') { throw "Glob in nofollow allow-list: '$entry'" }

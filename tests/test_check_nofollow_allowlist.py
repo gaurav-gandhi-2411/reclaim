@@ -70,6 +70,37 @@ def test_runtime_importer_of_excluded_name_fails(tmp_path: Path, site: Path, bod
     assert _run(tmp_path, ["pkg.tests"]) == 1
 
 
+def test_unreviewed_fstring_that_could_build_excluded_name_fails(
+    tmp_path: Path, site: Path
+) -> None:
+    _write(
+        site,
+        "pkg/lazy.py",
+        "import importlib\ndef get(n):\n    importlib.import_module(f'pkg.{n}')\n",
+    )
+    assert _run(tmp_path, ["pkg.tests"]) == 1
+
+
+def test_reviewed_fstring_site_passes_and_stale_review_fails(tmp_path: Path, site: Path) -> None:
+    _write(
+        site,
+        "pkg/lazy.py",
+        "import importlib\ndef get(n):\n    importlib.import_module(f'pkg.{n}')\n",
+    )
+    assert _run(tmp_path, ["pkg.tests", "@reviewed-dynamic pkg.lazy pkg."]) == 0
+    (site / "pkg" / "lazy.py").write_text("X = 1\n", encoding="utf-8")
+    assert _run(tmp_path, ["pkg.tests", "@reviewed-dynamic pkg.lazy pkg."]) == 1
+
+
+def test_fstring_with_unrelated_prefix_ignored(tmp_path: Path, site: Path) -> None:
+    _write(site, "pkg/msg.py", "def m(x):\n    return f'other.thing.{x}'\n")
+    assert _run(tmp_path, ["pkg.tests"]) == 0
+
+
+def test_unknown_directive_rejected(tmp_path: Path, site: Path) -> None:
+    assert _run(tmp_path, ["pkg.tests", "@skip-everything"]) == 1
+
+
 def test_importer_in_sibling_package_fails(tmp_path: Path, site: Path) -> None:
     _write(site, "other/__init__.py", "from pkg.tests.helpers import thing\n")
     assert _run(tmp_path, ["pkg.tests"]) == 1
