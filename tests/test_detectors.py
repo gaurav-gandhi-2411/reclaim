@@ -387,6 +387,72 @@ def test_windows_temp_candidates_proposed_when_temp_env_var_was_short_form(
     assert (long_temp_dir / "scratch.tmp") in _paths(result)
 
 
+_TEMP = "C:/Users/gg/AppData/Local/Temp"
+_WEEK_HOURS = 24.0 * 7
+
+
+def _temp_candidates(index: ScanIndex) -> set[Path]:
+    return _paths(
+        detect_temp_and_browser_caches(
+            index,
+            cache_paths=[],
+            temp_roots=[_TEMP],
+            min_temp_root_age_hours=_WEEK_HOURS,
+            now=_NOW,
+        )
+    )
+
+
+def test_temp_dir_with_old_own_mtime_but_recently_written_contents_is_not_proposed(
+    index: ScanIndex,
+) -> None:
+    """Dogfood finding 2026-09-24: node-compile-cache's own directory mtime was 26.9 days old
+    while files inside were rewritten 8 hours earlier (NTFS doesn't propagate nested writes to
+    the parent's mtime). The age guard must look at the whole subtree."""
+    _seed(
+        index,
+        _record(f"{_TEMP}/node-compile-cache", is_dir=True, mtime=_NOW - 27 * _DAY),
+        _record(f"{_TEMP}/node-compile-cache/v22", is_dir=True, mtime=_NOW - 27 * _DAY),
+        _record(f"{_TEMP}/node-compile-cache/v22/abc.bin", mtime=_NOW - 3600),
+    )
+    assert Path(f"{_TEMP}/node-compile-cache") not in _temp_candidates(index)
+
+
+def test_temp_dir_whose_whole_subtree_is_old_is_still_proposed(index: ScanIndex) -> None:
+    _seed(
+        index,
+        _record(f"{_TEMP}/old-build", is_dir=True, mtime=_NOW - 30 * _DAY),
+        _record(f"{_TEMP}/old-build/a.obj", mtime=_NOW - 29 * _DAY),
+    )
+    assert Path(f"{_TEMP}/old-build") in _temp_candidates(index)
+
+
+def test_temp_file_child_age_uses_its_own_mtime(index: ScanIndex) -> None:
+    _seed(
+        index,
+        _record(f"{_TEMP}/stale.tmp", mtime=_NOW - 10 * _DAY),
+        _record(f"{_TEMP}/fresh.tmp", mtime=_NOW - 3600),
+    )
+    found = _temp_candidates(index)
+    assert Path(f"{_TEMP}/stale.tmp") in found
+    assert Path(f"{_TEMP}/fresh.tmp") not in found
+
+
+def test_subtree_newest_mtime_does_not_leak_into_sibling_prefix(index: ScanIndex) -> None:
+    """`cache` must not see `cache2`'s fresh file -- the prefix range is path-segment aware."""
+    _seed(
+        index,
+        _record(f"{_TEMP}/cache", is_dir=True, mtime=_NOW - 30 * _DAY),
+        _record(f"{_TEMP}/cache/old.bin", mtime=_NOW - 30 * _DAY),
+        _record(f"{_TEMP}/cache2", is_dir=True, mtime=_NOW - 30 * _DAY),
+        _record(f"{_TEMP}/cache2/new.bin", mtime=_NOW - 60),
+    )
+    assert index.subtree_newest_mtime(Path(f"{_TEMP}/cache")) == _NOW - 30 * _DAY
+    found = _temp_candidates(index)
+    assert Path(f"{_TEMP}/cache") in found
+    assert Path(f"{_TEMP}/cache2") not in found
+
+
 def test_thumbnail_cache_is_categorized_distinctly_from_browser_cache(index: ScanIndex) -> None:
     _seed(
         index,
