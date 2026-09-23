@@ -3,7 +3,48 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## WAITING ON MERGE 2026-09-23 ~18:50 IST — read this first, it supersedes everything below
+## TRIP STAGED 2026-09-24 03:05 IST — read this first, it supersedes everything below
+
+**State (VERIFIED):** `origin/main` = `33ce814` (#109). CI is green on it; `scale-nightly` failed once
+on its 5,000 entries/s throughput floor (4,103/s) and passed on re-run, which matches that job's
+known flakiness (`f64e2df` failed at 2,852/s before). The installer in `packaging\dist` was built
+from `33ce814` (`.buildsha`; SHA-256 `00eca09b…f43c`, 306,167,824 B), and is installed at
+`%LOCALAPPDATA%\Programs\Reclaim` (the Aug-26 copy is renamed to `Reclaim.stale-20260826`).
+The HKCU uninstall key `{B6C1B6C7-…}_is1` is present. The scheduled task is Ready. The trip is
+staged in `C:\Users\Public\reclaim_ac3` from `33ce814` (installer hash-identical; stagehash written).
+
+**Merged this round:** #106 (named test-suite allow-list), #107, #108 (VC++ runtime set + DLL
+closure gate), #109 (`AIPackageLoadError`). **Open:** #110 (temp age guard uses subtree-newest
+mtime; a real wrong-candidate class found while dogfooding).
+
+**Findings to carry forward:**
+- The 5ee5254 build shipped winrt's 14.29 `msvcp140.dll` at the dist root with no
+  `msvcp140_1.dll`. Result: `import onnxruntime` failed, and `reclaim.exe` crashed with AV
+  0xc0000005 in MSVCP140.dll 14.29 (Application event log, 3 crashes, all smoke runs on the
+  never-shipped dist). Nuitka picked winrt's copy again in the 33ce814 build, so the pick is
+  deterministic in the full build. Ruled out: #106 (it excluded 0 binaries), Nuitka 4.1.3→4.2.2
+  (both ship the correct pair in isolation), and winrt import order (no repro in isolation). The
+  exact trigger inside the full build is NOT isolated. #108 makes it moot, and the new closure
+  gate fails on the 5ee5254 dist.
+- The transient C: drops (down to 2.7 GiB) are pagefile extensions: 9.5 → up to 38.6 GB, released
+  seconds to minutes later. They are driven by another session's Ollama loading 17.5 / 6.2 GiB
+  models with mmap disabled (server.log timestamps line up). They are NOT reclaim: a scan's own
+  transient disk is SQLite's `scan_seen` temp table, peak 1.74 GB, plus a WAL of at most 42 MB.
+- WAL is bounded on the frozen build: scans 1 and 2 of `C:\Users\gaura` both leave 0 B of WAL
+  after close (peaks 42 / 41.5 MB); the index is 4.89 GB for 5.86M rows.
+- Safe mode puts every candidate in Tier B by design (ADR-0023 guarantee 3). A tier-A dogfood in
+  safe mode finds 0 by design. Dogfood applied `crash_dump_file` (10/10, 121.7 MB, Recycle Bin).
+- A dry-run `apply --tier both` processes ~2.7 s per candidate, about 21 h for 27,955 candidates
+  (perf defect, not fixed). The `bytes_freed` label overstates Recycle Bin moves; the disk delta
+  is ~0.
+- Recycle Bin orphan `$R21C2JW` is NOT deleted: 63.5% of its files are hardlinked into live
+  venvs, so the approval's precondition failed. Deleting it would free 8.13 GB (not 22.6).
+  Waiting for GG.
+
+**Next:** GG runs the trip from ReclaimSmokeTest (command in the session report). Merge #110,
+then rebuild (warm, ~25 min with `-SkipCleanBuildDirs`) before any release.
+
+## WAITING ON MERGE 2026-09-23 ~18:50 IST — superseded by the section above
 
 **State at this checkpoint (VERIFIED unless marked):** `origin/main` = `e6d6c3f` (#105), CI green
 on it (ci, eval, scale-nightly, pages all success). `verify.py` on
