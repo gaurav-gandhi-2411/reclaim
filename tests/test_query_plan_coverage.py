@@ -134,6 +134,12 @@ _CASES: dict[str, Case] = {
         expect_index=True,
         reason="prefix-range scoped via _prefix_range",
     ),
+    "subtree_newest_mtime": Case(
+        lambda idx: idx.subtree_newest_mtime(_SCOPE),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range, same shape as subtree_size_bytes; called "
+        "once per temp-root directory child by the temp age guard",
+    ),
     "subtree_entry_count": Case(
         lambda idx: idx.subtree_entry_count(_SCOPE),
         expect_index=True,

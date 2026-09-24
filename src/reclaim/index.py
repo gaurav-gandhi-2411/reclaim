@@ -833,6 +833,20 @@ class ScanIndex:
         row = cursor.fetchone()
         return int(row["total"])
 
+    def subtree_newest_mtime(self, root: Path) -> float | None:
+        """Newest `mtime` of `root` itself or any row under it, or None if nothing is indexed
+        there. A directory's own mtime changes only when its direct entries are added, removed,
+        or renamed (NTFS), not when a file deeper down is rewritten -- so "how recently was this
+        tree used" must be answered from the subtree, never from the directory row alone."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT MAX(mtime) AS newest FROM files WHERE path = ? OR (path >= ? AND path < ?)",
+            (prefix, lower, upper),
+        )
+        row = cursor.fetchone()
+        return None if row["newest"] is None else float(row["newest"])
+
     def subtree_entry_count(self, under: Path) -> int:
         """Cheap `COUNT(*)` over the same rows `candidate_inventory(under=...)` would return,
         without materializing a single `FileRecord` -- used purely to decide whether a live
