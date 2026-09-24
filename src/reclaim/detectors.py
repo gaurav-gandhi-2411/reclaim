@@ -396,7 +396,17 @@ def detect_temp_and_browser_caches(
                 continue
             seen_roots.add(root_path)
             for child in index.direct_children(root_path):
-                age_seconds = now - child.mtime
+                # BS1 dogfood finding (2026-09-24): age a DIRECTORY child by the newest mtime
+                # anywhere inside it, not its own mtime. NTFS only bumps a directory's mtime when
+                # its direct entries change, so a live cache (node-compile-cache,
+                # playwright-transform-cache, transformers-cache...) rewritten hours ago still
+                # showed a 27-68 day old directory mtime and was proposed as stale temp.
+                newest = child.mtime
+                if child.is_dir:
+                    subtree_newest = index.subtree_newest_mtime(child.path)
+                    if subtree_newest is not None:
+                        newest = max(newest, subtree_newest)
+                age_seconds = now - newest
                 if age_seconds < min_age_seconds:
                     # Younger than the age floor -- never proposed, not even Tier B (matches
                     # `detect_dev_artifacts`'s "no manifest adjacent -> never proposed" posture
