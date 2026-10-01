@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ from reclaim import autoclean_schedule as sched
 from reclaim.autoclean_schedule import (
     NotAnInstalledBuildError,
     SchtasksOutcome,
+    TaskQueryError,
     TaskRegistrationError,
     build_task_xml,
     query_task,
@@ -23,17 +26,33 @@ from reclaim.autoclean_schedule import (
 
 _NS = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
 
-_QUERY_OUTPUT = """
-Folder: \\
-HostName:                             HOST
-TaskName:                             \\Reclaim Weekly Auto-Clean (bob)
-Next Run Time:                        10/4/2026 10:00:00 AM
-Status:                               Ready
-Last Run Time:                        N/A
-Last Result:                          267011
-Task To Run:                          C:\\Apps\\reclaim.exe auto-clean --apply
-Scheduled Task State:                 Enabled
-"""
+_NEXT = "2026-10-04T10:00:00.0000000+05:30"
+_NEVER = "1999-11-30T00:00:00.0000000+05:30"
+
+
+def _ps_json(**overrides: object) -> str:
+    """What QUERY_SCRIPT prints for a registered, never-run task, with fields overridden."""
+    data: dict[str, object] = {
+        "registered": True,
+        "state": "Ready",
+        "last_run_time": _NEVER,
+        "next_run_time": _NEXT,
+        "last_result": 267011,
+    }
+    data.update(overrides)
+    return json.dumps(data)
+
+
+class FakePowerShell:
+    """Injectable PowerShell runner: records (script, name) and replays one outcome."""
+
+    def __init__(self, outcome: SchtasksOutcome) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, script: str, name: str) -> SchtasksOutcome:
+        self.calls.append((script, name))
+        return self.outcome
 
 
 class FakeSchtasks:
@@ -66,7 +85,7 @@ def test_task_xml_is_utf16le_with_bom_and_least_privilege() -> None:
     assert "<ScheduleByWeek>" in text and "<Sunday />" in text
     assert "<StartWhenAvailable>true</StartWhenAvailable>" in text
     assert "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in text
-    assert "<ExecutionTimeLimit>PT30M</ExecutionTimeLimit>" in text
+    assert "<ExecutionTimeLimit>PT45M</ExecutionTimeLimit>" in text
     root = ET.fromstring(text.split("?>", 1)[1])  # noqa: S314 -- our own XML
     exe = root.find(".//t:Exec", _NS)
     assert exe is not None
@@ -125,61 +144,145 @@ def test_register_failure_is_raised_and_logged_never_swallowed(tmp_path: Path) -
 def test_unregister_is_idempotent_when_task_absent(tmp_path: Path) -> None:
     fake = FakeSchtasks(
         delete=SchtasksOutcome(1, "ERROR: The system cannot find the file specified."),
-        query=SchtasksOutcome(1, "ERROR: The system cannot find the file specified."),
     )
+    ps = FakePowerShell(SchtasksOutcome(0, '{"registered":false}'))
 
-    assert unregister_task(username="bob", runner=fake, diag_log_path=tmp_path / "d.log") is False
+    assert (
+        unregister_task(
+            username="bob", runner=fake, query_runner=ps, diag_log_path=tmp_path / "d.log"
+        )
+        is False
+    )
 
 
 def test_unregister_raises_when_task_exists_but_delete_fails(tmp_path: Path) -> None:
-    fake = FakeSchtasks(
-        delete=SchtasksOutcome(1, "ERROR: Access is denied."),
-        query=SchtasksOutcome(0, _QUERY_OUTPUT),
-    )
+    fake = FakeSchtasks(delete=SchtasksOutcome(1, "ERROR: Access is denied."))
+    ps = FakePowerShell(SchtasksOutcome(0, _ps_json()))
 
     with pytest.raises(TaskRegistrationError):
-        unregister_task(username="bob", runner=fake, diag_log_path=tmp_path / "d.log")
+        unregister_task(
+            username="bob", runner=fake, query_runner=ps, diag_log_path=tmp_path / "d.log"
+        )
 
 
 def test_unregister_returns_true_when_deleted(tmp_path: Path) -> None:
     fake = FakeSchtasks()
+    ps = FakePowerShell(SchtasksOutcome(1, "must not be queried"))
 
-    assert unregister_task(username="bob", runner=fake, diag_log_path=tmp_path / "d.log") is True
+    assert (
+        unregister_task(
+            username="bob", runner=fake, query_runner=ps, diag_log_path=tmp_path / "d.log"
+        )
+        is True
+    )
+    assert ps.calls == []
 
 
-def test_query_parses_verbose_list_output(tmp_path: Path) -> None:
-    fake = FakeSchtasks(query=SchtasksOutcome(0, _QUERY_OUTPUT))
+def test_query_registered_ready_with_real_dates(tmp_path: Path) -> None:
+    ps = FakePowerShell(
+        SchtasksOutcome(0, _ps_json(last_run_time="2026-09-27T10:00:01.5+05:30", last_result=0))
+    )
 
-    status = query_task(username="bob", runner=fake, diag_log_path=tmp_path / "d.log")
+    status = query_task(username="bob", runner=ps, diag_log_path=tmp_path / "d.log")
 
     assert status.registered is True
     assert status.state == "Ready"
-    assert status.last_run_time is None  # "N/A"
-    assert status.last_result == 267011
-    assert status.next_run_time == "10/4/2026 10:00:00 AM"
-    assert fake.calls[0] == [
-        "/query",
-        "/tn",
-        "Reclaim Weekly Auto-Clean (bob)",
-        "/v",
-        "/fo",
-        "list",
-    ]
+    assert status.last_run_time == "2026-09-27T10:00:01.5+05:30"
+    assert status.last_result == 0
+    assert status.next_run_time == _NEXT
+    assert ps.calls[0][1] == "Reclaim Weekly Auto-Clean (bob)"
 
 
-def test_query_reports_disabled_and_missing(tmp_path: Path) -> None:
-    disabled = _QUERY_OUTPUT.replace(
-        "Scheduled Task State:                 Enabled",
-        "Scheduled Task State:                 Disabled",
-    )
-    fake = FakeSchtasks(query=SchtasksOutcome(0, disabled))
-    assert query_task(username="bob", runner=fake, diag_log_path=tmp_path / "d.log").state == (
-        "Disabled"
+@pytest.mark.parametrize(
+    "sentinel", [_NEVER, "0001-01-01T00:00:00.0000000", "1601-01-01T00:00:00Z"]
+)
+def test_query_maps_never_run_sentinels_to_none(sentinel: str, tmp_path: Path) -> None:
+    ps = FakePowerShell(
+        SchtasksOutcome(0, _ps_json(last_run_time=sentinel, next_run_time=sentinel))
     )
 
-    missing = FakeSchtasks(query=SchtasksOutcome(1, "ERROR: not found"))
-    status = query_task(username="bob", runner=missing, diag_log_path=tmp_path / "d.log")
+    status = query_task(username="bob", runner=ps, diag_log_path=tmp_path / "d.log")
+
+    assert status.registered is True
+    assert status.last_run_time is None and status.next_run_time is None
+
+
+def test_query_null_times_stay_none(tmp_path: Path) -> None:
+    ps = FakePowerShell(SchtasksOutcome(0, _ps_json(last_run_time=None, next_run_time=None)))
+
+    status = query_task(username="bob", runner=ps, diag_log_path=tmp_path / "d.log")
+
+    assert status.last_run_time is None and status.next_run_time is None
+
+
+def test_query_missing_task_is_registered_false_not_an_error(tmp_path: Path) -> None:
+    ps = FakePowerShell(SchtasksOutcome(0, '{"registered":false}'))
+
+    status = query_task(username="bob", runner=ps, diag_log_path=tmp_path / "d.log")
+
     assert status.registered is False and status.state is None
+
+
+def test_query_reports_disabled_state(tmp_path: Path) -> None:
+    ps = FakePowerShell(SchtasksOutcome(0, _ps_json(state="Disabled", next_run_time=None)))
+
+    status = query_task(username="bob", runner=ps, diag_log_path=tmp_path / "d.log")
+
+    assert status.state == "Disabled" and status.next_run_time is None
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        SchtasksOutcome(1, "Get-ScheduledTask : Access is denied"),
+        SchtasksOutcome(-1, "OSError: powershell.exe not found"),
+        SchtasksOutcome(0, "this is not json"),
+        SchtasksOutcome(0, ""),
+        SchtasksOutcome(0, "[1, 2]"),
+        SchtasksOutcome(0, '{"registered": "yes"}'),
+        SchtasksOutcome(0, '{"registered": true}'),
+        SchtasksOutcome(0, _ps_json(last_result="0")),
+        SchtasksOutcome(0, _ps_json(next_run_time="not a date")),
+    ],
+)
+def test_query_failure_or_garbage_is_a_typed_error(
+    outcome: SchtasksOutcome, tmp_path: Path
+) -> None:
+    with pytest.raises(TaskQueryError):
+        query_task(username="bob", runner=FakePowerShell(outcome), diag_log_path=tmp_path / "d.log")
+
+
+def test_query_failure_is_written_to_the_diagnostic_log(tmp_path: Path) -> None:
+    diag = tmp_path / "d.log"
+    with pytest.raises(TaskQueryError):
+        query_task(
+            username="bob",
+            runner=FakePowerShell(SchtasksOutcome(1, "Access is denied")),
+            diag_log_path=diag,
+        )
+
+    assert "ACTION: query" in diag.read_text(encoding="utf-8")
+
+
+def test_hostile_task_name_never_enters_the_script(tmp_path: Path) -> None:
+    ps = FakePowerShell(SchtasksOutcome(0, '{"registered":false}'))
+    hostile = 'O\'Brien $x `y` "z"'
+
+    query_task(username=hostile, runner=ps, diag_log_path=tmp_path / "d.log")
+
+    script, name = ps.calls[0]
+    assert name == f"Reclaim Weekly Auto-Clean ({hostile})"
+    assert hostile not in script and "O'Brien" not in script
+    assert "$env:RECLAIM_TASK_NAME" in script
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows-only")
+def test_real_query_of_hostile_unregistered_name_is_registered_false(tmp_path: Path) -> None:
+    status = query_task(
+        username="Reclaim-pytest (O'Brien $x) [a*]", diag_log_path=tmp_path / "d.log"
+    )
+
+    assert status.registered is False
 
 
 def test_default_diag_path_is_under_data_root() -> None:
@@ -200,7 +303,9 @@ def test_real_task_scheduler_round_trip(tmp_path: Path) -> None:
         status = query_task(username=user, diag_log_path=diag)
         assert status.registered is True
         assert status.state == "Ready"
+        assert status.last_run_time is None  # never ran: sentinel mapped to None
         assert status.next_run_time is not None
+        assert datetime.fromisoformat(status.next_run_time) > datetime.now().astimezone()
         assert unregister_task(username=user, diag_log_path=diag) is True
         assert query_task(username=user, diag_log_path=diag).registered is False
     finally:
