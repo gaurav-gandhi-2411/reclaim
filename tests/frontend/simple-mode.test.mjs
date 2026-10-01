@@ -22,6 +22,7 @@ const {
   buildQuickCleanGroupCard,
   renderSimpleIdle,
   renderSimpleOneClickResult,
+  renderSimpleOneClickProgress,
 } = await import("../../src/reclaim/api/static/app.js");
 
 function container() {
@@ -318,4 +319,48 @@ test("renderSimpleOneClickResult: null measurements never render literal 'null'"
     oneClickReport({ percent_used_after: null, disk_free_delta_bytes: null })
   );
   assert.equal(container().textContent.includes("null"), false);
+});
+
+// --- renderSimpleOneClickProgress (live view while the background clean runs) ------------------
+
+test("renderSimpleOneClickProgress: shows finished items live and the waiting uv item", () => {
+  const first = oneClickReport().items[0];
+  renderSimpleOneClickProgress({
+    status: "running",
+    items: [{ ...first, label: "Old temp files (C:/t)", key: "temp0" }],
+    current_item: "uv package cache: waiting for its cache lock if another process is using it… 12 min",
+    elapsed_seconds: 745,
+  });
+  const text = container().textContent;
+  assert.ok(text.includes("waiting for its cache lock"));
+  assert.ok(text.includes("12 min"));
+  assert.ok(text.includes("Old temp files (C:/t): Cleaned"), "completed items are listed live");
+  assert.ok(text.includes("Running for 12 min 25 s"));
+  assert.equal(container().querySelector('[data-kind="loading"]') !== null, true);
+});
+
+test("renderSimpleOneClickProgress: no items and no current item never renders 'null'", () => {
+  renderSimpleOneClickProgress({
+    status: "running",
+    items: [],
+    current_item: null,
+    elapsed_seconds: 0,
+  });
+  const text = container().textContent;
+  assert.equal(text.includes("null"), false);
+  assert.ok(text.includes("Finishing up"));
+  assert.equal(container().querySelectorAll("li").length, 0);
+});
+
+test("renderSimpleOneClickProgress: server-supplied text renders as inert text, never markup", () => {
+  const payload = '<img src=x onerror="window.__oneClickProgressXss = true">';
+  renderSimpleOneClickProgress({
+    status: "running",
+    items: [{ ...oneClickReport().items[0], label: payload, detail: payload }],
+    current_item: payload,
+    elapsed_seconds: 5,
+  });
+  assert.equal(container().querySelectorAll("img").length, 0);
+  assert.equal(globalThis.window.__oneClickProgressXss, undefined);
+  assert.ok(container().textContent.includes(payload));
 });

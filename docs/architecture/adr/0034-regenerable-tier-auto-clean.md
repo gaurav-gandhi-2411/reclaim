@@ -75,10 +75,7 @@ only way anything outside the allow-list is ever offered for deletion.
 - It runs unelevated (`reclaim.elevation.assert_not_elevated` is respected); roots that need
   administrator rights (`C:\Windows\Temp`, `ProgramData` WER) are reported `skipped_no_access`,
   not failed.
-- **What did not work / known limits:** (1) while any `uv` process is running — and on a
-  workstation running several agent sessions that is most of the time — `uv cache prune` cannot
-  take the cache lock, so the biggest cache is skipped and reported as such; the weekly run can
-  therefore miss it. We do not `--force` past the lock. (2) The share-mode-0 probe protects
+- **What did not work / known limits:** (1) *Superseded behaviour, kept for the record:* the first version skipped `uv cache prune` whenever any `uv` process was running, and on a workstation running several agent sessions that is most of the time, so the biggest cache (26.7 GB) was almost never cleaned. uv's cache lock exists precisely so a prune WAITS for in-flight installs instead of racing them, so the pre-skip was removed: `uv cache prune` now runs with `UV_LOCK_TIMEOUT` = `UV_LOCK_WAIT_SECONDS` (30 min, overridable via `RegenerableEnv.uv_lock_wait_seconds`) and a subprocess timeout 60 s longer, never `--force`. Only an expired wait is a skip: `skipped_in_use`, detail "waited 1800 s for uv's cache lock". uv runs last so every other item is finished and reported before the wait, and the one-click `POST /api/clean/regenerable` (`apply=true`) is a single-flight background job (202 + run id, 409 if one is running) polled through `GET /api/clean/regenerable/status`, so no HTTP request is held for up to 30 minutes; `apply=false` previews stay synchronous and never wait. pip/yarn/conda keep the busy-process skip because no lock they hold is relied on here. A scheduled caller must allow for the wait (its task time limit must exceed 30 min plus the rest of the run). (2) The share-mode-0 probe protects
   against deleting a file another process has open, but not against a process that opens a file
   immediately after the probe; the age floor and the closed-browser gate carry that residual risk.
   (3) Logical-vs-real byte accounting for hardlinked caches is approximate by construction.

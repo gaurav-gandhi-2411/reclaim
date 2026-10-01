@@ -193,6 +193,19 @@ def test_start_simple_one_click_takes_no_paths_and_starts_no_scan() -> None:
     )
 
 
+def test_one_click_status_polling_takes_no_paths_and_starts_no_scan() -> None:
+    # ADR-0034: the clean runs as a background job; the page only starts it (above) and polls its
+    # status. The polling side must stay as closed as the starting side.
+    source = _APP_JS_PATH.read_text(encoding="utf-8")
+    start_body = _extract_js_function_body(source, "startSimpleOneClick")
+    assert "pollRegenerableStatus" in start_body, "the click must hand over to the status poll"
+    body = _extract_js_function_body(source, "pollRegenerableStatus")
+    assert "/api/clean/regenerable/status" in body
+    assert "/api/scan" not in body
+    assert "paths" not in body
+    assert "POST" not in body, "polling must be read-only"
+
+
 def test_start_simple_scan_calls_my_files_endpoint_never_full_drive() -> None:
     source = _APP_JS_PATH.read_text(encoding="utf-8")
     body = _extract_js_function_body(source, "startSimpleScan")

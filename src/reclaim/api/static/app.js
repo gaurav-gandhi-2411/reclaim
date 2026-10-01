@@ -1023,28 +1023,112 @@ const REGENERABLE_STATUS_TEXT = {
   failed: "Failed",
 };
 
+const REGENERABLE_POLL_INTERVAL_MS = 2000;
+
+// The real clean is a background job on the server (uv's prune can wait up to 30 minutes for its
+// cache lock), so this only starts it and then polls /api/clean/regenerable/status.
 async function startSimpleOneClick() {
   const container = simpleViewEl();
+  clearSimplePoll();
   renderState(container, "loading", {
-    title: "Cleaning caches, old temp files and crash dumps…",
-    message: "This usually takes under a minute. Anything that's in use is left alone.",
+    title: "Starting the clean…",
+    message: "Anything that's in use is left alone.",
   });
-  let report;
   try {
-    report = await api("/api/clean/regenerable", {
+    await api("/api/clean/regenerable", {
       method: "POST",
       body: JSON.stringify({ apply: true }),
     });
   } catch (err) {
+    // 409: a clean is already running (e.g. this page was reloaded) -- watch that one instead.
+    if (err.status !== 409) {
+      renderState(container, "error", {
+        title: "Clean failed",
+        message: err.message,
+        actionLabel: "Back to start",
+        onAction: renderSimpleIdle,
+      });
+      return;
+    }
+  }
+  await pollRegenerableStatus();
+}
+
+async function pollRegenerableStatus() {
+  const container = simpleViewEl();
+  let status;
+  try {
+    status = await api("/api/clean/regenerable/status");
+  } catch (err) {
+    clearSimplePoll();
     renderState(container, "error", {
-      title: err.status === 409 ? "A clean is already running" : "Clean failed",
+      title: "Could not check the clean's progress",
       message: err.message,
-      actionLabel: "Back to start",
-      onAction: renderSimpleIdle,
+      actionLabel: "Check again",
+      onAction: pollRegenerableStatus,
     });
     return;
   }
-  renderSimpleOneClickResult(report);
+
+  if (status.status === "running") {
+    renderSimpleOneClickProgress(status);
+    if (!simplePollHandle) {
+      simplePollHandle = setInterval(pollRegenerableStatus, REGENERABLE_POLL_INTERVAL_MS);
+    }
+    return;
+  }
+
+  clearSimplePoll();
+  if (status.status === "done" && status.report) {
+    renderSimpleOneClickResult(status.report);
+    return;
+  }
+  renderState(container, "error", {
+    title: status.status === "failed" ? "Clean failed" : "No clean is running",
+    message: status.error || "Nothing was reported. Try again.",
+    actionLabel: "Back to start",
+    onAction: renderSimpleIdle,
+  });
+}
+
+function formatElapsedSeconds(seconds) {
+  const total = Math.max(0, Math.round(seconds ?? 0));
+  const minutes = Math.floor(total / 60);
+  return minutes >= 1 ? `${minutes} min ${total % 60} s` : `${total} s`;
+}
+
+// Live view while the job runs: finished items appear as they complete, and the item in progress
+// (uv, which may be waiting for its cache lock, is always last) is named with its own wording.
+// Server-supplied text goes in via textContent only.
+function renderSimpleOneClickProgress(status) {
+  const container = simpleViewEl();
+  renderState(container, "loading", {
+    title: status.current_item || "Finishing up…",
+    message: `Running for ${formatElapsedSeconds(status.elapsed_seconds)}. Anything that's in use is left alone.`,
+  });
+  if (status.items && status.items.length > 0) {
+    container.appendChild(buildRegenerableItemList(status.items));
+  }
+}
+
+function buildRegenerableItemList(items) {
+  const list = document.createElement("ul");
+  list.className = "rc-regenerable-items";
+  for (const item of items) {
+    if (item.status === "skipped_not_present" || item.status === "skipped_tool_missing") continue;
+    const li = document.createElement("li");
+    const status = REGENERABLE_STATUS_TEXT[item.status] ?? item.status;
+    const size = item.bytes_removed > 0 ? ` — ${item.bytes_removed_human}` : "";
+    li.textContent = `${item.label}: ${status}${size}`;
+    if (item.detail) {
+      const detail = document.createElement("div");
+      detail.className = "rc-scan-status";
+      detail.textContent = item.detail;
+      li.appendChild(detail);
+    }
+    list.appendChild(li);
+  }
+  return list;
 }
 
 // Every value here that traces back to disk (labels carry real root paths, details can carry
@@ -1085,22 +1169,7 @@ function renderSimpleOneClickResult(report) {
   }
   container.appendChild(panel);
 
-  const list = document.createElement("ul");
-  list.className = "rc-regenerable-items";
-  for (const item of report.items) {
-    if (item.status === "skipped_not_present" || item.status === "skipped_tool_missing") continue;
-    const li = document.createElement("li");
-    const status = REGENERABLE_STATUS_TEXT[item.status] ?? item.status;
-    const size = item.bytes_removed > 0 ? ` — ${item.bytes_removed_human}` : "";
-    li.textContent = `${item.label}: ${status}${size}`;
-    if (item.detail) {
-      const detail = document.createElement("div");
-      detail.className = "rc-scan-status";
-      detail.textContent = item.detail;
-      li.appendChild(detail);
-    }
-    list.appendChild(li);
-  }
+  const list = buildRegenerableItemList(report.items);
   container.appendChild(list);
 
   if (report.files_skipped_in_use > 0) {
@@ -1836,6 +1905,7 @@ export {
   closeFullDriveConfirmDialog,
   renderSimpleIdle,
   renderSimpleOneClickResult,
+  renderSimpleOneClickProgress,
   renderApplyReport,
 };
 
