@@ -831,15 +831,13 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
 # that trip's Step 10 output matches no default anywhere in this codebase (the shipped default is
 # 80.0), which only a manual edit could have produced.
 #
-# Deliberate near-duplicate of `_set_category_enabled_in_toml_text`/`set_category_enabled` above,
-# not a shared/generalized helper: two call sites (categories, notifications) is this codebase's
-# own stated threshold for "duplicate, don't abstract yet" (see engineering defaults) -- and the
-# category version's docstring/tests are the working, tested contract this mirrors; refactoring it
-# to serve a second section wasn't asked for and would touch code this fix doesn't need to touch.
-def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
-    """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to the
-    single `[notifications]` section instead of a per-category one."""
-    section_header = "[notifications]"
+# Generalised to `_set_section_enabled_in_toml_text` when the third call site (the weekly
+# auto-clean toggle, ADR-0034) arrived -- the "abstract on the third occurrence" threshold. The
+# per-category variant above is left as-is (it addresses a nested `[categories.<name>]` header).
+def _set_section_enabled_in_toml_text(text: str, section: str, *, enabled: bool) -> str:
+    """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to one
+    top-level `[<section>]` (notifications, autoclean) instead of a per-category one."""
+    section_header = f"[{section}]"
     value_literal = "true" if enabled else "false"
     enabled_line = f"enabled = {value_literal}\n"
 
@@ -863,6 +861,12 @@ def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
 
     lines.insert(start_idx + 1, enabled_line)
     return "".join(lines)
+
+
+def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
+    """Pure text transform for the single `[notifications]` section (named wrapper kept so its
+    existing callers/tests are unchanged)."""
+    return _set_section_enabled_in_toml_text(text, "notifications", enabled=enabled)
 
 
 def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
