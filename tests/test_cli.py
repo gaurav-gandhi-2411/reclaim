@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import reclaim.reconciliation as reconciliation_module
+import reclaim.scanner as scanner_module
 from reclaim.cli import _VERSION, _build_parser, _run_serve, main
 from reclaim.index import InaccessibleEntry, ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
@@ -243,6 +244,16 @@ def test_scan_prints_inaccessible_size_accounting_when_paths_are_skipped(
         return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
+    # The scan lists directories via `reclaim.dirlist` first and only falls back to os.scandir,
+    # so the simulated "can't list this directory" has to hold for both.
+    real_list_directory = scanner_module.list_directory
+
+    def fake_list_directory(path: str, volume_serial: int | None = None) -> object:
+        if "blocked_dir" in path:
+            raise PermissionError(13, "Access is denied", path)
+        return real_list_directory(path, volume_serial)
+
+    monkeypatch.setattr(scanner_module, "list_directory", fake_list_directory)
     db = tmp_path / "index.sqlite3"
 
     assert main(["scan", str(root), "--db", str(db)]) == 0

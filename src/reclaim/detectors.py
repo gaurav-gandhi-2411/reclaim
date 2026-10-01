@@ -9,11 +9,13 @@ from pathlib import Path
 import structlog
 
 from reclaim.config import Config
+from reclaim.freshstat import fresh_stat_signature
 from reclaim.index import ScanIndex
 from reclaim.linkinfo import estimate_reclaimable_bytes
 from reclaim.models import (
     REBUILDABLE_CATEGORY_GROUPS,
     Candidate,
+    FileRecord,
     Mode,
     RawCandidate,
     Tier,
@@ -24,6 +26,18 @@ from reclaim.safety import SafetyValidator
 logger = structlog.get_logger(__name__)
 
 _SECONDS_PER_DAY = 86400.0
+
+# ADR-0035 decision-point re-stat. The scan's size/mtime come from the NTFS directory listing,
+# which can lag for a file that is open for write (stale toward OLDER mtime / last-close size).
+# Every age/size threshold below therefore re-`stat`s ONLY the entries the listing says would
+# be proposed -- a stale-old listing can only turn a "keep" into a wrongly-proposed "old", never
+# the reverse, so entries the listing already keeps need no check.
+#
+# Cap on files re-`stat`ed per temp-root child directory: every file when the subtree has at
+# most this many, else the newest this-many by listing mtime. A writer whose listing mtime is
+# old AND which is not among the newest-N of a subtree larger than the cap is not caught here;
+# bounded cost is the owner's stated trade (apply-time preflight still re-verifies identity).
+_TEMP_CHILD_RESTAT_CAP = 2000
 
 # Config `[categories]` group ids — the coarse identifier every `RawCandidate.category_group`
 # must be one of, matched against `_CATEGORY_GROUP_ENABLED_GETTERS` in `_category_enabled`.
@@ -319,6 +333,29 @@ def detect_model_caches(
 # --- Browser/temp/thumbnail caches ----------------------------------------------------------
 
 
+def _restat_newest_mtime(index: ScanIndex, child: FileRecord, listing_newest: float) -> float:
+    """`listing_newest`, raised to the live mtime of whatever could be open for write.
+
+    A file child is re-`stat`ed itself; a directory child gets its files re-`stat`ed (all of
+    them up to `_TEMP_CHILD_RESTAT_CAP`, else the newest-N by listing mtime). A path that cannot
+    be `stat`ed contributes nothing (see `fresh_stat_signature`). Only ever raises the value."""
+    if child.is_dir:
+        paths = index.newest_files_under(child.path, limit=_TEMP_CHILD_RESTAT_CAP + 1)
+        if len(paths) > _TEMP_CHILD_RESTAT_CAP:
+            logger.info(
+                "candidates.temp_restat_capped", path=str(child.path), cap=_TEMP_CHILD_RESTAT_CAP
+            )
+            paths = paths[:_TEMP_CHILD_RESTAT_CAP]
+    else:
+        paths = [child.path]
+    newest = listing_newest
+    for path in paths:
+        fresh = fresh_stat_signature(path)
+        if fresh is not None:
+            newest = max(newest, fresh.mtime)
+    return newest
+
+
 def detect_temp_and_browser_caches(
     index: ScanIndex,
     cache_paths: Sequence[str],
@@ -407,6 +444,10 @@ def detect_temp_and_browser_caches(
                     if subtree_newest is not None:
                         newest = max(newest, subtree_newest)
                 age_seconds = now - newest
+                if age_seconds >= min_age_seconds:
+                    # Listing says "old enough": confirm against live mtimes (ADR-0035).
+                    newest = _restat_newest_mtime(index, child, newest)
+                    age_seconds = now - newest
                 if age_seconds < min_age_seconds:
                     # Younger than the age floor -- never proposed, not even Tier B (matches
                     # `detect_dev_artifacts`'s "no manifest adjacent -> never proposed" posture
@@ -523,6 +564,12 @@ def detect_old_installers(index: ScanIndex, *, max_age_days: int, now: float) ->
         age_seconds = now - record.mtime
         if age_seconds < threshold_seconds:
             continue
+        # ADR-0035: confirm the listing-derived age against the live mtime before proposing.
+        fresh = fresh_stat_signature(record.path)
+        if fresh is not None:
+            age_seconds = now - max(record.mtime, fresh.mtime)
+            if age_seconds < threshold_seconds:
+                continue
         age_days = int(age_seconds // _SECONDS_PER_DAY)
         candidates.append(
             RawCandidate(
@@ -637,6 +684,13 @@ def detect_large_logs(
         age_seconds = now - record.mtime
         if age_seconds < threshold_seconds:
             continue
+        # ADR-0035: confirm listing-derived age AND size against the live stat. A log open for
+        # write (a service still holding a "stale" log) lags in the listing.
+        fresh = fresh_stat_signature(record.path)
+        if fresh is not None:
+            age_seconds = now - max(record.mtime, fresh.mtime)
+            if age_seconds < threshold_seconds or fresh.size < min_size_bytes:
+                continue
         age_days = int(age_seconds // _SECONDS_PER_DAY)
         size_mb = record.size_bytes / (1024 * 1024)
         threshold_mb = min_size_bytes // (1024 * 1024)

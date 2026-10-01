@@ -5,6 +5,7 @@ import functools
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -17,8 +18,14 @@ from pathlib import Path
 
 import structlog
 
+from reclaim.dirlist import (
+    ListedEntry,
+    ListingUnsupported,
+    filetime_to_unix_seconds,
+    list_directory,
+)
 from reclaim.drives import is_network_drive
-from reclaim.index import InaccessibleEntry, ScanIndex, StoredStat, is_unchanged
+from reclaim.index import InaccessibleEntry, ScanIndex, StoredStat, file_row, is_unchanged
 from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
@@ -590,12 +597,12 @@ class _RiskCounter:
         self.guarded = 0
         self.fast = 0
 
-    def record(self, *, guarded: bool) -> None:
+    def record(self, *, guarded: bool, count: int = 1) -> None:
         with self._lock:
             if guarded:
-                self.guarded += 1
+                self.guarded += count
             else:
-                self.fast += 1
+                self.fast += count
 
 
 def build_record(
@@ -701,6 +708,127 @@ def build_record(
     return record, (is_dir_entry and not is_reparse_point)
 
 
+# --- Listing-sourced records (scan speed, "Lever 2") ---------------------------------------------
+#
+# `build_record` pays one `os.stat()` (CreateFile + GetFileInformationByHandle + CloseHandle) per
+# entry purely to learn the file ID / volume serial `os.scandir` doesn't carry. `dirlist` returns
+# those, plus size/attributes/times, from the directory enumeration itself, so a plain file's
+# `FileRecord` needs no per-file syscall at all. What still goes through `os.stat()` exactly as
+# before (never from the listing):
+#   - risky entries (reparse point / cloud placeholder): same timeout-guarded stat as always;
+#   - directories: a directory's `os.stat().st_size` (its index-allocation size, e.g. 4096) is
+#     NOT what the directory listing reports for it (0) -- measured, tests/test_dirlist.py -- and
+#     the index stores `size` for directory rows, so a directory row built from the listing
+#     would differ from one built by `build_record`;
+#   - an entry whose 128-bit file ID doesn't fit in 64 bits (never on NTFS; defensive).
+# Anything the listing can't serve at all (non-NTFS volume, network root, access denied) falls
+# back to the original scandir + `build_record` path for that directory.
+_USE_DIRECTORY_LISTING = True  # flipped off by tests that simulate failures via os.scandir/os.stat
+_ATTRIBUTE_DIRECTORY = 0x10
+# Entries the walk must still `os.stat()` (see the section comment above): directories + risky.
+_LISTING_NEEDS_STAT_ATTRIBUTES = _ATTRIBUTE_DIRECTORY | _RISK_ATTRIBUTES
+
+
+def _suffix_lower(name: str) -> str:
+    """`Path(name).suffix.lower()` without constructing a `Path` per file. Same rule as pathlib
+    on the supported Python (3.12): a dot at index 0 (dotfile) or as the last character is not a
+    suffix. tests/test_dirlist.py pins this against `Path(...).suffix` for edge-case names."""
+    dot = name.rfind(".")
+    return name[dot:].lower() if 0 < dot < len(name) - 1 else ""
+
+
+def _list_directory_or_none(
+    long_dir: str, volume_serial: int | None = None
+) -> tuple[int, list[ListedEntry]] | None:
+    """The ID-bearing listing of `long_dir`, or `None` when the caller must use the legacy
+    `os.scandir` path instead (unsupported volume, or any OSError -- the legacy path then
+    re-attempts the listing and reports the failure exactly as it always has)."""
+    try:
+        return list_directory(long_dir, volume_serial)
+    except ListingUnsupported:
+        return None
+    except OSError:
+        return None
+
+
+def build_record_from_listing(
+    item: ListedEntry,
+    *,
+    volume_serial: int,
+    current_dir: Path,
+    dir_prefix: str,
+    git_cache: GitRepoCache,
+    skipped: list[SkippedPath],
+    stat_executor: ThreadPoolExecutor | None = None,
+    risk_counter: _RiskCounter | None = None,
+) -> tuple[FileRecord, bool] | None:
+    r"""`build_record` for an entry obtained from `dirlist.list_directory` instead of
+    `os.scandir`: returns the same `(record, should_recurse)` / `None` contract with the same
+    `FileRecord` content (tests/test_scanner_listing.py compares the two builders field for
+    field), but plain files cost no per-file syscall. `dir_prefix` is the `\\?\`-prefixed
+    directory string with a trailing backslash, used to form the raw path for the stat that
+    risky entries and directories still need (see the section comment above)."""
+    name, attributes, size, last_write, creation, id_low, id_high = item
+    entry_path = current_dir / name
+    risky = bool(attributes & _RISK_ATTRIBUTES)
+    if risk_counter is not None:
+        risk_counter.record(guarded=risky)
+
+    is_dir_entry = False
+    if risky or attributes & _ATTRIBUTE_DIRECTORY or id_high:
+        try:
+            st = _guarded_stat(stat_executor if risky else None, dir_prefix + name)
+        except (OSError, FutureTimeoutError) as exc:
+            logger.warning("scan.entry_unreadable", path=str(entry_path), error=str(exc))
+            # Same P0-5 best-effort size probe `build_record` runs for a directory whose stat
+            # failed (the listing itself says whether it was one).
+            size_estimate: int | None = None
+            is_lower_bound = False
+            if attributes & _ATTRIBUTE_DIRECTORY:
+                size_estimate, is_lower_bound = _probe_inaccessible_dir_size(entry_path)
+            skipped.append(
+                SkippedPath(
+                    path=str(entry_path),
+                    error=str(exc),
+                    size_estimate_bytes=size_estimate,
+                    size_estimate_is_lower_bound=is_lower_bound,
+                )
+            )
+            return None
+        # `S_ISDIR(st_mode)` is what `DirEntry.is_dir(follow_symlinks=False)` reports (both go
+        # through CPython's one attribute->mode conversion): False for a symlink even when it
+        # carries FILE_ATTRIBUTE_DIRECTORY, True for a junction -- recursion is still gated on
+        # the reparse bit alone below.
+        is_dir_entry = stat.S_ISDIR(st.st_mode)
+        attributes = st.st_file_attributes
+        size_bytes, mtime, ctime = st.st_size, st.st_mtime, st.st_ctime
+        dev, ino = st.st_dev, st.st_ino
+    else:
+        size_bytes = size
+        mtime = filetime_to_unix_seconds(last_write)
+        ctime = filetime_to_unix_seconds(creation)
+        dev, ino = volume_serial, id_low
+
+    repo_search_start = entry_path if is_dir_entry else current_dir
+    repo_root = git_cache.repo_root_for(repo_search_start)
+    git_clean = git_cache.is_clean(repo_root) if repo_root is not None else False
+
+    record = FileRecord(
+        path=entry_path,
+        is_dir=is_dir_entry,
+        size_bytes=size_bytes,
+        attributes=attributes,
+        ext=_suffix_lower(name) if not is_dir_entry else "",
+        git_repo_root=repo_root,
+        git_repo_clean=git_clean,
+        mtime=mtime,
+        ctime=ctime,
+        dev=dev,
+        ino=ino,
+    )
+    return record, (is_dir_entry and not bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+
+
 def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | None:
     r"""Reconstructs a fresh `FileRecord` for one already-known path outside of an in-progress
     `scan_tree` walk (`build_record` needs a live `os.DirEntry`, which callers here don't have)
@@ -773,21 +901,38 @@ class _BatchIndexWriter:
         self.written = 0
         self.touched = 0
 
-    def flush(self, upserts: list[FileRecord], unchanged_paths: list[str]) -> None:
+    @property
+    def scanned_at(self) -> float:
+        """The `last_scanned` stamp rows built by the walk (`index.file_row`) must carry."""
+        return self._scanned_at
+
+    def flush(
+        self,
+        upserts: list[FileRecord],
+        unchanged_paths: list[str],
+        upsert_rows: list[tuple[object, ...]] | None = None,
+    ) -> None:
         """Writes one batch: `upserts` (changed/new records, or every record when
         `incremental=False`) via `upsert_records`, and every visited path this batch covers
         (both `upserts` and `unchanged_paths`) into the scan's seen-tracking table, so
         `prune_unseen_under_root` can later tell a still-present-but-unchanged file apart from
         one that's genuinely gone — without `scan_tree` ever holding either set fully in Python
         memory (see `index.py`'s `begin_scan_tracking`/`record_seen`/`prune_unseen_under_root`).
-        A no-op if both lists are empty (the caller's final flush after an already-flushed,
-        exactly-full last batch)."""
-        if not upserts and not unchanged_paths:
+        `upsert_rows` are changed/new files the listing-sourced walk already turned into `files`
+        rows (`index.file_row`) without ever building a `Path`/`FileRecord`; they are written in
+        the same transaction-per-flush as `upserts`. A no-op if all three are empty (the caller's
+        final flush after an already-flushed, exactly-full last batch)."""
+        if not upserts and not unchanged_paths and not upsert_rows:
             return
-        seen = [record.path.as_posix() for record in upserts] + unchanged_paths
+        rows = upsert_rows or []
+        seen = [record.path.as_posix() for record in upserts]
+        seen.extend(str(row[0]) for row in rows)
+        seen.extend(unchanged_paths)
         with self._lock:
             if upserts:
                 self.written += self._index.upsert_records(upserts, scanned_at=self._scanned_at)
+            if rows:
+                self.written += self._index.upsert_rows(rows)
             self._index.record_seen(seen)
             self.touched += len(unchanged_paths)
 
@@ -852,15 +997,123 @@ def _walk_subtree(
     skipped: list[SkippedPath] = []
     dirs_visited = 0
     pending_upserts: list[FileRecord] = []
+    pending_rows: list[tuple[object, ...]] = []
     pending_unchanged: list[str] = []
+    # Volume serial (= `st_dev`) of the walk's volume, learned from the first directory the
+    # listing serves and reused for the rest -- see `dirlist.list_directory`.
+    volume_serial: int | None = None
+    scanned_at = writer.scanned_at
+    cached_stats = stat_cache if incremental else None
     stack = [start]
     while stack:
         if cancel_event is not None and cancel_event.is_set():
             break
         current_dir = stack.pop()
         dirs_visited += 1
+        long_dir = long_path(current_dir)
+        # A network-mapped/UNC root keeps the legacy path outright: every entry there is
+        # guarded-stat'd anyway, and the listing's trust is only established for local NTFS.
+        listing = (
+            _list_directory_or_none(long_dir, volume_serial)
+            if _USE_DIRECTORY_LISTING and not force_guard
+            else None
+        )
+        if listing is not None:
+            volume_serial, listed = listing
+            dir_prefix = long_dir if long_dir.endswith("\\") else long_dir + "\\"
+            posix_dir = current_dir.as_posix()
+            posix_prefix = posix_dir if posix_dir.endswith("/") else posix_dir + "/"
+            # Resolved at most once per directory, and only if a row actually needs building:
+            # every plain file here shares `current_dir`'s repo root, which `build_record`
+            # re-derived (from the same memo) once per file.
+            plain_git: tuple[str | None, bool] | None = None
+            plain_count = 0
+            for item in listed:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                name, attributes, size, last_write, creation, id_low, id_high = item
+                if attributes & _LISTING_NEEDS_STAT_ATTRIBUTES or id_high:
+                    built = build_record_from_listing(
+                        item,
+                        volume_serial=volume_serial,
+                        current_dir=current_dir,
+                        dir_prefix=dir_prefix,
+                        git_cache=git_cache,
+                        skipped=skipped,
+                        stat_executor=stat_executor,
+                        risk_counter=risk_counter,
+                    )
+                    if built is None:
+                        continue
+                    record, should_recurse = built
+                    _classify_record(
+                        record, stat_cache, incremental, pending_upserts, pending_unchanged
+                    )
+                    if tracker is not None:
+                        tracker.add(1)
+                    if should_recurse:
+                        stack.append(record.path)
+                else:
+                    # Plain file: no syscall, no Path, no FileRecord -- see the "Listing-sourced
+                    # records" section comment for what this is exactly equal to.
+                    plain_count += 1
+                    posix_path = posix_prefix + name
+                    mtime = filetime_to_unix_seconds(last_write)
+                    stored = cached_stats.get(posix_path) if cached_stats is not None else None
+                    if is_unchanged(stored, current_size=size, current_mtime=mtime):
+                        pending_unchanged.append(posix_path)
+                    else:
+                        if plain_git is None:
+                            repo_root = git_cache.repo_root_for(current_dir)
+                            plain_git = (
+                                (
+                                    repo_root.as_posix(),
+                                    git_cache.is_clean(repo_root),
+                                )
+                                if repo_root is not None
+                                else (None, False)
+                            )
+                        pending_rows.append(
+                            file_row(
+                                posix_path=posix_path,
+                                name=name,
+                                size=size,
+                                mtime=mtime,
+                                ctime=filetime_to_unix_seconds(creation),
+                                ext=_suffix_lower(name),
+                                attributes=attributes,
+                                dev=volume_serial,
+                                ino=id_low,
+                                is_dir=False,
+                                git_repo_root_posix=plain_git[0],
+                                git_repo_clean=plain_git[1],
+                                scanned_at=scanned_at,
+                            )
+                        )
+                if (
+                    len(pending_upserts) + len(pending_rows) >= _WRITE_BATCH_SIZE
+                    or len(pending_unchanged) >= _WRITE_BATCH_SIZE
+                ):
+                    writer.flush(pending_upserts, pending_unchanged, pending_rows)
+                    pending_upserts = []
+                    pending_rows = []
+                    pending_unchanged = []
+                    # Progress/telemetry for plain files is reported per batch, not per file
+                    # (a lock round-trip per file across 32 workers is real contention), but
+                    # still inside a huge flat directory so progress doesn't stall there.
+                    if plain_count:
+                        risk_counter.record(guarded=False, count=plain_count)
+                        if tracker is not None:
+                            tracker.add(plain_count)
+                        plain_count = 0
+            if plain_count:
+                risk_counter.record(guarded=False, count=plain_count)
+                if tracker is not None:
+                    tracker.add(plain_count)
+            continue
+
         try:
-            entries = list(os.scandir(long_path(current_dir)))
+            entries = list(os.scandir(long_dir))
         except OSError as exc:
             logger.warning("scan.dir_unreadable", path=str(current_dir), error=str(exc))
             size_estimate, is_lower_bound = _probe_inaccessible_dir_size(current_dir)
@@ -897,11 +1150,12 @@ def _walk_subtree(
             if len(pending_upserts) >= _WRITE_BATCH_SIZE or len(pending_unchanged) >= (
                 _WRITE_BATCH_SIZE
             ):
-                writer.flush(pending_upserts, pending_unchanged)
+                writer.flush(pending_upserts, pending_unchanged, pending_rows)
                 pending_upserts = []
+                pending_rows = []
                 pending_unchanged = []
 
-    writer.flush(pending_upserts, pending_unchanged)
+    writer.flush(pending_upserts, pending_unchanged, pending_rows)
     return _SubtreeResult(dirs_visited=dirs_visited, skipped=skipped)
 
 

@@ -134,6 +134,12 @@ _CASES: dict[str, Case] = {
         expect_index=True,
         reason="prefix-range scoped via _prefix_range",
     ),
+    "newest_files_under": Case(
+        lambda idx: idx.newest_files_under(_SCOPE, limit=10),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range (then a bounded sort of that one subtree); "
+        "called once per old temp-root directory child by the ADR-0035 re-stat",
+    ),
     "subtree_newest_mtime": Case(
         lambda idx: idx.subtree_newest_mtime(_SCOPE),
         expect_index=True,
@@ -255,6 +261,12 @@ _CASES: dict[str, Case] = {
         reason="INSERT ... ON CONFLICT — EXPLAIN QUERY PLAN produces no plan rows for this "
         "statement shape (verified empirically); conflict resolution is index-based internally "
         "but there's no SEARCH/SCAN decision to assert on",
+    ),
+    "upsert_rows": Case(
+        action=None,
+        expect_index=False,
+        reason="the same INSERT ... ON CONFLICT statement as upsert_records (which now just "
+        "delegates here) -- EXPLAIN QUERY PLAN produces no plan rows for this shape",
     ),
     "_ensure_name_and_path_lower_columns": Case(
         action=None,

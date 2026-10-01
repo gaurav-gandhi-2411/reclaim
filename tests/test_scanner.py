@@ -1117,6 +1117,9 @@ def test_scan_tree_records_inaccessible_directory_as_distinct_entity(
         return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
+    # This fake simulates the failure at `os.scandir`, the legacy listing; the directory-listing
+    # walk (the default) has its own equivalent in tests/test_scanner_listing.py.
+    monkeypatch.setattr(scanner_module, "_USE_DIRECTORY_LISTING", False)
 
     with ScanIndex(tmp_path / "index.sqlite3") as index:
         stats = scan_tree(root, index)
@@ -1164,6 +1167,7 @@ def test_scan_tree_clears_a_previously_inaccessible_path_once_it_becomes_readabl
         return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
+    monkeypatch.setattr(scanner_module, "_USE_DIRECTORY_LISTING", False)  # see test above
 
     with ScanIndex(tmp_path / "index.sqlite3") as index:
         scan_tree(root, index)
