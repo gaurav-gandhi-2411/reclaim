@@ -957,15 +957,27 @@ function renderSimpleIdle() {
   // the volume root -- see service.user_scan_roots's docstring for the full incident.
   const intro = document.createElement("p");
   intro.className = "rc-simple-intro";
-  intro.textContent = "Scans your files and finds safe things to clean up.";
+  intro.textContent =
+    "Frees space right away from things that rebuild themselves: package caches, old temp " +
+    "files, crash dumps and closed browsers' caches. Nothing else is touched.";
   container.appendChild(intro);
 
+  // ADR-0034: one click runs the closed regenerable-tier allow-list (no scan first, no paths
+  // chosen by this page) and reports what it actually freed. Everything outside that list is
+  // still reviewed through the scan below, never auto-cleaned.
   const scanBtn = document.createElement("button");
   scanBtn.type = "button";
   scanBtn.className = "rc-btn rc-btn-success rc-simple-primary-btn";
   scanBtn.textContent = "Clean My Computer";
-  scanBtn.addEventListener("click", startSimpleScan);
+  scanBtn.addEventListener("click", startSimpleOneClick);
   container.appendChild(scanBtn);
+
+  const reviewBtn = document.createElement("button");
+  reviewBtn.type = "button";
+  reviewBtn.className = "rc-btn rc-btn-secondary rc-simple-review-btn";
+  reviewBtn.textContent = "Scan my files for more to review";
+  reviewBtn.addEventListener("click", startSimpleScan);
+  container.appendChild(reviewBtn);
 
   // Whole-drive scan stays available, but only as a deliberate, separately-surfaced opt-in --
   // never the one-click default. openFullDriveConfirmDialog warns explicitly that this can
@@ -983,6 +995,193 @@ function renderSimpleIdle() {
     note.textContent = `Last cleaned this session: ${simpleLastCleanedNote}.`;
     container.appendChild(note);
   }
+}
+
+// Human wording per regenerable item status. "Skipped" outcomes are surfaced, never hidden: a
+// one-click clean that silently skipped the biggest cache would look like it worked.
+const REGENERABLE_STATUS_TEXT = {
+  cleaned: "Cleaned",
+  nothing_to_clean: "Nothing to clean",
+  would_clean: "Would clean",
+  skipped_not_present: "Not on this computer",
+  skipped_tool_missing: "Tool not installed",
+  skipped_in_use: "Skipped — in use right now",
+  skipped_browser_running: "Skipped — browser is open",
+  skipped_no_access: "Skipped — needs administrator rights",
+  failed: "Failed",
+};
+
+const REGENERABLE_POLL_INTERVAL_MS = 2000;
+
+// The real clean is a background job on the server (uv's prune can wait up to 30 minutes for its
+// cache lock), so this only starts it and then polls /api/clean/regenerable/status.
+async function startSimpleOneClick() {
+  const container = simpleViewEl();
+  clearSimplePoll();
+  renderState(container, "loading", {
+    title: "Starting the clean…",
+    message: "Anything that's in use is left alone.",
+  });
+  try {
+    await api("/api/clean/regenerable", {
+      method: "POST",
+      body: JSON.stringify({ apply: true }),
+    });
+  } catch (err) {
+    // 409: a clean is already running (e.g. this page was reloaded) -- watch that one instead.
+    if (err.status !== 409) {
+      renderState(container, "error", {
+        title: "Clean failed",
+        message: err.message,
+        actionLabel: "Back to start",
+        onAction: renderSimpleIdle,
+      });
+      return;
+    }
+  }
+  await pollRegenerableStatus();
+}
+
+async function pollRegenerableStatus() {
+  const container = simpleViewEl();
+  let status;
+  try {
+    status = await api("/api/clean/regenerable/status");
+  } catch (err) {
+    clearSimplePoll();
+    renderState(container, "error", {
+      title: "Could not check the clean's progress",
+      message: err.message,
+      actionLabel: "Check again",
+      onAction: pollRegenerableStatus,
+    });
+    return;
+  }
+
+  if (status.status === "running") {
+    renderSimpleOneClickProgress(status);
+    if (!simplePollHandle) {
+      simplePollHandle = setInterval(pollRegenerableStatus, REGENERABLE_POLL_INTERVAL_MS);
+    }
+    return;
+  }
+
+  clearSimplePoll();
+  if (status.status === "done" && status.report) {
+    renderSimpleOneClickResult(status.report);
+    return;
+  }
+  renderState(container, "error", {
+    title: status.status === "failed" ? "Clean failed" : "No clean is running",
+    message: status.error || "Nothing was reported. Try again.",
+    actionLabel: "Back to start",
+    onAction: renderSimpleIdle,
+  });
+}
+
+function formatElapsedSeconds(seconds) {
+  const total = Math.max(0, Math.round(seconds ?? 0));
+  const minutes = Math.floor(total / 60);
+  return minutes >= 1 ? `${minutes} min ${total % 60} s` : `${total} s`;
+}
+
+// Live view while the job runs: finished items appear as they complete, and the item in progress
+// (uv, which may be waiting for its cache lock, is always last) is named with its own wording.
+// Server-supplied text goes in via textContent only.
+function renderSimpleOneClickProgress(status) {
+  const container = simpleViewEl();
+  renderState(container, "loading", {
+    title: status.current_item || "Finishing up…",
+    message: `Running for ${formatElapsedSeconds(status.elapsed_seconds)}. Anything that's in use is left alone.`,
+  });
+  if (status.items && status.items.length > 0) {
+    container.appendChild(buildRegenerableItemList(status.items));
+  }
+}
+
+function buildRegenerableItemList(items) {
+  const list = document.createElement("ul");
+  list.className = "rc-regenerable-items";
+  for (const item of items) {
+    if (item.status === "skipped_not_present" || item.status === "skipped_tool_missing") continue;
+    const li = document.createElement("li");
+    const status = REGENERABLE_STATUS_TEXT[item.status] ?? item.status;
+    const size = item.bytes_removed > 0 ? ` — ${item.bytes_removed_human}` : "";
+    li.textContent = `${item.label}: ${status}${size}`;
+    if (item.detail) {
+      const detail = document.createElement("div");
+      detail.className = "rc-scan-status";
+      detail.textContent = item.detail;
+      li.appendChild(detail);
+    }
+    list.appendChild(li);
+  }
+  return list;
+}
+
+// Every value here that traces back to disk (labels carry real root paths, details can carry
+// tool output) goes in via textContent only -- same XSS-safe-rendering rule as the rest of this
+// file.
+function renderSimpleOneClickResult(report) {
+  simpleLastCleanedNote = `freed ${report.bytes_removed_human}`;
+  const container = simpleViewEl();
+  container.innerHTML = "";
+
+  const panel = document.createElement("div");
+  panel.className = "rc-state-panel";
+  panel.dataset.kind = "success";
+  panel.setAttribute("role", "status");
+
+  const heading = document.createElement("strong");
+  heading.textContent = `Freed ${report.bytes_removed_human}`;
+  panel.appendChild(heading);
+
+  const lines = [];
+  if (report.percent_used_after !== null && report.percent_used_after !== undefined) {
+    lines.push(`C: is now ${Math.round(report.percent_used_after)}% used.`);
+  }
+  if (report.disk_free_delta_bytes !== null && report.disk_free_delta_bytes !== undefined) {
+    const delta = report.disk_free_delta_bytes;
+    const sign = delta >= 0 ? "+" : "−";
+    lines.push(
+      `Measured free-space change on C: ${sign}${formatFromBytes(Math.abs(delta))} ` +
+        "(includes anything else writing to the disk at the same time)."
+    );
+  }
+  lines.push(`Took ${report.duration_seconds} s.`);
+  for (const text of lines) {
+    const p = document.createElement("p");
+    p.style.margin = "0";
+    p.textContent = text;
+    panel.appendChild(p);
+  }
+  container.appendChild(panel);
+
+  const list = buildRegenerableItemList(report.items);
+  container.appendChild(list);
+
+  if (report.files_skipped_in_use > 0) {
+    const note = document.createElement("p");
+    note.className = "rc-scan-status";
+    note.textContent =
+      `${report.files_skipped_in_use.toLocaleString()} file(s) were in use and left alone — ` +
+      "run it again after closing those programs.";
+    container.appendChild(note);
+  }
+
+  const reviewBtn = document.createElement("button");
+  reviewBtn.type = "button";
+  reviewBtn.className = "rc-btn rc-btn-secondary";
+  reviewBtn.textContent = "Scan my files for more to review";
+  reviewBtn.addEventListener("click", startSimpleScan);
+  container.appendChild(reviewBtn);
+
+  const doneBtn = document.createElement("button");
+  doneBtn.type = "button";
+  doneBtn.className = "rc-btn rc-btn-primary";
+  doneBtn.textContent = "Done";
+  doneBtn.addEventListener("click", renderSimpleIdle);
+  container.appendChild(doneBtn);
 }
 
 async function startSimpleScan() {
@@ -1706,6 +1905,8 @@ export {
   openFullDriveConfirmDialog,
   closeFullDriveConfirmDialog,
   renderSimpleIdle,
+  renderSimpleOneClickResult,
+  renderSimpleOneClickProgress,
   renderApplyReport,
 };
 
