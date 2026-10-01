@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import reclaim.scanner as scanner_module
 from reclaim.api import security
 from reclaim.api.app import create_app
 from reclaim.config import (
@@ -1226,6 +1227,16 @@ def test_summary_surfaces_inaccessible_paths_from_a_persisted_scan(
         return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
+    # The scan lists directories via `reclaim.dirlist` first and only falls back to os.scandir,
+    # so the simulated "can't list this directory" has to hold for both.
+    real_list_directory = scanner_module.list_directory
+
+    def fake_list_directory(path: str, volume_serial: int | None = None) -> object:
+        if "blocked_dir" in path:
+            raise PermissionError(13, "Access is denied", path)
+        return real_list_directory(path, volume_serial)
+
+    monkeypatch.setattr(scanner_module, "list_directory", fake_list_directory)
     client = _make_app(tmp_path, config=_config(root))
 
     _scan_and_wait(client, root)
