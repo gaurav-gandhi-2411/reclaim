@@ -1837,6 +1837,7 @@ export {
   renderSimpleIdle,
   renderSimpleOneClickResult,
   renderApplyReport,
+  describeAutoCleanTask,
 };
 
 function updateApplyBar() {
@@ -2475,6 +2476,12 @@ async function updateNotificationsSetting(checkbox, toggleText, statusEl) {
 // notifications toggle above; the task facts shown under it come from a live Task Scheduler
 // query, so "on" with no task (or a task left behind while off) is visible, not hidden. ---------
 
+// The API sends ISO-8601 (locale-independent); format with the viewer's own locale here.
+function formatTaskTime(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? String(iso) : date.toLocaleString();
+}
+
 function describeAutoCleanTask(data) {
   if (!data.task_registered) {
     return data.enabled
@@ -2482,11 +2489,11 @@ function describeAutoCleanTask(data) {
       : "No weekly task is scheduled.";
   }
   const parts = [`Scheduled task: ${data.task_state || "unknown state"}`];
-  parts.push(data.last_run_time ? `last run ${data.last_run_time}` : "has not run yet");
+  parts.push(data.last_run_time ? `last run ${formatTaskTime(data.last_run_time)}` : "has not run yet");
   if (data.last_run_time && data.last_result !== null && data.last_result !== 0) {
     parts.push(`last result code ${data.last_result}`);
   }
-  if (data.next_run_time) parts.push(`next run ${data.next_run_time}`);
+  if (data.next_run_time) parts.push(`next run ${formatTaskTime(data.next_run_time)}`);
   return parts.join(" · ") + ".";
 }
 

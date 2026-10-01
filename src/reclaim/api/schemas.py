@@ -742,9 +742,10 @@ class UpdateNotificationsSettingRequest(BaseModel):
     enabled: bool
 
 
-# ADR-0034: the weekly auto-clean toggle. The task fields come from a live `schtasks /query`, not
-# from config -- `enabled` (what the user chose) and `task_registered` (what Windows actually has)
-# can disagree, and the UI shows both. Times are the raw locale-formatted text schtasks printed.
+# ADR-0034: the weekly auto-clean toggle. The task fields come from a live typed ScheduledTasks
+# query, not from config -- `enabled` (what the user chose) and `task_registered` (what
+# Windows actually has) can disagree, and the UI shows both. Times are ISO-8601 strings
+# (locale-independent; the UI formats them) and `task_state` is the TaskState enum name.
 class AutoCleanSettingOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
