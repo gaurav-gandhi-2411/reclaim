@@ -177,6 +177,49 @@ def test_apply_include_categories_restricts_to_named_categories(
     assert "dev_artifact_node_modules" not in out
 
 
+def test_apply_output_reports_bytes_freed_and_bytes_moved_separately(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B7: a Recycle Bin move frees nothing until the bin is emptied, so the apply summary must
+    carry BOTH fields -- `bytes_freed=0 bytes_moved=<n>` -- plus the self-explanatory note, and
+    the per-category line must split them too. (Dry-run classifies exactly like a real run.)"""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "package.json").write_bytes(b"{}")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "pkg.js").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[categories.dev_artifacts]\nenabled = true\nretention_days = 30\n", encoding="utf-8"
+    )
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "apply",
+            str(root),
+            "--db",
+            str(db),
+            "--config",
+            str(config_path),
+            "--method",
+            "recycle_bin",
+            "--mode-log",
+            str(mode_log),
+        ]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "bytes_freed=0 bytes_moved=100" in out
+    assert "moved to Recycle Bin, not yet freed" in out
+    assert "dev_artifact_node_modules: count=1 bytes_freed=0 bytes_moved=100" in out
+
+
 # --- P0-5: inaccessible-path accounting + `reclaim reconcile` --------------------------------
 
 

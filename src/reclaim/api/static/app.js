@@ -864,25 +864,13 @@ function renderQuickCleanResult(container, report) {
   heading.textContent = `Cleaned — batch ${report.batch_id}`;
   panel.appendChild(heading);
 
-  // Every branch below states what ACTUALLY happened to the bytes — recycle_bin/vault are both
-  // moves (recoverable), never described as "freed"; only direct_delete really frees the space
-  // immediately. See house rule: never claim space was freed when it was only moved.
+  // The wording states what ACTUALLY happened to the bytes — `bytes_moved` (recycle_bin/vault
+  // moves, recoverable) is never described as "freed"; only `bytes_freed` (direct delete or a
+  // synchronously purged vault copy) really frees space. See house rule: never claim space was
+  // freed when it was only moved.
   const summary = document.createElement("p");
   summary.style.margin = "0";
-  if (report.method === "recycle_bin") {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
-      "the Recycle Bin — empty the Recycle Bin to free the space.";
-  } else if (report.method === "vault") {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
-      "the Reclaim vault — restorable from the Quarantine & Restore tab; the space is held " +
-      "until purged.";
-  } else {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) permanently ` +
-      "freed.";
-  }
+  summary.textContent = applyReportBytesPhrase(report);
   panel.appendChild(summary);
 
   const detail = document.createElement("p");
@@ -969,15 +957,27 @@ function renderSimpleIdle() {
   // the volume root -- see service.user_scan_roots's docstring for the full incident.
   const intro = document.createElement("p");
   intro.className = "rc-simple-intro";
-  intro.textContent = "Scans your files and finds safe things to clean up.";
+  intro.textContent =
+    "Frees space right away from things that rebuild themselves: package caches, old temp " +
+    "files, crash dumps and closed browsers' caches. Nothing else is touched.";
   container.appendChild(intro);
 
+  // ADR-0034: one click runs the closed regenerable-tier allow-list (no scan first, no paths
+  // chosen by this page) and reports what it actually freed. Everything outside that list is
+  // still reviewed through the scan below, never auto-cleaned.
   const scanBtn = document.createElement("button");
   scanBtn.type = "button";
   scanBtn.className = "rc-btn rc-btn-success rc-simple-primary-btn";
   scanBtn.textContent = "Clean My Computer";
-  scanBtn.addEventListener("click", startSimpleScan);
+  scanBtn.addEventListener("click", startSimpleOneClick);
   container.appendChild(scanBtn);
+
+  const reviewBtn = document.createElement("button");
+  reviewBtn.type = "button";
+  reviewBtn.className = "rc-btn rc-btn-secondary rc-simple-review-btn";
+  reviewBtn.textContent = "Scan my files for more to review";
+  reviewBtn.addEventListener("click", startSimpleScan);
+  container.appendChild(reviewBtn);
 
   // Whole-drive scan stays available, but only as a deliberate, separately-surfaced opt-in --
   // never the one-click default. openFullDriveConfirmDialog warns explicitly that this can
@@ -995,6 +995,193 @@ function renderSimpleIdle() {
     note.textContent = `Last cleaned this session: ${simpleLastCleanedNote}.`;
     container.appendChild(note);
   }
+}
+
+// Human wording per regenerable item status. "Skipped" outcomes are surfaced, never hidden: a
+// one-click clean that silently skipped the biggest cache would look like it worked.
+const REGENERABLE_STATUS_TEXT = {
+  cleaned: "Cleaned",
+  nothing_to_clean: "Nothing to clean",
+  would_clean: "Would clean",
+  skipped_not_present: "Not on this computer",
+  skipped_tool_missing: "Tool not installed",
+  skipped_in_use: "Skipped — in use right now",
+  skipped_browser_running: "Skipped — browser is open",
+  skipped_no_access: "Skipped — needs administrator rights",
+  failed: "Failed",
+};
+
+const REGENERABLE_POLL_INTERVAL_MS = 2000;
+
+// The real clean is a background job on the server (uv's prune can wait up to 30 minutes for its
+// cache lock), so this only starts it and then polls /api/clean/regenerable/status.
+async function startSimpleOneClick() {
+  const container = simpleViewEl();
+  clearSimplePoll();
+  renderState(container, "loading", {
+    title: "Starting the clean…",
+    message: "Anything that's in use is left alone.",
+  });
+  try {
+    await api("/api/clean/regenerable", {
+      method: "POST",
+      body: JSON.stringify({ apply: true }),
+    });
+  } catch (err) {
+    // 409: a clean is already running (e.g. this page was reloaded) -- watch that one instead.
+    if (err.status !== 409) {
+      renderState(container, "error", {
+        title: "Clean failed",
+        message: err.message,
+        actionLabel: "Back to start",
+        onAction: renderSimpleIdle,
+      });
+      return;
+    }
+  }
+  await pollRegenerableStatus();
+}
+
+async function pollRegenerableStatus() {
+  const container = simpleViewEl();
+  let status;
+  try {
+    status = await api("/api/clean/regenerable/status");
+  } catch (err) {
+    clearSimplePoll();
+    renderState(container, "error", {
+      title: "Could not check the clean's progress",
+      message: err.message,
+      actionLabel: "Check again",
+      onAction: pollRegenerableStatus,
+    });
+    return;
+  }
+
+  if (status.status === "running") {
+    renderSimpleOneClickProgress(status);
+    if (!simplePollHandle) {
+      simplePollHandle = setInterval(pollRegenerableStatus, REGENERABLE_POLL_INTERVAL_MS);
+    }
+    return;
+  }
+
+  clearSimplePoll();
+  if (status.status === "done" && status.report) {
+    renderSimpleOneClickResult(status.report);
+    return;
+  }
+  renderState(container, "error", {
+    title: status.status === "failed" ? "Clean failed" : "No clean is running",
+    message: status.error || "Nothing was reported. Try again.",
+    actionLabel: "Back to start",
+    onAction: renderSimpleIdle,
+  });
+}
+
+function formatElapsedSeconds(seconds) {
+  const total = Math.max(0, Math.round(seconds ?? 0));
+  const minutes = Math.floor(total / 60);
+  return minutes >= 1 ? `${minutes} min ${total % 60} s` : `${total} s`;
+}
+
+// Live view while the job runs: finished items appear as they complete, and the item in progress
+// (uv, which may be waiting for its cache lock, is always last) is named with its own wording.
+// Server-supplied text goes in via textContent only.
+function renderSimpleOneClickProgress(status) {
+  const container = simpleViewEl();
+  renderState(container, "loading", {
+    title: status.current_item || "Finishing up…",
+    message: `Running for ${formatElapsedSeconds(status.elapsed_seconds)}. Anything that's in use is left alone.`,
+  });
+  if (status.items && status.items.length > 0) {
+    container.appendChild(buildRegenerableItemList(status.items));
+  }
+}
+
+function buildRegenerableItemList(items) {
+  const list = document.createElement("ul");
+  list.className = "rc-regenerable-items";
+  for (const item of items) {
+    if (item.status === "skipped_not_present" || item.status === "skipped_tool_missing") continue;
+    const li = document.createElement("li");
+    const status = REGENERABLE_STATUS_TEXT[item.status] ?? item.status;
+    const size = item.bytes_removed > 0 ? ` — ${item.bytes_removed_human}` : "";
+    li.textContent = `${item.label}: ${status}${size}`;
+    if (item.detail) {
+      const detail = document.createElement("div");
+      detail.className = "rc-scan-status";
+      detail.textContent = item.detail;
+      li.appendChild(detail);
+    }
+    list.appendChild(li);
+  }
+  return list;
+}
+
+// Every value here that traces back to disk (labels carry real root paths, details can carry
+// tool output) goes in via textContent only -- same XSS-safe-rendering rule as the rest of this
+// file.
+function renderSimpleOneClickResult(report) {
+  simpleLastCleanedNote = `freed ${report.bytes_removed_human}`;
+  const container = simpleViewEl();
+  container.innerHTML = "";
+
+  const panel = document.createElement("div");
+  panel.className = "rc-state-panel";
+  panel.dataset.kind = "success";
+  panel.setAttribute("role", "status");
+
+  const heading = document.createElement("strong");
+  heading.textContent = `Freed ${report.bytes_removed_human}`;
+  panel.appendChild(heading);
+
+  const lines = [];
+  if (report.percent_used_after !== null && report.percent_used_after !== undefined) {
+    lines.push(`C: is now ${Math.round(report.percent_used_after)}% used.`);
+  }
+  if (report.disk_free_delta_bytes !== null && report.disk_free_delta_bytes !== undefined) {
+    const delta = report.disk_free_delta_bytes;
+    const sign = delta >= 0 ? "+" : "−";
+    lines.push(
+      `Measured free-space change on C: ${sign}${formatFromBytes(Math.abs(delta))} ` +
+        "(includes anything else writing to the disk at the same time)."
+    );
+  }
+  lines.push(`Took ${report.duration_seconds} s.`);
+  for (const text of lines) {
+    const p = document.createElement("p");
+    p.style.margin = "0";
+    p.textContent = text;
+    panel.appendChild(p);
+  }
+  container.appendChild(panel);
+
+  const list = buildRegenerableItemList(report.items);
+  container.appendChild(list);
+
+  if (report.files_skipped_in_use > 0) {
+    const note = document.createElement("p");
+    note.className = "rc-scan-status";
+    note.textContent =
+      `${report.files_skipped_in_use.toLocaleString()} file(s) were in use and left alone — ` +
+      "run it again after closing those programs.";
+    container.appendChild(note);
+  }
+
+  const reviewBtn = document.createElement("button");
+  reviewBtn.type = "button";
+  reviewBtn.className = "rc-btn rc-btn-secondary";
+  reviewBtn.textContent = "Scan my files for more to review";
+  reviewBtn.addEventListener("click", startSimpleScan);
+  container.appendChild(reviewBtn);
+
+  const doneBtn = document.createElement("button");
+  doneBtn.type = "button";
+  doneBtn.className = "rc-btn rc-btn-primary";
+  doneBtn.textContent = "Done";
+  doneBtn.addEventListener("click", renderSimpleIdle);
+  container.appendChild(doneBtn);
 }
 
 async function startSimpleScan() {
@@ -1242,8 +1429,21 @@ function renderSimpleGroups(summary) {
 // content (the same renderQuickCleanResult success panel Quick Clean shows, matched wording) —
 // just adds the way back to a fresh idle screen the spec requires ("a fresh scan next time, not
 // stale data").
+function simpleCleanedNote(report) {
+  const freed = report.bytes_freed || 0;
+  const moved = report.bytes_moved || 0;
+  if (moved === 0) {
+    return `${report.bytes_freed_human} freed`;
+  }
+  const where = report.method === "vault" ? "Reclaim vault" : "Recycle Bin";
+  const movedPart = `${report.bytes_moved_human} moved to the ${where} (not yet freed)`;
+  return freed > 0 ? `${report.bytes_freed_human} freed, ${movedPart}` : movedPart;
+}
+
 function renderSimpleCleanSuccess(report) {
-  simpleLastCleanedNote = report.bytes_freed_human;
+  // B7: describe moved bytes as moved, never "freed" — the idle-screen note renders this string
+  // after "Last cleaned this session:", so it carries its own verb when anything was only moved.
+  simpleLastCleanedNote = simpleCleanedNote(report);
   const backBtn = document.createElement("button");
   backBtn.type = "button";
   backBtn.className = "rc-btn rc-btn-primary";
@@ -1705,6 +1905,8 @@ export {
   openFullDriveConfirmDialog,
   closeFullDriveConfirmDialog,
   renderSimpleIdle,
+  renderSimpleOneClickResult,
+  renderSimpleOneClickProgress,
   renderApplyReport,
 };
 
@@ -1771,24 +1973,45 @@ async function runApply(dryRun) {
 // branch; anything else (including a genuinely unrecognized method) gets a neutral, honest
 // phrase that commits to no specific outcome, rather than an unverified "freed" claim.
 function applyReportBytesPhrase(report) {
-  const humanBytes = `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes)`;
-  if (report.method === "recycle_bin") {
+  // B7: `bytes_freed` is genuinely freed space (direct delete / synchronously purged);
+  // `bytes_moved` is a recoverable Recycle Bin / vault move whose space is still held. They are
+  // phrased separately, from the report's own fields, never inferred from `report.method`.
+  const freed = report.bytes_freed || 0;
+  const moved = report.bytes_moved || 0;
+  const freedText = `${report.bytes_freed_human} (${freed.toLocaleString()} bytes)`;
+  const movedText = `${report.bytes_moved_human} (${moved.toLocaleString()} bytes)`;
+  const knownMethod =
+    report.method === "recycle_bin" || report.method === "vault" || report.method === "direct_delete";
+  if (!knownMethod) {
+    const total = freed + moved;
     return report.apply
-      ? `${humanBytes} moved to the Recycle Bin — empty the Recycle Bin to free the space.`
-      : `${humanBytes} would be moved to the Recycle Bin.`;
+      ? `${total.toLocaleString()} bytes processed (unrecognized method "${report.method}" — outcome not confirmed).`
+      : `${total.toLocaleString()} bytes would be processed (unrecognized method "${report.method}" — outcome not confirmed).`;
   }
-  if (report.method === "vault") {
-    return report.apply
-      ? `${humanBytes} moved to the Reclaim vault — restorable from the Quarantine & Restore ` +
-          "tab; the space is held until purged."
-      : `${humanBytes} would be moved to the Reclaim vault.`;
+  const parts = [];
+  if (moved > 0) {
+    if (report.method === "recycle_bin") {
+      parts.push(
+        report.apply
+          ? `${movedText} moved to the Recycle Bin — empty the Recycle Bin to free the space.`
+          : `${movedText} would be moved to the Recycle Bin.`
+      );
+    } else {
+      parts.push(
+        report.apply
+          ? `${movedText} moved to the Reclaim vault — restorable from the Quarantine & Restore ` +
+              "tab; the space is held until purged."
+          : `${movedText} would be moved to the Reclaim vault.`
+      );
+    }
   }
-  if (report.method === "direct_delete") {
-    return report.apply ? `${humanBytes} permanently freed.` : `${humanBytes} would be permanently freed.`;
+  if (freed > 0) {
+    parts.push(report.apply ? `${freedText} permanently freed.` : `${freedText} would be permanently freed.`);
   }
-  return report.apply
-    ? `${humanBytes} processed (unrecognized method "${report.method}" — outcome not confirmed).`
-    : `${humanBytes} would be processed (unrecognized method "${report.method}" — outcome not confirmed).`;
+  if (parts.length === 0) {
+    return report.apply ? "No space was moved or freed." : "No space would be moved or freed.";
+  }
+  return parts.join(" ");
 }
 
 function renderApplyReport(container, report) {
@@ -1815,7 +2038,13 @@ function renderApplyReport(container, report) {
     const list = document.createElement("ul");
     for (const entry of report.category_breakdown) {
       const li = document.createElement("li");
-      li.textContent = `${entry.category_label}: ${entry.count} item(s), ${entry.bytes_freed_human}`;
+      const breakdownParts = [];
+      if ((entry.bytes_freed || 0) > 0) breakdownParts.push(`${entry.bytes_freed_human} freed`);
+      if ((entry.bytes_moved || 0) > 0) {
+        breakdownParts.push(`${entry.bytes_moved_human} moved (not yet freed)`);
+      }
+      if (breakdownParts.length === 0) breakdownParts.push(`${entry.bytes_freed_human} freed`);
+      li.textContent = `${entry.category_label}: ${entry.count} item(s), ${breakdownParts.join(", ")}`;
       list.appendChild(li);
     }
     panel.appendChild(list);

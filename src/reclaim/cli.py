@@ -896,8 +896,17 @@ def _run_apply(args: argparse.Namespace) -> int:
     print(  # noqa: T201
         f"reclaim apply [{mode}] batch={report.batch_id} method={report.method} "
         f"processed={report.files_processed} succeeded={report.files_succeeded} "
-        f"failed={report.files_failed} bytes_freed={report.bytes_freed}"
+        f"failed={report.files_failed} bytes_freed={report.bytes_freed} "
+        f"bytes_moved={report.bytes_moved}"
     )
+    if report.bytes_moved > 0:
+        # No disk space is freed by a Recycle Bin / vault move until the bin is emptied / the
+        # vault purged -- say so in the output itself rather than leaving it to inference.
+        where = "Recycle Bin" if report.method == "recycle_bin" else "vault"
+        print(  # noqa: T201
+            f"  bytes_moved={report.bytes_moved} moved to {where}, not yet freed "
+            f"(space is released when the {where} is emptied)"
+        )
     if report.disk_free_delta_bytes is not None:
         print(  # noqa: T201
             f"reclaim apply: disk free before={report.disk_free_before_bytes} "
@@ -915,7 +924,8 @@ def _run_apply(args: argparse.Namespace) -> int:
         )
     for category, breakdown in sorted(report.category_breakdown.items()):
         print(  # noqa: T201
-            f"  {category}: count={breakdown.count} bytes={breakdown.bytes_freed}"
+            f"  {category}: count={breakdown.count} bytes_freed={breakdown.bytes_freed} "
+            f"bytes_moved={breakdown.bytes_moved}"
         )
     _print_duplicate_reclaim_estimate(selected)
     _print_top_n_largest(selected)

@@ -18,15 +18,21 @@ function container() {
   return document.getElementById("apply-result");
 }
 
+// B7: recycle_bin/vault reports carry the 2048 bytes in `bytes_moved` (bytes_freed is 0 --
+// nothing is freed until the bin is emptied / vault purged); direct_delete is the reverse.
 function baseReport(overrides) {
+  const method = overrides.method ?? "direct_delete";
+  const moved = method === "recycle_bin" || method === "vault";
   return {
     batch_id: "batch-123",
     apply: true,
     files_succeeded: 3,
     files_processed: 3,
     files_failed: 0,
-    bytes_freed: 2048,
-    bytes_freed_human: "2.0 KB",
+    bytes_freed: moved ? 0 : 2048,
+    bytes_freed_human: moved ? "0 B" : "2.0 KB",
+    bytes_moved: moved ? 2048 : 0,
+    bytes_moved_human: moved ? "2.0 KB" : "0 B",
     category_breakdown: [],
     disk_free_delta_bytes: null,
     disk_free_before_bytes: null,
@@ -102,4 +108,46 @@ test("renderApplyReport: an unrecognized method never says 'freed' -- dry-run", 
   const text = container().textContent;
   assert.equal(text.includes("freed"), false, "unrecognized method must never claim bytes were freed");
   assert.ok(text.includes('unrecognized method "future_unknown_method"'), `got: ${text}`);
+});
+
+// B7 teeth: the phrase is driven by the report's own bytes_freed/bytes_moved fields, not by
+// report.method. A recycle_bin report that (wrongly) carried its bytes in bytes_freed would be
+// worded "permanently freed" here, so a backend regression that counts a move as freed surfaces.
+test("renderApplyReport: mixed batch words moved and freed bytes separately", () => {
+  renderApplyReport(
+    container(),
+    baseReport({
+      method: "vault",
+      apply: true,
+      bytes_freed: 1024,
+      bytes_freed_human: "1.0 KB",
+      bytes_moved: 2048,
+      bytes_moved_human: "2.0 KB",
+    })
+  );
+  const text = container().textContent;
+  assert.ok(text.includes("2.0 KB (2,048 bytes) moved to the Reclaim vault"), `got: ${text}`);
+  assert.ok(text.includes("1.0 KB (1,024 bytes) permanently freed."), `got: ${text}`);
+});
+
+test("renderApplyReport: category breakdown labels moved bytes as not yet freed", () => {
+  renderApplyReport(
+    container(),
+    baseReport({
+      method: "recycle_bin",
+      category_breakdown: [
+        {
+          category_label: "Browser cache",
+          count: 3,
+          bytes_freed: 0,
+          bytes_freed_human: "0 B",
+          bytes_moved: 2048,
+          bytes_moved_human: "2.0 KB",
+        },
+      ],
+    })
+  );
+  const li = container().querySelector("li").textContent;
+  assert.ok(li.includes("2.0 KB moved (not yet freed)"), `got: ${li}`);
+  assert.equal(li.includes("0 B freed"), false, `got: ${li}`);
 });

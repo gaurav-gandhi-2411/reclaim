@@ -168,13 +168,42 @@ def _extract_js_function_body(source: str, function_name: str) -> str:
     return source[start : i - 1]
 
 
-def test_clean_my_computer_primary_button_is_wired_to_start_simple_scan() -> None:
+def test_clean_my_computer_primary_button_runs_the_regenerable_tier_not_a_scan() -> None:
+    # ADR-0034: the primary button no longer starts a scan at all. It must run the closed
+    # regenerable-tier clean, and the scan stays reachable as the separate "review more" control.
     source = _APP_JS_PATH.read_text(encoding="utf-8")
     assert 'scanBtn.textContent = "Clean My Computer";' in source
-    assert 'scanBtn.addEventListener("click", startSimpleScan);' in source, (
-        "the primary 'Clean My Computer' button must be wired to startSimpleScan -- if this "
-        "changed, confirm it was NOT rewired back to a whole-drive scan by default"
+    assert 'scanBtn.addEventListener("click", startSimpleOneClick);' in source, (
+        "the primary 'Clean My Computer' button must run startSimpleOneClick (ADR-0034)"
     )
+    assert 'reviewBtn.addEventListener("click", startSimpleScan);' in source, (
+        "the scan must stay reachable as the secondary 'review more' action -- and it is "
+        "startSimpleScan, whose scope is pinned by the test below"
+    )
+
+
+def test_start_simple_one_click_takes_no_paths_and_starts_no_scan() -> None:
+    source = _APP_JS_PATH.read_text(encoding="utf-8")
+    body = _extract_js_function_body(source, "startSimpleOneClick")
+    assert "/api/clean/regenerable" in body
+    assert "/api/scan" not in body, "the one-click clean must never start a scan of any scope"
+    assert "paths" not in body, (
+        "the one-click clean must never send a path list -- the server's allow-list is the only "
+        "source of what gets cleaned (ADR-0034)"
+    )
+
+
+def test_one_click_status_polling_takes_no_paths_and_starts_no_scan() -> None:
+    # ADR-0034: the clean runs as a background job; the page only starts it (above) and polls its
+    # status. The polling side must stay as closed as the starting side.
+    source = _APP_JS_PATH.read_text(encoding="utf-8")
+    start_body = _extract_js_function_body(source, "startSimpleOneClick")
+    assert "pollRegenerableStatus" in start_body, "the click must hand over to the status poll"
+    body = _extract_js_function_body(source, "pollRegenerableStatus")
+    assert "/api/clean/regenerable/status" in body
+    assert "/api/scan" not in body
+    assert "paths" not in body
+    assert "POST" not in body, "polling must be read-only"
 
 
 def test_start_simple_scan_calls_my_files_endpoint_never_full_drive() -> None:
