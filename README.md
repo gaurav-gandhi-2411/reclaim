@@ -54,12 +54,34 @@ for the full technical proof):
 
 - **Every delete goes to the Recycle Bin.** Never a permanent delete, no matter what you select.
 - **Nothing applies automatically.** You always pick what to clean and confirm it — Reclaim never
-  acts on its own.
+  acts on its own (the one opt-in exception is the [weekly cache clean](#weekly-cache-clean-optional-off-by-default),
+  which you must switch on and which only touches regenerable caches).
 - **The riskiest categories stay off** (exact-duplicate detection, ML model caches, and
   dev-environment folders) until you explicitly opt in to power mode.
 - **Power mode is a typed opt-in, and reversible.** It unlocks the full toolset (permanent delete
   for rebuildable caches, auto-apply) only after you type an exact confirmation phrase in the
   dashboard. You can switch back to safe mode at any time, with no confirmation required.
+
+## Weekly cache clean (optional, off by default)
+
+**Settings -> Weekly cache clean** lets Reclaim clear only what other programs rebuild on their
+own, once a week (Sundays, 10:00), with no clicks from you. It is the one thing in Reclaim that
+runs without you picking each item, so it is **off until you turn it on**, and it is deliberately
+tiny (see ADR-0034):
+
+- **Only a fixed list:** package-manager download caches (cleaned with each tool's own command),
+  temp files untouched for 7+ days, old crash dumps, and caches of browsers that are *not
+  running*. Never your documents, downloads, the Recycle Bin, or the quarantine vault.
+- **Skips anything in use,** and tells you how many files it left alone.
+- **Shows a notification** ("Freed X, C: now Y% used") only when something was freed or skipped.
+- **Per Windows account:** the task is named `Reclaim Weekly Auto-Clean (<your username>)`, runs
+  without administrator rights, and only while you are signed in. Turning the toggle off removes
+  it, and a leftover task does nothing once the setting is off.
+- **Needs the installed app** (a source checkout has no `reclaim.exe` to schedule; the toggle
+  explains this instead of failing silently).
+
+By hand: `reclaim auto-clean` previews (a dry run); `reclaim auto-clean --apply` really cleans.
+Every item is recorded in `data/regenerable_audit.jsonl`.
 
 ## How to restore something
 
