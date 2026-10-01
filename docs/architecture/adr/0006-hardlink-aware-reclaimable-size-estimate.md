@@ -82,6 +82,10 @@ overstate reclaimable space by construction, not just by coincidence.
   hardlink question is about what happens to *disk-wide free space* afterward, which
   `disk_free_delta_bytes`'s real, measured before/after already answers honestly. Conflating the
   two would have replaced one honest number with a different, no-more-honest estimate.
+  *Update (B7):* `bytes_freed` now counts only genuinely released space (direct delete, or a
+  synchronously purged vault copy); Recycle Bin / vault moves are reported separately in
+  `bytes_moved` (recoverable, space still held). Still `size_bytes`-based, still not
+  hardlink-adjusted.
 - **The 48GB logical duplicate figure from the first real-disk dry run is now explicitly
   superseded** — the corrected run (this same day) is the first trustworthy number for that
   category; see `PLAN.md`'s checkpoint for the actual measured logical-vs-reclaimable split.

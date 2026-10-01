@@ -454,8 +454,12 @@ class CategoryBreakdownOut(BaseModel):
     category_group: str
     category_label: str
     count: int
+    # Genuinely freed bytes (direct delete / synchronously purged). Recycle Bin / vault moves
+    # are reported in `bytes_moved` instead: recoverable, space still held.
     bytes_freed: int
     bytes_freed_human: str
+    bytes_moved: int = 0
+    bytes_moved_human: str = "0 B"
 
 
 class ApplyResponse(BaseModel):
@@ -468,6 +472,8 @@ class ApplyResponse(BaseModel):
     files_processed: int
     files_succeeded: int
     files_failed: int
+    # Genuinely freed bytes only (direct delete / synchronously purged). Recycle Bin / vault
+    # moves are in `bytes_moved` -- no disk space is freed until the bin is emptied / vault purged.
     bytes_freed: int
     bytes_freed_human: str
     category_breakdown: list[CategoryBreakdownOut]
@@ -478,6 +484,8 @@ class ApplyResponse(BaseModel):
     # synchronously_purged` exactly.
     synchronously_purged_count: int = 0
     bytes_synchronously_purged: int = 0
+    bytes_moved: int = 0
+    bytes_moved_human: str = "0 B"
 
 
 class ApplyStatusOut(BaseModel):
