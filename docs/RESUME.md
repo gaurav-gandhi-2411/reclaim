@@ -30,6 +30,19 @@ every reading):** C: free 53.17 -> 85.04 GB. Deleted: 7 `C:\adk*` venvs 4.68 GB 
 (dirty=3), `adk6725_repro`/`adkrel060-scratch` (tiny, no git), `triage-iq-wt-groq-model-fix`.
 Stray 0-byte `scratch_patch.py` appeared in the main checkout at 19:25 (not mine; left).
 
+## SAFE POINT 2026-10-01 — all agents finished, everything pushed; waiting on owner merges + admin window
+
+Branches: #119 `fix/pyjwt-advisories` (ready, CLEAN), #112 Nuitka pin, #113 regenerable tier (+1a uv wait,
+async job), #116 weekly auto-clean (+1c typed task query, based on #113), #115 bytes_freed/moved, #117
+review-queue perf (+1b full ANALYZE at scan end, archive-pairs memo), #118 scan listing IDs (+1d live
+re-stat at decision points), #114 docs, soak harness `test/frozen-serve-soak` (PR opened after this).
+1b: full `ANALYZE files` fixes the un-hinted plans (52.1 s -> 0.476 s); `PRAGMA optimize` /
+`analysis_limit` do NOT. Path-scoped apply 202.3 -> 132.3 s (remaining = whole detector suite per
+request; needs the warm-candidate-cache behaviour change, NOT done, owner decision).
+Next: owner merges #119 -> rebase all others on main -> re-run checks -> table; admin window (Docker/WSL
+steps 1-3 + `powercfg /hibernate off`, reboot); then Docker prune; rebuild (~25 min warm BELIEVED);
+soak 2 h; Phase C; B6.
+
 ## PRIORITY CHANGE 2026-10-01 — "daily driver" plan (Phases A/B/C), read this first
 
 Supersedes the AC3-trip priority below. #110 and #111 are merged (`origin/main` = `3deb05d`).
