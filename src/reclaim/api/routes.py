@@ -727,7 +727,11 @@ def update_notifications_setting(
 
 @router.get("/settings/autoclean", response_model=AutoCleanSettingOut)
 def autoclean_settings(request: Request) -> AutoCleanSettingOut:
-    return service.autoclean_settings(get_state(request))
+    """409 (actionable message) when Task Scheduler could not be queried at all."""
+    try:
+        return service.autoclean_settings(get_state(request))
+    except AutoCleanScheduleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("/settings/autoclean", response_model=AutoCleanSettingOut)
