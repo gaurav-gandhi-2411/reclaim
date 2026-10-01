@@ -30,6 +30,10 @@ from reclaim.api.schemas import (
     PowerModeRequest,
     QuarantineListResponse,
     RecoveryStatusResponse,
+    RegenerableCleanRequest,
+    RegenerableCleanResponse,
+    RegenerableStartResponse,
+    RegenerableStatusResponse,
     RestoreStatusOut,
     ScanRequest,
     ScanStatusOut,
@@ -424,6 +428,38 @@ def candidates(
             status_code=400, detail=f"tier must be one of A, B, both (got {tier!r})"
         )
     return service.list_candidates(get_state(request), tier=tier, category_group=category)
+
+
+@router.post(
+    "/clean/regenerable",
+    response_model=RegenerableCleanResponse | RegenerableStartResponse,
+    responses={202: {"model": RegenerableStartResponse}},
+)
+def clean_regenerable(
+    payload: RegenerableCleanRequest, request: Request
+) -> RegenerableCleanResponse | JSONResponse:
+    """ADR-0034: the one-click clean. Takes NO paths from the client -- it runs the closed
+    allow-list in `reclaim.regenerable` (tool-native cache prunes, aged TEMP, crash dumps,
+    caches of browsers that are not running). `apply=false` previews synchronously (200, never
+    waits on a lock). `apply=true` starts a background job and returns 202 with a run id -- uv's
+    prune may wait up to 30 min for its cache lock -- poll `GET /clean/regenerable/status`.
+    409 if one is already running in this process."""
+    state = get_state(request)
+    audit_logger.info("api.regenerable_clean", apply=payload.apply)
+    try:
+        if not payload.apply:
+            return service.run_regenerable_clean(state, apply=False)
+        started = service.start_regenerable_clean(state)
+    except service.RegenerableCleanBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(status_code=202, content=started.model_dump())
+
+
+@router.get("/clean/regenerable/status", response_model=RegenerableStatusResponse)
+def clean_regenerable_status() -> RegenerableStatusResponse:
+    """Progress of the latest background regenerable clean: items finished so far, the item in
+    progress, and the full report once done."""
+    return service.get_regenerable_status()
 
 
 @router.get("/clean/one-click-summary", response_model=OneClickCleanSummaryResponse)

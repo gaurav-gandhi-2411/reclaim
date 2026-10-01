@@ -43,6 +43,19 @@ def test_cli_version_flag_matches_pyproject() -> None:
     )
 
 
+def test_build_script_pins_nuitka_exactly() -> None:
+    # 2026-10-01: the build venv used a bare `uv pip install nuitka`, so the compiler silently
+    # drifted 4.1.3 (uv.lock) -> 4.2.2 with nobody choosing it. The -O2 patch depends on Nuitka's
+    # internals, so any install of nuitka in this script must carry an exact `==` pin.
+    script_text = (_REPO_ROOT / "packaging" / "build_installer.ps1").read_text(encoding="utf-8")
+    installs = re.findall(r"^uv pip install .*nuitka.*$", script_text, flags=re.MULTILINE)
+    assert installs, "build_installer.ps1 no longer installs nuitka via `uv pip install`"
+    for line in installs:
+        assert "nuitka==" in line, f"unpinned nuitka install in build_installer.ps1: {line!r}"
+    default = re.search(r'\[string\]\$NuitkaVersion = "(\d+\.\d+\.\d+)"', script_text)
+    assert default is not None, "build_installer.ps1 lost its $NuitkaVersion default pin"
+
+
 def test_build_script_version_matches_pyproject() -> None:
     # The Nuitka --product-version flag moved out of README.md and into build_installer.ps1
     # (packaging/build_installer.ps1) when the manual build command became a script -- this is
