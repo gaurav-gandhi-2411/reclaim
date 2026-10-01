@@ -885,3 +885,26 @@ class RegenerableCleanResponse(BaseModel):
     disk_free_delta_bytes: int | None
     percent_used_after: float | None
     duration_seconds: float
+
+
+class RegenerableStartResponse(BaseModel):
+    """202 body of an `apply=true` POST: the job is running; poll the status endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: str
+
+
+class RegenerableStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # idle | running | done | failed
+    run_id: str | None
+    # Items finished so far, in the order they completed (uv, which may wait on its
+    # cache lock, is always last).
+    items: list[RegenerableItemOut]
+    current_item: str | None
+    elapsed_seconds: float
+    report: RegenerableCleanResponse | None
+    error: str | None

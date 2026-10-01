@@ -50,6 +50,7 @@ class FakeMachine:
         self.on_path: set[str] = set()
         self.locked: set[str] = set()
         self.commands: list[list[str]] = []
+        self.call_meta: list[tuple[float, dict[str, str]]] = []
         self.command_effect: dict[str, CommandResult] = {}
         self.command_delete: dict[str, Path] = {}
 
@@ -57,8 +58,9 @@ class FakeMachine:
         def which(name: str) -> str | None:
             return f"C:/fake/{name}.exe" if name in self.on_path else None
 
-        def run(argv: Sequence[str], _timeout: float, _env: dict[str, str]) -> CommandResult:
+        def run(argv: Sequence[str], timeout: float, cmd_env: dict[str, str]) -> CommandResult:
             self.commands.append(list(argv))
+            self.call_meta.append((timeout, cmd_env))
             key = Path(argv[0]).stem
             target = self.command_delete.get(key)
             if target is not None and target.exists():
@@ -291,27 +293,146 @@ def test_native_tool_never_uses_force_or_clean_all(machine: FakeMachine) -> None
     assert uv_spec.argv_tail == ("cache", "prune")
 
 
-def test_native_tool_skipped_when_its_process_is_running(machine: FakeMachine) -> None:
-    _write(machine.local / "uv" / "cache" / "a", 100)
-    machine.on_path.add("uv")
-    machine.running = frozenset({"uv.exe"})
+def test_pip_is_still_skipped_when_its_process_is_running(machine: FakeMachine) -> None:
+    # pip has no cache lock this module can rely on, so a running pip stays the in-use signal.
+    _write(machine.local / "pip" / "Cache" / "a", 100)
+    machine.on_path.add("pip")
+    machine.running = frozenset({"pip.exe"})
 
     report = run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
 
     assert machine.commands == []
-    assert _item(report, "uv").status == "skipped_in_use"
+    assert _item(report, "pip").status == "skipped_in_use"
 
 
-def test_native_tool_lock_timeout_is_a_skip_not_a_failure(machine: FakeMachine) -> None:
+def test_uv_runs_even_while_uv_exe_is_running_and_waits_on_its_own_lock(
+    machine: FakeMachine,
+) -> None:
+    cache = machine.local / "uv" / "cache"
+    _write(cache / "a", 700)
+    machine.on_path.add("uv")
+    machine.running = frozenset({"uv.exe", "uvx.exe"})
+    machine.command_delete["uv"] = cache
+
+    report = run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
+
+    assert machine.commands == [["C:/fake/uv.exe", "cache", "prune"]]
+    assert _item(report, "uv").status == "cleaned"
+    timeout, cmd_env = machine.call_meta[0]
+    assert cmd_env["UV_LOCK_TIMEOUT"] == str(int(rg.UV_LOCK_WAIT_SECONDS)) == "1800"
+    assert timeout > rg.UV_LOCK_WAIT_SECONDS, "hard kill must come after uv's own timeout"
+
+
+def test_uv_lock_wait_is_overridable_through_the_env(machine: FakeMachine) -> None:
+    _write(machine.local / "uv" / "cache" / "a", 100)
+    machine.on_path.add("uv")
+
+    run_regenerable_clean(machine.env(uv_lock_wait_seconds=90.0), apply=True, audit_log_path=None)
+
+    timeout, cmd_env = machine.call_meta[0]
+    assert cmd_env["UV_LOCK_TIMEOUT"] == "90"
+    assert timeout == 90.0 + rg._LOCK_WAIT_KILL_MARGIN_SECONDS
+
+
+def test_uv_lock_timeout_is_skipped_in_use_naming_the_wait(machine: FakeMachine) -> None:
+    # Real text captured from uv 0.11.14 with its cache `.lock` held by another process.
     _write(machine.local / "uv" / "cache" / "a", 100)
     machine.on_path.add("uv")
     machine.command_effect["uv"] = CommandResult(
+        2,
+        "",
+        "Cache is currently in-use, waiting for other uv processes to finish (use `--force` to "
+        "override)\nerror: Timeout (1800s) when waiting for lock on `C:\\c` at `C:\\c\\.lock`, "
+        "is another uv process running? You can set `UV_LOCK_TIMEOUT` to increase the timeout.",
+    )
+
+    report = run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
+
+    item = _item(report, "uv")
+    assert item.status == "skipped_in_use"
+    assert item.detail == "waited 1800 s for uv's cache lock"
+
+
+def test_uv_subprocess_wall_timeout_is_also_skipped_in_use(machine: FakeMachine) -> None:
+    _write(machine.local / "uv" / "cache" / "a", 100)
+    machine.on_path.add("uv")
+    machine.command_effect["uv"] = CommandResult(-1, "", "timed out", timed_out=True)
+
+    report = run_regenerable_clean(
+        machine.env(uv_lock_wait_seconds=120.0), apply=True, audit_log_path=None
+    )
+
+    item = _item(report, "uv")
+    assert item.status == "skipped_in_use"
+    assert item.detail == "waited 120 s for uv's cache lock"
+
+
+def test_uv_preview_never_runs_the_command_or_waits(machine: FakeMachine) -> None:
+    _write(machine.local / "uv" / "cache" / "a", 100)
+    machine.on_path.add("uv")
+    machine.running = frozenset({"uv.exe"})
+
+    report = run_regenerable_clean(machine.env(), apply=False, audit_log_path=None)
+
+    assert machine.commands == []
+    assert _item(report, "uv").status == "would_clean"
+
+
+def test_no_command_in_the_allow_list_is_ever_run_with_force_for_uv(
+    machine: FakeMachine,
+) -> None:
+    _write(machine.local / "uv" / "cache" / "a", 100)
+    machine.on_path.add("uv")
+    machine.command_effect["uv"] = CommandResult(2, "", "error: Timeout (1s) waiting for lock")
+
+    run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
+
+    assert all("--force" not in argv for argv in machine.commands)
+
+
+def test_uv_is_ordered_last_and_progress_callbacks_fire_in_order(machine: FakeMachine) -> None:
+    _write(machine.local / "uv" / "cache" / "a", 100)
+    _write(machine.local / "pip" / "Cache" / "a", 100)
+    machine.on_path.update({"uv", "pip"})
+    started: list[tuple[str, bool]] = []
+    done: list[str] = []
+
+    report = run_regenerable_clean(
+        machine.env(),
+        apply=True,
+        audit_log_path=None,
+        on_item_start=lambda key, _label, waits: started.append((key, waits)),
+        on_item_done=lambda item: done.append(item.key),
+    )
+
+    keys = [i.key for i in report.items]
+    assert keys[-1] == "uv"
+    assert keys.index("pip") < keys.index("uv") and keys.index("temp0") < keys.index("uv")
+    assert [k for k, _ in started] == keys == done
+    assert started[-1] == ("uv", True) and not any(w for _k, w in started[:-1])
+
+
+def test_a_raising_progress_callback_never_aborts_the_clean(machine: FakeMachine) -> None:
+    def boom(*_a: object) -> None:
+        raise RuntimeError("ui bug")
+
+    report = run_regenerable_clean(
+        machine.env(), apply=True, audit_log_path=None, on_item_start=boom, on_item_done=boom
+    )
+
+    assert len(report.items) == len(rg.NATIVE_TOOLS) + 1 + 1 + len(rg.BROWSERS)
+
+
+def test_native_tool_lock_timeout_is_a_skip_not_a_failure(machine: FakeMachine) -> None:
+    _write(machine.local / "pip" / "Cache" / "a", 100)
+    machine.on_path.add("pip")
+    machine.command_effect["pip"] = CommandResult(
         2, "", "error: Timeout (5s) when waiting for lock on cache dir"
     )
 
     report = run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
 
-    assert _item(report, "uv").status == "skipped_in_use"
+    assert _item(report, "pip").status == "skipped_in_use"
 
 
 def test_native_tool_missing_or_cache_absent_is_reported_not_run(machine: FakeMachine) -> None:
