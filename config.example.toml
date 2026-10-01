@@ -127,3 +127,10 @@ enabled = false
 # as old_installers.max_age_days above) -- edit this value directly if you want a different
 # threshold.
 disk_threshold_percent = 80.0
+
+# ADR-0034: weekly auto-clean of the regenerable safe tier only (package-manager caches, old
+# temp files, crash dumps, closed-browser caches). Off by default; the Settings tab toggle writes
+# this flag AND registers/removes the per-account Task Scheduler entry -- edit it by hand only if
+# you also manage that task yourself. `reclaim auto-clean --scheduled` re-checks this flag.
+[autoclean]
+enabled = false

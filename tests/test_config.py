@@ -735,3 +735,47 @@ def test_win_path_resolves_a_real_short_form_env_var_to_long_form(
 
     assert Path(resolved).resolve() == long_dir.resolve()
     assert "~" not in resolved
+
+
+# --- ADR-0034: the weekly auto-clean toggle's config section -------------------------------------
+
+
+def test_bare_config_defaults_autoclean_to_disabled() -> None:
+    assert Config().autoclean.enabled is False
+
+
+def test_set_autoclean_enabled_round_trips_and_preserves_other_sections(tmp_path: Path) -> None:
+    from reclaim.config import set_autoclean_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[notifications]\nenabled = true\n", encoding="utf-8")
+
+    set_autoclean_enabled(config_path, enabled=True)
+    config = load_config(config_path)
+    assert config.autoclean.enabled is True
+    assert config.notifications.enabled is True
+
+    set_autoclean_enabled(config_path, enabled=False)
+    config = load_config(config_path)
+    assert config.autoclean.enabled is False
+    assert config.notifications.enabled is True
+
+
+def test_set_autoclean_enabled_creates_missing_file(tmp_path: Path) -> None:
+    from reclaim.config import set_autoclean_enabled
+
+    config_path = tmp_path / "nested" / "config.toml"
+
+    set_autoclean_enabled(config_path, enabled=True)
+
+    assert load_config(config_path).autoclean.enabled is True
+
+
+def test_unknown_autoclean_lookalike_top_level_section_is_still_rejected(tmp_path: Path) -> None:
+    from reclaim.config import UnknownConfigKeyError
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[autoclean]\nenabled = true\n[ai_autoclean]\nenabled = true\n")
+
+    with pytest.raises(UnknownConfigKeyError):
+        load_config(config_path)
