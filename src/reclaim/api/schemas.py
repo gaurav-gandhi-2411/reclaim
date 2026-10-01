@@ -842,3 +842,46 @@ class CategoryExplanationResponse(BaseModel):
     message: str | None  # unavailable_reason / error message; None only when status == "ok"
     explanation: str | None
     cached: bool
+
+
+# --- Regenerable tier (ADR-0034): the one-click / weekly clean of provably-regenerable data ---
+
+
+class RegenerableCleanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # `False` is a preview: same allow-list walk, nothing deleted, no command run.
+    apply: bool = True
+
+
+class RegenerableItemOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    key: str
+    label: str
+    status: str
+    bytes_removed: int
+    bytes_removed_human: str
+    files_removed: int
+    files_skipped_in_use: int
+    detail: str
+    skipped_paths: list[str]
+
+
+class RegenerableCleanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    apply: bool
+    items: list[RegenerableItemOut]
+    # Logical bytes removed -- see `regenerable.RegenerableReport.bytes_removed` for why this is
+    # reported next to, not instead of, the measured disk-free delta.
+    bytes_removed: int
+    bytes_removed_human: str
+    files_skipped_in_use: int
+    disk_free_before_bytes: int | None
+    disk_free_after_bytes: int | None
+    disk_free_delta_bytes: int | None
+    percent_used_after: float | None
+    duration_seconds: float

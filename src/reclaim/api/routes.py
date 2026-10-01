@@ -30,6 +30,8 @@ from reclaim.api.schemas import (
     PowerModeRequest,
     QuarantineListResponse,
     RecoveryStatusResponse,
+    RegenerableCleanRequest,
+    RegenerableCleanResponse,
     RestoreStatusOut,
     ScanRequest,
     ScanStatusOut,
@@ -424,6 +426,22 @@ def candidates(
             status_code=400, detail=f"tier must be one of A, B, both (got {tier!r})"
         )
     return service.list_candidates(get_state(request), tier=tier, category_group=category)
+
+
+@router.post("/clean/regenerable", response_model=RegenerableCleanResponse)
+def clean_regenerable(
+    payload: RegenerableCleanRequest, request: Request
+) -> RegenerableCleanResponse:
+    """ADR-0034: the one-click clean. Takes NO paths from the client -- it runs the closed
+    allow-list in `reclaim.regenerable` (tool-native cache prunes, aged TEMP, crash dumps,
+    caches of browsers that are not running). `apply=false` previews. 409 if one is already
+    running in this process."""
+    state = get_state(request)
+    audit_logger.info("api.regenerable_clean", apply=payload.apply)
+    try:
+        return service.run_regenerable_clean(state, apply=payload.apply)
+    except service.RegenerableCleanBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/clean/one-click-summary", response_model=OneClickCleanSummaryResponse)

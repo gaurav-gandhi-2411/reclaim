@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import platform
+import shutil
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -11,7 +13,7 @@ from pathlib import Path
 
 import structlog
 
-from reclaim import anthropic_key_store, update_check
+from reclaim import anthropic_key_store, regenerable, update_check
 from reclaim.ai import category_explainer, presentation
 from reclaim.ai.models import AICluster
 from reclaim.api import ai_orchestration
@@ -50,6 +52,8 @@ from reclaim.api.schemas import (
     QuarantineListResponse,
     RecoveryItemOut,
     RecoveryStatusResponse,
+    RegenerableCleanResponse,
+    RegenerableItemOut,
     RestoreItemOut,
     RestoreResponse,
     RestoreStatusOut,
@@ -2374,4 +2378,73 @@ def build_category_explanation(state: AppState, category_group: str) -> Category
         message=None,
         explanation=result.explanation,
         cached=result.cached,
+    )
+
+
+# --- Regenerable tier (ADR-0034) ---------------------------------------------------------------
+
+
+class RegenerableCleanBusyError(RuntimeError):
+    """Raised when a regenerable clean is already running in this process."""
+
+
+_regenerable_clean_lock = threading.Lock()
+
+
+def regenerable_clean_env() -> regenerable.RegenerableEnv:
+    """Seam for tests: the real machine's roots/processes. Never takes caller input."""
+    return regenerable.RegenerableEnv.from_os_environment()
+
+
+def run_regenerable_clean(
+    state: AppState, *, apply: bool, audit_log_path: Path | None = None
+) -> RegenerableCleanResponse:
+    """One click: the closed allow-list in `reclaim.regenerable`, nothing the client names. Not an
+    `apply_batch` call -- see ADR-0034 for why ADR-0023's safe-mode guarantees are unaffected."""
+    if not _regenerable_clean_lock.acquire(blocking=False):
+        raise RegenerableCleanBusyError("a clean is already running")
+    try:
+        env = regenerable_clean_env()
+        report = regenerable.run_regenerable_clean(
+            env,
+            apply=apply,
+            audit_log_path=audit_log_path
+            if audit_log_path is not None
+            else regenerable.DEFAULT_AUDIT_LOG_PATH,
+        )
+        percent_used: float | None = None
+        if env.disk_anchor is not None:
+            try:
+                usage = shutil.disk_usage(env.disk_anchor)
+                percent_used = usage.used / usage.total * 100.0 if usage.total else None
+            except OSError:
+                percent_used = None
+    finally:
+        _regenerable_clean_lock.release()
+    return RegenerableCleanResponse(
+        run_id=report.run_id,
+        apply=report.apply,
+        items=[
+            RegenerableItemOut(
+                kind=item.kind,
+                key=item.key,
+                label=item.label,
+                status=item.status,
+                bytes_removed=item.bytes_removed,
+                bytes_removed_human=format_bytes(item.bytes_removed),
+                files_removed=item.files_removed,
+                files_skipped_in_use=item.files_skipped_in_use,
+                detail=item.detail,
+                skipped_paths=item.skipped_paths,
+            )
+            for item in report.items
+        ],
+        bytes_removed=report.bytes_removed,
+        bytes_removed_human=format_bytes(report.bytes_removed),
+        files_skipped_in_use=report.files_skipped_in_use,
+        disk_free_before_bytes=report.disk_free_before_bytes,
+        disk_free_after_bytes=report.disk_free_after_bytes,
+        disk_free_delta_bytes=report.disk_free_delta_bytes,
+        percent_used_after=percent_used,
+        duration_seconds=round(report.duration_seconds, 2),
     )
