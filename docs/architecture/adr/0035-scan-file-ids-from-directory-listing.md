@@ -56,6 +56,31 @@ neither effect was observed beyond the 110/168 files above; it is a loss of exac
 new class of deletion. If exactness matters more than the speed,
 `scanner._USE_DIRECTORY_LISTING = False` restores the legacy path.
 
+**Intended difference, as shipped: the listing for the walk, a live `stat` at the decisions.**
+The owner's decision is to keep the listing for the walk (the speed) and to re-`stat` only the
+*candidate set* at the points where size/mtime exactness decides something, via
+`freshstat.fresh_stat_signature(path)` (a real `os.stat`, `None` when unreadable):
+
+| decision point | where | re-`stat` applied to |
+|---|---|---|
+| temp-root min-age, incl. newest-mtime-of-subtree (#110) | `detectors.detect_temp_and_browser_caches` | only children the listing says are old enough; a file child itself, a directory child's files (all up to 2000, else the newest 2000 by listing mtime) |
+| old installers `max_age_days` | `detectors.detect_old_installers` | only installers the listing says are old enough |
+| large logs `stale_days` (and the size floor) | `detectors.detect_large_logs` | only logs the listing says are large and stale enough |
+| dedup hash-cache reuse, keyed `(size, mtime)` | `dedup._hash_member` | only a would-be cache hit; a mismatch is a miss (rehash) |
+
+Bound argument: the listing can only be stale toward an OLDER mtime / the last-close size (the
+write has not reached the directory entry), so a stale listing can only turn "keep" into a wrong
+"old"; entries the listing already keeps need no check. Everything below is therefore the
+listing's "would be proposed / would be reused" set, never the index. A path that cannot be
+`stat`ed carries no evidence of a live writer, so the listing's value stands. Residual: a
+temp-root child directory with more than 2000 files re-`stat`s only its newest 2000 by listing
+mtime, so an open-for-write file with an old listing mtime outside that window is not caught
+there (the apply-time preflight identity check still compares live `(dev, ino, mtime)`). No
+other detector compares an mtime to a threshold (`detect_crash_dumps`, `detect_archive_pairs`,
+dev/package/model caches have no age rule). Separately, entries directly under the scan root are
+always built by the legacy `os.scandir` + `os.stat` path (`scan_tree`'s top level), so they were
+never affected.
+
 **Speed** (interleaved base/new A/B, 3 repetitions each, on a live machine other sessions were
 using; timings moved by 20-40% between repetitions, so only the interleaved ratios mean
 anything). Walk only, SQLite writes stubbed out, 0.8M entries: base 67.5/67.7/78.2 s vs new
@@ -122,4 +147,6 @@ byte-identity check at scan time, which is the cost aggregation exists to avoid.
   listing's amortized cost, and needs an OS-version fallback. Candidate if exactness for
   open-for-write files must be restored for plain files above some size.
 - **Re-`stat` files modified in the last N hours** to bound the stale window: cheap and removes
-  the common case, but not the long-open-file case; not done.
+  the common case, but not the long-open-file case; not done. The shipped variant re-`stat`s by
+  *decision*, not by recency (see "Intended difference" above), which does cover a long-open file
+  whenever it falls in the re-checked set.
