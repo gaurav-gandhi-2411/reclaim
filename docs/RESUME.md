@@ -3,6 +3,33 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## UPDATE 2026-10-01 (evening) — PR hygiene, owner decisions 1a-1d, cleanup executed
+
+**PR hygiene (VERIFIED via `gh pr view`):** `pip-audit` was red on EVERY open PR because eight
+advisories were published against pyjwt 2.13.0 (transitive via mcp) after main's last green run
+(2026-09-24). Not caused by any PR's diff. Fix = PR #119 (`uv.lock` pyjwt 2.13.0 -> 2.15.1; local
+`pip-audit` clean, MCP tests pass). All other PRs go green only after #119 merges and they are
+rebased onto main. #112 had wrongly been left non-draft; converted back to draft.
+**Stack:** #116 is based on #113's branch; after #113 merges, rebase #116 `--onto main` and
+`gh pr edit 116 --base main` (squash-merge leaves #113's old commits in #116's history).
+
+**Owner decisions applied (branches pushed; PR bodies updated):** 1a uv waits <= 30 min on its own
+lock (`UV_LOCK_TIMEOUT`), never `--force`, async job + status endpoint (#113); 1c task query via
+`Get-ScheduledTaskInfo` typed JSON, `PT45M` limit (#116); 1d listing for the walk + live re-stat at
+age/size/hash-cache decisions (#118); 1b ANALYZE/optimize after scan (branch `perf/analyze-after-scan`
+in flight when this was written).
+
+**Cleanup executed (owner-approved list; measured with `Win32_PageFileUsage` pagefile 4,608 MB at
+every reading):** C: free 53.17 -> 85.04 GB. Deleted: 7 `C:\adk*` venvs 4.68 GB logical, `C:\tmp_keras_wt_venv`
+2.77, `reclaim-emergency-quarantine-20260820-232958` 3.78, July quarantine batch 5.12 + real-disk-run
+`index.sqlite3` 5.90 (manifests/logs cited by CASE_STUDY kept), HF xet cache 9.95, HF
+`models--stabilityai--stable-diffusion-2-1` 5.16 (AetherArt code loads only
+`sd2-community/stable-diffusion-2-1`), `C:\src\flutter` 3.22 (not on PATH, unreferenced; the
+`sdks\flutter` one is referenced by mindmeld's local.properties). NOT deleted per the owner's rule:
+8 verification clones (each has 9 modified `artifacts/*.txt` retrained outputs), `adk6725fix`
+(dirty=3), `adk6725_repro`/`adkrel060-scratch` (tiny, no git), `triage-iq-wt-groq-model-fix`.
+Stray 0-byte `scratch_patch.py` appeared in the main checkout at 19:25 (not mine; left).
+
 ## PRIORITY CHANGE 2026-10-01 — "daily driver" plan (Phases A/B/C), read this first
 
 Supersedes the AC3-trip priority below. #110 and #111 are merged (`origin/main` = `3deb05d`).
