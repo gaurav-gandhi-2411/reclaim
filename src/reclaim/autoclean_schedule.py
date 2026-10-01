@@ -145,7 +145,7 @@ def resolve_exe_path(exe_path: Path | None = None) -> Path:
     return exe_dir / EXE_NAME
 
 
-def _real_runner(argv: Sequence[str]) -> SchtasksOutcome:
+def run_schtasks(argv: Sequence[str]) -> SchtasksOutcome:
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed schtasks argv, shell=False
             ["schtasks.exe", *argv],  # noqa: S607 -- Windows system tool on PATH
@@ -194,7 +194,7 @@ def register_task(
     *,
     exe_path: Path | None = None,
     username: str | None = None,
-    runner: SchtasksRunner = _real_runner,
+    runner: SchtasksRunner = run_schtasks,
     diag_log_path: Path | None = None,
 ) -> str:
     """Creates (or overwrites, `/f`) this account's weekly task. Returns the task name.
@@ -224,7 +224,7 @@ def register_task(
 def unregister_task(
     *,
     username: str | None = None,
-    runner: SchtasksRunner = _real_runner,
+    runner: SchtasksRunner = run_schtasks,
     diag_log_path: Path | None = None,
 ) -> bool:
     """Deletes this account's task. Idempotent: returns False when there was nothing to delete,
@@ -260,7 +260,7 @@ def _none_if_na(value: str | None) -> str | None:
 def query_task(
     *,
     username: str | None = None,
-    runner: SchtasksRunner = _real_runner,
+    runner: SchtasksRunner = run_schtasks,
     diag_log_path: Path | None = None,
 ) -> TaskStatus:
     """`schtasks /query /tn <name> /v /fo list`, parsed. A non-zero exit means "not registered".
