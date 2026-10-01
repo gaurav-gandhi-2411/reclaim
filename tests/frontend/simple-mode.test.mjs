@@ -21,6 +21,7 @@ const {
   renderSimpleEmpty,
   buildQuickCleanGroupCard,
   renderSimpleIdle,
+  renderSimpleOneClickResult,
 } = await import("../../src/reclaim/api/static/app.js");
 
 function container() {
@@ -160,7 +161,7 @@ test("renderSimpleEmpty shows a friendly empty state with a way back to idle", (
 test("renderSimpleIdle: intro copy no longer claims to scan the whole computer by default", () => {
   renderSimpleIdle();
   const el = container();
-  assert.ok(el.textContent.includes("Scans your files"));
+  assert.ok(el.textContent.includes("caches"));
   assert.equal(
     el.textContent.includes("Scans your whole computer"),
     false,
@@ -213,4 +214,108 @@ test("renderSimpleGroups renders exactly one 'Clean now' button and every group'
   assert.ok(el.textContent.includes("Temporary & browser cache files"));
   const buttons = [...el.querySelectorAll("button")].filter((b) => b.textContent === "Clean now");
   assert.equal(buttons.length, 1, "exactly one 'Clean now' button");
+});
+
+// --- renderSimpleOneClickResult (ADR-0034) ----------------------------------------------------
+
+function oneClickReport(overrides = {}) {
+  return {
+    run_id: "abc123",
+    apply: true,
+    items: [
+      {
+        kind: "native_command",
+        key: "uv",
+        label: "uv package cache",
+        status: "cleaned",
+        bytes_removed: 3221225472,
+        bytes_removed_human: "3.0 GB",
+        files_removed: 0,
+        files_skipped_in_use: 0,
+        detail: "`uv cache prune` exit 0",
+        skipped_paths: [],
+      },
+      {
+        kind: "browser_cache",
+        key: "chrome",
+        label: "Google Chrome cache",
+        status: "skipped_browser_running",
+        bytes_removed: 0,
+        bytes_removed_human: "0 B",
+        files_removed: 0,
+        files_skipped_in_use: 0,
+        detail: "Google Chrome is running; its cache is left alone",
+        skipped_paths: [],
+      },
+      {
+        kind: "browser_cache",
+        key: "firefox",
+        label: "Mozilla Firefox cache",
+        status: "skipped_not_present",
+        bytes_removed: 0,
+        bytes_removed_human: "0 B",
+        files_removed: 0,
+        files_skipped_in_use: 0,
+        detail: "",
+        skipped_paths: [],
+      },
+    ],
+    bytes_removed: 3221225472,
+    bytes_removed_human: "3.0 GB",
+    files_skipped_in_use: 4,
+    disk_free_before_bytes: 1000,
+    disk_free_after_bytes: 3221226472,
+    disk_free_delta_bytes: 3221225472,
+    percent_used_after: 94.4,
+    duration_seconds: 12.5,
+    ...overrides,
+  };
+}
+
+test("renderSimpleOneClickResult: leads with 'Freed X' and the new C: usage", () => {
+  renderSimpleOneClickResult(oneClickReport());
+  const text = container().textContent;
+  assert.ok(text.includes("Freed 3.0 GB"));
+  assert.ok(text.includes("C: is now 94% used"));
+  assert.ok(text.includes("+3.0 GB"), "the measured free-space delta is shown beside the total");
+});
+
+test("renderSimpleOneClickResult: skipped items are shown, not hidden; absent ones are dropped", () => {
+  renderSimpleOneClickResult(oneClickReport());
+  const text = container().textContent;
+  assert.ok(text.includes("Google Chrome cache: Skipped — browser is open"));
+  assert.equal(text.includes("Mozilla Firefox"), false, "a tool/browser that isn't here is noise");
+  assert.ok(text.includes("4 file(s) were in use and left alone"));
+});
+
+test("renderSimpleOneClickResult: offers 'scan for more' and 'Done'", () => {
+  renderSimpleOneClickResult(oneClickReport());
+  const labels = [...container().querySelectorAll("button")].map((b) => b.textContent);
+  assert.ok(labels.includes("Scan my files for more to review"));
+  assert.ok(labels.includes("Done"));
+});
+
+test("renderSimpleOneClickResult: disk-derived text renders as inert text, never markup", () => {
+  const payload = '<img src=x onerror="window.__oneClickXss = true">';
+  renderSimpleOneClickResult(
+    oneClickReport({
+      items: [
+        {
+          ...oneClickReport().items[0],
+          label: payload,
+          detail: payload,
+        },
+      ],
+    })
+  );
+  assert.equal(container().querySelectorAll("img").length, 0);
+  assert.equal(globalThis.window.__oneClickXss, undefined);
+  assert.ok(container().textContent.includes(payload));
+});
+
+test("renderSimpleOneClickResult: null measurements never render literal 'null'", () => {
+  renderSimpleOneClickResult(
+    oneClickReport({ percent_used_after: null, disk_free_delta_bytes: null })
+  );
+  assert.equal(container().textContent.includes("null"), false);
 });
