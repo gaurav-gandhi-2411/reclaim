@@ -990,6 +990,7 @@ def scan_tree(
     pending_unchanged: list[str] = []
     recurse_into: list[Path] = []
     stat_executor = ThreadPoolExecutor(max_workers=_STAT_TIMEOUT_WORKERS)
+    scan_ok = False
     try:
         for entry in top_level_entries:
             if cancel_event is not None and cancel_event.is_set():
@@ -1079,8 +1080,19 @@ def scan_tree(
             raise
         finally:
             index.end_scan_tracking()
+        scan_ok = True
     finally:
         stat_executor.shutdown(wait=False, cancel_futures=False)
+        # Planner statistics (see `ScanIndex.refresh_planner_stats`): a completed or cancelled
+        # scan refreshes them unconditionally; a scan that raised only fills them in if they
+        # are absent, so a retry loop of failing scans never pays a full ANALYZE each time yet
+        # an index can never stay statistics-less forever. Best effort -- never masks the real
+        # scan outcome (a full disk, the usual failure here, fails ANALYZE too).
+        try:
+            stats_seconds = index.refresh_planner_stats(only_if_missing=not scan_ok)
+            logger.info("scan.planner_stats_refreshed", seconds=round(stats_seconds, 2))
+        except (OSError, sqlite3.Error) as stats_exc:
+            logger.warning("scan.planner_stats_failed", error=str(stats_exc))
 
     return ScanStats(
         root=root,
