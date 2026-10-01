@@ -2701,6 +2701,11 @@ def autoclean_schtasks_runner() -> autoclean_schedule.SchtasksRunner:
     return autoclean_schedule.run_schtasks
 
 
+def autoclean_query_runner() -> autoclean_schedule.PowerShellRunner:
+    """Seam for tests: the real PowerShell (ScheduledTasks module) status-query runner."""
+    return autoclean_schedule.run_powershell
+
+
 def autoclean_exe_path() -> Path | None:
     """Seam for tests: `None` means "resolve the installed reclaim.exe" (a dev run then raises
     `NotAnInstalledBuildError`, which the endpoint reports as a 409 with an actionable message)."""
@@ -2708,10 +2713,10 @@ def autoclean_exe_path() -> Path | None:
 
 
 def autoclean_settings(state: AppState) -> AutoCleanSettingOut:
-    """What the user chose (config) next to what Windows actually has (a live schtasks query)."""
+    """What the user chose (config) next to what Windows actually has (a live typed query)."""
     with state.lock:
         enabled = state.config.autoclean.enabled
-    status = autoclean_schedule.query_task(runner=autoclean_schtasks_runner())
+    status = autoclean_schedule.query_task(runner=autoclean_query_runner())
     return AutoCleanSettingOut(
         enabled=enabled,
         task_registered=status.registered,
@@ -2742,7 +2747,9 @@ def update_autoclean_setting(state: AppState, *, enabled: bool) -> AutoCleanSett
                 exe_path=autoclean_exe_path(), runner=autoclean_schtasks_runner()
             )
         else:
-            autoclean_schedule.unregister_task(runner=autoclean_schtasks_runner())
+            autoclean_schedule.unregister_task(
+                runner=autoclean_schtasks_runner(), query_runner=autoclean_query_runner()
+            )
     except autoclean_schedule.AutoCleanScheduleError:
         if enabled:
             set_autoclean_enabled(state.config_path, enabled=previous)
