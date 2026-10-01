@@ -1,4 +1,4 @@
-# 0034. The scan reads file IDs, sizes and times from the directory listing; per-tree aggregate rows were evaluated and not shipped
+# 0035. The scan reads file IDs, sizes and times from the directory listing; per-tree aggregate rows were evaluated and not shipped
 
 ## Context
 
