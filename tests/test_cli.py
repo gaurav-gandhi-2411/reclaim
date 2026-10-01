@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import reclaim.reconciliation as reconciliation_module
+import reclaim.scanner as scanner_module
 from reclaim.cli import _VERSION, _build_parser, _run_serve, main
 from reclaim.index import InaccessibleEntry, ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
@@ -177,6 +178,49 @@ def test_apply_include_categories_restricts_to_named_categories(
     assert "dev_artifact_node_modules" not in out
 
 
+def test_apply_output_reports_bytes_freed_and_bytes_moved_separately(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B7: a Recycle Bin move frees nothing until the bin is emptied, so the apply summary must
+    carry BOTH fields -- `bytes_freed=0 bytes_moved=<n>` -- plus the self-explanatory note, and
+    the per-category line must split them too. (Dry-run classifies exactly like a real run.)"""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "package.json").write_bytes(b"{}")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "pkg.js").write_bytes(b"x" * 100)
+    db = tmp_path / "index.sqlite3"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[categories.dev_artifacts]\nenabled = true\nretention_days = 30\n", encoding="utf-8"
+    )
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+
+    assert main(["scan", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "apply",
+            str(root),
+            "--db",
+            str(db),
+            "--config",
+            str(config_path),
+            "--method",
+            "recycle_bin",
+            "--mode-log",
+            str(mode_log),
+        ]
+    )
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "bytes_freed=0 bytes_moved=100" in out
+    assert "moved to Recycle Bin, not yet freed" in out
+    assert "dev_artifact_node_modules: count=1 bytes_freed=0 bytes_moved=100" in out
+
+
 # --- P0-5: inaccessible-path accounting + `reclaim reconcile` --------------------------------
 
 
@@ -200,6 +244,16 @@ def test_scan_prints_inaccessible_size_accounting_when_paths_are_skipped(
         return real_scandir(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
+    # The scan lists directories via `reclaim.dirlist` first and only falls back to os.scandir,
+    # so the simulated "can't list this directory" has to hold for both.
+    real_list_directory = scanner_module.list_directory
+
+    def fake_list_directory(path: str, volume_serial: int | None = None) -> object:
+        if "blocked_dir" in path:
+            raise PermissionError(13, "Access is denied", path)
+        return real_list_directory(path, volume_serial)
+
+    monkeypatch.setattr(scanner_module, "list_directory", fake_list_directory)
     db = tmp_path / "index.sqlite3"
 
     assert main(["scan", str(root), "--db", str(db)]) == 0

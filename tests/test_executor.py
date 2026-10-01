@@ -120,7 +120,10 @@ def test_dry_run_leaves_file_byte_unchanged_and_present(tmp_path: Path) -> None:
     assert not manifest_path.exists()
     assert report.files_succeeded == 1
     assert report.files_failed == 0
-    assert report.bytes_freed == len(original_content)
+    # B7: default method is "vault" -- a recoverable move, so the simulated report classifies
+    # these bytes as moved (not freed), exactly as a real run would.
+    assert report.bytes_freed == 0
+    assert report.bytes_moved == len(original_content)
     assert report.disk_free_before_bytes is None
     assert report.disk_free_after_bytes is None
     assert report.disk_free_delta_bytes is None
@@ -184,7 +187,8 @@ def test_vault_apply_moves_file_and_restore_round_trips_byte_identical(tmp_path:
     assert apply_report.apply is True
     assert apply_report.files_succeeded == 1
     assert apply_report.files_failed == 0
-    assert apply_report.bytes_freed == len(original_content)
+    assert apply_report.bytes_freed == 0  # B7: vaulted, not freed
+    assert apply_report.bytes_moved == len(original_content)
     assert not target.exists()  # genuinely gone from its original location
     assert manifest_path.exists()
 
@@ -1031,7 +1035,8 @@ def test_partial_batch_failure_is_surfaced_and_does_not_abort_other_items(tmp_pa
     assert report.files_processed == 2
     assert report.files_succeeded == 1
     assert report.files_failed == 1
-    assert report.bytes_freed == 7  # only the succeeded item's real size, not both
+    assert report.bytes_moved == 7  # only the succeeded item's real size, not both
+    assert report.bytes_freed == 0  # B7: a vault move frees nothing
 
     failed_items = [item for item in report.items if not item.succeeded]
     succeeded_items = [item for item in report.items if item.succeeded]
@@ -1067,9 +1072,11 @@ def test_category_breakdown_and_bytes_freed_only_count_succeeded_items(tmp_path:
         now=_NOW,
     )
 
-    assert report.bytes_freed == 30
+    assert report.bytes_moved == 30
+    assert report.bytes_freed == 0  # B7: vault moves are not freed bytes
     assert report.category_breakdown["cache_a"].count == 2
-    assert report.category_breakdown["cache_a"].bytes_freed == 30
+    assert report.category_breakdown["cache_a"].bytes_moved == 30
+    assert report.category_breakdown["cache_a"].bytes_freed == 0
     assert "cache_b" not in report.category_breakdown  # the failed item's category never counted
 
 
@@ -2336,3 +2343,113 @@ def test_two_serialized_batches_preserve_chronological_order_and_blocked_batch_w
     b_sizes = [entry.size_bytes for entry in parsed if entry.batch_id == "batch_b"]
     assert a_sizes == list(range(entries_per_batch))
     assert b_sizes == list(range(entries_per_batch))
+
+
+# --- B7: bytes_freed (space genuinely released) vs bytes_moved (recoverable, space still held) ---
+
+
+def _fake_send2trash_removing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stands in for the real Recycle Bin call; like the real one it removes the source, so
+    `apply_batch`'s own post-condition check (K2a) sees a genuine success."""
+    monkeypatch.setattr(executor_module.send2trash, "send2trash", lambda path: Path(path).unlink())
+
+
+def test_recycle_bin_batch_reports_moved_not_freed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Teeth: counting a Recycle Bin move as freed (the pre-B7 behavior) fails every assert."""
+    _fake_send2trash_removing(monkeypatch)
+    paths = []
+    for name, size in (("a.bin", 10), ("b.bin", 20)):
+        path = tmp_path / name
+        path.write_bytes(b"x" * size)
+        paths.append((path, size))
+
+    report = apply_batch(
+        [_candidate(p, size_bytes=size, category="cat") for p, size in paths],
+        safety=_safety(),
+        apply=True,
+        method="recycle_bin",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    assert report.files_succeeded == 2
+    assert report.bytes_freed == 0
+    assert report.bytes_moved == 30
+    assert report.category_breakdown["cat"].bytes_freed == 0
+    assert report.category_breakdown["cat"].bytes_moved == 30
+
+
+def test_direct_delete_batch_reports_freed_not_moved(tmp_path: Path) -> None:
+    """Power-mode direct delete (retention_days=None) really frees the space immediately."""
+    target = tmp_path / "cache" / "file.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x" * 29)
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=29, retention_days=None, category="cat")],
+        safety=_safety(),
+        apply=True,
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    assert report.items[0].method == "direct_delete"
+    assert report.bytes_freed == 29
+    assert report.bytes_moved == 0
+    assert report.category_breakdown["cat"].bytes_freed == 29
+    assert report.category_breakdown["cat"].bytes_moved == 0
+
+
+def test_failed_items_count_toward_neither_freed_nor_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_send2trash_removing(monkeypatch)
+    present = tmp_path / "present.bin"
+    present.write_bytes(b"x" * 7)
+
+    report = apply_batch(
+        [
+            _candidate(present, size_bytes=7),
+            _candidate(tmp_path / "missing.bin", size_bytes=999),
+        ],
+        safety=_safety(),
+        apply=True,
+        method="recycle_bin",
+        manifest_path=tmp_path / "manifest.jsonl",
+        now=_NOW,
+    )
+
+    assert report.files_failed == 1
+    assert report.bytes_moved == 7
+    assert report.bytes_freed == 0
+
+
+def test_dry_run_classifies_bytes_the_same_as_a_real_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry-run report must split freed/moved identically to the real run it previews, for
+    every method -- otherwise the preview and the outcome would disagree about the same bytes."""
+    _fake_send2trash_removing(monkeypatch)
+    # direct_delete is never requested per batch; it is derived per item from retention_days=None.
+    cases = (("recycle_bin", 30, 0), ("vault", 30, 0), ("vault", None, 11))
+    for method, retention_days, expected_freed in cases:
+        root = tmp_path / f"{method}_{retention_days}"
+        root.mkdir()
+        target = root / "file.bin"
+        target.write_bytes(b"x" * 11)
+        candidate = _candidate(target, size_bytes=11, retention_days=retention_days)
+        common: dict[str, Any] = {
+            "safety": _safety(),
+            "method": method,
+            "vault_dir": root / "vault",
+            "manifest_path": root / "manifest.jsonl",
+            "now": _NOW,
+        }
+        preview = apply_batch([candidate], apply=False, **common)
+        real = apply_batch([candidate], apply=True, **common)
+
+        assert (preview.bytes_freed, preview.bytes_moved) == (real.bytes_freed, real.bytes_moved)
+        expected = (expected_freed, 11 - expected_freed)
+        assert (real.bytes_freed, real.bytes_moved) == expected, (method, retention_days)

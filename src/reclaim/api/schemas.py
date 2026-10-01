@@ -454,8 +454,12 @@ class CategoryBreakdownOut(BaseModel):
     category_group: str
     category_label: str
     count: int
+    # Genuinely freed bytes (direct delete / synchronously purged). Recycle Bin / vault moves
+    # are reported in `bytes_moved` instead: recoverable, space still held.
     bytes_freed: int
     bytes_freed_human: str
+    bytes_moved: int = 0
+    bytes_moved_human: str = "0 B"
 
 
 class ApplyResponse(BaseModel):
@@ -468,6 +472,8 @@ class ApplyResponse(BaseModel):
     files_processed: int
     files_succeeded: int
     files_failed: int
+    # Genuinely freed bytes only (direct delete / synchronously purged). Recycle Bin / vault
+    # moves are in `bytes_moved` -- no disk space is freed until the bin is emptied / vault purged.
     bytes_freed: int
     bytes_freed_human: str
     category_breakdown: list[CategoryBreakdownOut]
@@ -478,6 +484,8 @@ class ApplyResponse(BaseModel):
     # synchronously_purged` exactly.
     synchronously_purged_count: int = 0
     bytes_synchronously_purged: int = 0
+    bytes_moved: int = 0
+    bytes_moved_human: str = "0 B"
 
 
 class ApplyStatusOut(BaseModel):
@@ -842,3 +850,69 @@ class CategoryExplanationResponse(BaseModel):
     message: str | None  # unavailable_reason / error message; None only when status == "ok"
     explanation: str | None
     cached: bool
+
+
+# --- Regenerable tier (ADR-0034): the one-click / weekly clean of provably-regenerable data ---
+
+
+class RegenerableCleanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # `False` is a preview: same allow-list walk, nothing deleted, no command run.
+    apply: bool = True
+
+
+class RegenerableItemOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    key: str
+    label: str
+    status: str
+    bytes_removed: int
+    bytes_removed_human: str
+    files_removed: int
+    files_skipped_in_use: int
+    detail: str
+    skipped_paths: list[str]
+
+
+class RegenerableCleanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    apply: bool
+    items: list[RegenerableItemOut]
+    # Logical bytes removed -- see `regenerable.RegenerableReport.bytes_removed` for why this is
+    # reported next to, not instead of, the measured disk-free delta.
+    bytes_removed: int
+    bytes_removed_human: str
+    files_skipped_in_use: int
+    disk_free_before_bytes: int | None
+    disk_free_after_bytes: int | None
+    disk_free_delta_bytes: int | None
+    percent_used_after: float | None
+    duration_seconds: float
+
+
+class RegenerableStartResponse(BaseModel):
+    """202 body of an `apply=true` POST: the job is running; poll the status endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: str
+
+
+class RegenerableStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: str  # idle | running | done | failed
+    run_id: str | None
+    # Items finished so far, in the order they completed (uv, which may wait on its
+    # cache lock, is always last).
+    items: list[RegenerableItemOut]
+    current_item: str | None
+    elapsed_seconds: float
+    report: RegenerableCleanResponse | None
+    error: str | None

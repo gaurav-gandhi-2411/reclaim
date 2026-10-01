@@ -734,6 +734,7 @@ async def test_delete_refuses_when_path_swapped_between_preview_and_delete_via_m
         assert outcome["files_succeeded"] == 0
         assert outcome["files_failed"] == 1
         assert outcome["bytes_freed"] == 0
+        assert outcome["bytes_moved"] == 0
 
     # The real, disk-level proof: the swapped-in content is untouched, never vaulted.
     assert node_modules_dir.exists()
