@@ -30,6 +30,27 @@ every reading):** C: free 53.17 -> 85.04 GB. Deleted: 7 `C:\adk*` venvs 4.68 GB 
 (dirty=3), `adk6725_repro`/`adkrel060-scratch` (tiny, no git), `triage-iq-wt-groq-model-fix`.
 Stray 0-byte `scratch_patch.py` appeared in the main checkout at 19:25 (not mine; left).
 
+## WORKING RULES LEARNED 2026-10-01 (read before touching this repo)
+
+- **Never work in reclaim's MAIN checkout (`C:\Users\gaura\ml-projects\reclaim`).** Every session and
+  every subagent uses its own `git worktree` (`git worktree add ..\reclaim-wt-<slug> -b <branch>
+  origin/main`). A stray 0-byte `scratch_patch.py` appeared untracked in the main checkout at
+  2026-10-01 19:25:18; provenance (VERIFIED from the subagent transcript): a subagent running from
+  `.claude\worktrees\agent-*` executed `cat > ../../../scratch_patch.py`, whose `../../..` is the main
+  checkout, and the `cat` blocked on stdin until the task was killed (the following `rm -f` never ran).
+  It was provably empty and untracked, so it was deleted.
+- **A deletion's check and the deletion never run in the same command; an empty check output is a failed
+  check.** Incident: a duplicate HF SD 2.1 copy was deleted in the same command as a completeness check
+  of the kept copy whose filter printed nothing; the kept copy was intact only by luck. Written into
+  `C:\Users\gaura\.claude\agents\executor.md`.
+- **pip / conda / yarn have no cache lock to wait on (measured).** pip 25.1: no lock, purge with one
+  file held exits 2 with `PermissionError` (now `skipped_in_use`); conda 25.5.1: per-repodata byte lock
+  not taken by `clean --tarballs --index-cache`; yarn not installed (NOT MEASURED). See ADR-0034.
+- **Post-reboot state 2026-10-01 21:36 IST:** `hiberfil.sys` gone (C: free 104.17 GB, pagefile 4,608 MB),
+  but `LastBootUpTime` is 09:58 today (uptime 11 h 38 m, no 6006/6005 events since) and
+  `HypervisorPresent=False`, `wsl --status` still says WSL2 unsupported: the reboot after the admin
+  steps has NOT been observed yet (the last hypervisor-init event is 2026-09-28 21:32).
+
 ## SAFE POINT 2026-10-01 — all agents finished, everything pushed; waiting on owner merges + admin window
 
 Branches: #119 `fix/pyjwt-advisories` (ready, CLEAN), #112 Nuitka pin, #113 regenerable tier (+1a uv wait,
