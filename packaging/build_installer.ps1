@@ -59,6 +59,11 @@ param(
     # ample disk headroom exists to absorb. A true "about to crash" floor, not a comfort margin.
     [int]$PreflightMinFreeRamGb = 8, # refuse to even START a build without this much headroom.
     [int]$PollIntervalSeconds = 15,
+    [string]$NuitkaVersion = "4.2.2", # Pinned (2026-10-01): this step used to be a bare `uv pip
+    # install nuitka`, which silently resolved to 4.2.2 while uv.lock pinned 4.1.3 -- the build
+    # compiled with a version nobody had chosen. 4.2.2 is what produced the 33ce814 build that was
+    # smoke-tested and installed. The -O2 patch below depends on Nuitka internals, so a bump is a
+    # deliberate edit here (re-verify the patch + both smoke tests), never an ambient upgrade.
     [int]$NuitkaJobs = 0, # 0 = auto: 6 if preflight free RAM >= 16GB, else 4. Pass explicitly to
     # override. Only meaningful on a verified-quiet machine (Step 0) -- raising parallelism under
     # real contention just adds more processes competing for the same starved cores.
@@ -192,8 +197,12 @@ Remove-DirectoryWithRetry -Path $BuildVenvPath
 $env:UV_PROJECT_ENVIRONMENT = $BuildVenvPath
 uv sync --extra ai --no-dev
 if ($LASTEXITCODE -ne 0) { throw "uv sync --extra ai --no-dev failed (exit $LASTEXITCODE)" }
-uv pip install --python "$BuildVenvPath\Scripts\python.exe" nuitka
-if ($LASTEXITCODE -ne 0) { throw "nuitka install into the build venv failed (exit $LASTEXITCODE)" }
+uv pip install --python "$BuildVenvPath\Scripts\python.exe" "nuitka==$NuitkaVersion"
+if ($LASTEXITCODE -ne 0) { throw "nuitka==$NuitkaVersion install into the build venv failed (exit $LASTEXITCODE)" }
+$installedNuitka = (& "$BuildVenvPath\Scripts\python.exe" -c "import importlib.metadata as m; print(m.version('nuitka'))").Trim()
+if ($installedNuitka -ne $NuitkaVersion) {
+    throw "build venv has nuitka $installedNuitka, expected the pinned $NuitkaVersion"
+}
 
 Write-Output "    Asserting the dev toolchain is genuinely absent..."
 # Written to a scratch .py file and invoked by path, not passed inline via `-c @'...'@`: passing
