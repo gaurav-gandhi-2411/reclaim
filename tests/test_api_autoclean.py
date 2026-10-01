@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,14 +16,16 @@ from reclaim.config import Config, load_config
 _HOST = "127.0.0.1"
 _PORT = 8765
 
-_QUERY_OUTPUT = """
-TaskName:                             \\Reclaim Weekly Auto-Clean (someone)
-Next Run Time:                        10/4/2026 10:00:00 AM
-Status:                               Ready
-Last Run Time:                        9/27/2026 10:00:01 AM
-Last Result:                          0
-Scheduled Task State:                 Enabled
-"""
+_NEXT = "2026-10-04T10:00:00.0000000+05:30"
+_QUERY_JSON = json.dumps(
+    {
+        "registered": True,
+        "state": "Ready",
+        "last_run_time": "2026-09-27T10:00:01.0000000+05:30",
+        "next_run_time": _NEXT,
+        "last_result": 0,
+    }
+)
 
 
 class FakeSchtasks:
@@ -46,11 +49,13 @@ class FakeSchtasks:
                 return SchtasksOutcome(1, "ERROR: The system cannot find the file specified.")
             self.registered = False
             return SchtasksOutcome(0, "SUCCESS")
-        if verb == "/query":
-            if not self.registered:
-                return SchtasksOutcome(1, "ERROR: The system cannot find the file specified.")
-            return SchtasksOutcome(0, _QUERY_OUTPUT)
         raise AssertionError(f"unexpected schtasks call {argv}")
+
+    def query(self, script: str, name: str) -> SchtasksOutcome:
+        """The PowerShell typed-query runner seam."""
+        if not self.registered:
+            return SchtasksOutcome(0, '{"registered":false}')
+        return SchtasksOutcome(0, _QUERY_JSON)
 
 
 def _client(tmp_path: Path, config_path: Path) -> TestClient:
@@ -77,6 +82,7 @@ def _client(tmp_path: Path, config_path: Path) -> TestClient:
 def fake_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSchtasks:
     fake = FakeSchtasks()
     monkeypatch.setattr(service, "autoclean_schtasks_runner", lambda: fake)
+    monkeypatch.setattr(service, "autoclean_query_runner", lambda: fake.query)
     monkeypatch.setattr(service, "autoclean_exe_path", lambda: Path(r"C:\Apps\reclaim.exe"))
     monkeypatch.setattr(
         autoclean_schedule, "default_diagnostic_log_path", lambda: tmp_path / "diag.log"
@@ -108,7 +114,7 @@ def test_enabling_persists_registers_and_reports_task_state(
     assert body["enabled"] is True and body["task_registered"] is True
     assert body["task_state"] == "Ready"
     assert body["last_result"] == 0
-    assert body["next_run_time"] == "10/4/2026 10:00:00 AM"
+    assert body["next_run_time"] == _NEXT
     assert fake_tasks.registered is True
     assert load_config(config_path).autoclean.enabled is True
     assert client.get("/api/settings/autoclean").json()["enabled"] is True
