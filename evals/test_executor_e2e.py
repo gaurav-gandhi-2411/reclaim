@@ -122,7 +122,9 @@ def test_executor_end_to_end_real_scan_apply_restore(tmp_path: Path) -> None:
 
     # --- The report's bytes-freed number matches real measured sizes, independently
     # recomputed from the ground-truth content captured before anything moved.
-    assert apply_report.bytes_freed == expected_node_modules_bytes + expected_old_log_bytes
+    # B7: method="vault" is a recoverable move, so the bytes are reported as moved, not freed.
+    assert apply_report.bytes_moved == expected_node_modules_bytes + expected_old_log_bytes
+    assert apply_report.bytes_freed == 0
 
     restore_report = restore_batch(
         apply_report.batch_id,
@@ -133,7 +135,7 @@ def test_executor_end_to_end_real_scan_apply_restore(tmp_path: Path) -> None:
     )
     assert restore_report.files_failed == 0
     assert restore_report.files_succeeded == len(tier_a_candidates)
-    assert restore_report.bytes_restored == apply_report.bytes_freed
+    assert restore_report.bytes_restored == apply_report.bytes_moved
 
     # --- Every file restored, byte-identical, read straight from disk (ground truth, not the
     # manifest's own claim of success).

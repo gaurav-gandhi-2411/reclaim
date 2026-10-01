@@ -1302,6 +1302,8 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
             count=data.count,
             bytes_freed=data.bytes_freed,
             bytes_freed_human=format_bytes(data.bytes_freed),
+            bytes_moved=data.bytes_moved,
+            bytes_moved_human=format_bytes(data.bytes_moved),
         )
         for group, data in sorted(report.category_breakdown.items())
     ]
@@ -1321,6 +1323,8 @@ def _apply_response(report: BatchApplyReport) -> ApplyResponse:
         disk_free_delta_bytes=report.disk_free_delta_bytes,
         synchronously_purged_count=report.synchronously_purged_count,
         bytes_synchronously_purged=report.bytes_synchronously_purged,
+        bytes_moved=report.bytes_moved,
+        bytes_moved_human=format_bytes(report.bytes_moved),
     )
 
 

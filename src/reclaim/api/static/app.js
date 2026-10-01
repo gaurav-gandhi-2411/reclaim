@@ -864,25 +864,13 @@ function renderQuickCleanResult(container, report) {
   heading.textContent = `Cleaned — batch ${report.batch_id}`;
   panel.appendChild(heading);
 
-  // Every branch below states what ACTUALLY happened to the bytes — recycle_bin/vault are both
-  // moves (recoverable), never described as "freed"; only direct_delete really frees the space
-  // immediately. See house rule: never claim space was freed when it was only moved.
+  // The wording states what ACTUALLY happened to the bytes — `bytes_moved` (recycle_bin/vault
+  // moves, recoverable) is never described as "freed"; only `bytes_freed` (direct delete or a
+  // synchronously purged vault copy) really frees space. See house rule: never claim space was
+  // freed when it was only moved.
   const summary = document.createElement("p");
   summary.style.margin = "0";
-  if (report.method === "recycle_bin") {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
-      "the Recycle Bin — empty the Recycle Bin to free the space.";
-  } else if (report.method === "vault") {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) moved to ` +
-      "the Reclaim vault — restorable from the Quarantine & Restore tab; the space is held " +
-      "until purged.";
-  } else {
-    summary.textContent =
-      `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes) permanently ` +
-      "freed.";
-  }
+  summary.textContent = applyReportBytesPhrase(report);
   panel.appendChild(summary);
 
   const detail = document.createElement("p");
@@ -1441,8 +1429,21 @@ function renderSimpleGroups(summary) {
 // content (the same renderQuickCleanResult success panel Quick Clean shows, matched wording) —
 // just adds the way back to a fresh idle screen the spec requires ("a fresh scan next time, not
 // stale data").
+function simpleCleanedNote(report) {
+  const freed = report.bytes_freed || 0;
+  const moved = report.bytes_moved || 0;
+  if (moved === 0) {
+    return `${report.bytes_freed_human} freed`;
+  }
+  const where = report.method === "vault" ? "Reclaim vault" : "Recycle Bin";
+  const movedPart = `${report.bytes_moved_human} moved to the ${where} (not yet freed)`;
+  return freed > 0 ? `${report.bytes_freed_human} freed, ${movedPart}` : movedPart;
+}
+
 function renderSimpleCleanSuccess(report) {
-  simpleLastCleanedNote = report.bytes_freed_human;
+  // B7: describe moved bytes as moved, never "freed" — the idle-screen note renders this string
+  // after "Last cleaned this session:", so it carries its own verb when anything was only moved.
+  simpleLastCleanedNote = simpleCleanedNote(report);
   const backBtn = document.createElement("button");
   backBtn.type = "button";
   backBtn.className = "rc-btn rc-btn-primary";
@@ -1972,24 +1973,45 @@ async function runApply(dryRun) {
 // branch; anything else (including a genuinely unrecognized method) gets a neutral, honest
 // phrase that commits to no specific outcome, rather than an unverified "freed" claim.
 function applyReportBytesPhrase(report) {
-  const humanBytes = `${report.bytes_freed_human} (${report.bytes_freed.toLocaleString()} bytes)`;
-  if (report.method === "recycle_bin") {
+  // B7: `bytes_freed` is genuinely freed space (direct delete / synchronously purged);
+  // `bytes_moved` is a recoverable Recycle Bin / vault move whose space is still held. They are
+  // phrased separately, from the report's own fields, never inferred from `report.method`.
+  const freed = report.bytes_freed || 0;
+  const moved = report.bytes_moved || 0;
+  const freedText = `${report.bytes_freed_human} (${freed.toLocaleString()} bytes)`;
+  const movedText = `${report.bytes_moved_human} (${moved.toLocaleString()} bytes)`;
+  const knownMethod =
+    report.method === "recycle_bin" || report.method === "vault" || report.method === "direct_delete";
+  if (!knownMethod) {
+    const total = freed + moved;
     return report.apply
-      ? `${humanBytes} moved to the Recycle Bin — empty the Recycle Bin to free the space.`
-      : `${humanBytes} would be moved to the Recycle Bin.`;
+      ? `${total.toLocaleString()} bytes processed (unrecognized method "${report.method}" — outcome not confirmed).`
+      : `${total.toLocaleString()} bytes would be processed (unrecognized method "${report.method}" — outcome not confirmed).`;
   }
-  if (report.method === "vault") {
-    return report.apply
-      ? `${humanBytes} moved to the Reclaim vault — restorable from the Quarantine & Restore ` +
-          "tab; the space is held until purged."
-      : `${humanBytes} would be moved to the Reclaim vault.`;
+  const parts = [];
+  if (moved > 0) {
+    if (report.method === "recycle_bin") {
+      parts.push(
+        report.apply
+          ? `${movedText} moved to the Recycle Bin — empty the Recycle Bin to free the space.`
+          : `${movedText} would be moved to the Recycle Bin.`
+      );
+    } else {
+      parts.push(
+        report.apply
+          ? `${movedText} moved to the Reclaim vault — restorable from the Quarantine & Restore ` +
+              "tab; the space is held until purged."
+          : `${movedText} would be moved to the Reclaim vault.`
+      );
+    }
   }
-  if (report.method === "direct_delete") {
-    return report.apply ? `${humanBytes} permanently freed.` : `${humanBytes} would be permanently freed.`;
+  if (freed > 0) {
+    parts.push(report.apply ? `${freedText} permanently freed.` : `${freedText} would be permanently freed.`);
   }
-  return report.apply
-    ? `${humanBytes} processed (unrecognized method "${report.method}" — outcome not confirmed).`
-    : `${humanBytes} would be processed (unrecognized method "${report.method}" — outcome not confirmed).`;
+  if (parts.length === 0) {
+    return report.apply ? "No space was moved or freed." : "No space would be moved or freed.";
+  }
+  return parts.join(" ");
 }
 
 function renderApplyReport(container, report) {
@@ -2016,7 +2038,13 @@ function renderApplyReport(container, report) {
     const list = document.createElement("ul");
     for (const entry of report.category_breakdown) {
       const li = document.createElement("li");
-      li.textContent = `${entry.category_label}: ${entry.count} item(s), ${entry.bytes_freed_human}`;
+      const breakdownParts = [];
+      if ((entry.bytes_freed || 0) > 0) breakdownParts.push(`${entry.bytes_freed_human} freed`);
+      if ((entry.bytes_moved || 0) > 0) {
+        breakdownParts.push(`${entry.bytes_moved_human} moved (not yet freed)`);
+      }
+      if (breakdownParts.length === 0) breakdownParts.push(`${entry.bytes_freed_human} freed`);
+      li.textContent = `${entry.category_label}: ${entry.count} item(s), ${breakdownParts.join(", ")}`;
       list.appendChild(li);
     }
     panel.appendChild(list);
