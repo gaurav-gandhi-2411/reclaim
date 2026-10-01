@@ -2413,6 +2413,7 @@ async function loadSettingsView() {
   // -- fire-and-forget, same "non-fatal status refresh" posture as loadModeStatus elsewhere.
   loadAnthropicKeyStatus();
   loadNotificationsSettings();
+  loadAutoCleanSettings();
 }
 
 // --- BH5 (2026-08-26 audit): low disk space alert toggle -- R5 shipped with no way for a real
@@ -2463,6 +2464,76 @@ async function updateNotificationsSetting(checkbox, toggleText, statusEl) {
   } catch (err) {
     checkbox.checked = !nextEnabled;
     toggleText.textContent = checkbox.checked ? "On" : "Off";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not save: ${err.message}`;
+  } finally {
+    checkbox.disabled = false;
+  }
+}
+
+// --- ADR-0034: weekly auto-clean toggle. Same fetch/render/toggle-with-rollback shape as the
+// notifications toggle above; the task facts shown under it come from a live Task Scheduler
+// query, so "on" with no task (or a task left behind while off) is visible, not hidden. ---------
+
+function describeAutoCleanTask(data) {
+  if (!data.task_registered) {
+    return data.enabled
+      ? "Turned on, but no scheduled task was found. Switch it off and on again to re-create it."
+      : "No weekly task is scheduled.";
+  }
+  const parts = [`Scheduled task: ${data.task_state || "unknown state"}`];
+  parts.push(data.last_run_time ? `last run ${data.last_run_time}` : "has not run yet");
+  if (data.last_run_time && data.last_result !== null && data.last_result !== 0) {
+    parts.push(`last result code ${data.last_result}`);
+  }
+  if (data.next_run_time) parts.push(`next run ${data.next_run_time}`);
+  return parts.join(" · ") + ".";
+}
+
+async function loadAutoCleanSettings() {
+  const checkbox = document.getElementById("autoclean-enabled-checkbox");
+  const taskNote = document.getElementById("autoclean-task-note");
+  const statusEl = document.getElementById("autoclean-status");
+  if (!checkbox) return;
+  taskNote.textContent = "Checking the scheduled task…";
+  try {
+    const data = await api("/api/settings/autoclean");
+    checkbox.checked = data.enabled;
+    taskNote.textContent = describeAutoCleanTask(data);
+    statusEl.className = "rc-settings-card-status";
+    statusEl.textContent = "";
+    checkbox.disabled = false;
+  } catch (err) {
+    taskNote.textContent = "";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not load: ${err.message}`;
+  }
+  // Static markup, re-entered on every Settings activation: attach the listener exactly once
+  // (see loadNotificationsSettings for why a dataset flag and not `{once: true}`).
+  if (!checkbox.dataset.listenerAttached) {
+    checkbox.dataset.listenerAttached = "true";
+    checkbox.addEventListener("change", () => {
+      updateAutoCleanSetting(checkbox, taskNote, statusEl);
+    });
+  }
+}
+
+async function updateAutoCleanSetting(checkbox, taskNote, statusEl) {
+  const nextEnabled = checkbox.checked;
+  checkbox.disabled = true;
+  statusEl.className = "rc-settings-card-status";
+  statusEl.textContent = nextEnabled ? "Scheduling…" : "Removing the scheduled task…";
+  try {
+    const data = await api("/api/settings/autoclean", {
+      method: "POST",
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    taskNote.textContent = describeAutoCleanTask(data);
+    statusEl.textContent = "";
+  } catch (err) {
+    // The server rolls the setting back when it cannot register the task (e.g. a non-installed
+    // build), so mirror that here rather than leaving the box ticked.
+    checkbox.checked = !nextEnabled;
     statusEl.className = "rc-settings-card-status rc-form-error";
     statusEl.textContent = `Could not save: ${err.message}`;
   } finally {
