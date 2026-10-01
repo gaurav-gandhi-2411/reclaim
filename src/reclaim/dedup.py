@@ -14,6 +14,7 @@ import blake3
 import structlog
 
 from reclaim.config import Config
+from reclaim.freshstat import fresh_stat_signature
 from reclaim.index import HashCacheEntry, ScanIndex, cached_full_hash, cached_partial_hash
 from reclaim.linkinfo import estimate_reclaimable_bytes
 from reclaim.models import (
@@ -420,7 +421,13 @@ def _hash_member(
     entry = hash_cache.get(record.path.as_posix())
     digest = cached_lookup(entry, record.size_bytes, record.mtime)
     if digest is not None:
-        return digest
+        # ADR-0035: the cache is keyed on the listing's (size, mtime), which lags for a file
+        # open for write -- confirm against a live stat before trusting the cached digest. Only
+        # a would-be cache HIT pays the stat (misses hash the file anyway).
+        fresh = fresh_stat_signature(record.path)
+        if fresh is None or (fresh.size, fresh.mtime) == (record.size_bytes, record.mtime):
+            return digest
+        logger.info("dedup.hash_cache_stale_listing", stage=stage, path=str(record.path))
     digest, reason = _hash_with_guard(executor, compute, record.path, *compute_args)
     if digest is None:
         logger.warning("dedup.hash_unreadable", stage=stage, path=str(record.path), reason=reason)

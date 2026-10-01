@@ -894,6 +894,19 @@ class ScanIndex:
         row = cursor.fetchone()
         return None if row["newest"] is None else float(row["newest"])
 
+    def newest_files_under(self, root: Path, *, limit: int) -> list[Path]:
+        """Paths of up to `limit` non-directory rows under `root`, newest indexed `mtime`
+        first. Bounded by `limit`, so a caller that re-`stat`s the result (the ADR-0035
+        decision-point re-check) pays O(limit) per subtree however large the subtree is."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT path FROM files WHERE path >= ? AND path < ? AND is_dir = 0 "
+            "ORDER BY mtime DESC LIMIT ?",
+            (lower, upper, limit),
+        )
+        return [Path(row["path"]) for row in cursor]
+
     def subtree_entry_count(self, under: Path) -> int:
         """Cheap `COUNT(*)` over the same rows `candidate_inventory(under=...)` would return,
         without materializing a single `FileRecord` -- used purely to decide whether a live
