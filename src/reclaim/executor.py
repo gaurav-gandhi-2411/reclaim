@@ -386,6 +386,9 @@ class ItemApplyResult:
 class CategoryBreakdown:
     count: int
     bytes_freed: int
+    # Bytes MOVED (Recycle Bin / vault, recoverable) rather than freed: the space is still held
+    # until the bin is emptied / the vault purged. `0` for purge.py, where everything is freed.
+    bytes_moved: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,7 +408,10 @@ class BatchApplyReport:
     files_succeeded: int
     files_failed: int
     # Sum of `Candidate.size_bytes` (the size Stage 2's scanner recorded for that specific file)
-    # across successfully-quarantined items — a real measured value, not an estimate.
+    # across succeeded items whose space is genuinely freed: `direct_delete` items, plus items
+    # synchronously purged out of the vault (ADR-0032). A real measured value, not an estimate.
+    # Recycle Bin / vault moves are NOT counted here (the space is still held) -- see
+    # `bytes_moved`.
     bytes_freed: int
     category_breakdown: dict[str, CategoryBreakdown]
     # Real `shutil.disk_usage()` free-space measurements, taken immediately before/after an
@@ -424,6 +430,10 @@ class BatchApplyReport:
     # bytes` alone. `0`/`0` for every existing caller/batch that never triggers a guard downgrade.
     synchronously_purged_count: int = 0
     bytes_synchronously_purged: int = 0
+    # Sum of `size_bytes` of succeeded `recycle_bin`/`vault` items NOT synchronously purged:
+    # recoverable, space still held until the bin is emptied / the vault purged. Dry-run reports
+    # classify identically (as if every item succeeded).
+    bytes_moved: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,17 +771,28 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
         unlink_clear_readonly(long_src)
 
 
+def _is_moved_not_freed(item: ItemApplyResult) -> bool:
+    """True for a succeeded Recycle Bin / vault move whose space is still held (recoverable)."""
+    return item.method in ("recycle_bin", "vault") and not item.synchronously_purged
+
+
 def _category_breakdown(items: Sequence[ItemApplyResult]) -> dict[str, CategoryBreakdown]:
     breakdown: dict[str, CategoryBreakdown] = {}
     for item in items:
         if not item.succeeded:
             continue
+        moved = item.size_bytes if _is_moved_not_freed(item) else 0
+        freed = item.size_bytes - moved
         existing = breakdown.get(item.category)
         if existing is None:
-            breakdown[item.category] = CategoryBreakdown(count=1, bytes_freed=item.size_bytes)
+            breakdown[item.category] = CategoryBreakdown(
+                count=1, bytes_freed=freed, bytes_moved=moved
+            )
         else:
             breakdown[item.category] = CategoryBreakdown(
-                count=existing.count + 1, bytes_freed=existing.bytes_freed + item.size_bytes
+                count=existing.count + 1,
+                bytes_freed=existing.bytes_freed + freed,
+                bytes_moved=existing.bytes_moved + moved,
             )
     return breakdown
 
@@ -1981,13 +2002,16 @@ def apply_batch(
         files_processed=len(items),
         files_succeeded=len(succeeded_items),
         files_failed=len(failed_items),
-        bytes_freed=sum(item.size_bytes for item in succeeded_items),
+        bytes_freed=sum(
+            item.size_bytes for item in succeeded_items if not _is_moved_not_freed(item)
+        ),
         category_breakdown=_category_breakdown(items),
         disk_free_before_bytes=disk_free_before,
         disk_free_after_bytes=disk_free_after,
         disk_free_delta_bytes=disk_free_delta,
         synchronously_purged_count=len(purged_items),
         bytes_synchronously_purged=sum(item.size_bytes for item in purged_items),
+        bytes_moved=sum(item.size_bytes for item in succeeded_items if _is_moved_not_freed(item)),
     )
 
 

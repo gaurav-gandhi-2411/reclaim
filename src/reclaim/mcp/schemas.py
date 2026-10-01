@@ -94,4 +94,7 @@ class DeleteResult(BaseModel):
     files_processed: int
     files_succeeded: int
     files_failed: int
+    # Genuinely freed bytes only; Recycle Bin / vault moves (recoverable, space still held) are
+    # reported in `bytes_moved`.
     bytes_freed: int
+    bytes_moved: int = 0
