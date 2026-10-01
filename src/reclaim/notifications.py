@@ -339,3 +339,39 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
         logger.info("notifications.toast_failed", exc_info=True)
         return False
     return True
+
+
+def autoclean_toast_body(freed_bytes: int, percent_used: float | None) -> str:
+    """`Freed X, C: now Y% used.` -- the second half is omitted when usage is unknown. Pure, so
+    the exact user-facing text is unit-testable without any toast stack."""
+    from reclaim.api.schemas import format_bytes  # deferred: keep this module's import light
+
+    freed = f"Freed {format_bytes(freed_bytes)}"
+    if percent_used is None:
+        return f"{freed}."
+    return f"{freed}, C: now {percent_used:.0f}% used."
+
+
+def send_autoclean_toast(freed_bytes: int, percent_used: float | None, skipped_in_use: int) -> bool:
+    """Fires the "weekly auto-clean finished" toast (ADR-0034). Same reliability posture as
+    `send_disk_space_toast`: NEVER raises, `windows_toasts` imported lazily, `True` only means
+    the toast call did not raise (not that the user saw it).
+
+    Whether to call this at all is the caller's decision (`reclaim auto-clean --notify` only does
+    so when something was freed or skipped as in-use -- a weekly "Freed 0 B" toast is noise).
+    `skipped_in_use` is accepted so the signature matches that policy and is logged."""
+    try:
+        logger.info(
+            "notifications.autoclean_toast", freed_bytes=freed_bytes, skipped_in_use=skipped_in_use
+        )
+        from windows_toasts import InteractableWindowsToaster, Toast
+
+        toaster = InteractableWindowsToaster("Reclaim")
+        toast = Toast(
+            ["Reclaim cleaned your disk", autoclean_toast_body(freed_bytes, percent_used)]
+        )
+        toaster.show_toast(toast)
+    except Exception:
+        logger.info("notifications.autoclean_toast_failed", exc_info=True)
+        return False
+    return True
