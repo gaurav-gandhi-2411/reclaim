@@ -581,6 +581,18 @@ class NotificationsConfig(BaseModel):
     snooze_days: int = 7
 
 
+class AutoCleanConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Opt-in, default OFF (ADR-0034): a recurring background delete is exactly the kind of thing a
+    # user must choose, not discover. When true the Settings-tab toggle has registered a per-
+    # account weekly Task Scheduler entry (see reclaim.autoclean_schedule) that runs
+    # `reclaim auto-clean --apply --notify --scheduled` -- the regenerable safe tier ONLY
+    # (reclaim.regenerable's closed allow-list). `--scheduled` re-reads this flag at run time, so a
+    # stale task left behind after the user toggled this off does nothing.
+    enabled: bool = False
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -588,6 +600,7 @@ class Config(BaseSettings):
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    autoclean: AutoCleanConfig = Field(default_factory=AutoCleanConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not
@@ -875,5 +888,16 @@ def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
     of the Settings-tab notifications toggle (BH5)."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_notifications_enabled_in_toml_text(text, enabled=enabled)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_text, encoding="utf-8")
+
+
+def set_autoclean_enabled(config_path: Path, *, enabled: bool) -> None:
+    """Persists the `[autoclean]` section's `enabled` flag to `config_path`'s on-disk TOML text,
+    creating the file (and its parent directory) if it doesn't exist yet -- the write side of the
+    Settings-tab weekly auto-clean toggle (ADR-0034), built exactly like
+    `set_notifications_enabled`."""
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
