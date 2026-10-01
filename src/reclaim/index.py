@@ -863,7 +863,12 @@ class ScanIndex:
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
             "SELECT COUNT(*) AS total FROM files "
-            "WHERE (path = ? OR (path >= ? AND path < ?)) AND is_cloud_placeholder = 0",
+            # Unary `+` on `is_cloud_placeholder` is load-bearing, not noise: it makes that term
+            # non-indexable so the planner uses the primary-key path range. Without it (no
+            # ANALYZE stats on this DB) SQLite picked `idx_files_is_cloud_placeholder` -- ~every
+            # row has value 0 -- and walked most of the table: measured 5.04s vs 0.00s for the same
+            # 397-row prefix on the real 5.86M-row index. Same rows either way.
+            "WHERE (path = ? OR (path >= ? AND path < ?)) AND +is_cloud_placeholder = 0",
             (prefix, lower, upper),
         )
         row = cursor.fetchone()
@@ -933,7 +938,13 @@ class ScanIndex:
             clauses.append("(path = ? OR (path >= ? AND path < ?))")
             params.extend([prefix, lower, upper])
         if candidates_only:
-            clauses.append("is_cloud_placeholder = 0")
+            # Unary `+` ONLY when `under` scopes the query: same planner trap as
+            # `subtree_entry_count` (see its comment) -- keeps the primary-key range as the access
+            # path. Unscoped (`under=None`) keeps the plain term, whose index is the only filter.
+            placeholder_term = (
+                "+is_cloud_placeholder = 0" if under is not None else ("is_cloud_placeholder = 0")
+            )
+            clauses.append(placeholder_term)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         # S608: `clauses` is built only from the fixed literal strings above and `?`
         # placeholders — no caller-supplied value is ever interpolated into the SQL text.
