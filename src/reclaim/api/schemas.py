@@ -755,6 +755,27 @@ class UpdateNotificationsSettingRequest(BaseModel):
     enabled: bool
 
 
+# ADR-0034: the weekly auto-clean toggle. The task fields come from a live `schtasks /query`, not
+# from config -- `enabled` (what the user chose) and `task_registered` (what Windows actually has)
+# can disagree, and the UI shows both. Times are the raw locale-formatted text schtasks printed.
+class AutoCleanSettingOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    task_registered: bool
+    task_name: str
+    task_state: str | None = None
+    last_run_time: str | None = None
+    last_result: int | None = None
+    next_run_time: str | None = None
+
+
+class UpdateAutoCleanSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------
 
 
