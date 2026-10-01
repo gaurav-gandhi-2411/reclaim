@@ -3185,3 +3185,22 @@ session: `.github/workflows/eval.yml`'s safety-gate job's own comments already d
 identical "wired locally, missing from CI" gap this job's comments warn about recurring, for
 two files unrelated to this session's change. Flagged for a future session; `test_scan_scope_gate.py`
 (this session's own new file) WAS added to both lists, so it does not repeat the gap.
+
+### 2026-10-01 — B2: full-profile scan speed (`perf/scan-listing-ids`) — Lever 2 shipped, Lever 1 not
+
+Base `3deb05d`. **Lever 2** (file IDs/sizes/times from the directory listing, `reclaim/dirlist.py`,
+`scanner.build_record_from_listing`, `index.file_row`) is implemented: row-for-row equal to the
+`os.stat` path on 456,044 rows of uv cache + `.venv` + HF hub (one ARCHIVE-bit difference) and on
+`triage-iq` (55,563 rows; 52 differ: 50 `attributes` by a `0x40000` bit `os.stat` adds, 2 live
+directory changes). Known exactness loss: files open for write can show their last-close size/mtime
+(110 sizes / 168 mtimes of 4,557,160 files in the whole `C:\Users\gaura` profile), see ADR-0034.
+**Measured, interleaved x3 on a contended machine**: walk only (SQLite stubbed) 2.6x; end to end
+1.32-1.37x on the full profile (base 1813/1649/1736 s -> new 1344/1252/1270 s), median 1.39x on a
+0.8M-entry set. The owner's >=3x was NOT reached: after Lever 2 the scan waits on SQLite (six
+secondary indexes + `scan_seen`); creating the indexes after the scan instead of during it measured
+~1.9x on top (same-window A/B, 0.8M rows) and is the recommended next change (not done here).
+**Lever 1** (aggregate rows) was evaluated and NOT shipped: no tree class is provably invisible to
+every per-file consumer (dedup, detectors, treemap/`physical_size_bytes`, apply re-verification, AI
+analysis); `.git`, the least entangled class, is 1.6% of the profile's rows. Proof table in ADR-0034.
+Next: owner decides on the write-path change (deferred index creation) and on whether open-for-write
+exactness needs a targeted re-stat.
