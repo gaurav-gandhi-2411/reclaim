@@ -3,6 +3,35 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## PRIORITY CHANGE 2026-10-01 — "daily driver" plan (Phases A/B/C), read this first
+
+Supersedes the AC3-trip priority below. #110 and #111 are merged (`origin/main` = `3deb05d`).
+Owner's brief: clean C: now (A), make Reclaim safe/fast/self-maintaining on the owner's account (B),
+rebuild + install + run for real (C). Never self-merge; admin/UAC steps are routed with numbered steps.
+
+**Phase A (VERIFIED unless marked):**
+- `$R21C2JW` (Recycle Bin item, 899,224 files) deleted, 609 s. C: free 61.02 -> 69.91 GB over that
+  window (+8.89 GB; includes Docker Desktop start, so not purely this delete).
+- TEMP: 11.06 GB total, of which 8.88 GB is `%TEMP%\claude` (live sessions' scratchpads, left alone);
+  eligible by #110's recursive-newest-mtime rule (>7 d, no `.git`/venv): ~0 GB. Crash dumps 0 GB.
+  Browser caches: Chrome and Edge were running (skipped, Edge ~0.43 GB); Brave dir empty.
+- uv: `uv cache prune` is blocked by other sessions' running `uv` processes (cache lock); a background
+  prune with `UV_LOCK_TIMEOUT=3300` was queued; result UNKNOWN at this checkpoint (BELIEVED to block
+  until those `uv run` processes exit). `--force` deliberately not used.
+- Docker engine will not start: `wsl --status` says "WSL2 is not supported with your current machine
+  configuration"; `HypervisorPresent=False` although firmware virtualization is enabled. Needs admin.
+  `docker_data.vhdx` = 62.3 GB; prune/compaction therefore NOT done.
+- C: free drifted 69.9 -> 55.8 GB during the session; pagefile allocation grew 4,608 -> 12,821 MB
+  (+8.2 GB, `Win32_PageFileUsage`), the rest is concurrent sessions' writes (BELIEVED, unattributed).
+
+**Phase B (in flight; branches pushed, PRs draft):** B8 = PR #112. B1/B2-targeted = branch
+`feat/regenerable-safe-tier` (ADR-0034; `reclaim.regenerable`, `POST /api/clean/regenerable`, UI).
+B5 = `feat/weekly-autoclean`. B7 = `fix/bytes-freed-vs-moved`. B4 = `perf/review-queue-dry-run`.
+B2-full-scan levers = `perf/scan-listing-ids`. B3 inventory: `docs/` (see crash-inventory section in
+the PR that carries it); 3 APPCRASH events (MSVCP140 14.29 vs 14.50 mismatch) fixed by #108,
+2 RADAR_PRE_LEAK_64 events (2026-07-25, 2026-08-26) undiagnosed.
+**Phase C** not started: needs B1-B8 merged by the owner, then rebuild from main (~5 h).
+
 ## TRIP STAGED 2026-09-24 03:05 IST — read this first, it supersedes everything below
 
 **State (VERIFIED):** `origin/main` = `33ce814` (#109). CI is green on it; `scale-nightly` failed once
