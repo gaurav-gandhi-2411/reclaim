@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -384,6 +385,41 @@ class ScanIndex:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
+
+    def has_planner_stats(self) -> bool:
+        """True iff `ANALYZE` has populated `sqlite_stat1` for the `files` table."""
+        has_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone()
+        if has_table is None:
+            return False
+        row = self._conn.execute("SELECT 1 FROM sqlite_stat1 WHERE tbl = 'files' LIMIT 1")
+        return row.fetchone() is not None
+
+    def refresh_planner_stats(self, *, only_if_missing: bool = False) -> float:
+        """Runs a FULL `ANALYZE files` and returns the seconds it took (0.0 if skipped).
+
+        Why: with no `sqlite_stat1`, SQLite assumes every index is equally selective and picked
+        `idx_files_is_cloud_placeholder` (one value in practice) over the primary-key path range
+        for prefix-scoped queries, walking most of a 5.86M-row table (8.8 s per call; see
+        `subtree_entry_count`). Measured on a copy of the real 4.89 GB index: full ANALYZE
+        11-17 s, after which the plan flips to the PK range even without the unary `+` hint.
+
+        Deliberately NOT `PRAGMA optimize` / `analysis_limit`: bounded analysis samples the first
+        N entries of each index, and a low-cardinality index (`is_cloud_placeholder`, every value
+        0) then reports ~1000 rows per key instead of ~5.8M -- measured, the bad plan survived
+        both `PRAGMA optimize` and `analysis_limit=1000`. Full ANALYZE is the only variant that
+        fixed the plans. An index that has never been analyzed (e.g. one built before this
+        existed) therefore gets its statistics at the end of its next scan.
+        """
+        if only_if_missing and self.has_planner_stats():
+            return 0.0
+        start = time.perf_counter()
+        # An explicit limit of 0 = unbounded, in case a caller/connection configured one.
+        self._conn.execute("PRAGMA analysis_limit=0")
+        self._conn.execute("ANALYZE files")
+        self._conn.commit()
+        return time.perf_counter() - start
 
     def close(self) -> None:
         # TRUNCATE checkpoint reclaims whatever the session's writes left in the WAL (see the
