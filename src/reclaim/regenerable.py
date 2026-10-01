@@ -631,6 +631,12 @@ def _run_native_tool(
     elif lock_expired:
         result.status = "skipped_in_use"
         result.detail = "tool is in use by another process (lock timeout); skipped"
+    elif outcome.returncode != 0 and _file_in_use_error(combined):
+        # Measured 2026-10-01 (pip 25.1): `pip cache purge` takes NO global lock; with one cache
+        # file held open it removes every other file and then exits 2 with a PermissionError
+        # traceback. There is nothing to wait on, so this is a partial purge reported as a skip.
+        result.status = "skipped_in_use"
+        result.detail = "a cache file is open in another process; the rest was removed"
     elif outcome.returncode != 0:
         result.status = "failed"
         result.detail = (outcome.stderr or outcome.stdout).strip()[
@@ -640,6 +646,14 @@ def _run_native_tool(
         result.status = "cleaned" if result.bytes_removed > 0 else "nothing_to_clean"
         result.detail = f"`{spec.executable} {' '.join(spec.argv_tail)}` exit 0"
     return result
+
+
+def _file_in_use_error(lowered_output: str) -> bool:
+    """True if a tool's lower-cased output says a file was held open by another process."""
+    return any(
+        marker in lowered_output
+        for marker in ("permissionerror", "being used by another process", "winerror 32")
+    )
 
 
 def _aged_children(

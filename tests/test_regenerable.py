@@ -454,6 +454,24 @@ def test_native_tool_nonzero_exit_is_failed_with_message(machine: FakeMachine) -
     assert "boom" in item.detail
 
 
+def test_pip_purge_with_a_held_file_is_a_skip_not_a_failure(machine: FakeMachine) -> None:
+    # Real pip 25.1 output shape, measured 2026-10-01: purge removes the other files, then exits 2
+    # with a PermissionError traceback when one cache file is open elsewhere. pip has no cache
+    # lock to wait on, so the honest classification is "skipped (in use)", not "failed".
+    _write(machine.local / "pip" / "Cache" / "a", 100)
+    machine.on_path.add("pip")
+    machine.command_effect["pip"] = CommandResult(
+        2,
+        "",
+        "ERROR: Exception:\nPermissionError: [WinError 32] The process cannot access the file "
+        "because it is being used by another process",
+    )
+    report = run_regenerable_clean(machine.env(), apply=True, audit_log_path=None)
+    item = _item(report, "pip")
+    assert item.status == "skipped_in_use"
+    assert "open in another process" in item.detail
+
+
 def test_one_item_crashing_does_not_stop_the_others(machine: FakeMachine) -> None:
     target = _write(machine.temp / "old.bin", 10)
     machine.on_path.add("pip")
