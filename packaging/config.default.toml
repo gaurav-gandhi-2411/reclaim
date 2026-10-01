@@ -143,3 +143,8 @@ enabled = false
 # as old_installers.max_age_days above) -- edit this value directly if you want a different
 # threshold.
 disk_threshold_percent = 80.0
+
+# ADR-0034: weekly auto-clean of the regenerable safe tier. Off by default (opt-in via the Settings
+# tab, which writes this section and registers the per-account scheduled task).
+[autoclean]
+enabled = false
