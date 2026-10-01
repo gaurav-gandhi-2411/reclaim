@@ -13,7 +13,7 @@ from pathlib import Path
 
 import structlog
 
-from reclaim import anthropic_key_store, regenerable, update_check
+from reclaim import anthropic_key_store, autoclean_schedule, regenerable, update_check
 from reclaim.ai import category_explainer, presentation
 from reclaim.ai.models import AICluster
 from reclaim.api import ai_orchestration
@@ -27,6 +27,7 @@ from reclaim.api.schemas import (
     ApplyRequest,
     ApplyResponse,
     ApplyStatusOut,
+    AutoCleanSettingOut,
     CandidateOut,
     CandidatesResponse,
     CandidatesWarmStatusOut,
@@ -80,7 +81,12 @@ from reclaim.api.state import (
     RestoreStatus,
     ScanStatus,
 )
-from reclaim.config import CategoriesConfig, set_category_enabled, set_notifications_enabled
+from reclaim.config import (
+    CategoriesConfig,
+    set_autoclean_enabled,
+    set_category_enabled,
+    set_notifications_enabled,
+)
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -2401,6 +2407,14 @@ def run_regenerable_clean(
 ) -> RegenerableCleanResponse:
     """One click: the closed allow-list in `reclaim.regenerable`, nothing the client names. Not an
     `apply_batch` call -- see ADR-0034 for why ADR-0023's safe-mode guarantees are unaffected."""
+    return regenerable_clean_response(apply=apply, audit_log_path=audit_log_path)
+
+
+def regenerable_clean_response(
+    *, apply: bool, audit_log_path: Path | None = None
+) -> RegenerableCleanResponse:
+    """The state-free core shared by the dashboard endpoint and `reclaim auto-clean` (so the CLI
+    and the API report byte-identical shapes and both write the same audit log)."""
     if not _regenerable_clean_lock.acquire(blocking=False):
         raise RegenerableCleanBusyError("a clean is already running")
     try:
@@ -2448,3 +2462,69 @@ def run_regenerable_clean(
         percent_used_after=percent_used,
         duration_seconds=round(report.duration_seconds, 2),
     )
+
+
+# --- Weekly auto-clean toggle (ADR-0034) ---------------------------------------------------------
+
+
+def autoclean_schtasks_runner() -> autoclean_schedule.SchtasksRunner:
+    """Seam for tests: the real `schtasks.exe` runner. Never takes caller input."""
+    return autoclean_schedule.run_schtasks
+
+
+def autoclean_exe_path() -> Path | None:
+    """Seam for tests: `None` means "resolve the installed reclaim.exe" (a dev run then raises
+    `NotAnInstalledBuildError`, which the endpoint reports as a 409 with an actionable message)."""
+    return None
+
+
+def autoclean_settings(state: AppState) -> AutoCleanSettingOut:
+    """What the user chose (config) next to what Windows actually has (a live schtasks query)."""
+    with state.lock:
+        enabled = state.config.autoclean.enabled
+    status = autoclean_schedule.query_task(runner=autoclean_schtasks_runner())
+    return AutoCleanSettingOut(
+        enabled=enabled,
+        task_registered=status.registered,
+        task_name=status.task_name,
+        task_state=status.state,
+        last_run_time=status.last_run_time,
+        last_result=status.last_result,
+        next_run_time=status.next_run_time,
+    )
+
+
+def update_autoclean_setting(state: AppState, *, enabled: bool) -> AutoCleanSettingOut:
+    """Turns weekly auto-clean on/off: config.toml AND the Windows scheduled task, never one
+    without the other.
+
+    ON: the flag is written first, then the task registered; if registration fails (e.g. a
+    non-installed dev build, Task Scheduler locked down) the flag is rolled back to its previous
+    value and the typed `AutoCleanScheduleError` propagates -- config must never say "on" with no
+    task behind it. OFF: the flag is written first so a task that then fails to delete is already
+    neutralised by `auto-clean --scheduled`'s own enabled check; the delete error still propagates
+    (after the in-memory config reflects "off") so the user is told the task is still there."""
+    with state.lock:
+        previous = state.config.autoclean.enabled
+    set_autoclean_enabled(state.config_path, enabled=enabled)
+    try:
+        if enabled:
+            autoclean_schedule.register_task(
+                exe_path=autoclean_exe_path(), runner=autoclean_schtasks_runner()
+            )
+        else:
+            autoclean_schedule.unregister_task(runner=autoclean_schtasks_runner())
+    except autoclean_schedule.AutoCleanScheduleError:
+        if enabled:
+            set_autoclean_enabled(state.config_path, enabled=previous)
+        else:
+            _set_autoclean_in_memory(state, enabled=False)
+        raise
+    _set_autoclean_in_memory(state, enabled=enabled)
+    return autoclean_settings(state)
+
+
+def _set_autoclean_in_memory(state: AppState, *, enabled: bool) -> None:
+    with state.lock:
+        updated = state.config.autoclean.model_copy(update={"enabled": enabled})
+        state.config = state.config.model_copy(update={"autoclean": updated})
