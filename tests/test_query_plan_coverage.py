@@ -134,6 +134,12 @@ _CASES: dict[str, Case] = {
         expect_index=True,
         reason="prefix-range scoped via _prefix_range",
     ),
+    "newest_files_under": Case(
+        lambda idx: idx.newest_files_under(_SCOPE, limit=10),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range (then a bounded sort of that one subtree); "
+        "called once per old temp-root directory child by the ADR-0035 re-stat",
+    ),
     "subtree_newest_mtime": Case(
         lambda idx: idx.subtree_newest_mtime(_SCOPE),
         expect_index=True,
