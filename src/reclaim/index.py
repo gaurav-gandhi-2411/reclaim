@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from reclaim.models import FileRecord
+from reclaim.models import (
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+    FILE_ATTRIBUTE_REPARSE_POINT,
+    FileRecord,
+)
 
 # Migration/backfill batch size for `_backfill_name_and_path_lower` — streamed via
 # `fetchmany`/`executemany` in chunks rather than loading every legacy row at once, so
@@ -297,6 +301,46 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
     )
 
 
+def file_row(
+    *,
+    posix_path: str,
+    name: str,
+    size: int,
+    mtime: float,
+    ctime: float,
+    ext: str,
+    attributes: int,
+    dev: int,
+    ino: int,
+    is_dir: bool,
+    git_repo_root_posix: str | None,
+    git_repo_clean: bool,
+    scanned_at: float,
+) -> tuple[object, ...]:
+    """The `files` row `_record_to_row` would produce, built from plain strings/numbers so the
+    scanner's hot path never has to construct a `Path` + `FileRecord` per file just to have them
+    taken apart again. Same column order as `_COLUMNS` by construction (one layout, two entry
+    points); tests/test_scanner_listing.py asserts row-for-row equality with `_record_to_row`."""
+    return (
+        posix_path,
+        size,
+        mtime,
+        ctime,
+        ext,
+        attributes,
+        _to_db_int64(dev),
+        _to_db_int64(ino),
+        int(is_dir),
+        int(bool(attributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)),
+        int(bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)),
+        git_repo_root_posix,
+        int(git_repo_clean),
+        scanned_at,
+        name.lower(),
+        posix_path.lower(),
+    )
+
+
 class ScanIndex:
     """SQLite-backed inventory of every filesystem entry the scanner has seen.
 
@@ -394,7 +438,10 @@ class ScanIndex:
 
     def upsert_records(self, records: Iterable[FileRecord], *, scanned_at: float) -> int:
         """Full upsert (all columns) for new or changed records. Returns rows written."""
-        rows = [_record_to_row(record, scanned_at) for record in records]
+        return self.upsert_rows([_record_to_row(record, scanned_at) for record in records])
+
+    def upsert_rows(self, rows: Sequence[tuple[object, ...]]) -> int:
+        """`upsert_records` for rows already in `_COLUMNS` order (`_record_to_row`/`file_row`)."""
         if not rows:
             return 0
         placeholders = ", ".join("?" for _ in _COLUMNS)

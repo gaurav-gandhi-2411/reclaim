@@ -245,6 +245,12 @@ _CASES: dict[str, Case] = {
         "statement shape (verified empirically); conflict resolution is index-based internally "
         "but there's no SEARCH/SCAN decision to assert on",
     ),
+    "upsert_rows": Case(
+        action=None,
+        expect_index=False,
+        reason="the same INSERT ... ON CONFLICT statement as upsert_records (which now just "
+        "delegates here) -- EXPLAIN QUERY PLAN produces no plan rows for this shape",
+    ),
     "_ensure_name_and_path_lower_columns": Case(
         action=None,
         expect_index=False,
