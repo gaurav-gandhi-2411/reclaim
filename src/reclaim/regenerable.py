@@ -45,6 +45,16 @@ _GUARD_NAMES = frozenset({".git", ".venv", "venv", "pyvenv.cfg", "site-packages"
 
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
+# How long `uv cache prune` may WAIT for uv's own cache lock before the item is skipped. uv holds
+# that lock precisely so a prune waits for in-flight installs instead of racing them, so waiting
+# is the safe behaviour; skipping up front whenever any uv.exe runs meant the biggest cache was
+# almost never cleaned on a workstation with several agent sessions (ADR-0034, limit 1). 30 min:
+# long enough to outlast typical agent-session installs, short enough that the run is bounded.
+UV_LOCK_WAIT_SECONDS = 1800.0
+# The subprocess timeout is the lock wait plus this margin, so uv's own "Timeout ... waiting for
+# lock" error (a clean, reportable exit) normally fires before the hard kill does.
+_LOCK_WAIT_KILL_MARGIN_SECONDS = 60.0
+
 ItemKind = Literal["native_command", "aged_temp", "crash_dump", "browser_cache"]
 ItemStatus = Literal[
     "cleaned",
@@ -71,7 +81,9 @@ class CommandResult:
 class NativeToolSpec:
     """One package manager's own cache-clean command. `busy_process_names` are the tool's own
     executables: if any is running, the tool may hold its cache lock or be mid-install, so the
-    whole item is skipped (never `--force`d past a lock)."""
+    whole item is skipped (never `--force`d past a lock) -- UNLESS `own_lock` is set: the tool
+    then guards its cache with a real lock that makes the command WAIT (bounded, see
+    `UV_LOCK_WAIT_SECONDS`) instead of racing, so a running process is not a reason to skip."""
 
     key: str
     label: str
@@ -80,6 +92,7 @@ class NativeToolSpec:
     cache_root_relative_to: Literal["local_appdata", "home"]
     cache_root_tail: str
     busy_process_names: frozenset[str]
+    own_lock: bool = False
 
 
 # Allow-list. Each command only removes the tool's regenerable download/index cache -- never an
@@ -95,6 +108,9 @@ NATIVE_TOOLS: tuple[NativeToolSpec, ...] = (
         "local_appdata",
         "uv/cache",
         frozenset({"uv.exe", "uvx.exe"}),
+        # Measured (uv 0.11.14, scratch cache dir): with its `.lock` held elsewhere, `uv cache
+        # prune` waits and then exits 2 with "Timeout (Ns) when waiting for lock on ...".
+        own_lock=True,
     ),
     NativeToolSpec(
         "pip",
@@ -308,6 +324,9 @@ class RegenerableEnv:
     has_open_handle: Callable[[str], bool] = file_has_open_handle
     min_age_seconds: float = DEFAULT_MIN_AGE_SECONDS
     command_timeout_seconds: float = 300.0
+    # Bounded wait for a tool that has its own cache lock (uv). Overridable so tests and the
+    # scheduled task can pick a different bound.
+    uv_lock_wait_seconds: float = UV_LOCK_WAIT_SECONDS
     disk_anchor: Path | None = None
 
     @classmethod
@@ -571,17 +590,20 @@ def _run_native_tool(
         result.status = "skipped_not_present"
         result.detail = f"{cache_root} does not exist"
         return result
-    try:
-        running = env.running_process_names()
-    except OSError:
-        result.status = "skipped_in_use"
-        result.detail = "could not enumerate running processes; skipped (fail-closed)"
-        return result
-    busy = sorted(spec.busy_process_names & running)
-    if busy:
-        result.status = "skipped_in_use"
-        result.detail = f"{', '.join(busy)} is running; the tool may hold its cache lock"
-        return result
+    if not spec.own_lock:
+        # pip/yarn/conda (and npm, which has no busy names) have no lock this module can rely on
+        # (BELIEVED, not measured here), so a running process is the only in-use signal: skip.
+        try:
+            running = env.running_process_names()
+        except OSError:
+            result.status = "skipped_in_use"
+            result.detail = "could not enumerate running processes; skipped (fail-closed)"
+            return result
+        busy = sorted(spec.busy_process_names & running)
+        if busy:
+            result.status = "skipped_in_use"
+            result.detail = f"{', '.join(busy)} is running; the tool may hold its cache lock"
+            return result
 
     before = dir_size_bytes(cache_root)
     if not apply:
@@ -591,14 +613,22 @@ def _run_native_tool(
         return result
 
     child_env = dict(os.environ)
-    # Never block behind another session's lock: a short timeout turns "in use" into a skip.
-    child_env["UV_LOCK_TIMEOUT"] = "5"
+    timeout = env.command_timeout_seconds
+    wait = env.uv_lock_wait_seconds
+    if spec.own_lock:
+        # Wait for the tool's own lock (never `--force` past it); the expiry is the only skip.
+        child_env["UV_LOCK_TIMEOUT"] = str(int(wait))
+        timeout = wait + _LOCK_WAIT_KILL_MARGIN_SECONDS
     argv = [exe, *spec.argv_tail]
-    outcome = env.run_command(argv, env.command_timeout_seconds, child_env)
+    outcome = env.run_command(argv, timeout, child_env)
     after = dir_size_bytes(cache_root)
     result.bytes_removed = max(0, before - after)
     combined = f"{outcome.stdout}\n{outcome.stderr}".lower()
-    if outcome.timed_out or ("timeout" in combined and "lock" in combined):
+    lock_expired = outcome.timed_out or ("timeout" in combined and "lock" in combined)
+    if spec.own_lock and lock_expired:
+        result.status = "skipped_in_use"
+        result.detail = f"waited {int(wait)} s for {spec.key}'s cache lock"
+    elif lock_expired:
         result.status = "skipped_in_use"
         result.detail = "tool is in use by another process (lock timeout); skipped"
     elif outcome.returncode != 0:
@@ -742,73 +772,107 @@ def _measure_free(anchor: Path | None) -> int | None:
         return None
 
 
-def run_regenerable_clean(
-    env: RegenerableEnv | None = None,
-    *,
-    apply: bool,
-    audit_log_path: Path | None = DEFAULT_AUDIT_LOG_PATH,
-) -> RegenerableReport:
-    """Runs the whole allow-list. NEVER raises for a per-item problem: each item reports its own
-    status. Every item (and every skipped/failed path, up to a cap) is appended to the audit
-    log as one JSON line, written whether or not `apply` is set (dry runs are marked)."""
-    resolved = env if env is not None else RegenerableEnv.from_os_environment()
-    run_id = uuid.uuid4().hex[:12]
-    started = resolved.now()
-    free_before = _measure_free(resolved.disk_anchor)
+@dataclass(frozen=True, slots=True)
+class _PlannedItem:
+    key: str
+    kind: ItemKind
+    label: str
+    runner: Callable[[], RegenerableItemResult]
+    # True for an item that may block for a long, bounded time on a tool's own lock: it runs
+    # last so every other item is finished and reported before the wait starts.
+    waits_on_lock: bool = False
 
-    items: list[RegenerableItemResult] = []
-    for spec in NATIVE_TOOLS:
-        items.append(
-            _guarded(
-                functools.partial(_run_native_tool, spec, resolved, apply=apply),
-                spec.key,
-                "native_command",
-                spec.label,
-            )
+
+def _plan_items(resolved: RegenerableEnv, *, apply: bool) -> list[_PlannedItem]:
+    planned: list[_PlannedItem] = [
+        _PlannedItem(
+            spec.key,
+            "native_command",
+            spec.label,
+            functools.partial(_run_native_tool, spec, resolved, apply=apply),
+            waits_on_lock=spec.own_lock,
         )
+        for spec in NATIVE_TOOLS
+    ]
     for index, root in enumerate(resolved.temp_roots):
-        items.append(
-            _guarded(
+        label = f"Old temp files ({root})"
+        planned.append(
+            _PlannedItem(
+                f"temp{index}",
+                "aged_temp",
+                label,
                 functools.partial(
                     _aged_children,
                     root,
                     resolved,
                     "aged_temp",
                     f"temp{index}",
-                    f"Old temp files ({root})",
+                    label,
                     apply=apply,
                 ),
-                f"temp{index}",
-                "aged_temp",
-                f"Old temp files ({root})",
             )
         )
     for index, root in enumerate(resolved.crash_dump_roots):
-        items.append(
-            _guarded(
+        label = f"Old crash dumps ({root})"
+        planned.append(
+            _PlannedItem(
+                f"crash{index}",
+                "crash_dump",
+                label,
                 functools.partial(
                     _aged_children,
                     root,
                     resolved,
                     "crash_dump",
                     f"crash{index}",
-                    f"Old crash dumps ({root})",
+                    label,
                     apply=apply,
                 ),
-                f"crash{index}",
-                "crash_dump",
-                f"Old crash dumps ({root})",
             )
         )
-    for browser in BROWSERS:
-        items.append(
-            _guarded(
-                functools.partial(_run_browser, browser, resolved, apply=apply),
-                browser.key,
-                "browser_cache",
-                f"{browser.label} cache",
-            )
+    planned.extend(
+        _PlannedItem(
+            browser.key,
+            "browser_cache",
+            f"{browser.label} cache",
+            functools.partial(_run_browser, browser, resolved, apply=apply),
         )
+        for browser in BROWSERS
+    )
+    # Stable sort: lock-waiting items last, everything else keeps its allow-list order.
+    return sorted(planned, key=lambda item: item.waits_on_lock)
+
+
+def run_regenerable_clean(
+    env: RegenerableEnv | None = None,
+    *,
+    apply: bool,
+    audit_log_path: Path | None = DEFAULT_AUDIT_LOG_PATH,
+    on_item_start: Callable[[str, str, bool], None] | None = None,
+    on_item_done: Callable[[RegenerableItemResult], None] | None = None,
+    run_id: str | None = None,
+) -> RegenerableReport:
+    """Runs the whole allow-list. NEVER raises for a per-item problem: each item reports its own
+    status. Every item (and every skipped/failed path, up to a cap) is appended to the audit
+    log as one JSON line, written whether or not `apply` is set (dry runs are marked).
+
+    Items that may wait on a tool's own lock (uv) run last. The optional callbacks let a caller
+    show live progress: `on_item_start(key, label, waits_on_lock)` before each item and
+    `on_item_done(result)` after it. They are observers only -- an exception raised by one is
+    logged and swallowed so a UI bug can never abort a clean."""
+    resolved = env if env is not None else RegenerableEnv.from_os_environment()
+    run_id = run_id or uuid.uuid4().hex[:12]
+    started = resolved.now()
+    free_before = _measure_free(resolved.disk_anchor)
+
+    items: list[RegenerableItemResult] = []
+    for planned in _plan_items(resolved, apply=apply):
+        if on_item_start is not None:
+            _notify(on_item_start, planned.key, planned.label, planned.waits_on_lock)
+        item = _guarded(planned.runner, planned.key, planned.kind, planned.label)
+        items.append(item)
+        if on_item_done is not None:
+            _notify(on_item_done, item)
 
     finished = resolved.now()
     free_after = _measure_free(resolved.disk_anchor) if apply else None
@@ -832,6 +896,13 @@ def run_regenerable_clean(
         duration_s=round(report.duration_seconds, 2),
     )
     return report
+
+
+def _notify(callback: Callable[..., None], *args: object) -> None:
+    try:
+        callback(*args)
+    except Exception:
+        logger.warning("regenerable.progress_callback_failed", exc_info=True)
 
 
 def _guarded(

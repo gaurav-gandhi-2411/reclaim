@@ -4,8 +4,10 @@ import platform
 import shutil
 import threading
 import time
+import uuid
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from importlib import metadata
@@ -54,6 +56,8 @@ from reclaim.api.schemas import (
     RecoveryStatusResponse,
     RegenerableCleanResponse,
     RegenerableItemOut,
+    RegenerableStartResponse,
+    RegenerableStatusResponse,
     RestoreItemOut,
     RestoreResponse,
     RestoreStatusOut,
@@ -2396,49 +2400,52 @@ def regenerable_clean_env() -> regenerable.RegenerableEnv:
     return regenerable.RegenerableEnv.from_os_environment()
 
 
-def run_regenerable_clean(
-    state: AppState, *, apply: bool, audit_log_path: Path | None = None
+def _regenerable_item_out(item: regenerable.RegenerableItemResult) -> RegenerableItemOut:
+    return RegenerableItemOut(
+        kind=item.kind,
+        key=item.key,
+        label=item.label,
+        status=item.status,
+        bytes_removed=item.bytes_removed,
+        bytes_removed_human=format_bytes(item.bytes_removed),
+        files_removed=item.files_removed,
+        files_skipped_in_use=item.files_skipped_in_use,
+        detail=item.detail,
+        skipped_paths=item.skipped_paths,
+    )
+
+
+def _execute_regenerable_clean(
+    *,
+    apply: bool,
+    audit_log_path: Path | None,
+    on_item_start: Callable[[str, str, bool], None] | None = None,
+    on_item_done: Callable[[regenerable.RegenerableItemResult], None] | None = None,
+    run_id: str | None = None,
 ) -> RegenerableCleanResponse:
-    """One click: the closed allow-list in `reclaim.regenerable`, nothing the client names. Not an
-    `apply_batch` call -- see ADR-0034 for why ADR-0023's safe-mode guarantees are unaffected."""
-    if not _regenerable_clean_lock.acquire(blocking=False):
-        raise RegenerableCleanBusyError("a clean is already running")
-    try:
-        env = regenerable_clean_env()
-        report = regenerable.run_regenerable_clean(
-            env,
-            apply=apply,
-            audit_log_path=audit_log_path
-            if audit_log_path is not None
-            else regenerable.DEFAULT_AUDIT_LOG_PATH,
-        )
-        percent_used: float | None = None
-        if env.disk_anchor is not None:
-            try:
-                usage = shutil.disk_usage(env.disk_anchor)
-                percent_used = usage.used / usage.total * 100.0 if usage.total else None
-            except OSError:
-                percent_used = None
-    finally:
-        _regenerable_clean_lock.release()
+    """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`."""
+    env = regenerable_clean_env()
+    report = regenerable.run_regenerable_clean(
+        env,
+        apply=apply,
+        audit_log_path=audit_log_path
+        if audit_log_path is not None
+        else regenerable.DEFAULT_AUDIT_LOG_PATH,
+        on_item_start=on_item_start,
+        on_item_done=on_item_done,
+        run_id=run_id,
+    )
+    percent_used: float | None = None
+    if env.disk_anchor is not None:
+        try:
+            usage = shutil.disk_usage(env.disk_anchor)
+            percent_used = usage.used / usage.total * 100.0 if usage.total else None
+        except OSError:
+            percent_used = None
     return RegenerableCleanResponse(
         run_id=report.run_id,
         apply=report.apply,
-        items=[
-            RegenerableItemOut(
-                kind=item.kind,
-                key=item.key,
-                label=item.label,
-                status=item.status,
-                bytes_removed=item.bytes_removed,
-                bytes_removed_human=format_bytes(item.bytes_removed),
-                files_removed=item.files_removed,
-                files_skipped_in_use=item.files_skipped_in_use,
-                detail=item.detail,
-                skipped_paths=item.skipped_paths,
-            )
-            for item in report.items
-        ],
+        items=[_regenerable_item_out(item) for item in report.items],
         bytes_removed=report.bytes_removed,
         bytes_removed_human=format_bytes(report.bytes_removed),
         files_skipped_in_use=report.files_skipped_in_use,
@@ -2448,3 +2455,130 @@ def run_regenerable_clean(
         percent_used_after=percent_used,
         duration_seconds=round(report.duration_seconds, 2),
     )
+
+
+def run_regenerable_clean(
+    state: AppState, *, apply: bool, audit_log_path: Path | None = None
+) -> RegenerableCleanResponse:
+    """Synchronous run, used for the `apply=false` preview (fast: a preview never runs a tool
+    command, so it never waits on a lock). The real clean goes through
+    `start_regenerable_clean`. Not an `apply_batch` call -- see ADR-0034 for why ADR-0023's
+    safe-mode guarantees are unaffected."""
+    if not _regenerable_clean_lock.acquire(blocking=False):
+        raise RegenerableCleanBusyError("a clean is already running")
+    try:
+        return _execute_regenerable_clean(apply=apply, audit_log_path=audit_log_path)
+    finally:
+        _regenerable_clean_lock.release()
+
+
+@dataclass(slots=True)
+class _RegenerableJob:
+    run_id: str
+    started_monotonic: float
+    status: str = "running"  # running | done | failed
+    items: list[RegenerableItemOut] = field(default_factory=list)
+    current_key: str | None = None
+    current_label: str | None = None
+    current_waits_on_lock: bool = False
+    current_started_monotonic: float = 0.0
+    finished_monotonic: float | None = None
+    report: RegenerableCleanResponse | None = None
+    error: str | None = None
+
+
+_regenerable_job: _RegenerableJob | None = None
+_regenerable_job_lock = threading.Lock()  # guards `_regenerable_job` reads/writes only
+
+
+def start_regenerable_clean(
+    state: AppState, *, audit_log_path: Path | None = None
+) -> RegenerableStartResponse:
+    """Starts the real (`apply=true`) clean on a background thread and returns at once: uv's
+    prune may wait up to `regenerable.UV_LOCK_WAIT_SECONDS` for its cache lock, which must never
+    hold an HTTP request. Single-flight on `_regenerable_clean_lock` (the thread releases it)."""
+    global _regenerable_job
+    if not _regenerable_clean_lock.acquire(blocking=False):
+        raise RegenerableCleanBusyError("a clean is already running")
+    job = _RegenerableJob(run_id=uuid.uuid4().hex[:12], started_monotonic=time.monotonic())
+    with _regenerable_job_lock:
+        _regenerable_job = job
+
+    def on_start(key: str, label: str, waits_on_lock: bool) -> None:
+        with _regenerable_job_lock:
+            job.current_key = key
+            job.current_label = label
+            job.current_waits_on_lock = waits_on_lock
+            job.current_started_monotonic = time.monotonic()
+
+    def on_done(item: regenerable.RegenerableItemResult) -> None:
+        with _regenerable_job_lock:
+            job.items.append(_regenerable_item_out(item))
+            job.current_key = job.current_label = None
+            job.current_waits_on_lock = False
+
+    def work() -> None:
+        response: RegenerableCleanResponse | None = None
+        error: str | None = None
+        try:
+            response = _execute_regenerable_clean(
+                apply=True,
+                audit_log_path=audit_log_path,
+                on_item_start=on_start,
+                on_item_done=on_done,
+                run_id=job.run_id,
+            )
+        except Exception as exc:
+            logger.warning("regenerable.job_failed", run_id=job.run_id, exc_info=True)
+            error = f"{type(exc).__name__}: {exc}"[:300]
+        finally:
+            # Release first, publish the terminal status second: a client that sees "done" can
+            # immediately start the next clean without a spurious 409.
+            _regenerable_clean_lock.release()
+            with _regenerable_job_lock:
+                job.report = response
+                job.error = error
+                job.status = "done" if error is None and response is not None else "failed"
+                job.current_key = job.current_label = None
+                job.finished_monotonic = time.monotonic()
+
+    threading.Thread(target=work, name=f"regenerable-{job.run_id}", daemon=True).start()
+    return RegenerableStartResponse(run_id=job.run_id, status="running")
+
+
+def _regenerable_current_item_text(job: _RegenerableJob, now: float) -> str | None:
+    if job.current_label is None:
+        return None
+    minutes = int((now - job.current_started_monotonic) // 60)
+    if not job.current_waits_on_lock:
+        return f"Cleaning {job.current_label}…"
+    # Honest wording: while the tool runs we cannot tell "waiting for its lock" from "pruning".
+    base = f"{job.current_label}: waiting for its cache lock if another process is using it"
+    return f"{base}… {minutes} min" if minutes >= 1 else f"{base}…"
+
+
+def get_regenerable_status() -> RegenerableStatusResponse:
+    """Snapshot of the latest background clean (idle if none has run in this process)."""
+    with _regenerable_job_lock:
+        job = _regenerable_job
+        if job is None:
+            return RegenerableStatusResponse(
+                status="idle",
+                run_id=None,
+                items=[],
+                current_item=None,
+                elapsed_seconds=0.0,
+                report=None,
+                error=None,
+            )
+        now = time.monotonic()
+        end = job.finished_monotonic if job.finished_monotonic is not None else now
+        return RegenerableStatusResponse(
+            status=job.status,
+            run_id=job.run_id,
+            items=list(job.items),
+            current_item=_regenerable_current_item_text(job, now),
+            elapsed_seconds=round(end - job.started_monotonic, 1),
+            report=job.report,
+            error=job.error,
+        )
