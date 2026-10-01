@@ -418,6 +418,7 @@ def build_mcp_server(state: AppState) -> FastMCP:
                 files_succeeded=response.files_succeeded,
                 files_failed=response.files_failed,
                 bytes_freed=response.bytes_freed,
+                bytes_moved=response.bytes_moved,
             )
             return DeleteResult(
                 batch_id=response.batch_id,
@@ -425,6 +426,7 @@ def build_mcp_server(state: AppState) -> FastMCP:
                 files_succeeded=response.files_succeeded,
                 files_failed=response.files_failed,
                 bytes_freed=response.bytes_freed,
+                bytes_moved=response.bytes_moved,
             )
         finally:
             # Released unconditionally -- a refusal (stale scan, hash mismatch) or a real

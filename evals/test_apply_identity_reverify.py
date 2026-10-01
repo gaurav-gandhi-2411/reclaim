@@ -474,6 +474,9 @@ def test_entry_count_guard_downgraded_candidate_with_unchanged_identity_is_not_s
     assert not result.vault_path.exists()  # ...then immediately purged back out again
     assert report.synchronously_purged_count == 1
     assert report.bytes_synchronously_purged == 1
+    # B7: a guard-downgraded, synchronously purged vault copy really is freed -- not "moved".
+    assert report.bytes_freed == 1
+    assert report.bytes_moved == 0
     entries = fold_latest_manifest_entries(tmp_path / "manifest.jsonl")
     matching = [e for e in entries if e.original_path == cache_dir]
     assert len(matching) == 1

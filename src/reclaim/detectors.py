@@ -622,18 +622,27 @@ def detect_archive_pairs(index: ScanIndex) -> list[RawCandidate]:
     prefix query), never against the whole inventory.
     """
     candidates: list[RawCandidate] = []
+    # One `direct_children` query per distinct parent directory, not per archive: it reads the
+    # parent's WHOLE subtree range, so N archives in one directory repeated that read N times
+    # (real index: 1,852 archive files in only 177 directories, ~50 s of a ~185 s run). Only the
+    # child-directory names are kept (never full records), in the same order the query returns
+    # them, so tie-breaking (`ratio > best_ratio`, first wins) is unchanged.
+    child_dir_names: dict[Path, list[str]] = {}
     for record in index.files_by_ext(_ARCHIVE_EXTS_FOR_PREFILTER, is_dir=False):
         stem = _archive_stem(record.path.name)
         if stem is None:
             continue
         best_match: str | None = None
         best_ratio = 0.0
-        for sibling in index.direct_children(record.path.parent):
-            if not sibling.is_dir:
-                continue
-            ratio = SequenceMatcher(None, stem.lower(), sibling.path.name.lower()).ratio()
+        parent = record.path.parent
+        if parent not in child_dir_names:
+            child_dir_names[parent] = [
+                sibling.path.name for sibling in index.direct_children(parent) if sibling.is_dir
+            ]
+        for sibling_name in child_dir_names[parent]:
+            ratio = SequenceMatcher(None, stem.lower(), sibling_name.lower()).ratio()
             if ratio >= _ARCHIVE_OVERLAP_THRESHOLD and ratio > best_ratio:
-                best_ratio, best_match = ratio, sibling.path.name
+                best_ratio, best_match = ratio, sibling_name
         if best_match is None:
             continue
         candidates.append(

@@ -198,6 +198,17 @@ _CASES: dict[str, Case] = {
         reason="INSERT OR IGNORE ... — same statement shape as upsert_records above; "
         "EXPLAIN QUERY PLAN produces no plan rows for this shape (verified empirically)",
     ),
+    "refresh_planner_stats": Case(
+        action=None,
+        expect_index=False,
+        reason="ANALYZE files -- deliberately reads every row once to build sqlite_stat1; a "
+        "maintenance statement, not a lookup (cost pinned in tests/test_planner_stats.py)",
+    ),
+    "has_planner_stats": Case(
+        action=None,
+        expect_index=False,
+        reason="existence probe on sqlite_master/sqlite_stat1 (LIMIT 1) -- never touches `files`",
+    ),
     "end_scan_tracking": Case(
         action=None,
         expect_index=False,

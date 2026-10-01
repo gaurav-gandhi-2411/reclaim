@@ -3,6 +3,96 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## UPDATE 2026-10-01 (evening) — PR hygiene, owner decisions 1a-1d, cleanup executed
+
+**PR hygiene (VERIFIED via `gh pr view`):** `pip-audit` was red on EVERY open PR because eight
+advisories were published against pyjwt 2.13.0 (transitive via mcp) after main's last green run
+(2026-09-24). Not caused by any PR's diff. Fix = PR #119 (`uv.lock` pyjwt 2.13.0 -> 2.15.1; local
+`pip-audit` clean, MCP tests pass). All other PRs go green only after #119 merges and they are
+rebased onto main. #112 had wrongly been left non-draft; converted back to draft.
+**Stack:** #116 is based on #113's branch; after #113 merges, rebase #116 `--onto main` and
+`gh pr edit 116 --base main` (squash-merge leaves #113's old commits in #116's history).
+
+**Owner decisions applied (branches pushed; PR bodies updated):** 1a uv waits <= 30 min on its own
+lock (`UV_LOCK_TIMEOUT`), never `--force`, async job + status endpoint (#113); 1c task query via
+`Get-ScheduledTaskInfo` typed JSON, `PT45M` limit (#116); 1d listing for the walk + live re-stat at
+age/size/hash-cache decisions (#118); 1b ANALYZE/optimize after scan (branch `perf/analyze-after-scan`
+in flight when this was written).
+
+**Cleanup executed (owner-approved list; measured with `Win32_PageFileUsage` pagefile 4,608 MB at
+every reading):** C: free 53.17 -> 85.04 GB. Deleted: 7 `C:\adk*` venvs 4.68 GB logical, `C:\tmp_keras_wt_venv`
+2.77, `reclaim-emergency-quarantine-20260820-232958` 3.78, July quarantine batch 5.12 + real-disk-run
+`index.sqlite3` 5.90 (manifests/logs cited by CASE_STUDY kept), HF xet cache 9.95, HF
+`models--stabilityai--stable-diffusion-2-1` 5.16 (AetherArt code loads only
+`sd2-community/stable-diffusion-2-1`), `C:\src\flutter` 3.22 (not on PATH, unreferenced; the
+`sdks\flutter` one is referenced by mindmeld's local.properties). NOT deleted per the owner's rule:
+8 verification clones (each has 9 modified `artifacts/*.txt` retrained outputs), `adk6725fix`
+(dirty=3), `adk6725_repro`/`adkrel060-scratch` (tiny, no git), `triage-iq-wt-groq-model-fix`.
+Stray 0-byte `scratch_patch.py` appeared in the main checkout at 19:25 (not mine; left).
+
+## WORKING RULES LEARNED 2026-10-01 (read before touching this repo)
+
+- **Never work in reclaim's MAIN checkout (`C:\Users\gaura\ml-projects\reclaim`).** Every session and
+  every subagent uses its own `git worktree` (`git worktree add ..\reclaim-wt-<slug> -b <branch>
+  origin/main`). A stray 0-byte `scratch_patch.py` appeared untracked in the main checkout at
+  2026-10-01 19:25:18; provenance (VERIFIED from the subagent transcript): a subagent running from
+  `.claude\worktrees\agent-*` executed `cat > ../../../scratch_patch.py`, whose `../../..` is the main
+  checkout, and the `cat` blocked on stdin until the task was killed (the following `rm -f` never ran).
+  It was provably empty and untracked, so it was deleted.
+- **A deletion's check and the deletion never run in the same command; an empty check output is a failed
+  check.** Incident: a duplicate HF SD 2.1 copy was deleted in the same command as a completeness check
+  of the kept copy whose filter printed nothing; the kept copy was intact only by luck. Written into
+  `C:\Users\gaura\.claude\agents\executor.md`.
+- **pip / conda / yarn have no cache lock to wait on (measured).** pip 25.1: no lock, purge with one
+  file held exits 2 with `PermissionError` (now `skipped_in_use`); conda 25.5.1: per-repodata byte lock
+  not taken by `clean --tarballs --index-cache`; yarn not installed (NOT MEASURED). See ADR-0034.
+- **Post-reboot state 2026-10-01 21:36 IST:** `hiberfil.sys` gone (C: free 104.17 GB, pagefile 4,608 MB),
+  but `LastBootUpTime` is 09:58 today (uptime 11 h 38 m, no 6006/6005 events since) and
+  `HypervisorPresent=False`, `wsl --status` still says WSL2 unsupported: the reboot after the admin
+  steps has NOT been observed yet (the last hypervisor-init event is 2026-09-28 21:32).
+
+## SAFE POINT 2026-10-01 — all agents finished, everything pushed; waiting on owner merges + admin window
+
+Branches: #119 `fix/pyjwt-advisories` (ready, CLEAN), #112 Nuitka pin, #113 regenerable tier (+1a uv wait,
+async job), #116 weekly auto-clean (+1c typed task query, based on #113), #115 bytes_freed/moved, #117
+review-queue perf (+1b full ANALYZE at scan end, archive-pairs memo), #118 scan listing IDs (+1d live
+re-stat at decision points), #114 docs, soak harness `test/frozen-serve-soak` (PR opened after this).
+1b: full `ANALYZE files` fixes the un-hinted plans (52.1 s -> 0.476 s); `PRAGMA optimize` /
+`analysis_limit` do NOT. Path-scoped apply 202.3 -> 132.3 s (remaining = whole detector suite per
+request; needs the warm-candidate-cache behaviour change, NOT done, owner decision).
+Next: owner merges #119 -> rebase all others on main -> re-run checks -> table; admin window (Docker/WSL
+steps 1-3 + `powercfg /hibernate off`, reboot); then Docker prune; rebuild (~25 min warm BELIEVED);
+soak 2 h; Phase C; B6.
+
+## PRIORITY CHANGE 2026-10-01 — "daily driver" plan (Phases A/B/C), read this first
+
+Supersedes the AC3-trip priority below. #110 and #111 are merged (`origin/main` = `3deb05d`).
+Owner's brief: clean C: now (A), make Reclaim safe/fast/self-maintaining on the owner's account (B),
+rebuild + install + run for real (C). Never self-merge; admin/UAC steps are routed with numbered steps.
+
+**Phase A (VERIFIED unless marked):**
+- `$R21C2JW` (Recycle Bin item, 899,224 files) deleted, 609 s. C: free 61.02 -> 69.91 GB over that
+  window (+8.89 GB; includes Docker Desktop start, so not purely this delete).
+- TEMP: 11.06 GB total, of which 8.88 GB is `%TEMP%\claude` (live sessions' scratchpads, left alone);
+  eligible by #110's recursive-newest-mtime rule (>7 d, no `.git`/venv): ~0 GB. Crash dumps 0 GB.
+  Browser caches: Chrome and Edge were running (skipped, Edge ~0.43 GB); Brave dir empty.
+- uv: `uv cache prune` is blocked by other sessions' running `uv` processes (cache lock); a background
+  prune with `UV_LOCK_TIMEOUT=3300` was queued; result UNKNOWN at this checkpoint (BELIEVED to block
+  until those `uv run` processes exit). `--force` deliberately not used.
+- Docker engine will not start: `wsl --status` says "WSL2 is not supported with your current machine
+  configuration"; `HypervisorPresent=False` although firmware virtualization is enabled. Needs admin.
+  `docker_data.vhdx` = 62.3 GB; prune/compaction therefore NOT done.
+- C: free drifted 69.9 -> 55.8 GB during the session; pagefile allocation grew 4,608 -> 12,821 MB
+  (+8.2 GB, `Win32_PageFileUsage`), the rest is concurrent sessions' writes (BELIEVED, unattributed).
+
+**Phase B (in flight; branches pushed, PRs draft):** B8 = PR #112. B1/B2-targeted = branch
+`feat/regenerable-safe-tier` (ADR-0034; `reclaim.regenerable`, `POST /api/clean/regenerable`, UI).
+B5 = `feat/weekly-autoclean`. B7 = `fix/bytes-freed-vs-moved`. B4 = `perf/review-queue-dry-run`.
+B2-full-scan levers = `perf/scan-listing-ids`. B3 inventory: `docs/` (see crash-inventory section in
+the PR that carries it); 3 APPCRASH events (MSVCP140 14.29 vs 14.50 mismatch) fixed by #108,
+2 RADAR_PRE_LEAK_64 events (2026-07-25, 2026-08-26) undiagnosed.
+**Phase C** not started: needs B1-B8 merged by the owner, then rebuild from main (~5 h).
+
 ## TRIP STAGED 2026-09-24 03:05 IST — read this first, it supersedes everything below
 
 **State (VERIFIED):** `origin/main` = `33ce814` (#109). CI is green on it; `scale-nightly` failed once

@@ -1581,7 +1581,12 @@ def test_one_click_apply_uses_explicit_paths_from_the_summary_and_moves_to_recyc
     )
     assert body["apply"] is True
     assert body["method"] == "recycle_bin"  # safe mode forces this regardless of the request
-    assert body["bytes_freed"] == 5_000
+    # B7: a Recycle Bin move frees nothing until the bin is emptied -- reported as moved.
+    assert body["bytes_freed"] == 0
+    assert body["bytes_moved"] == 5_000
+    assert body["bytes_moved_human"] == "4.9 KB"
+    assert all(entry["bytes_freed"] == 0 for entry in body["category_breakdown"])
+    assert sum(entry["bytes_moved"] for entry in body["category_breakdown"]) == 5_000
     assert not paths["node_modules_dir"].exists()  # really moved, not just previewed
 
 
