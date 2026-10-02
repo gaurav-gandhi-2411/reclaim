@@ -66,7 +66,7 @@ def first_matching_pattern(
     else None. For a directory the trailing-slash form is tried too, so a `*/proj/*` glob also
     matches the directory `proj` itself -- deleting a directory deletes everything under it.
     Pure string matching, no I/O: shared by the generic pipeline, the executor's last-line check
-    and the regenerable tier (ADR-0037)."""
+    and the regenerable tier (ADR-0039)."""
     base = Path(path)
     for pattern in patterns:
         if _pattern_matches(base, pattern):
@@ -208,7 +208,7 @@ class SafetyValidator:
     def __init__(self, config: Config) -> None:
         self._safety = config.safety
         self._dev_artifacts_enabled = config.categories.dev_artifacts.enabled
-        # ADR-0037: `[safety] deny` + one glob per `[exclusions] project_names` entry.
+        # ADR-0039: `[safety] deny` + one glob per `[exclusions] project_names` entry.
         self._user_exclusions = exclusion_patterns(config)
 
     @property
@@ -254,7 +254,7 @@ class SafetyValidator:
                 ),
             )
 
-        # ADR-0037: `[exclusions] project_names` (and, for a directory candidate, a user pattern
+        # ADR-0039: `[exclusions] project_names` (and, for a directory candidate, a user pattern
         # matched by anything INSIDE it -- deleting the directory would delete that content).
         exclusion_hit = self.exclusion_match(record.path, is_dir=record.is_dir)
         if exclusion_hit is not None:

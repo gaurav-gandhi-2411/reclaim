@@ -902,7 +902,7 @@ class RegenerableItemOut(BaseModel):
     files_skipped_in_use: int
     detail: str
     skipped_paths: list[str]
-    # ADR-0037: `"<path> :: <pattern>"` per entry left alone because of a user exclusion.
+    # ADR-0039: `"<path> :: <pattern>"` per entry left alone because of a user exclusion.
     excluded: list[str] = Field(default_factory=list)
 
 
@@ -922,7 +922,7 @@ class RegenerableCleanResponse(BaseModel):
     disk_free_delta_bytes: int | None
     percent_used_after: float | None
     duration_seconds: float
-    # ADR-0037: everything skipped because of a user exclusion, and how many of the paths
+    # ADR-0039: everything skipped because of a user exclusion, and how many of the paths
     # this run actually handed to a delete match an exclusion (must be 0; the CLI fails
     # the run otherwise).
     excluded: list[str] = Field(default_factory=list)

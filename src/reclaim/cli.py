@@ -1126,7 +1126,7 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
 
     apply: bool = args.apply
     try:
-        # ADR-0037: the weekly task reads the installed config.toml, so its exclusions apply.
+        # ADR-0039: the weekly task reads the installed config.toml, so its exclusions apply.
         response = service.regenerable_clean_response(
             apply=apply, excluded_patterns=exclusion_patterns(config)
         )
