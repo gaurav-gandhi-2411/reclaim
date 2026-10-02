@@ -384,7 +384,13 @@ def candidates_warm_status(request: Request) -> CandidatesWarmStatusOut:
     no feedback, driving a "Not Responding" server state before this fix)."""
     state = get_state(request)
     with state.lock:
-        return service.to_candidates_warm_status_out(state.candidates_warm_status)
+        status = state.candidates_warm_status
+    # Recomputed outside `state.lock` (it reads the mode log / allowed roots): a stored "ready"
+    # only counts while the cache key still matches -- else it is "stale" with the reason.
+    stale_reason = (
+        service.candidates_cache_stale_reason(state) if status.status == "ready" else None
+    )
+    return service.to_candidates_warm_status_out(status, stale_reason=stale_reason)
 
 
 @router.post("/candidates/warm", response_model=CandidatesWarmStatusOut, status_code=202)

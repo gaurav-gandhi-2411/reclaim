@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import platform
 import shutil
 import threading
@@ -229,26 +230,59 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     ]
 
 
+def _candidates_cache_key(state: AppState) -> tuple[int, str, str, tuple[str, ...]]:
+    """Everything the cached candidate list is a pure function of, other than the index itself
+    (which only changes when a scan completes, i.e. `scan_generation`).
+
+    Computed FRESH on every cache read/warm-check -- never stored on a mutation path -- so a
+    trigger that nobody remembered to wire an invalidation call into still misses the cache
+    instead of serving it stale (the #43 failure class: a category toggle changed what
+    `_all_candidates` would return but the cache was keyed only on `scan_generation`, so the
+    dashboard kept serving pre-toggle tiers). Components:
+
+    - `scan_generation`: a completed scan changed the index.
+    - `live_mode`: re-read from the mode log (it can be switched by `POST /api/mode/*` or by
+      another process via the CLI); SAFE forces tiers to B and dangerous categories off.
+    - a digest of `effective_config` (mode-resolved): any category enable/disable, min-age,
+      retention, threshold, safety-list or other setting change, and a config reload.
+    - `resolve_allowed_apply_roots`: the scope filter is baked into the cached list, and the
+      outside-home scan root's opt-in window expires with time (AN5).
+    """
+    config_digest = hashlib.blake2b(
+        state.effective_config.model_dump_json().encode("utf-8"), digest_size=16
+    ).hexdigest()
+    return (
+        state.scan_generation,
+        state.live_mode.value,
+        config_digest,
+        tuple(str(r) for r in resolve_allowed_apply_roots(state)),
+    )
+
+
 def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     """Cached, concurrency-guarded wrapper around `_all_candidates` (perf/dedup-cache,
     docs/AUDIT-2026-08.md P0-3) — every call site that needs the full candidate universe for the
     CURRENT scan (`build_summary`, `build_treemap`, `list_candidates`,
-    `build_one_click_summary`, and `resolve_apply_selection`'s blanket-apply path) should call
-    this instead of `_all_candidates` directly.
+    `build_one_click_summary`, and `resolve_apply_selection`'s blanket-apply AND (when warm)
+    path-scoped paths) should call this instead of `_all_candidates` directly.
+
+    Keyed by `_candidates_cache_key` (scan generation + live mode + effective-config digest +
+    allowed roots), not `scan_generation` alone -- see that function for why.
 
     `state.candidates_cache_lock` is held across the ENTIRE compute-or-fetch critical section,
-    deliberately — a second caller racing the first for the same `scan_generation` blocks on the
+    deliberately — a second caller racing the first for the same key blocks on the
     lock rather than starting its own redundant whole-index BLAKE3 hash pass, and sees the first
     caller's now-cached result the moment it acquires the lock. See `AppState.candidates_cache`'s
     docstring for why this is a dedicated lock rather than `state.lock`.
     """
     with state.candidates_cache_lock:
-        generation = state.scan_generation
-        if state.candidates_cache is not None and state.candidates_cache_generation == generation:
+        key = _candidates_cache_key(state)
+        if state.candidates_cache is not None and state.candidates_cache_key == key:
             return state.candidates_cache
         candidates = _all_candidates(index, state)
         state.candidates_cache = candidates
-        state.candidates_cache_generation = generation
+        state.candidates_cache_generation = key[0]
+        state.candidates_cache_key = key
         return candidates
 
 
@@ -287,10 +321,35 @@ def is_candidates_cache_warm(state: AppState) -> bool:
     try:
         return (
             state.candidates_cache is not None
-            and state.candidates_cache_generation == state.scan_generation
+            and state.candidates_cache_key == _candidates_cache_key(state)
         )
     finally:
         state.candidates_cache_lock.release()
+
+
+_CACHE_KEY_COMPONENTS = ("scan", "mode", "config", "scope")
+
+
+def candidates_cache_stale_reason(state: AppState) -> str | None:
+    """None when the cached candidate list is valid for the CURRENT state, else the first key
+    component that differs from what the cache was built under: "scan" | "mode" | "config" |
+    "scope" (checked in that order -- a mode switch also changes the mode-resolved config
+    digest, and the more specific cause wins), or "cold" when nothing is cached at all.
+
+    Cheap by construction: recomputes only `_candidates_cache_key` (a mode-log read, one JSON
+    dump + hash of the config, the allowed-roots resolution) and never runs a detector. Takes no
+    lock -- it reads the two cache attributes once; a compute racing this call is reported by the
+    caller's own "computing" status, never by this function."""
+    cached_key = state.candidates_cache_key
+    if cached_key is None:
+        return "cold"
+    current = _candidates_cache_key(state)
+    for name, was, now in zip(_CACHE_KEY_COMPONENTS, cached_key, current, strict=True):
+        if was != now:
+            return name
+    # Same key but an explicit invalidation dropped the list (the category-toggle handler does
+    # this, leaving the old key behind) -- the key diff above names the real cause when it can.
+    return "cold" if state.candidates_cache is None else None
 
 
 def run_candidates_warm(state: AppState) -> None:
@@ -334,17 +393,27 @@ def run_candidates_warm(state: AppState) -> None:
         )
 
 
-def to_candidates_warm_status_out(status: CandidatesWarmStatus) -> CandidatesWarmStatusOut:
+def to_candidates_warm_status_out(
+    status: CandidatesWarmStatus, *, stale_reason: str | None = None
+) -> CandidatesWarmStatusOut:
+    """`stale_reason` (from `candidates_cache_stale_reason`) turns a stored "ready" into "stale":
+    the stored status only records that SOME warm-up finished, not that its result still matches
+    the current scan/mode/config/scope (the mode-switch gap: "ready" while the key was cold)."""
+    if status.status == "ready" and stale_reason is not None:
+        out_status = "stale"
+    else:
+        out_status, stale_reason = status.status, None
     elapsed_seconds = None
     if status.started_at is not None:
         end = status.finished_at if status.finished_at is not None else time.time()
         elapsed_seconds = end - status.started_at
     return CandidatesWarmStatusOut(
-        status=status.status,
+        status=out_status,
         started_at=status.started_at,
         finished_at=status.finished_at,
         elapsed_seconds=elapsed_seconds,
         error=status.error,
+        stale_reason=stale_reason,
     )
 
 
@@ -1389,6 +1458,19 @@ def resolve_apply_selection(
             )
         with ScanIndex(state.db_path) as index:
             candidates = _cached_all_candidates(index, state)
+    elif is_candidates_cache_warm(state):
+        # perf/path-scoped-apply-cache: a warm cache (same key as every read path -- see
+        # `_candidates_cache_key`) replaces ONLY the detection recompute that cost minutes on a
+        # large index. Nothing downstream is skipped: every apply-time check (identity re-verify,
+        # scope/ownership, hardlink, preflight, postcondition) still runs inside `apply_batch`
+        # on whatever this returns, exactly as for a freshly detected candidate, and a cached
+        # entry whose file changed since the scan is refused there. Duplicate-cluster candidates
+        # are excluded so a duplicate requested by path keeps resolving through
+        # `_build_user_selected_candidate` below, as it did before this cache was used here.
+        with ScanIndex(state.db_path) as index:
+            candidates = [
+                c for c in _cached_all_candidates(index, state) if c.category_group != "duplicates"
+            ]
     else:
         with ScanIndex(state.db_path) as index:
             candidates = generate_candidates(index, state.effective_config, state.safety)
