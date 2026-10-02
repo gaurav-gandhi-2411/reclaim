@@ -31,6 +31,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.index import ScanIndex
+from reclaim.index_prune import prune_dead_rows
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import (
     DEFAULT_MODE_LOG_PATH,
@@ -43,7 +44,6 @@ from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode,
 from reclaim.purge import purge_eligible_entries, purge_expired
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation
 from reclaim.safety import SafetyValidator
-from reclaim.index_prune import prune_dead_rows
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
 # Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
