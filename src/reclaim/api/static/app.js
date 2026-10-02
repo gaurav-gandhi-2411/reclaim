@@ -469,9 +469,22 @@ async function pollScanStatus() {
 
 const CANDIDATES_WARM_POLL_INTERVAL_MS = 1500;
 
+// The server recomputes the cache key on every warm-status read (scan / mode / config / scope),
+// so "ready" is trustworthy and anything else -- "idle", "failed", or "stale" (a mode switch,
+// category toggle, new scan or scope change since the last warm-up) -- re-starts the warm job
+// exactly once here (then polls it); never a loop, never a silent slow call on a "ready" that
+// quietly went cold.
+const STALE_REASON_TEXT = {
+  mode: "You switched modes",
+  config: "Your settings changed",
+  scan: "A new scan finished",
+  scope: "The scan scope changed",
+};
+
 async function ensureCandidatesWarm(stateEl) {
   let status = await api("/api/candidates/warm-status");
   if (status.status === "ready") return;
+  const staleCause = status.status === "stale" ? STALE_REASON_TEXT[status.stale_reason] : null;
   if (status.status !== "computing") {
     status = await api("/api/candidates/warm", { method: "POST" });
   }
@@ -479,9 +492,11 @@ async function ensureCandidatesWarm(stateEl) {
     const elapsed = status.elapsed_seconds != null ? Math.round(status.elapsed_seconds) : 0;
     renderState(stateEl, "loading", {
       title: "Indexing your files…",
-      message:
-        `This can take a few minutes the first time after a large scan — ${elapsed}s so far. ` +
-        "The page is not stuck; this runs in the background.",
+      message: staleCause
+        ? `${staleCause} — refreshing the file index (${elapsed}s so far). ` +
+          "The page is not stuck; this runs in the background."
+        : `This can take a few minutes the first time after a large scan — ${elapsed}s so far. ` +
+          "The page is not stuck; this runs in the background.",
     });
     await new Promise((resolve) => setTimeout(resolve, CANDIDATES_WARM_POLL_INTERVAL_MS));
     status = await api("/api/candidates/warm-status");
@@ -1908,6 +1923,9 @@ export {
   renderSimpleOneClickResult,
   renderSimpleOneClickProgress,
   renderApplyReport,
+  ensureCandidatesWarm,
+  switchToSafeMode,
+  confirmPowerMode,
 };
 
 function updateApplyBar() {
@@ -2665,10 +2683,19 @@ async function loadModeStatus() {
   }
 }
 
+// A mode switch changes what the candidate cache holds (SAFE forces tiers / dangerous
+// categories off), so reload the visible view: Overview then re-checks warm-status, sees "stale"
+// and re-warms instead of calling /api/summary against a cold cache.
+function refreshActiveView() {
+  const activeView = document.querySelector('.rc-tab[aria-selected="true"]')?.dataset.view;
+  if (activeView) return VIEW_LOADERS[activeView]?.();
+}
+
 async function switchToSafeMode() {
   try {
     const status = await api("/api/mode/safe", { method: "POST" });
     renderModeBadge(status.mode);
+    await refreshActiveView();
   } catch {
     // Reverting to safe mode never requires confirmation and should never fail in practice;
     // if it does, the badge simply stays on whatever it last successfully rendered.
@@ -2698,6 +2725,7 @@ async function confirmPowerMode() {
     });
     renderModeBadge(status.mode);
     closePowerModeDialog();
+    await refreshActiveView();
   } catch (err) {
     error.textContent = err.message || "That didn't match the required phrase exactly.";
   }
