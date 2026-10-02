@@ -274,6 +274,10 @@ class AppState:
     # (ADR-0025 decision 2): lost on restart, rebuilt on the next call.
     candidates_cache: list[Candidate] | None = None
     candidates_cache_generation: int | None = None
+    # perf/path-scoped-apply-cache: the full key the cache above was computed under (see
+    # `service._candidates_cache_key`) -- `candidates_cache_generation` alone could not tell a
+    # post-toggle / post-mode-switch state from the one the cache was built in.
+    candidates_cache_key: tuple[int, str, str, tuple[str, ...]] | None = None
     candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
     # AE1: single-flight background-warm status for the cache above -- see
     # `CandidatesWarmStatus`'s own docstring for the real cold-start cost this exists to make
