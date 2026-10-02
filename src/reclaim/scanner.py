@@ -1306,6 +1306,13 @@ def scan_tree(
             # finished visiting the tree, so its `all_skipped` list is only a PARTIAL sample and
             # replacing would wrongly erase inaccessible entries a prior, complete scan already
             # recorded (and this run simply never got to re-examine).
+            # Fail closed (2026-10 index-staleness audit): everything this walk could NOT list
+            # (an unreadable directory, an entry whose stat failed, an offline/unreadable root)
+            # is absent from `scan_seen` because it was never examined, not because it is gone.
+            # Mark those subtrees seen so their rows survive; before this, one directory that
+            # turned unreadable between scans silently erased its whole indexed subtree.
+            if not cancelled:
+                index.protect_under(Path(skipped.path).as_posix() for skipped in all_skipped)
             files_pruned = 0 if cancelled else index.prune_unseen_under_root(root)
             if not cancelled:
                 index.replace_inaccessible_under_root(

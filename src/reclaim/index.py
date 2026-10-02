@@ -564,6 +564,65 @@ class ScanIndex:
         self._conn.commit()
         return cursor.rowcount
 
+    def protect_under(self, paths: Iterable[str]) -> int:
+        """Marks every existing row at or under each of `paths` (POSIX form) as seen, so
+        `prune_unseen_under_root` keeps it. Returns the number of path prefixes protected.
+
+        Fail-closed pruning: a directory the scan could not list (permission change, offline
+        network root, I/O fault) was never walked, so its rows are absent from `scan_seen`
+        for a reason that says nothing about whether the files still exist. Without this the
+        prune would delete every row under it. Same prefix-range scoping as the prune itself."""
+        count = 0
+        for path in paths:
+            prefix = path.rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO scan_seen (path) SELECT path FROM files "
+                "WHERE path = ? OR (path >= ? AND path < ?)",
+                (prefix, lower, upper),
+            )
+            count += 1
+        self._conn.commit()
+        return count
+
+    def page_rows_after(
+        self, after: str, *, limit: int, prefix: str | None = None
+    ) -> list[tuple[str, int, bool]]:
+        """Up to `limit` `(path, size, is_dir)` rows with `path > after`, in path order
+        (keyset pagination over the primary key: stable while rows are deleted behind the
+        cursor), optionally limited to `prefix` itself and everything under it."""
+        if prefix is None:
+            cursor = self._conn.execute(
+                "SELECT path, size, is_dir FROM files WHERE path > ? ORDER BY path LIMIT ?",
+                (after, limit),
+            )
+        else:
+            stripped = prefix.rstrip("/")
+            lower, upper = _prefix_range(stripped)
+            cursor = self._conn.execute(
+                "SELECT path, size, is_dir FROM files "
+                "WHERE path > ? AND (path = ? OR (path >= ? AND path < ?)) "
+                "ORDER BY path LIMIT ?",
+                (after, stripped, lower, upper, limit),
+            )
+        return [(row["path"], int(row["size"]), bool(row["is_dir"])) for row in cursor]
+
+    def delete_paths(self, paths: Sequence[str]) -> int:
+        """Deletes the rows whose exact `path` is in `paths` (primary-key point deletes)."""
+        if not paths:
+            return 0
+        self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
+        self._conn.commit()
+        return len(paths)
+
+    def vacuum(self) -> None:
+        """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
+        free disk roughly equal to the database size and an exclusive lock (fails with
+        `sqlite3.OperationalError` if another connection holds the database open)."""
+        self._conn.commit()
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def end_scan_tracking(self) -> None:
         """Drops the temp table — always safe to call (even if `begin_scan_tracking` never ran,
         e.g. an early failure), since a dropped connection-scoped temp table costs nothing to
