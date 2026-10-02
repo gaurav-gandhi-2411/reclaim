@@ -15,6 +15,7 @@ from reclaim.api.schemas import (
     AnthropicKeyStatusResponse,
     ApplyRequest,
     ApplyStatusOut,
+    AutoCleanSettingOut,
     CandidatesResponse,
     CandidatesWarmStatusOut,
     CategoryExplanationResponse,
@@ -44,6 +45,7 @@ from reclaim.api.schemas import (
     TestAnthropicKeyRequest,
     TestAnthropicKeyResponse,
     TreemapResponse,
+    UpdateAutoCleanSettingRequest,
     UpdateCategorySettingRequest,
     UpdateCheckResponse,
     UpdateNotificationsSettingRequest,
@@ -56,6 +58,7 @@ from reclaim.api.state import (
     RestoreStatus,
     ScanStatus,
 )
+from reclaim.autoclean_schedule import AutoCleanScheduleError
 from reclaim.drives import NoFixedDrivesFoundError
 from reclaim.executor import (
     BatchNotFoundError,
@@ -717,6 +720,32 @@ def update_notifications_setting(
     payload: UpdateNotificationsSettingRequest, request: Request
 ) -> NotificationsSettingOut:
     return service.update_notifications_setting(get_state(request), enabled=payload.enabled)
+
+
+# ADR-0034: weekly auto-clean of the regenerable tier (config flag + per-account scheduled task).
+
+
+@router.get("/settings/autoclean", response_model=AutoCleanSettingOut)
+def autoclean_settings(request: Request) -> AutoCleanSettingOut:
+    """409 (actionable message) when Task Scheduler could not be queried at all."""
+    try:
+        return service.autoclean_settings(get_state(request))
+    except AutoCleanScheduleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/settings/autoclean", response_model=AutoCleanSettingOut)
+def update_autoclean_setting(
+    payload: UpdateAutoCleanSettingRequest, request: Request
+) -> AutoCleanSettingOut:
+    """409 (with the actionable message) when the scheduled task cannot be registered/removed --
+    e.g. a source/dev run with no installed exe. When enabling fails the config flag has already
+    been rolled back, so the response never leaves "on" without a task."""
+    audit_logger.info("api.autoclean_setting", enabled=payload.enabled)
+    try:
+        return service.update_autoclean_setting(get_state(request), enabled=payload.enabled)
+    except AutoCleanScheduleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------
