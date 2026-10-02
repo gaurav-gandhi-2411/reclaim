@@ -70,6 +70,18 @@ def _probe_dir(posix_dir: str) -> _Dir:
     return _Dir.EXISTS if stat.S_ISDIR(mode) else _Dir.MISSING
 
 
+def _entry_confirmed_missing(posix_path: str) -> bool:
+    """True only on a definitive not-found for the entry ITSELF (lstat, so a junction/symlink
+    whose target is gone still counts as present -- `_probe_dir` follows links)."""
+    try:
+        os.lstat(_os_path(posix_path))
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _anchor(posix_path: str) -> str | None:
     """Drive (`C:`) or UNC share (`//server/share`) the path lives on; None if neither."""
     drive, _ = os.path.splitdrive(posix_path.replace("/", "\\"))
@@ -171,6 +183,12 @@ def prune_dead_rows(
                         report.unknown_rows_kept += 1
                     else:
                         is_dead = not (_name_variants(name) & names)
+                if not is_dead and is_dir and state is _Dir.EXISTS:
+                    # A directory row whose own directory is gone from a parent that still
+                    # exists (the parent check above cannot see this). `state_of` only says
+                    # MISSING when the drive is reachable; the lstat then rules out a link
+                    # whose target vanished. The result is cached for this directory's children.
+                    is_dead = state_of(path) is _Dir.MISSING and _entry_confirmed_missing(path)
                 if is_dead:
                     dead.append(path)
                     report.dead_rows += 1

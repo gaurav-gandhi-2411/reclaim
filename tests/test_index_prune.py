@@ -167,7 +167,8 @@ def test_dry_run_reports_but_deletes_nothing(tmp_path: Path, index: ScanIndex) -
     report = prune_dead_rows(index)
 
     assert report.applied is False
-    assert report.dead_rows == 3  # gone/c.txt, gone/sub (dir row), gone/sub/d.txt
+    # gone (dir row), gone/c.txt, gone/sub (dir row), gone/sub/d.txt
+    assert report.dead_rows == 4
     assert report.dead_bytes == 20  # the two 10-byte files; directory rows add no bytes
     assert _paths(index, root) == before
 
@@ -180,13 +181,13 @@ def test_apply_deletes_exactly_the_dead_rows(tmp_path: Path, index: ScanIndex) -
 
     gone = (root / "gone").as_posix()
     expected_dead = {
+        gone,
         f"{gone}/c.txt",
         f"{gone}/sub",
         f"{gone}/sub/d.txt",
     }
     assert report.dead_rows == len(expected_dead)
-    # The `gone` directory row itself lives in `root`, which still exists: only a rescan (not
-    # a directory-level check) can know it is gone, so it stays. Everything else survives too.
+    # Everything else survives, including all rows of the directories that still exist.
     assert _paths(index, root) == before - expected_dead
     assert (root / "keep" / "a.txt").as_posix() in _paths(index, root)  # teeth: live dir keeps rows
 
@@ -319,7 +320,7 @@ def test_root_prefixes_limit_the_pass(tmp_path: Path, index: ScanIndex) -> None:
 
     report = prune_dead_rows(index, apply=True, root_prefixes=[r1.as_posix()])
 
-    assert report.dead_rows == 3
+    assert report.dead_rows == 4
     assert (r2 / "gone" / "c.txt").as_posix() in _paths(index, r2)
     assert (r1 / "gone" / "c.txt").as_posix() not in _paths(index, r1)
 
@@ -339,13 +340,13 @@ def test_cli_index_prune_dry_run_then_apply(
 
     assert main(["index-prune", "--db", str(db)]) == 0
     dry = capsys.readouterr().out
-    assert "would remove (dry run, use --apply) 3 of" in dry
+    assert "would remove (dry run, use --apply) 4 of" in dry
     with ScanIndex(db) as idx:
         assert (root / "gone" / "c.txt").as_posix() in _paths(idx, root)
 
     assert main(["index-prune", "--db", str(db), "--apply", "--vacuum"]) == 0
     applied = capsys.readouterr().out
-    assert "removed 3 of" in applied
+    assert "removed 4 of" in applied
     with ScanIndex(db) as idx:
         assert (root / "gone" / "c.txt").as_posix() not in _paths(idx, root)
         assert (root / "keep" / "a.txt").as_posix() in _paths(idx, root)
@@ -356,3 +357,26 @@ def test_cli_index_prune_vacuum_requires_apply_and_missing_db_fails(tmp_path: Pa
     ScanIndex(db).close()
     assert main(["index-prune", "--db", str(db), "--vacuum"]) == 2
     assert main(["index-prune", "--db", str(tmp_path / "nope.sqlite3")]) == 1
+
+
+def test_junction_whose_target_is_gone_keeps_its_row(tmp_path: Path, index: ScanIndex) -> None:
+    import subprocess
+
+    root = tmp_path / "root"
+    target = tmp_path / "target"
+    root.mkdir()
+    target.mkdir()
+    link = root / "link"
+    made = subprocess.run(  # noqa: S603 -- fixed test args
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607
+        capture_output=True,
+        check=False,
+    )
+    if made.returncode != 0:
+        pytest.skip("cannot create a junction here")
+    scan_tree(root, index)
+    shutil.rmtree(target)  # the link entry still exists; only its target is gone
+
+    prune_dead_rows(index, apply=True)
+
+    assert link.as_posix() in _paths(index, root)
