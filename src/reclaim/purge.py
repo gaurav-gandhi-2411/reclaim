@@ -271,23 +271,6 @@ def purge_expired(
             if entry.category_group in REBUILDABLE_CATEGORY_GROUPS
         ]
 
-    # ADR-0037: a vault entry whose ORIGINAL path is user-excluded (vaulted before the exclusion
-    # was configured) is left in the vault -- skipped, not purged, and not a reason to abort the
-    # whole run. The user can still restore or purge it deliberately after editing config.toml.
-    kept_excluded = [
-        entry
-        for entry, _stale in eligible
-        if safety.exclusion_match(entry.original_path, is_dir=entry.is_dir) is not None
-    ]
-    if kept_excluded:
-        logger.info(
-            "purge.excluded_entries_left_in_vault",
-            count=len(kept_excluded),
-            sample=[str(e.original_path) for e in kept_excluded[:5]],
-        )
-        excluded_ids = {id(e) for e in kept_excluded}
-        eligible = [(e, stale) for e, stale in eligible if id(e) not in excluded_ids]
-
     blocked: list[str] = []
     for entry, _stale in eligible:
         result = safety.evaluate(_fresh_record_for_purge(entry))
