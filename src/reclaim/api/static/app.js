@@ -80,9 +80,11 @@ const CSRF_HEADER_NAME = "X-Reclaim-CSRF-Token";
 const CSRF_TOKEN = document.querySelector('meta[name="reclaim-csrf-token"]')?.content ?? "";
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, body = null) {
     super(message);
     this.status = status;
+    this.code = body?.code ?? null; // e.g. "candidates_not_warm"
+    this.staleReason = body?.stale_reason ?? null;
   }
 }
 
@@ -99,7 +101,11 @@ async function api(path, options = {}) {
   const body = isJson ? await response.json() : null;
   if (!response.ok) {
     const detail = body?.detail ?? response.statusText;
-    throw new ApiError(typeof detail === "string" ? detail : JSON.stringify(detail), response.status);
+    throw new ApiError(
+      typeof detail === "string" ? detail : JSON.stringify(detail),
+      response.status,
+      body
+    );
   }
   return body;
 }
@@ -462,10 +468,11 @@ async function pollScanStatus() {
 // warm`) and polls it with a real elapsed-time message instead of blocking silently. Deliberately
 // NOT a percentage progress bar -- the underlying detector/dedup pass has no cheap way to report
 // fine-grained progress within this fix's scope (the fix is "stop blocking silently", not "make
-// the algorithm itself instrumented or faster"). Scoped to the Overview tab specifically for now;
-// `/api/treemap`/`/api/candidates`/`/api/clean/one-click-summary` share the identical underlying
-// cold-start cost via the same cache and would benefit from the same treatment -- not yet done,
-// disclosed rather than silently incomplete.
+// the algorithm itself instrumented or faster"). EVERY view that reads the candidate cache goes
+// through `readCandidateCache` below (Overview, Quick Clean, treemap, review queue, SIMPLE-mode
+// results), and the server itself now answers a cold/stale read with a typed 409 instead of
+// blocking (fix/warm-check-all-views), so no screen can show data from before a mode switch or
+// category toggle.
 
 const CANDIDATES_WARM_POLL_INTERVAL_MS = 1500;
 
@@ -506,6 +513,22 @@ async function ensureCandidatesWarm(stateEl) {
   }
 }
 
+// The single entry point every candidate-cache view uses: warm check first (one re-warm per
+// stale detection, with the loading state + inert stale cause in `stateEl`), then the read. If
+// the cache went stale in the gap between the check and the read, the server answers 409
+// `candidates_not_warm` (and has already started the warm-up): wait for it and read ONCE more --
+// bounded, never a loop; a second 409 surfaces as the view's normal error state.
+async function readCandidateCache(stateEl, path) {
+  await ensureCandidatesWarm(stateEl);
+  try {
+    return await api(path);
+  } catch (err) {
+    if (err.code !== "candidates_not_warm") throw err;
+    await ensureCandidatesWarm(stateEl);
+    return await api(path);
+  }
+}
+
 async function loadOverview() {
   const stateEl = document.getElementById("overview-state");
   const contentEl = document.getElementById("overview-content");
@@ -513,9 +536,7 @@ async function loadOverview() {
   renderState(stateEl, "loading", { title: "Loading summary…" });
 
   try {
-    await ensureCandidatesWarm(stateEl);
-    renderState(stateEl, "loading", { title: "Loading summary…" });
-    const summary = await api("/api/summary");
+    const summary = await readCandidateCache(stateEl, "/api/summary");
     if (!summary.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -716,7 +737,8 @@ async function loadQuickClean() {
   renderState(stateEl, "loading", { title: "Checking for safe-to-clean items…" });
 
   try {
-    const data = await api("/api/clean/one-click-summary");
+    lastQuickCleanGroups = []; // never let a stale list reach the confirm dialog / apply body
+    const data = await readCandidateCache(stateEl, "/api/clean/one-click-summary");
     if (!data.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -813,6 +835,23 @@ function openQuickCleanDialog(target) {
   warningEl.textContent = warning || "";
   warningEl.hidden = !warning;
   document.getElementById("quick-clean-dialog").hidden = false;
+}
+
+// The groups behind the dialog (and the apply body) were fetched earlier; if a mode switch,
+// category toggle or new scan has made the cache stale since, reload through the shared warm
+// check instead of confirming a pre-switch list.
+async function openQuickCleanDialogIfFresh(target) {
+  let status;
+  try {
+    status = await api("/api/candidates/warm-status");
+  } catch {
+    status = { status: "unknown" };
+  }
+  if (status.status === "ready") {
+    openQuickCleanDialog(target);
+    return;
+  }
+  await (target === "simple" ? loadSimpleResults() : loadQuickClean());
 }
 
 function closeQuickCleanDialog() {
@@ -914,7 +953,7 @@ function renderQuickCleanResult(container, report) {
 function initQuickClean() {
   document
     .getElementById("quick-clean-btn")
-    .addEventListener("click", () => openQuickCleanDialog("overview"));
+    .addEventListener("click", () => openQuickCleanDialogIfFresh("overview"));
   document.getElementById("quick-clean-cancel").addEventListener("click", closeQuickCleanDialog);
   document.getElementById("quick-clean-confirm").addEventListener("click", confirmQuickClean);
 }
@@ -938,6 +977,8 @@ const SIMPLE_SCAN_POLL_INTERVAL_MS = 1500; // matches the existing ADVANCED scan
 
 let simplePollHandle = null;
 let simpleLastCleanedNote = null; // session-only "last cleaned: X" note for the idle screen
+// True while SIMPLE mode's results screen is what's showing, so a mode switch can refresh it.
+let simpleResultsShown = false;
 
 function simpleViewEl() {
   return document.getElementById("simple-view-content");
@@ -964,6 +1005,7 @@ function formatEtaSeconds(etaSeconds) {
 
 function renderSimpleIdle() {
   clearSimplePoll();
+  simpleResultsShown = false;
   const container = simpleViewEl();
   container.innerHTML = "";
 
@@ -1389,7 +1431,10 @@ async function loadSimpleResults() {
   const container = simpleViewEl();
   renderState(container, "loading", { title: "Checking what's safe to clean…" });
   try {
-    const summary = await api("/api/clean/one-click-summary");
+    simpleResultsShown = false;
+    lastQuickCleanGroups = [];
+    const summary = await readCandidateCache(container, "/api/clean/one-click-summary");
+    simpleResultsShown = true;
     if (!summary.has_scan || summary.total_file_count === 0) {
       renderSimpleEmpty();
       return;
@@ -1438,7 +1483,7 @@ function renderSimpleGroups(summary) {
   cleanBtn.type = "button";
   cleanBtn.className = "rc-btn rc-btn-success rc-simple-primary-btn";
   cleanBtn.textContent = "Clean now";
-  cleanBtn.addEventListener("click", () => openQuickCleanDialog("simple"));
+  cleanBtn.addEventListener("click", () => openQuickCleanDialogIfFresh("simple"));
   container.appendChild(cleanBtn);
 }
 
@@ -1627,7 +1672,7 @@ async function loadTreemapView() {
   renderState(stateEl, "loading", { title: "Loading treemap…" });
 
   try {
-    const data = await api("/api/treemap");
+    const data = await readCandidateCache(stateEl, "/api/treemap");
     if (!data.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -1697,7 +1742,7 @@ async function loadReviewQueue() {
   if (category) params.set("category", category);
 
   try {
-    const data = await api(`/api/candidates?${params.toString()}`);
+    const data = await readCandidateCache(stateEl, `/api/candidates?${params.toString()}`);
     if (!data.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -1926,8 +1971,17 @@ export {
   renderSimpleOneClickProgress,
   renderApplyReport,
   ensureCandidatesWarm,
+  readCandidateCache,
+  loadOverview,
+  loadQuickClean,
+  loadTreemapView,
+  loadReviewQueue,
+  loadSimpleResults,
+  openQuickCleanDialogIfFresh,
+  refreshActiveView,
   switchToSafeMode,
   confirmPowerMode,
+  describeAutoCleanTask,
 };
 
 function updateApplyBar() {
@@ -2533,6 +2587,7 @@ async function loadSettingsView() {
   // -- fire-and-forget, same "non-fatal status refresh" posture as loadModeStatus elsewhere.
   loadAnthropicKeyStatus();
   loadNotificationsSettings();
+  loadAutoCleanSettings();
 }
 
 // --- BH5 (2026-08-26 audit): low disk space alert toggle -- R5 shipped with no way for a real
@@ -2583,6 +2638,82 @@ async function updateNotificationsSetting(checkbox, toggleText, statusEl) {
   } catch (err) {
     checkbox.checked = !nextEnabled;
     toggleText.textContent = checkbox.checked ? "On" : "Off";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not save: ${err.message}`;
+  } finally {
+    checkbox.disabled = false;
+  }
+}
+
+// --- ADR-0034: weekly auto-clean toggle. Same fetch/render/toggle-with-rollback shape as the
+// notifications toggle above; the task facts shown under it come from a live Task Scheduler
+// query, so "on" with no task (or a task left behind while off) is visible, not hidden. ---------
+
+// The API sends ISO-8601 (locale-independent); format with the viewer's own locale here.
+function formatTaskTime(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? String(iso) : date.toLocaleString();
+}
+
+function describeAutoCleanTask(data) {
+  if (!data.task_registered) {
+    return data.enabled
+      ? "Turned on, but no scheduled task was found. Switch it off and on again to re-create it."
+      : "No weekly task is scheduled.";
+  }
+  const parts = [`Scheduled task: ${data.task_state || "unknown state"}`];
+  parts.push(data.last_run_time ? `last run ${formatTaskTime(data.last_run_time)}` : "has not run yet");
+  if (data.last_run_time && data.last_result !== null && data.last_result !== 0) {
+    parts.push(`last result code ${data.last_result}`);
+  }
+  if (data.next_run_time) parts.push(`next run ${formatTaskTime(data.next_run_time)}`);
+  return parts.join(" · ") + ".";
+}
+
+async function loadAutoCleanSettings() {
+  const checkbox = document.getElementById("autoclean-enabled-checkbox");
+  const taskNote = document.getElementById("autoclean-task-note");
+  const statusEl = document.getElementById("autoclean-status");
+  if (!checkbox) return;
+  taskNote.textContent = "Checking the scheduled task…";
+  try {
+    const data = await api("/api/settings/autoclean");
+    checkbox.checked = data.enabled;
+    taskNote.textContent = describeAutoCleanTask(data);
+    statusEl.className = "rc-settings-card-status";
+    statusEl.textContent = "";
+    checkbox.disabled = false;
+  } catch (err) {
+    taskNote.textContent = "";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not load: ${err.message}`;
+  }
+  // Static markup, re-entered on every Settings activation: attach the listener exactly once
+  // (see loadNotificationsSettings for why a dataset flag and not `{once: true}`).
+  if (!checkbox.dataset.listenerAttached) {
+    checkbox.dataset.listenerAttached = "true";
+    checkbox.addEventListener("change", () => {
+      updateAutoCleanSetting(checkbox, taskNote, statusEl);
+    });
+  }
+}
+
+async function updateAutoCleanSetting(checkbox, taskNote, statusEl) {
+  const nextEnabled = checkbox.checked;
+  checkbox.disabled = true;
+  statusEl.className = "rc-settings-card-status";
+  statusEl.textContent = nextEnabled ? "Scheduling…" : "Removing the scheduled task…";
+  try {
+    const data = await api("/api/settings/autoclean", {
+      method: "POST",
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    taskNote.textContent = describeAutoCleanTask(data);
+    statusEl.textContent = "";
+  } catch (err) {
+    // The server rolls the setting back when it cannot register the task (e.g. a non-installed
+    // build), so mirror that here rather than leaving the box ticked.
+    checkbox.checked = !nextEnabled;
     statusEl.className = "rc-settings-card-status rc-form-error";
     statusEl.textContent = `Could not save: ${err.message}`;
   } finally {
@@ -2691,6 +2822,9 @@ async function loadModeStatus() {
 // categories off), so reload the visible view: Overview then re-checks warm-status, sees "stale"
 // and re-warms instead of calling /api/summary against a cold cache.
 function refreshActiveView() {
+  if (document.documentElement.getAttribute("data-mode") !== "advanced" && simpleResultsShown) {
+    return loadSimpleResults();
+  }
   const activeView = document.querySelector('.rc-tab[aria-selected="true"]')?.dataset.view;
   if (activeView) return VIEW_LOADERS[activeView]?.();
 }

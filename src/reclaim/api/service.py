@@ -16,7 +16,7 @@ from pathlib import Path
 
 import structlog
 
-from reclaim import anthropic_key_store, regenerable, update_check
+from reclaim import anthropic_key_store, autoclean_schedule, regenerable, update_check
 from reclaim.ai import category_explainer, presentation
 from reclaim.ai.models import AICluster
 from reclaim.api import ai_orchestration
@@ -30,6 +30,7 @@ from reclaim.api.schemas import (
     ApplyRequest,
     ApplyResponse,
     ApplyStatusOut,
+    AutoCleanSettingOut,
     CandidateOut,
     CandidatesResponse,
     CandidatesWarmStatusOut,
@@ -85,7 +86,12 @@ from reclaim.api.state import (
     RestoreStatus,
     ScanStatus,
 )
-from reclaim.config import CategoriesConfig, set_category_enabled, set_notifications_enabled
+from reclaim.config import (
+    CategoriesConfig,
+    set_autoclean_enabled,
+    set_category_enabled,
+    set_notifications_enabled,
+)
 from reclaim.dedup import (
     cluster_needs_manual_review,
     find_duplicate_clusters,
@@ -300,7 +306,14 @@ class CandidatesNotWarmError(RuntimeError):
     status write it's waiting to observe never happens until this call returns. AE3 fixed exactly
     this failure shape for `GET /api/summary` (`ensureCandidatesWarm`) but never extended it to
     this call site -- the same class of bug AE3 exists to prevent, just at a different choke
-    point."""
+    point.
+
+    `stale_reason` (additive): "cold" | "scan" | "mode" | "config" | "scope" | "computing" -- why
+    the cache is not usable, for the 409 body and the dashboard's inert-text notice."""
+
+    def __init__(self, message: str, *, stale_reason: str | None = None) -> None:
+        super().__init__(message)
+        self.stale_reason = stale_reason
 
 
 def is_candidates_cache_warm(state: AppState) -> bool:
@@ -350,6 +363,25 @@ def candidates_cache_stale_reason(state: AppState) -> str | None:
     # Same key but an explicit invalidation dropped the list (the category-toggle handler does
     # this, leaving the old key behind) -- the key diff above names the real cause when it can.
     return "cold" if state.candidates_cache is None else None
+
+
+def require_warm_candidates(state: AppState) -> None:
+    """Raise `CandidatesNotWarmError` unless `_cached_all_candidates` would return instantly.
+
+    Called by every request-path reader of the candidate cache (summary, treemap, candidates
+    list, one-click summary) right before it reads, so a cold OR stale cache (mode switch,
+    category toggle, new scan, scope change -- `candidates_cache_stale_reason`) is reported
+    ("not warm yet, warm-up started") instead of silently blocking the request thread for the
+    minutes `generate_candidates` + duplicate hashing can take on a large index. Never runs a
+    detector itself. The message names the stale cause for the UI to show as inert text."""
+    if is_candidates_cache_warm(state):
+        return
+    reason = candidates_cache_stale_reason(state) or "computing"
+    raise CandidatesNotWarmError(
+        f"the candidates cache is not warm yet (reason: {reason}) -- a warm-up has been "
+        "started; poll GET /api/candidates/warm-status until status is 'ready', then retry",
+        stale_reason=reason,
+    )
 
 
 def run_candidates_warm(state: AppState) -> None:
@@ -858,7 +890,9 @@ def _reconciliation_fields(
     return report.volume, report.delta_bytes, report.delta_pct
 
 
-def build_summary(state: AppState) -> SummaryResponse:
+def build_summary(state: AppState, *, require_warm: bool = True) -> SummaryResponse:
+    """`require_warm` (default True): raise `CandidatesNotWarmError` on a cold/stale cache
+    instead of computing it in-line -- see `require_warm_candidates`."""
     # D12: the most recent COMPLETED scan's skipped/unreadable accounting -- in-memory,
     # process-session state like `scan_status` itself (read under `state.lock`, same pattern
     # `build_treemap` uses for `scan_status.root`), never persisted to the index (it isn't a
@@ -896,6 +930,8 @@ def build_summary(state: AppState) -> SummaryResponse:
                 reconciliation_delta_bytes=reconciliation_delta_bytes,
                 reconciliation_delta_pct=reconciliation_delta_pct,
             )
+        if require_warm:
+            require_warm_candidates(state)
         total_indexed_bytes = physical_size_bytes(index.full_inventory())
         candidates = _cached_all_candidates(index, state)
 
@@ -968,7 +1004,9 @@ def _inaccessible_treemap_node(summary: InaccessibleSummary) -> TreemapNodeOut:
     )
 
 
-def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
+def build_treemap(
+    state: AppState, *, max_nodes: int = 60, require_warm: bool = True
+) -> TreemapResponse:
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return TreemapResponse(
@@ -993,6 +1031,8 @@ def build_treemap(state: AppState, *, max_nodes: int = 60) -> TreemapResponse:
             )
 
         children = index.direct_children(root)
+        if require_warm:
+            require_warm_candidates(state)
         candidates = _cached_all_candidates(index, state)
         candidate_by_path = {c.path: c for c in candidates}
 
@@ -1095,7 +1135,7 @@ def _candidate_out(candidate: Candidate, cluster: DuplicateCluster | None) -> Ca
 
 
 def list_candidates(
-    state: AppState, *, tier: str, category_group: str | None
+    state: AppState, *, tier: str, category_group: str | None, require_warm: bool = True
 ) -> CandidatesResponse:
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
@@ -1107,6 +1147,8 @@ def list_candidates(
                 total_bytes_human=format_bytes(0),
             )
 
+        if require_warm:
+            require_warm_candidates(state)
         candidates = _cached_all_candidates(index, state)
         needs_cluster_info = category_group in (None, "duplicates") and any(
             c.category_group == "duplicates" for c in candidates
@@ -1150,7 +1192,9 @@ _ONE_CLICK_SAFE_CATEGORY_GROUPS: frozenset[str] = frozenset(
 )
 
 
-def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
+def build_one_click_summary(
+    state: AppState, *, require_warm: bool = True
+) -> OneClickCleanSummaryResponse:
     """Groups the current scan's `_ONE_CLICK_SAFE_CATEGORY_GROUPS` candidates for the
     dashboard's one-click clean button, in plain language (`plain_language_category`) with the
     real measured size/count per group.
@@ -1175,6 +1219,8 @@ def build_one_click_summary(state: AppState) -> OneClickCleanSummaryResponse:
                 total_bytes_human=format_bytes(0),
                 total_file_count=0,
             )
+        if require_warm:
+            require_warm_candidates(state)
         candidates = _cached_all_candidates(index, state)
 
     grouped: dict[str, list[Candidate]] = defaultdict(list)
@@ -1454,7 +1500,8 @@ def resolve_apply_selection(
             raise CandidatesNotWarmError(
                 "the candidates cache is not warm yet -- call POST /api/candidates/warm and "
                 "poll GET /api/candidates/warm-status until status is 'ready', then retry this "
-                "apply request"
+                "apply request",
+                stale_reason=candidates_cache_stale_reason(state) or "computing",
             )
         with ScanIndex(state.db_path) as index:
             candidates = _cached_all_candidates(index, state)
@@ -2672,3 +2719,89 @@ def get_regenerable_status() -> RegenerableStatusResponse:
             report=job.report,
             error=job.error,
         )
+
+
+def regenerable_clean_response(
+    *, apply: bool, audit_log_path: Path | None = None
+) -> RegenerableCleanResponse:
+    """State-free synchronous run shared by `reclaim auto-clean` (which blocks, so it may wait on
+    uv's lock) and the preview: same shape, same audit log as the dashboard endpoint."""
+    if not _regenerable_clean_lock.acquire(blocking=False):
+        raise RegenerableCleanBusyError("a clean is already running")
+    try:
+        return _execute_regenerable_clean(apply=apply, audit_log_path=audit_log_path)
+    finally:
+        _regenerable_clean_lock.release()
+
+
+# --- Weekly auto-clean toggle (ADR-0034) ---------------------------------------------------------
+
+
+def autoclean_schtasks_runner() -> autoclean_schedule.SchtasksRunner:
+    """Seam for tests: the real `schtasks.exe` runner. Never takes caller input."""
+    return autoclean_schedule.run_schtasks
+
+
+def autoclean_query_runner() -> autoclean_schedule.PowerShellRunner:
+    """Seam for tests: the real PowerShell (ScheduledTasks module) status-query runner."""
+    return autoclean_schedule.run_powershell
+
+
+def autoclean_exe_path() -> Path | None:
+    """Seam for tests: `None` means "resolve the installed reclaim.exe" (a dev run then raises
+    `NotAnInstalledBuildError`, which the endpoint reports as a 409 with an actionable message)."""
+    return None
+
+
+def autoclean_settings(state: AppState) -> AutoCleanSettingOut:
+    """What the user chose (config) next to what Windows actually has (a live typed query)."""
+    with state.lock:
+        enabled = state.config.autoclean.enabled
+    status = autoclean_schedule.query_task(runner=autoclean_query_runner())
+    return AutoCleanSettingOut(
+        enabled=enabled,
+        task_registered=status.registered,
+        task_name=status.task_name,
+        task_state=status.state,
+        last_run_time=status.last_run_time,
+        last_result=status.last_result,
+        next_run_time=status.next_run_time,
+    )
+
+
+def update_autoclean_setting(state: AppState, *, enabled: bool) -> AutoCleanSettingOut:
+    """Turns weekly auto-clean on/off: config.toml AND the Windows scheduled task, never one
+    without the other.
+
+    ON: the flag is written first, then the task registered; if registration fails (e.g. a
+    non-installed dev build, Task Scheduler locked down) the flag is rolled back to its previous
+    value and the typed `AutoCleanScheduleError` propagates -- config must never say "on" with no
+    task behind it. OFF: the flag is written first so a task that then fails to delete is already
+    neutralised by `auto-clean --scheduled`'s own enabled check; the delete error still propagates
+    (after the in-memory config reflects "off") so the user is told the task is still there."""
+    with state.lock:
+        previous = state.config.autoclean.enabled
+    set_autoclean_enabled(state.config_path, enabled=enabled)
+    try:
+        if enabled:
+            autoclean_schedule.register_task(
+                exe_path=autoclean_exe_path(), runner=autoclean_schtasks_runner()
+            )
+        else:
+            autoclean_schedule.unregister_task(
+                runner=autoclean_schtasks_runner(), query_runner=autoclean_query_runner()
+            )
+    except autoclean_schedule.AutoCleanScheduleError:
+        if enabled:
+            set_autoclean_enabled(state.config_path, enabled=previous)
+        else:
+            _set_autoclean_in_memory(state, enabled=False)
+        raise
+    _set_autoclean_in_memory(state, enabled=enabled)
+    return autoclean_settings(state)
+
+
+def _set_autoclean_in_memory(state: AppState, *, enabled: bool) -> None:
+    with state.lock:
+        updated = state.config.autoclean.model_copy(update={"enabled": enabled})
+        state.config = state.config.model_copy(update={"autoclean": updated})
