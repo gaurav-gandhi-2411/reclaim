@@ -327,6 +327,31 @@ def is_candidates_cache_warm(state: AppState) -> bool:
         state.candidates_cache_lock.release()
 
 
+_CACHE_KEY_COMPONENTS = ("scan", "mode", "config", "scope")
+
+
+def candidates_cache_stale_reason(state: AppState) -> str | None:
+    """None when the cached candidate list is valid for the CURRENT state, else the first key
+    component that differs from what the cache was built under: "scan" | "mode" | "config" |
+    "scope" (checked in that order -- a mode switch also changes the mode-resolved config
+    digest, and the more specific cause wins), or "cold" when nothing is cached at all.
+
+    Cheap by construction: recomputes only `_candidates_cache_key` (a mode-log read, one JSON
+    dump + hash of the config, the allowed-roots resolution) and never runs a detector. Takes no
+    lock -- it reads the two cache attributes once; a compute racing this call is reported by the
+    caller's own "computing" status, never by this function."""
+    cached_key = state.candidates_cache_key
+    if cached_key is None:
+        return "cold"
+    current = _candidates_cache_key(state)
+    for name, was, now in zip(_CACHE_KEY_COMPONENTS, cached_key, current, strict=True):
+        if was != now:
+            return name
+    # Same key but an explicit invalidation dropped the list (the category-toggle handler does
+    # this, leaving the old key behind) -- the key diff above names the real cause when it can.
+    return "cold" if state.candidates_cache is None else None
+
+
 def run_candidates_warm(state: AppState) -> None:
     """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
     real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
@@ -368,17 +393,27 @@ def run_candidates_warm(state: AppState) -> None:
         )
 
 
-def to_candidates_warm_status_out(status: CandidatesWarmStatus) -> CandidatesWarmStatusOut:
+def to_candidates_warm_status_out(
+    status: CandidatesWarmStatus, *, stale_reason: str | None = None
+) -> CandidatesWarmStatusOut:
+    """`stale_reason` (from `candidates_cache_stale_reason`) turns a stored "ready" into "stale":
+    the stored status only records that SOME warm-up finished, not that its result still matches
+    the current scan/mode/config/scope (the mode-switch gap: "ready" while the key was cold)."""
+    if status.status == "ready" and stale_reason is not None:
+        out_status = "stale"
+    else:
+        out_status, stale_reason = status.status, None
     elapsed_seconds = None
     if status.started_at is not None:
         end = status.finished_at if status.finished_at is not None else time.time()
         elapsed_seconds = end - status.started_at
     return CandidatesWarmStatusOut(
-        status=status.status,
+        status=out_status,
         started_at=status.started_at,
         finished_at=status.finished_at,
         elapsed_seconds=elapsed_seconds,
         error=status.error,
+        stale_reason=stale_reason,
     )
 
 

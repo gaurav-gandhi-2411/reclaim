@@ -195,11 +195,16 @@ class CandidatesWarmStatusOut(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: str  # "idle" | "computing" | "ready" | "failed" -- see CandidatesWarmStatusLiteral
+    # "idle" | "computing" | "ready" | "failed" | "stale". "stale" is computed at read time: a
+    # warm-up finished but the cache key (scan/mode/config/scope) no longer matches.
+    status: str
     started_at: float | None
     finished_at: float | None
     elapsed_seconds: float | None
     error: str | None
+    # Set only with status "stale": "scan" | "mode" | "config" | "scope" | "cold". Additive and
+    # defaulted, so existing clients that ignore it are unaffected.
+    stale_reason: str | None = None
 
 
 class FixedDrivesResponse(BaseModel):
