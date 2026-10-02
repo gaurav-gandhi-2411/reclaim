@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from reclaim.app_paths import data_root
-from reclaim.config import Config, load_config, load_effective_config
+from reclaim.config import Config, exclusion_patterns, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
 from reclaim.detectors import generate_candidates
 from reclaim.elevation import ElevatedProcessError, assert_not_elevated
@@ -1126,7 +1126,10 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
 
     apply: bool = args.apply
     try:
-        response = service.regenerable_clean_response(apply=apply)
+        # ADR-0037: the weekly task reads the installed config.toml, so its exclusions apply.
+        response = service.regenerable_clean_response(
+            apply=apply, excluded_patterns=exclusion_patterns(config)
+        )
     except service.RegenerableCleanBusyError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
         return 1
@@ -1143,6 +1146,11 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
                 f"{item.status:<24} {item.bytes_removed_human:>9}  {item.label}"
                 + (f"  -- {item.detail}" if item.detail else "")
             )
+        for entry in response.excluded:
+            print(f"skipped_excluded: {entry}")  # noqa: T201
+        print(  # noqa: T201
+            f"excluded: {len(response.excluded)}, excluded_applied: {response.excluded_applied}"
+        )
         verb = "Total freed" if apply else "Total that would be freed"
         print(f"{verb}: {response.bytes_removed_human} ({response.bytes_removed} bytes)")  # noqa: T201
         if apply and response.disk_free_before_bytes is not None:
@@ -1161,6 +1169,15 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
             print(  # noqa: T201
                 f"Would free {response.bytes_removed_human} (dry run -- pass --apply to clean)"
             )
+
+    if response.excluded_applied > 0:
+        # Mechanical form of "no excluded project appeared among applied paths": a
+        # non-zero count means the skip logic itself failed -- never report success.
+        print(  # noqa: T201
+            f"reclaim auto-clean: INVARIANT VIOLATION excluded_applied={response.excluded_applied}",
+            file=sys.stderr,
+        )
+        return 1
 
     if apply and args.notify and (response.bytes_removed > 0 or response.files_skipped_in_use > 0):
         send_autoclean_toast(

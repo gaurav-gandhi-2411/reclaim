@@ -27,7 +27,7 @@ from reclaim.models import (
     Tier,
     Verdict,
 )
-from reclaim.safety import SafetyValidator
+from reclaim.safety import SafetyValidator, first_matching_pattern
 from reclaim.scanner import long_path
 
 logger = structlog.get_logger(__name__)
@@ -586,6 +586,7 @@ def find_duplicate_clusters(
     *,
     min_reclaim_bytes: int = _DEFAULT_MIN_RECLAIM_BYTES,
     skips: list[HashSkip] | None = None,
+    exclusion_patterns: Sequence[str] = (),
 ) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
     cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
@@ -613,6 +614,12 @@ def find_duplicate_clusters(
     least one other file), that meant building millions of `FileRecord` objects — and holding
     them all at once — before a single hash ran. Peak memory here is bounded by the *largest
     single size bucket*, not the total candidate count.
+
+    `exclusion_patterns` (ADR-0037, `SafetyValidator.exclusion_patterns`): a file whose path
+    matches one is dropped from its size bucket BEFORE any hashing -- never read, never hashed,
+    never a cluster member, and so never the keeper either. Deliberate: an excluded file is
+    treated as if it did not exist, so no other copy can be proposed for deletion "because a
+    copy survives in the excluded tree".
     """
     candidate_count = index.duplicate_size_candidate_count(min_reclaim_bytes=min_reclaim_bytes)
     if candidate_count == 0:
@@ -752,6 +759,10 @@ def find_duplicate_clusters(
         ):
             counters["buckets"] += 1
             members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
+            if exclusion_patterns:
+                members = [
+                    m for m in members if first_matching_pattern(m.path, exclusion_patterns) is None
+                ]
             window.append((size, members))
             window_files += len(members)
             if window_files >= _WINDOW_FILES:
@@ -848,7 +859,12 @@ def generate_duplicate_candidates(
     resolved_clusters = (
         clusters
         if clusters is not None
-        else find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips)
+        else find_duplicate_clusters(
+            index,
+            min_reclaim_bytes=min_reclaim_bytes,
+            skips=skips,
+            exclusion_patterns=safety.exclusion_patterns,
+        )
     )
     model_cache_roots = [Path(p) for p in config.categories.model_caches.paths]
     env_root_cache: dict[Path, bool] = {}  # one pass only -- see `_is_environment_root`

@@ -1682,6 +1682,23 @@ def apply_batch(
             f"executor: {[str(c.path) for c in blocked[:5]]}"
         )
 
+    # ADR-0037 last line of defence, independent of candidate generation: a candidate (even a
+    # hand-built or stale-cached one carrying a non-BLOCKED verdict) whose path -- or, for a
+    # directory, anything inside it -- matches a user exclusion is never applied. Whole-batch
+    # refusal, same philosophy as the BLOCKED check above; runs in dry-run too so a preview can
+    # never promise a delete the real run would refuse.
+    excluded_hits = [
+        (c.path, hit)
+        for c in candidates
+        if (hit := safety.exclusion_match(c.path, is_dir=c.is_dir)) is not None
+    ]
+    if excluded_hits:
+        raise SafetyInvariantError(
+            f"apply_batch received {len(excluded_hits)} candidate(s) matching a user exclusion "
+            "([exclusions]/[safety] deny in config.toml) — refusing the entire batch, touching "
+            f"nothing: {[f'{path} ({pattern})' for path, pattern in excluded_hits[:5]]}"
+        )
+
     resolved_vault_dir = vault_dir if vault_dir is not None else DEFAULT_VAULT_DIR
     resolved_manifest_path = manifest_path if manifest_path is not None else DEFAULT_MANIFEST_PATH
     now_ts = now if now is not None else time.time()

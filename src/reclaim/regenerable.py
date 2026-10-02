@@ -30,6 +30,7 @@ from typing import Literal
 import structlog
 
 from reclaim.app_paths import data_root
+from reclaim.safety import first_matching_pattern, subtree_exclusion_match
 
 logger = structlog.get_logger(__name__)
 
@@ -65,6 +66,7 @@ ItemStatus = Literal[
     "skipped_browser_running",
     "skipped_tool_missing",
     "skipped_no_access",
+    "skipped_excluded",
     "failed",
 ]
 
@@ -328,6 +330,12 @@ class RegenerableEnv:
     # scheduled task can pick a different bound.
     uv_lock_wait_seconds: float = UV_LOCK_WAIT_SECONDS
     disk_anchor: Path | None = None
+    # ADR-0037: user exclusion patterns (`config.exclusion_patterns` -- `[safety] deny` globs and
+    # one `*<name>*` glob per `[exclusions] project_names`). Any top-level entry whose full path,
+    # or ANY path beneath it, matches is skipped whole and reported, never deleted. Native tool
+    # cache roots and browser cache dirs are fixed, but are checked too (a match there is a
+    # skipped_excluded item). Empty = no exclusions (the product default).
+    excluded_patterns: tuple[str, ...] = ()
 
     @classmethod
     def from_os_environment(cls) -> RegenerableEnv:
@@ -365,6 +373,11 @@ class RegenerableItemResult:
     files_skipped_in_use: int = 0
     detail: str = ""
     skipped_paths: list[str] = field(default_factory=list)
+    # ADR-0037: `"<path> :: <pattern>"` for every entry left alone because of a user exclusion.
+    excluded: list[str] = field(default_factory=list)
+    # Every top-level path this item actually handed to a delete (apply only) -- the set the
+    # run report intersects with the exclusions to state `excluded_applied: 0` mechanically.
+    applied_paths: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -390,6 +403,14 @@ class RegenerableReport:
     @property
     def files_skipped_in_use(self) -> int:
         return sum(i.files_skipped_in_use for i in self.items)
+
+    @property
+    def excluded(self) -> list[str]:
+        return [entry for i in self.items for entry in i.excluded]
+
+    @property
+    def applied_paths(self) -> list[str]:
+        return [path for i in self.items for path in i.applied_paths]
 
     @property
     def duration_seconds(self) -> float:
@@ -660,6 +681,13 @@ def _run_native_tool(
             result.detail = f"{', '.join(busy)} is running; the tool may hold its cache lock"
             return result
 
+    root_hit = first_matching_pattern(cache_root, env.excluded_patterns, is_dir=True)
+    if root_hit is not None:
+        result.status = "skipped_excluded"
+        result.excluded.append(f"{cache_root} :: {root_hit}")
+        result.detail = f"{cache_root} matches the user exclusion {root_hit!r}; left alone"
+        return result
+
     before = dir_size_bytes(cache_root)
     if not apply:
         result.status = "would_clean" if before > 0 else "nothing_to_clean"
@@ -675,6 +703,7 @@ def _run_native_tool(
         child_env["UV_LOCK_TIMEOUT"] = str(int(wait))
         timeout = wait + _LOCK_WAIT_KILL_MARGIN_SECONDS
     argv = [exe, *spec.argv_tail]
+    result.applied_paths.append(str(cache_root))
     outcome = env.run_command(argv, timeout, child_env)
     after = dir_size_bytes(cache_root)
     result.bytes_removed = max(0, before - after)
@@ -720,6 +749,12 @@ def _aged_children(
         result.status = "skipped_not_present"
         result.detail = f"{root} does not exist"
         return result
+    root_hit = first_matching_pattern(root, env.excluded_patterns, is_dir=True)
+    if root_hit is not None:
+        result.status = "skipped_excluded"
+        result.excluded.append(f"{root} :: {root_hit}")
+        result.detail = f"{root} matches the user exclusion {root_hit!r}; left alone"
+        return result
     now = env.now()
     try:
         children = [entry.path for entry in os.scandir(root)]
@@ -738,6 +773,19 @@ def _aged_children(
         child_path = Path(child)
         if not _resolve_contained(child_path, root) and not _is_reparse_or_missing(child):
             continue
+        # ADR-0037: BEFORE the age/guard logic and before anything is measured for deletion. The
+        # whole top-level entry is skipped when the entry OR anything beneath it matches: a
+        # deletable-looking parent (`%TEMP%/claude`) must not take an excluded child with it.
+        # A reparse point is removed as a link entry (its target is never walked or touched), so
+        # only the link's own path is checked.
+        exclusion_hit = (
+            first_matching_pattern(child, env.excluded_patterns, is_dir=True)
+            if _is_reparse_or_missing(child)
+            else subtree_exclusion_match(child, env.excluded_patterns)
+        )
+        if exclusion_hit is not None:
+            result.excluded.append(f"{child} :: {exclusion_hit}")
+            continue
         info = _scan_tree(child)
         age = now - info.newest_mtime
         if age < env.min_age_seconds or info.newest_mtime <= 0:
@@ -753,6 +801,7 @@ def _aged_children(
             st = Path(child).lstat()
         except OSError:
             continue
+        result.applied_paths.append(child)
         if _is_reparse(st):
             _remove_reparse_entry(child, st, result, env=env, enforce_age=True)
         elif stat.S_ISDIR(st.st_mode):
@@ -764,6 +813,10 @@ def _aged_children(
             f"left {len(guarded)} entr{'y' if len(guarded) == 1 else 'ies'} that contain a "
             f"git repo / virtualenv / node_modules for review: {', '.join(guarded[:5])}"
         )
+    if result.excluded:
+        count = len(result.excluded)
+        note = f"left {count} excluded entr{'y' if count == 1 else 'ies'} alone"
+        result.detail = f"{result.detail}; {note}" if result.detail else note
     if apply:
         result.status = "cleaned" if result.files_removed else "nothing_to_clean"
     else:
@@ -803,6 +856,18 @@ def _run_browser(spec: BrowserSpec, env: RegenerableEnv, *, apply: bool) -> Rege
     )
     profiles = _browser_profile_dirs(env.local_appdata, spec)
     targets = [p / name for p in profiles for name in spec.cache_dir_names if (p / name).is_dir()]
+    kept: list[Path] = []
+    for target in targets:
+        hit = first_matching_pattern(target, env.excluded_patterns, is_dir=True)
+        if hit is None:
+            kept.append(target)
+        else:
+            result.excluded.append(f"{target} :: {hit}")
+    if targets and not kept:
+        result.status = "skipped_excluded"
+        result.detail = f"every {spec.label} cache directory matches a user exclusion"
+        return result
+    targets = kept
     if not targets:
         result.status = "skipped_not_present"
         result.detail = f"no {spec.label} cache directories found"
@@ -821,6 +886,7 @@ def _run_browser(spec: BrowserSpec, env: RegenerableEnv, *, apply: bool) -> Rege
         if not apply:
             result.bytes_removed += dir_size_bytes(target)
             continue
+        result.applied_paths.append(str(target))
         _delete_tree_contents(str(target), env=env, result=result, remove_top=False)
     if apply:
         result.status = "cleaned" if result.files_removed else "nothing_to_clean"
@@ -967,6 +1033,18 @@ def run_regenerable_clean(
     return report
 
 
+def count_excluded_applied(applied_paths: Sequence[str], patterns: Sequence[str]) -> int:
+    """How many of the paths a run actually handed to a delete match a user exclusion -- the
+    mechanical form of "none of the excluded projects appeared among applied candidates". Must be
+    0; a non-zero value is a bug in this module's own skip logic, so callers treat it as a hard
+    failure (ADR-0037)."""
+    return sum(
+        1
+        for path in applied_paths
+        if first_matching_pattern(path, patterns, is_dir=True) is not None
+    )
+
+
 def _notify(callback: Callable[..., None], *args: object) -> None:
     try:
         callback(*args)
@@ -1007,6 +1085,7 @@ def _write_audit(report: RegenerableReport, path: Path | None) -> None:
                             "files_removed": item.files_removed,
                             "files_skipped_in_use": item.files_skipped_in_use,
                             "skipped_paths": item.skipped_paths,
+                            "excluded": item.excluded,
                             "detail": item.detail,
                         }
                     )
