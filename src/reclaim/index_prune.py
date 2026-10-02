@@ -62,7 +62,9 @@ def _os_path(posix_dir: str) -> str:
 def _probe_dir(posix_dir: str) -> _Dir:
     """Classifies one directory. MISSING only on a definitive not-found / not-a-directory."""
     try:
-        mode = os.stat(_os_path(posix_dir)).st_mode
+        # PTH116: os.stat on the raw long-path string, same as `_entry_confirmed_missing`'s
+        # os.lstat; no pathlib round-trip of the `\\?\` prefix.
+        mode = os.stat(_os_path(posix_dir)).st_mode  # noqa: PTH116
     except (FileNotFoundError, NotADirectoryError):
         return _Dir.MISSING
     except OSError:
