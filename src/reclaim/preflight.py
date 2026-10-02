@@ -40,6 +40,7 @@ PreflightSkipReason = Literal[
     "file_in_use",
     "hardlink_shared_active_install",
     "identity_changed_since_scan",
+    "size_or_mtime_changed_since_scan",
     "outside_user_scope",
 ]
 
@@ -310,10 +311,12 @@ def check_hardlink_shared_active_install(path: Path) -> HardlinkShareCheck:
 #      scan-to-apply window, which is not a practical attack surface for a tool whose apply
 #      typically runs minutes to hours after its scan.
 #   2. Same-inode in-place content edits (no rename/recreate -- e.g. a process opens the
-#      existing file and overwrites its bytes without ever unlinking it) are NOT caught by this
-#      check, by design: `(dev, ino)` is unchanged by construction for an in-place edit, and
-#      this is a different threat class (data-integrity-of-contents, not
-#      wrong-file-deleted/misrouted) than what this fix addresses. Out of scope.
+#      existing file and overwrites its bytes without ever unlinking it) are NOT caught by
+#      `(dev, ino)` -- unchanged by construction for an in-place edit. ADR-0036 closes this for
+#      FILE candidates with a separate, second comparison (`IdentityCheck.size_or_mtime_changed`,
+#      surfaced as its own skip reason `size_or_mtime_changed_since_scan`): a file whose size or
+#      mtime moved since the scan is in active use by definition. Directory candidates are
+#      deliberately exempt (a directory's mtime changes on ANY child change).
 #   3. `FSCTL_SET_REPARSE_POINT`-based in-place reparse-point retargeting (rewriting an
 #      existing junction/symlink's target without deleting and recreating the reparse point
 #      itself, so the same MFT record -- and therefore the same `(dev, ino)` -- survives the
@@ -332,13 +335,13 @@ class IdentityCheck:
     -- a different, already-handled condition (the real move/delete attempt's own `try/except`
     reports it), not itself a reason to flag `identity_changed=True` here.
 
-    `recorded_mtime`/`live_mtime`/`recorded_size_bytes`/`live_size_bytes` are supplementary
-    DIAGNOSTIC context only, logged for a human reviewing a skip -- never part of the
-    `identity_changed` decision itself. `(dev, ino)` alone is the authoritative identity signal;
-    requiring mtime to also match would incorrectly flag a same-inode in-place content edit as
-    an "identity change", which residual-gap #2 above documents as deliberately OUT OF SCOPE for
-    this check, not something to accidentally start catching as a side effect of a stricter
-    comparison.
+    `identity_changed` is decided by `(dev, ino)` alone -- a same-inode in-place edit is NOT an
+    "identity change". ADR-0036 reports that case separately as `size_or_mtime_changed` (live
+    size or mtime differs from the recorded value, compared EXACTLY: the scanner stores
+    `st_mtime`/the dirlist's CPython-identical FILETIME conversion as a float64 and SQLite REAL
+    round-trips it bit-for-bit, so equality is the same test `index.is_unchanged` already uses).
+    `size_or_mtime_changed` is a pure observation here; whether it applies (file candidates
+    only, and only when the scan recorded an mtime baseline at all) is the caller's decision.
     """
 
     identity_changed: bool
@@ -350,6 +353,7 @@ class IdentityCheck:
     live_mtime: float | None
     recorded_size_bytes: int
     live_size_bytes: int | None
+    size_or_mtime_changed: bool = False
 
 
 def check_identity_unchanged_since_scan(
@@ -395,6 +399,7 @@ def check_identity_unchanged_since_scan(
         live_mtime=st.st_mtime,
         recorded_size_bytes=recorded_size_bytes,
         live_size_bytes=st.st_size,
+        size_or_mtime_changed=(st.st_size != recorded_size_bytes or st.st_mtime != recorded_mtime),
     )
 
 

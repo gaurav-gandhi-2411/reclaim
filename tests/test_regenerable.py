@@ -579,3 +579,93 @@ def test_time_module_not_used_for_age_in_tests() -> None:
     # Guards the fixture itself: NOW is a fixed epoch far from the wall clock, so a test that
     # passed only because of the real clock would fail here.
     assert abs(time.time() - NOW) > DAY
+
+
+# --- ADR-0036: re-stat immediately before each unlink ------------------------------------------
+
+
+def test_aged_file_appended_between_plan_and_delete_is_skipped(machine: FakeMachine) -> None:
+    # The plan (walk) judged `busy.log` aged and idle; the open-handle probe (which runs right
+    # before the unlink) is where a writer sneaks in. No handle is held at probe time, so only
+    # the re-stat can save it.
+    busy = _write(machine.temp / "busy.log", 100)
+    other = _write(machine.temp / "idle.log", 100)
+
+    def appender(path: str) -> bool:
+        if path == str(busy):
+            with busy.open("ab") as fh:
+                fh.write(b"y" * 50)
+        return False
+
+    report = run_regenerable_clean(
+        machine.env(has_open_handle=appender), apply=True, audit_log_path=None
+    )
+
+    item = _item(report, "temp0")
+    assert busy.exists() and busy.read_bytes().endswith(b"y" * 50)
+    assert not other.exists(), "an untouched aged file is still deleted"
+    assert item.files_skipped_in_use == 1
+    assert str(busy) in item.skipped_paths
+
+
+def test_aged_file_inside_directory_touched_after_plan_is_skipped(machine: FakeMachine) -> None:
+    inner = _write(machine.temp / "dir" / "a.bin", 10)
+    sibling = _write(machine.temp / "dir" / "b.bin", 10)
+    _age_dirs(machine.temp / "dir", 30)
+
+    def toucher(path: str) -> bool:
+        if path == str(inner):
+            stamp = NOW - 60.0  # same size, mtime now inside the age floor
+            os.utime(inner, (stamp, stamp))
+        return False
+
+    report = run_regenerable_clean(
+        machine.env(has_open_handle=toucher), apply=True, audit_log_path=None
+    )
+
+    assert inner.exists()
+    assert not sibling.exists()
+    assert _item(report, "temp0").files_skipped_in_use == 1
+
+
+def test_age_floor_is_rechecked_against_the_clock_at_delete_time(machine: FakeMachine) -> None:
+    # mtime and size are UNCHANGED since the walk, so only the age-floor re-check can fire:
+    # the injected clock says the file is old at plan time and young at delete time.
+    victim = _write(machine.temp / "v.log", 100)
+    probed = {"done": False}
+
+    def clock() -> float:
+        return NOW - 30 * DAY if probed["done"] else NOW
+
+    def probe(_path: str) -> bool:
+        probed["done"] = True  # the handle probe runs after the plan, right before the re-stat
+        return False
+
+    report = run_regenerable_clean(
+        machine.env(now=clock, has_open_handle=probe), apply=True, audit_log_path=None
+    )
+
+    assert victim.exists()
+    assert _item(report, "temp0").files_skipped_in_use == 1
+
+
+def test_browser_cache_file_appended_between_walk_and_delete_is_skipped(
+    machine: FakeMachine,
+) -> None:
+    profile = _chrome_profile(machine)
+    busy = _write(profile / "Cache" / "Cache_Data" / "f_1", 100, age_days=0.1)
+    idle = _write(profile / "Cache" / "Cache_Data" / "f_2", 100, age_days=0.1)
+
+    def appender(path: str) -> bool:
+        if path == str(busy):
+            with busy.open("ab") as fh:
+                fh.write(b"y" * 50)
+        return False
+
+    report = run_regenerable_clean(
+        machine.env(has_open_handle=appender), apply=True, audit_log_path=None
+    )
+
+    assert busy.exists()
+    assert not idle.exists(), "browser caches have no age floor; an untouched file still goes"
+    assert _item(report, "chrome").files_skipped_in_use == 1

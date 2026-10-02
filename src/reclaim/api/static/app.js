@@ -885,7 +885,9 @@ function renderQuickCleanResult(container, report) {
     const failList = document.createElement("ul");
     for (const item of failures) {
       const li = document.createElement("li");
-      li.textContent = `FAILED: ${item.path} — ${item.error}`;
+      li.textContent = item.skip_reason
+        ? `SKIPPED: ${item.path} — ${item.skip_reason}`
+        : `FAILED: ${item.path} — ${item.error}`;
       failList.appendChild(li);
     }
     panel.appendChild(failList);
@@ -2061,7 +2063,9 @@ function renderApplyReport(container, report) {
     const failList = document.createElement("ul");
     for (const item of failures) {
       const li = document.createElement("li");
-      li.textContent = `FAILED: ${item.path} — ${item.error}`;
+      li.textContent = item.skip_reason
+        ? `SKIPPED: ${item.path} — ${item.skip_reason}`
+        : `FAILED: ${item.path} — ${item.error}`;
       failList.appendChild(li);
     }
     panel.appendChild(failList);

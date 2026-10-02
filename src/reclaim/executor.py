@@ -1196,12 +1196,22 @@ _DEFAULT_DIRECT_DELETE_SIZE_GUARD_RETENTION_DAYS = 30
 _DEFAULT_DIRECT_DELETE_ENTRY_COUNT_GUARD = 87_882
 
 
-def _top_level_identity_mismatch(candidate: Candidate) -> str | None:
+def _top_level_identity_mismatch(
+    candidate: Candidate,
+) -> tuple[PreflightSkipReason, str] | None:
     """P0-K1a: re-verifies `candidate.path`'s live `(dev, ino)` against the scan-time baseline
     carried on `candidate` itself (`Candidate.dev`/`.ino`, populated at candidate-generation
     time -- see `models.Candidate`'s own field comment for the three real construction sites).
-    Returns a short, loggable description of the mismatch, or `None` if the identity still
-    matches (or no real baseline was ever wired through for this candidate -- see below).
+    Returns `(skip_reason, loggable description)` of the mismatch, or `None` if nothing changed
+    (or no real baseline was ever wired through for this candidate -- see below).
+
+    ADR-0036: for a FILE candidate with a recorded mtime baseline, a live size or mtime that
+    differs from the scan's record is a second, separately-reported mismatch
+    (`size_or_mtime_changed_since_scan`) -- same inode edited in place means something is
+    writing to it. Checked only AFTER `(dev, ino)` so a swapped file stays
+    `identity_changed_since_scan`. Directories are exempt (their mtime moves on any child
+    change; `_direct_delete_directory_mismatch` covers their contents). `mtime == 0.0` means the
+    candidate carries no mtime baseline (hand-built fixture), so that half is skipped.
 
     `candidate.dev == 0 and candidate.ino == 0` is treated as "no scan-time baseline available"
     (a not-yet-updated test/eval fixture; on a real NTFS volume device 0 / inode 0 never occurs
@@ -1220,12 +1230,20 @@ def _top_level_identity_mismatch(candidate: Candidate) -> str | None:
         recorded_mtime=candidate.mtime,
         recorded_size_bytes=candidate.size_bytes,
     )
-    if not check.identity_changed:
-        return None
-    return (
-        f"{candidate.path}: live (dev, ino)=({check.live_dev}, {check.live_ino}) no longer "
-        f"matches the scan's recorded ({check.recorded_dev}, {check.recorded_ino})"
-    )
+    if check.identity_changed:
+        return (
+            "identity_changed_since_scan",
+            f"{candidate.path}: live (dev, ino)=({check.live_dev}, {check.live_ino}) no longer "
+            f"matches the scan's recorded ({check.recorded_dev}, {check.recorded_ino})",
+        )
+    if check.size_or_mtime_changed and not candidate.is_dir and candidate.mtime != 0.0:
+        return (
+            "size_or_mtime_changed_since_scan",
+            f"{candidate.path}: live (size, mtime)=({check.live_size_bytes}, {check.live_mtime}) "
+            f"differs from the scan's recorded ({check.recorded_size_bytes}, "
+            f"{check.recorded_mtime}) -- modified since the scan, so treated as in active use",
+        )
+    return None
 
 
 def _live_subtree_records(root: Path) -> list[FileRecord]:
@@ -1447,10 +1465,11 @@ def _preflight_skip_reason(
     ):
         return "hardlink_shared_active_install"
 
-    top_level_detail = _top_level_identity_mismatch(candidate)
-    if top_level_detail is not None:
+    top_level_mismatch = _top_level_identity_mismatch(candidate)
+    if top_level_mismatch is not None:
+        top_level_reason, top_level_detail = top_level_mismatch
         logger.info("executor.identity_mismatch_detected", detail=top_level_detail)
-        return "identity_changed_since_scan"
+        return top_level_reason
 
     if item_method == "direct_delete" and candidate.is_dir:
         if scan_index is None:

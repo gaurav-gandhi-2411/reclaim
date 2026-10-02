@@ -1791,6 +1791,42 @@ def test_apply_response_surfaces_skip_reason_for_a_preflight_skipped_item(
     assert report["files_succeeded"] == len(tier_a_paths) - 1
 
 
+def test_apply_response_surfaces_size_or_mtime_changed_since_scan(tmp_path: Path) -> None:
+    """ADR-0036: a FILE appended to in place (same inode, so `identity_changed_since_scan`
+    cannot fire) between scan and `POST /api/apply` is skipped with its OWN reason in the real
+    HTTP response body, left intact, while an untouched sibling candidate in the same batch is
+    still removed. Also pins the OpenAPI enum so the new literal is part of the published shape."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    client = _make_app(tmp_path, config=_config(root))
+    _scan_and_wait(client, root)
+
+    tier_a_paths = [c["path"] for c in client.get("/api/candidates?tier=A").json()["candidates"]]
+    assert paths["old_log"].as_posix() in tier_a_paths
+    assert paths["node_modules_dir"].as_posix() in tier_a_paths
+
+    size_before = paths["old_log"].stat().st_size
+    with paths["old_log"].open("ab") as fh:  # same inode, new size AND new mtime
+        fh.write(b"appended after the scan")
+
+    report = _apply_and_wait(client, {"tier": "A", "paths": tier_a_paths, "dry_run": False})
+    items_by_path = {item["path"]: item for item in report["items"]}
+
+    changed = items_by_path[paths["old_log"].as_posix()]
+    assert changed["succeeded"] is False
+    assert changed["skip_reason"] == "size_or_mtime_changed_since_scan"
+    assert changed["error"] is None
+    assert paths["old_log"].stat().st_size == size_before + len(b"appended after the scan")
+
+    untouched = items_by_path[paths["node_modules_dir"].as_posix()]
+    assert untouched["succeeded"] is True
+    assert untouched["skip_reason"] is None
+
+    schemas = client.get("/openapi.json").json()["components"]["schemas"]
+    skip_schema = schemas["ItemApplyResultOut"]["properties"]["skip_reason"]
+    assert "size_or_mtime_changed_since_scan" in str(skip_schema)
+
+
 def test_apply_response_surfaces_postcondition_verification_failed_for_a_silent_noop_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
