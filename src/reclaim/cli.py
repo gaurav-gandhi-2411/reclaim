@@ -933,7 +933,13 @@ def _run_apply(args: argparse.Namespace) -> int:
     if materiality is not None:
         _print_materiality_exclusion(materiality, min_reclaim_bytes=min_reclaim_bytes)
     for item in report.items:
-        if not item.succeeded:
+        if item.skip_reason is not None:
+            # A pre-flight skip was never attempted (`error` is None) -- name the reason instead
+            # of printing a bare "FAILED: <path> — None".
+            print(  # noqa: T201
+                f"  SKIPPED: {item.path} — {item.skip_reason}", file=sys.stderr
+            )
+        elif not item.succeeded:
             print(f"  FAILED: {item.path} — {item.error}", file=sys.stderr)  # noqa: T201
     return 0 if report.files_failed == 0 else 1
 

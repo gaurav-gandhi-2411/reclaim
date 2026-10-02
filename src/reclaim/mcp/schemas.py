@@ -98,3 +98,8 @@ class DeleteResult(BaseModel):
     # reported in `bytes_moved`.
     bytes_freed: int
     bytes_moved: int = 0
+    # ADR-0036: how many items apply_batch's pre-flight skipped without attempting them, per
+    # `PreflightSkipReason` (e.g. {"size_or_mtime_changed_since_scan": 2}) -- counts only, never
+    # paths, same no-enumeration posture as the rest of this model. `files_failed` includes them;
+    # without this an agent cannot tell "skipped because it changed" from a real failure.
+    skipped_by_reason: dict[str, int] = {}

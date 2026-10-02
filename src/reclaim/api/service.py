@@ -1246,12 +1246,18 @@ def _build_user_selected_candidate(
     result = safety.evaluate(record)
     if result.verdict != Verdict.ELIGIBLE:
         return None
+    # ADR-0036: the identity/size/mtime baseline is the SCAN's record of this path when there is
+    # one, not the fresh stat just taken above -- a file modified after the scan used to drop out
+    # of the rule-based candidates (the ADR-0035 decision-point re-stat) and re-enter here with a
+    # fresh baseline that trivially matches itself, defeating `apply_batch`'s preflight. Only a
+    # path the scan never saw (outside the index) falls back to the fresh record.
+    baseline = scan_index.get_record(path) or record
     return Candidate(
         path=path,
         is_dir=False,
         category="user_selected_file",
         category_group="user_selected",
-        size_bytes=record.size_bytes,
+        size_bytes=baseline.size_bytes,
         tier=Tier.B,
         rationale=(
             "Individually selected (e.g. from the AI Suggestions view) -- safety-validated "
@@ -1262,18 +1268,16 @@ def _build_user_selected_candidate(
         safety_verdict=result.verdict,
         safety_reason_code=result.reason_code,
         retention_days=_USER_SELECTED_RETENTION_DAYS,
-        # P0-K1a: `record` above is a FRESH `FileRecord` (just built by `build_record_for_path`
-        # a few lines up, not a stale scan-index row) -- its dev/ino/mtime are the correct
-        # scan-time-equivalent baseline for `executor._preflight_skip_reason`'s identity
-        # re-check, same as the other two `Candidate`-construction sites. Not called out by name
-        # in this fix's original design note (which only named `detectors.py`/`dedup.py`), but
-        # this is the third and only other place a `Candidate` reaching `apply_batch` is built
-        # from real data -- leaving it at the 0/0/0.0 default would silently disable the
-        # identity check for every AI-suggestion/user-selected apply, not just narrow its
-        # coverage.
-        dev=record.dev,
-        ino=record.ino,
-        mtime=record.mtime,
+        # P0-K1a: `baseline` above is the scan-index row when the scan saw this path, else the
+        # FRESH `FileRecord` (just built by `build_record_for_path` a few lines up) -- its
+        # dev/ino/mtime are the scan-time baseline for `executor._preflight_skip_reason`'s
+        # identity re-check, same as the other two `Candidate`-construction sites. This is the
+        # third and only other place a `Candidate` reaching `apply_batch` is built from real
+        # data -- leaving it at the 0/0/0.0 default would silently disable the identity check
+        # for every AI-suggestion/user-selected apply, not just narrow its coverage.
+        dev=baseline.dev,
+        ino=baseline.ino,
+        mtime=baseline.mtime,
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -427,6 +428,9 @@ def build_mcp_server(state: AppState) -> FastMCP:
                 files_failed=response.files_failed,
                 bytes_freed=response.bytes_freed,
                 bytes_moved=response.bytes_moved,
+                skipped_by_reason=dict(
+                    Counter(item.skip_reason for item in response.items if item.skip_reason)
+                ),
             )
         finally:
             # Released unconditionally -- a refusal (stale scan, hash mismatch) or a real
