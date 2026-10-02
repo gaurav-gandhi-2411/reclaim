@@ -598,8 +598,9 @@ def find_duplicate_clusters(
     pass their own list and read it back after the call.
 
     `min_reclaim_bytes` is the materiality gate (2026-07-17 real-disk finding): a bucket whose
-    theoretical best-case reclaim — `(member_count - 1) * size` — falls below this floor is
-    never even queried for its members, let alone hashed. See
+    theoretical best-case reclaim — `(distinct_inodes - 1) * size`, the names of one hardlinked
+    file counting once — falls below this floor is never even queried for its members, let
+    alone hashed. See
     `ScanIndex.duplicate_size_candidates`'s docstring and `materiality_exclusion_stats` (the
     reporting counterpart of this same filter).
 

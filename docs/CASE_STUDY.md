@@ -111,7 +111,7 @@ real ones."**
    number that looked like it demanded hashing most of the disk. Querying the actual
    distribution showed it was dominated by 333K zero-byte files and a long tail of tiny sizes
    that could never reclaim anything material even in the best case. A materiality gate
-   (`(member_count - 1) × size` must clear a 1MB floor before a bucket is even queried) turned a
+   (`(distinct_inodes - 1) × size` must clear a 1MB floor before a bucket is even queried) turned a
    disk-I/O-bound multi-hour pass into one that skips the noise entirely.
 
 **Honesty — logical size is not reclaimable size, and "byte-identical" is not "safe to
