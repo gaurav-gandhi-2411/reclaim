@@ -3,6 +3,89 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## CHECKPOINT 2026-10-02 (owner shutting down) -- READ THIS FIRST, it supersedes the sections below
+
+**State at this checkpoint (VERIFIED by `git`/`gh` at the time of writing; re-check with `git fetch origin`
++ `gh pr list` before trusting it):** `origin/main` = `aba6043`. Nothing of this workstream is running:
+no subagent, no build, no scan, no soak, no verify, no benchmark (checked: process list; the only
+python/pytest processes belong to `fr-en-wt-eval`, another session's work on an EXCLUDED project, not touched).
+Docker Desktop is running (started for the prune; quit it if you want the RAM). C: free 90.04 GB, pagefile 8,704 MB.
+
+**Merged to main this round (all by the owner):** #112 Nuitka pin 4.2.2, #115 bytes_freed vs bytes_moved,
+#113 regenerable tier (ADR-0034) + one-click, #114 docs, #117 review-queue perf + full ANALYZE at scan end,
+#118 scan file IDs from the NTFS listing (ADR-0035), #120 soak harness, #119 pyjwt 2.15.1, #123/#124/#125
+dedup (stale-hash fix, env-root memo, parallel hashing), #122 apply identity compares size+mtime (ADR-0036),
+#121 path-scoped apply via the warm candidate cache + warm-status `stale`, #128 hash-persistence tests
+(ADR-0038), #126 repo `CLAUDE.md` + exclusion record, #130 `reclaim index-prune` + unlistable-subtree prune fix.
+
+**Open PRs (all rebased onto `aba6043`, all required checks green, CLEAN):**
+| PR | Branch | Base | State | Notes |
+|---|---|---|---|---|
+| #116 | `feat/weekly-autoclean` | main | ready | weekly auto-clean task, `reclaim auto-clean`, Settings toggle, typed `Get-ScheduledTaskInfo` query, PT45M limit |
+| #127 | `fix/warm-check-all-views` | main | ready | every cache reader checks warm status; cold/stale read = typed 409 `candidates_not_warm` (ADR-0037) |
+| #129 | `feat/cleanup-exclusion-list` | `feat/weekly-autoclean` | ready, STACKED | `[exclusions] project_names` honoured by every delete path, `excluded_applied` reported (ADR-0039); after #116 merges: `git rebase --onto origin/main <old #116 tip>` then `gh pr edit 129 --base main`, re-run CI |
+| #131 | `perf/dedup-inode-floor` | main | DRAFT, owner decision | see "Decisions" |
+A scratch merge of #116 + #127 + #129 + #131 onto main merged without conflicts and the full `scripts/verify.py`
+on the combined tree exited 0 (run before main moved to `aba6043`; re-verify after each merge: "green at
+handoff" is not enough for a train). #116 and #127 are independent of each other; #129 depends on #116.
+
+**Decisions waiting for the owner**
+1. **#131 inode-level floor.** Premise did not hold: of 6,570 dropped buckets only 178 (482 names) are
+   hardlink-only; 6,392 are 2+ distinct inodes whose real best-case reclaim is under 1 MiB (about 5.1 GB total)
+   that extra hardlink names had inflated over the floor. Candidates 1,967,289 -> 914,970 rows, hashed inodes
+   1,482,690 -> 713,252 (about 13 min saved, ESTIMATE). A = keep (recommended), B = exclude only the 178
+   single-inode buckets. Also unexplained: after a full ANALYZE the prefilter query slows from ~15-20 s to ~135 s
+   for BOTH old and new SQL (it runs 3x per dedup pass): investigate.
+2. **Run `reclaim index-prune --apply --vacuum` on the real installed index?** About 10-11 min, dashboard must be
+   closed (VACUUM needs an exclusive lock and ~1x index size free). Measured on a copy: 5,862,980 -> 3,773,256 rows,
+   4.89 GB -> 2.56 GB; `--deep` removes 71,293 more. 35.6% of rows were dead only because the index is one
+   un-rescanned scan from 2026-09-23.
+3. **Hash during scan?** A user who scans but never opens the dashboard has no hash cache (the installed index's
+   zero hashes were NOT a bug: dedup was simply never run on it; ADR-0038).
+4. **Warm-up still needs the whole dedup pass** (measured: new pipeline ~48 min cumulative on the real index copy
+   vs >2 h unfinished before; ESTIMATE ~1 h whole warm-up). Streaming/cancellable warm-up not built.
+
+**Next steps, in order (nothing below has started)**
+1. Owner merges #116, #127 (any order); I rebase+retarget #129, re-verify; owner merges #129 (and #131 if A).
+2. REBUILD from main: `pwsh packaging/build_installer.ps1` (~25 min warm EXPECTED, BELIEVED: Nuitka 4.2.2 is the
+   version of the current install so the ccache should be reused; my earlier "~5 h" was a stale figure; report the
+   actual and confirm cache reuse). Then both smoke tests (`packaging/test_packaged_serve.ps1`,
+   `test_packaged_safe_mode.ps1`) + `scripts/check_dist_dll_closure.py` (#108).
+3. Frozen-exe soak (2 h, FIRST RUN IS CALIBRATION; thresholds 5 MB/h private, 25/h handles, 5/h threads, 15 min
+   warm-up are reasoned, not calibrated): `python packaging\smoke\soak_serve.py --exe <reclaim.exe> --duration-minutes 120`.
+   Closes the two undiagnosed WER `RADAR_PRE_LEAK_64` reports (docs/crash-inventory-2026-10-01.md).
+4. Install on the owner's account; put `[exclusions] project_names = ["fr-en-transformer", "shipdoc-extract",
+   "intent-router"]` in the INSTALLED `config.toml` (the product default is empty; the dashboard reads it at
+   startup, the CLI/weekly task on each run). Phase C: one-click on the real drive (wall-clock, GB freed, measured
+   free before/after, skips and why, and `excluded_applied: 0`), weekly task registered and Ready, fresh full scan
+   (wall-clock, index size; run `index-prune` first if the owner approves).
+5. B6: enable the 80% notification on the OWNER's account (not ReclaimSmokeTest), tell the owner when to watch the
+   screen, trigger it (temporarily lower the threshold, restore 80), report `PeriodicNotificationCount` before/after
+   next to the owner's yes/no. Never confirmed by a human yet.
+6. One-paragraph "how to use it" for the owner.
+
+**Still open / not done**
+- Docker: the 55 anonymous volumes and 5 stopped containers and the build cache were pruned; `docker_data.vhdx`
+  went 62.30 -> 16.09 GB after the owner's diskpart compaction (46.21 GB, inside the 42-48 GB estimate); another
+  compaction would return ~2.1 GB. Ubuntu `ext4.vhdx` 26.37 GB (25 GB used; `/home/gaurav` 23 GB), nothing done.
+- `uv cache prune` (26.7 GB cache): a background prune with a 3,300 s lock timeout FAILED to get the lock (other
+  sessions held it the whole time) -- the 30-minute bounded wait in the regenerable tier may therefore also expire
+  on a busy workstation; the weekly run reports `skipped_in_use` with "waited N s". Never `--force`.
+- `fr-en-transformer` / `shipdoc-extract` / `intent-router`: HARD EXCLUSION stands (a session the owner starts on one
+  of them may work on that project only; see global CLAUDE.md 55e). The `v0.2.2-colab` tag task was dropped; nothing
+  was written there.
+- 34 git worktrees exist (`git worktree list`): ~19 `.claude/worktrees/agent-*` and `reclaim-wt-*` from this workstream
+  (all clean of unpushed work as far as known, NOT verified one by one) plus `rebase-mcp-q3` which is another
+  session's. Next session: per worktree check `git status`/`git log origin/main..HEAD`, read the output, THEN remove
+  (check-then-delete, never one command); several hold unstaged real `.onnx` files over LFS pointers. A stray 0-byte
+  scratch file from a subagent was already removed from the main checkout.
+- Unverified/limits to remember: the UI changes (Simple-mode one-click, Settings toggle, warm-check states) were
+  only tested with jsdom, never in a real browser (before/after screenshots owed per rule 15c); the compiled-exe
+  path of the weekly task and a real toast were never exercised; yarn was not installed so its lock behaviour is
+  NOT MEASURED (pip: no lock, conda: per-repodata byte lock not taken by `clean`; ADR-0034).
+- ADR numbers in use: 0034 regenerable tier, 0035 scan listing, 0036 apply identity, 0037 warm check (#127),
+  0038 hash persistence, 0039 exclusion list (#129); #131 only appends to ADR-0002.
+
 ## UPDATE 2026-10-01 (evening) — PR hygiene, owner decisions 1a-1d, cleanup executed
 
 **PR hygiene (VERIFIED via `gh pr view`):** `pip-audit` was red on EVERY open PR because eight
