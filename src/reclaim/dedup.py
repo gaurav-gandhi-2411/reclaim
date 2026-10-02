@@ -246,7 +246,31 @@ def _has_site_packages(directory: Path) -> bool:
     return False
 
 
-def _environment_root(path: Path) -> Path | None:
+def _is_environment_root(ancestor: Path, cache: dict[Path, bool] | None) -> bool:
+    """One directory's verdict for `_environment_root`'s walk, memoised in `cache` when given.
+    A directory's markers do not change within one candidate-generation pass, and the ancestors
+    of a cluster's members are overwhelmingly shared (every file under one venv walks the same
+    ~10 parents), so the un-memoised walk cost ~58 stat calls per duplicate member -- 91% of
+    `generate_duplicate_candidates`'s time on the owner's real index. Callers scope the cache to
+    one pass (never module-level), so a venv created later is still seen on the next pass."""
+    if cache is not None and ancestor in cache:
+        return cache[ancestor]
+    try:
+        result = (
+            (ancestor / _CONDA_MARKER_DIRNAME).is_dir()
+            or (ancestor / _VENV_MARKER_FILENAME).is_file()
+            or _has_python_executable(ancestor)
+            or _has_interpreter_bin_dir(ancestor)
+            or _has_site_packages(ancestor)
+        )
+    except OSError:
+        result = False
+    if cache is not None:
+        cache[ancestor] = result
+    return result
+
+
+def _environment_root(path: Path, cache: dict[Path, bool] | None = None) -> Path | None:
     """The root directory of the Python environment `path` lives inside (a conda base install, a
     named conda `envs/<name>`, a `venv`/`.venv`, or a standalone Python installation), if any.
     Walks UP from `path` looking for the nearest ancestor that IS an environment/installation
@@ -271,23 +295,14 @@ def _environment_root(path: Path) -> Path | None:
     if any(part.lower() == "pkgs" for part in path.parts):
         return None
     for ancestor in path.parents:
-        try:
-            if (ancestor / _CONDA_MARKER_DIRNAME).is_dir() or (
-                ancestor / _VENV_MARKER_FILENAME
-            ).is_file():
-                return ancestor
-            if (
-                _has_python_executable(ancestor)
-                or _has_interpreter_bin_dir(ancestor)
-                or _has_site_packages(ancestor)
-            ):
-                return ancestor
-        except OSError:
-            continue
+        if _is_environment_root(ancestor, cache):
+            return ancestor
     return None
 
 
-def _is_cross_environment_duplicate(duplicate: FileRecord, keep: FileRecord) -> bool:
+def _is_cross_environment_duplicate(
+    duplicate: FileRecord, keep: FileRecord, cache: dict[Path, bool] | None = None
+) -> bool:
     """ADR-0008: true if `duplicate` lives inside a recognized live Python environment (conda
     base, a named `envs/<name>`, or a venv) and `keep` does NOT live inside that SAME
     environment — whether `keep` is in a different environment, or not in any recognized
@@ -304,14 +319,17 @@ def _is_cross_environment_duplicate(duplicate: FileRecord, keep: FileRecord) -> 
     keep its OWN copy of its own files; an identical copy existing somewhere else (another
     environment, or a cache) does not make deleting the environment's own copy safe, regardless
     of what's kept."""
-    duplicate_root = _environment_root(duplicate.path)
+    duplicate_root = _environment_root(duplicate.path, cache)
     if duplicate_root is None:
         return False
-    return _environment_root(keep.path) != duplicate_root
+    return _environment_root(keep.path, cache) != duplicate_root
 
 
 def _dedup_ineligibility_reason(
-    duplicate: FileRecord, keep: FileRecord, model_cache_roots: Sequence[Path]
+    duplicate: FileRecord,
+    keep: FileRecord,
+    model_cache_roots: Sequence[Path],
+    env_root_cache: dict[Path, bool] | None = None,
 ) -> str | None:
     """ADR-0008: why `duplicate` can never be an `exact_duplicate` deletion candidate,
     regardless of `SafetyValidator`'s verdict — `None` if there's no such reason. Checked before
@@ -319,7 +337,7 @@ def _dedup_ineligibility_reason(
     as a `BLOCKED`/`ELIGIBLE` candidate — it simply isn't one."""
     if _is_model_cache_path(duplicate.path, model_cache_roots):
         return "model_cache_managed"
-    if _is_cross_environment_duplicate(duplicate, keep):
+    if _is_cross_environment_duplicate(duplicate, keep, env_root_cache):
         return "cross_environment"
     return None
 
@@ -688,10 +706,13 @@ def generate_duplicate_candidates(
         else find_duplicate_clusters(index, min_reclaim_bytes=min_reclaim_bytes, skips=skips)
     )
     model_cache_roots = [Path(p) for p in config.categories.model_caches.paths]
+    env_root_cache: dict[Path, bool] = {}  # one pass only -- see `_is_environment_root`
     for cluster in resolved_clusters:
         eligible_duplicates: list[FileRecord] = []
         for duplicate in cluster.duplicates:
-            reason = _dedup_ineligibility_reason(duplicate, cluster.keep, model_cache_roots)
+            reason = _dedup_ineligibility_reason(
+                duplicate, cluster.keep, model_cache_roots, env_root_cache
+            )
             if reason is not None:
                 logger.info(
                     "dedup.member_excluded",
