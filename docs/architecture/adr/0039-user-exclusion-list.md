@@ -1,4 +1,4 @@
-# 0037. User exclusion list: projects that no cleanup may ever touch
+# 0039. User exclusion list: projects that no cleanup may ever touch
 
 ## Context
 

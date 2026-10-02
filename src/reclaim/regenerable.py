@@ -330,7 +330,7 @@ class RegenerableEnv:
     # scheduled task can pick a different bound.
     uv_lock_wait_seconds: float = UV_LOCK_WAIT_SECONDS
     disk_anchor: Path | None = None
-    # ADR-0037: user exclusion patterns (`config.exclusion_patterns` -- `[safety] deny` globs and
+    # ADR-0039: user exclusion patterns (`config.exclusion_patterns` -- `[safety] deny` globs and
     # one `*<name>*` glob per `[exclusions] project_names`). Any top-level entry whose full path,
     # or ANY path beneath it, matches is skipped whole and reported, never deleted. Native tool
     # cache roots and browser cache dirs are fixed, but are checked too (a match there is a
@@ -373,7 +373,7 @@ class RegenerableItemResult:
     files_skipped_in_use: int = 0
     detail: str = ""
     skipped_paths: list[str] = field(default_factory=list)
-    # ADR-0037: `"<path> :: <pattern>"` for every entry left alone because of a user exclusion.
+    # ADR-0039: `"<path> :: <pattern>"` for every entry left alone because of a user exclusion.
     excluded: list[str] = field(default_factory=list)
     # Every top-level path this item actually handed to a delete (apply only) -- the set the
     # run report intersects with the exclusions to state `excluded_applied: 0` mechanically.
@@ -773,7 +773,7 @@ def _aged_children(
         child_path = Path(child)
         if not _resolve_contained(child_path, root) and not _is_reparse_or_missing(child):
             continue
-        # ADR-0037: BEFORE the age/guard logic and before anything is measured for deletion. The
+        # ADR-0039: BEFORE the age/guard logic and before anything is measured for deletion. The
         # whole top-level entry is skipped when the entry OR anything beneath it matches: a
         # deletable-looking parent (`%TEMP%/claude`) must not take an excluded child with it.
         # A reparse point is removed as a link entry (its target is never walked or touched), so
@@ -1037,7 +1037,7 @@ def count_excluded_applied(applied_paths: Sequence[str], patterns: Sequence[str]
     """How many of the paths a run actually handed to a delete match a user exclusion -- the
     mechanical form of "none of the excluded projects appeared among applied candidates". Must be
     0; a non-zero value is a bug in this module's own skip logic, so callers treat it as a hard
-    failure (ADR-0037)."""
+    failure (ADR-0039)."""
     return sum(
         1
         for path in applied_paths

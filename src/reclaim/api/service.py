@@ -2527,7 +2527,7 @@ def _execute_regenerable_clean(
 ) -> RegenerableCleanResponse:
     """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`."""
     env = regenerable_clean_env()
-    # ADR-0037: required (no default) so no caller can run the tier without stating its exclusions.
+    # ADR-0039: required (no default) so no caller can run the tier without stating its exclusions.
     env.excluded_patterns = tuple(excluded_patterns)
     report = regenerable.run_regenerable_clean(
         env,
