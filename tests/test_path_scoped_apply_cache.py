@@ -288,12 +288,12 @@ def test_swapped_file_is_skipped_identity_changed_and_nothing_else_touched(
 
 
 @pytest.mark.parametrize("warm", [False, True])
-def test_in_place_append_outcome_is_identical_warm_and_cold(tmp_path: Path, warm: bool) -> None:
-    """PRE-EXISTING behavior, pinned for parity rather than endorsed: the top-level file
-    identity check (`preflight.check_identity_unchanged_since_scan`) compares only `(dev, ino)`;
-    size/mtime are recorded for logging. An in-place append keeps the inode, so the file is NOT
-    skipped -- on the cold (detector) path and on the cached path alike. The cache neither adds
-    nor removes this gap."""
+def test_in_place_append_is_skipped_warm_and_cold(tmp_path: Path, warm: bool) -> None:
+    """ADR-0036 (#122): the top-level file identity check now compares size and mtime as well as
+    `(dev, ino)`. An in-place append keeps the inode but changes size and mtime, so it is skipped
+    with `size_or_mtime_changed_since_scan` on the cold (detector) path AND on the cached path:
+    the warm cache replaces only detection, never this check. (Before #122 this test pinned the
+    old gap: the appended file was applied.)"""
     root = tmp_path / "tree"
     tree = _Tree(root)
     client = _make_app(tmp_path, root)
@@ -301,11 +301,34 @@ def test_in_place_append_outcome_is_identical_warm_and_cold(tmp_path: Path, warm
     if warm:
         _warm(client)
         assert service.is_candidates_cache_warm(client.app.state.reclaim)
+    before = tree.log_a.read_bytes()
     with tree.log_a.open("ab") as fh:
         fh.write(b"more")
     result = _apply(client, [tree.log_a.as_posix()], dry_run=False)
     item = _item(result, tree.log_a)
-    assert (item["succeeded"], item["skip_reason"]) == (True, None)
+    assert (item["succeeded"], item["skip_reason"]) == (False, "size_or_mtime_changed_since_scan")
+    assert tree.log_a.read_bytes() == before + b"more"
+    _untouched(tree.log_b, tree.plain)
+
+
+def test_mtime_only_touch_is_skipped_through_the_warm_cache(tmp_path: Path) -> None:
+    """Teeth for the owner's condition on #121: a stale cached candidate for a file whose mtime
+    alone moved after the scan must still be skipped by the strengthened preflight."""
+    import os
+    import time
+
+    root = tmp_path / "tree"
+    tree = _Tree(root)
+    client = _make_app(tmp_path, root)
+    _scan(client, root)
+    _warm(client)
+    assert service.is_candidates_cache_warm(client.app.state.reclaim)
+    later = time.time() + 120
+    os.utime(tree.log_a, (later, later))
+    result = _apply(client, [tree.log_a.as_posix()], dry_run=False)
+    item = _item(result, tree.log_a)
+    assert (item["succeeded"], item["skip_reason"]) == (False, "size_or_mtime_changed_since_scan")
+    assert tree.log_a.exists()
     _untouched(tree.log_b, tree.plain)
 
 
