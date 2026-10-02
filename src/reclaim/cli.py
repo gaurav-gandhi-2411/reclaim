@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import sqlite3
 import sys
 import time
 from collections.abc import Sequence
@@ -42,6 +43,7 @@ from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode,
 from reclaim.purge import purge_eligible_entries, purge_expired
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation
 from reclaim.safety import SafetyValidator
+from reclaim.index_prune import prune_dead_rows
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
 # Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
@@ -116,6 +118,40 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Thread pool size for the per-top-level-directory walk (default: cpu-based).",
+    )
+
+    prune_parser = subparsers.add_parser(
+        "index-prune",
+        help="Remove index rows for files/directories that no longer exist (dry run unless "
+        "--apply). Checks directories, not files; anything it cannot verify is kept.",
+    )
+    prune_parser.add_argument(
+        "--db",
+        type=Path,
+        default=_DEFAULT_DB_PATH,
+        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+    )
+    prune_parser.add_argument(
+        "--apply", action="store_true", help="Actually delete the dead rows (default: dry run)."
+    )
+    prune_parser.add_argument(
+        "--root",
+        type=str,
+        action="append",
+        default=None,
+        help="Only consider rows under this path (repeatable). Default: the whole index.",
+    )
+    prune_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Also list every existing directory once and drop rows for entries no longer in "
+        "it (slower: one directory listing per indexed directory).",
+    )
+    prune_parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="With --apply: VACUUM afterwards so the file shrinks (needs free disk about equal "
+        "to the index size and no other process using the index).",
     )
 
     reconcile_parser = subparsers.add_parser(
@@ -617,6 +653,47 @@ def _run_scan(args: argparse.Namespace) -> int:
             f"{stats.inaccessible_known_bytes} bytes known (best-effort estimate), "
             f"{stats.inaccessible_unknown_count} path(s) with no size estimate at all "
             "-- see `reclaim reconcile` for how this compares to real disk usage."
+        )
+    return 0
+
+
+def _run_index_prune(args: argparse.Namespace) -> int:
+    if not args.db.exists():
+        print(  # noqa: T201
+            f"reclaim index-prune: no index found at {args.db} -- nothing to prune.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.vacuum and not args.apply:
+        print("reclaim index-prune: --vacuum requires --apply.", file=sys.stderr)  # noqa: T201
+        return 2
+    roots = [Path(root).as_posix() for root in args.root] if args.root else None
+    size_before = args.db.stat().st_size
+    try:
+        with ScanIndex(args.db) as index:
+            report = prune_dead_rows(index, apply=args.apply, root_prefixes=roots, deep=args.deep)
+            if args.apply and report.dead_rows:
+                # Same reason a scan refreshes them: planner statistics describe the table as
+                # it was; a large delete changes row counts per prefix.
+                index.refresh_planner_stats()
+            if args.apply and args.vacuum:
+                index.vacuum()
+    except sqlite3.OperationalError as exc:
+        print(f"reclaim index-prune: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+    verb = "removed" if args.apply else "would remove (dry run, use --apply)"
+    print(  # noqa: T201 -- CLI output, not application logging
+        f"reclaim index-prune: {verb} {report.dead_rows} of {report.rows_examined} rows "
+        f"({report.dead_bytes} bytes); {report.dirs_checked} directories checked, "
+        f"{report.dirs_missing} missing; {report.unknown_rows_kept} rows kept because their "
+        f"existence could not be verified; {report.seconds:.1f}s"
+    )
+    for prefix, count in report.dead_by_prefix.most_common(10):
+        print(f"reclaim index-prune:   {count:>9} dead rows under {prefix}")  # noqa: T201
+    if args.apply:
+        print(  # noqa: T201
+            f"reclaim index-prune: index file {size_before} -> {args.db.stat().st_size} bytes"
+            + ("" if args.vacuum else " (pass --vacuum to return freed pages to the OS)")
         )
     return 0
 
@@ -1309,6 +1386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_scan(args)
     if args.command == "reconcile":
         return _run_reconcile(args)
+    if args.command == "index-prune":
+        return _run_index_prune(args)
     if args.command == "apply":
         return _run_apply(args)
     if args.command == "undo":
