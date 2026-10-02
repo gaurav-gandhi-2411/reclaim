@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
@@ -28,6 +28,7 @@ from reclaim.models import (
     Verdict,
 )
 from reclaim.safety import SafetyValidator
+from reclaim.scanner import long_path
 
 logger = structlog.get_logger(__name__)
 
@@ -59,7 +60,15 @@ _WRITE_BATCH_SIZE = 500
 # syscall only costs one pool slot, not the calling thread — Python has no cross-platform way
 # to preempt a blocked `read()`, so a timed-out thread is abandoned, not killed.
 _HASH_READ_TIMEOUT_SECONDS = 30.0
-_HASH_TIMEOUT_WORKERS = 8
+# Measured on the owner's real index (docs: perf/dedup-warmup report): a COLD open() costs ~10 ms
+# (real-time AV scan on first open) while the bytes themselves are noise, so hashing is
+# latency-bound, not CPU- or bandwidth-bound -- 8 threads gave ~7x and 32 threads ~11x the serial
+# files/s. 16 = the machine's logical core count; the pool is I/O-wait dominated, not CPU.
+_HASH_TIMEOUT_WORKERS = 16
+# Buckets are hashed a window at a time (not bucket-by-bucket) so the pool stays full even though
+# most size buckets are small. Memory stays bounded: a window holds ~this many FileRecords (more
+# only when one single bucket is larger).
+_WINDOW_FILES = 2048
 
 # Mirrors `config.DuplicatesConfig.min_reclaim_bytes`'s default — the value real callers
 # (`generate_duplicate_candidates`, driven by `config.categories.duplicates.min_reclaim_bytes`)
@@ -360,7 +369,12 @@ def _hash_with_guard(
     """Runs `fn(path, *args)` on `executor` and returns `(digest, skip_reason)` — exactly one
     is `None`. Never raises: a timeout or `OSError` both become a skip reason instead of
     propagating and killing the whole dedup run over one bad file."""
-    future = executor.submit(fn, path, *args)
+    return _await_digest(executor.submit(fn, path, *args), timeout_seconds)
+
+
+def _await_digest(
+    future: Future[str], timeout_seconds: float = _HASH_READ_TIMEOUT_SECONDS
+) -> tuple[str | None, str | None]:
     try:
         return future.result(timeout=timeout_seconds), None
     except FutureTimeoutError:
@@ -402,22 +416,17 @@ def _cached_full_lookup(entry: HashCacheEntry | None, size: int, mtime: float) -
     return cached_full_hash(entry, current_size=size, current_mtime=mtime)
 
 
-def _hash_member(
-    *,
-    index: ScanIndex,
-    executor: ThreadPoolExecutor,
-    hash_cache: dict[str, HashCacheEntry],
+def _resolve_one(
     record: FileRecord,
+    *,
     stage: str,
+    hash_cache: dict[str, HashCacheEntry],
     cached_lookup: Callable[[HashCacheEntry | None, int, float], str | None],
     compute: Callable[..., str],
     compute_args: tuple[object, ...],
-    pending_writes: list[tuple[Path, int, float, str]],
-    skips: list[HashSkip] | None,
-) -> str | None:
-    """Shared body of one hash computation (partial or full), used identically by both stages
-    of `find_duplicate_clusters`'s per-bucket loop: check the cache, else hash-with-guard, else
-    record a skip; queue a DB write on a genuine cache miss. Returns `None` on skip."""
+) -> tuple[str, bool]:
+    """Worker-thread body for one hash (partial or full): `(digest, came_from_cache)`. Raises
+    `OSError` from the read, which `_await_digest` turns into a skip reason."""
     entry = hash_cache.get(record.path.as_posix())
     digest = cached_lookup(entry, record.size_bytes, record.mtime)
     if digest is not None:
@@ -426,16 +435,117 @@ def _hash_member(
         # a would-be cache HIT pays the stat (misses hash the file anyway).
         fresh = fresh_stat_signature(record.path)
         if fresh is None or (fresh.size, fresh.mtime) == (record.size_bytes, record.mtime):
-            return digest
+            return digest, True
         logger.info("dedup.hash_cache_stale_listing", stage=stage, path=str(record.path))
-    digest, reason = _hash_with_guard(executor, compute, record.path, *compute_args)
-    if digest is None:
-        logger.warning("dedup.hash_unreadable", stage=stage, path=str(record.path), reason=reason)
-        if skips is not None:
-            skips.append(HashSkip(path=record.path, stage=stage, reason=reason or ""))
-        return None
-    pending_writes.append((record.path, record.size_bytes, record.mtime, digest))
-    return digest
+    return compute(record.path, *compute_args), False
+
+
+def _same_file_now(record: FileRecord) -> bool:
+    """True iff `record`'s name still resolves, right now, to the very inode (and size) the index
+    recorded -- the proof a hardlink sibling may borrow its group's hash. A stat is ~0.7 ms where
+    a cold open is ~10 ms. Never raises: any doubt (missing, replaced, unreadable) is False and
+    the caller hashes that name on its own, exactly as it would without the optimisation."""
+    try:
+        st = Path(long_path(record.path)).stat()
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino, st.st_size) == (record.dev, record.ino, record.size_bytes)
+
+
+def _hash_stage(
+    executor: ThreadPoolExecutor,
+    records: Sequence[FileRecord],
+    *,
+    stage: str,
+    hash_cache: dict[str, HashCacheEntry],
+    cached_lookup: Callable[[HashCacheEntry | None, int, float], str | None],
+    compute: Callable[..., str],
+    with_size_arg: bool,
+    pending_writes: list[tuple[Path, int, float, str]],
+    skips: list[HashSkip] | None,
+    collapse_hardlinks: bool = True,
+) -> dict[Path, str]:
+    """Hashes `records` concurrently on `executor` (cache check, else compute, else skip) and
+    returns `{path: digest}` for every record that produced one.
+
+    Hardlinks: records sharing a non-zero `(dev, ino)` are one file with one content, so only
+    the first of each such group is read; every other name borrows that digest ONLY after a live
+    stat confirms it still points at the same inode (`_same_file_now`). A name that fails that
+    check -- or whose group's first member is unreadable -- is hashed on its own in a second
+    pass, so the skips, cache rows and clusters equal what hashing every name separately gives.
+    `ino == 0` means "identity unknown" (synthetic/test records) and is never collapsed."""
+    by_identity: dict[object, list[FileRecord]] = {}
+    for record in records:
+        key: object = (record.dev, record.ino) if record.ino and collapse_hardlinks else record.path
+        by_identity.setdefault(key, []).append(record)
+
+    submitted = [
+        (
+            group,
+            executor.submit(
+                _resolve_one,
+                group[0],
+                stage=stage,
+                hash_cache=hash_cache,
+                cached_lookup=cached_lookup,
+                compute=compute,
+                compute_args=(group[0].size_bytes,) if with_size_arg else (),
+            ),
+            [executor.submit(_same_file_now, sibling) for sibling in group[1:]],
+        )
+        for group in by_identity.values()
+    ]
+    digests: dict[Path, str] = {}
+    fallback: list[FileRecord] = []
+    for group, future, sibling_checks in submitted:
+        first = group[0]
+        reason: str | None = None
+        try:
+            digest, from_cache = future.result(timeout=_HASH_READ_TIMEOUT_SECONDS)
+        except FutureTimeoutError:
+            digest, from_cache, reason = None, False, "timeout"
+        except OSError as exc:
+            digest, from_cache, reason = None, False, str(exc)
+        if digest is None:
+            logger.warning(
+                "dedup.hash_unreadable", stage=stage, path=str(first.path), reason=reason
+            )
+            if skips is not None:
+                skips.append(HashSkip(path=first.path, stage=stage, reason=reason or ""))
+            fallback.extend(group[1:])
+            continue
+        digests[first.path] = digest
+        if not from_cache:
+            pending_writes.append((first.path, first.size_bytes, first.mtime, digest))
+        for sibling, check in zip(group[1:], sibling_checks, strict=True):
+            try:
+                same = check.result(timeout=_HASH_READ_TIMEOUT_SECONDS)
+            except FutureTimeoutError:
+                same = False
+            if not same:
+                fallback.append(sibling)
+                continue
+            digests[sibling.path] = digest
+            # The sibling never touched the disk, but a restart should still find its row.
+            own = hash_cache.get(sibling.path.as_posix())
+            if cached_lookup(own, sibling.size_bytes, sibling.mtime) is None:
+                pending_writes.append((sibling.path, sibling.size_bytes, sibling.mtime, digest))
+    if fallback:
+        digests.update(
+            _hash_stage(
+                executor,
+                fallback,
+                stage=stage,
+                hash_cache=hash_cache,
+                cached_lookup=cached_lookup,
+                compute=compute,
+                with_size_arg=with_size_arg,
+                pending_writes=pending_writes,
+                skips=skips,
+                collapse_hardlinks=False,
+            )
+        )
+    return digests
 
 
 def materiality_exclusion_stats(
@@ -502,88 +612,107 @@ def find_duplicate_clusters(
     clusters: list[DuplicateCluster] = []
     partial_writes: list[tuple[Path, int, float, str]] = []
     full_writes: list[tuple[Path, int, float, str]] = []
-    partial_hashed = 0
-    full_hashed = 0
-    buckets_seen = 0
+    counters = {"partial": 0, "full": 0, "buckets": 0}
     last_heartbeat = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
-        for size, members_iter in itertools.groupby(
-            index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes),
-            key=lambda record: record.size_bytes,
-        ):
-            buckets_seen += 1
-            members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
+    def heartbeat() -> None:
+        nonlocal last_heartbeat
+        now = time.monotonic()
+        if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
+            logger.info(
+                "dedup.progress",
+                buckets_seen=counters["buckets"],
+                partial_hashed=counters["partial"],
+                full_hashed=counters["full"],
+                candidate_files=candidate_count,
+                clusters_found=len(clusters),
+            )
+            last_heartbeat = now
 
+    def flush_writes() -> None:
+        if partial_writes:
+            index.store_partial_hashes(partial_writes)
+            partial_writes.clear()
+        if full_writes:
+            index.store_full_hashes(full_writes)
+            full_writes.clear()
+
+    def process_window(
+        executor: ThreadPoolExecutor, window: list[tuple[int, list[FileRecord]]]
+    ) -> None:
+        # Stage 1: 64KB head+tail partial hash of every file in the window, concurrently.
+        partial_digests = _hash_stage(
+            executor,
+            [record for _, members in window for record in members],
+            stage="partial",
+            hash_cache=hash_cache,
+            cached_lookup=_cached_partial_lookup,
+            compute=_compute_partial_hash,
+            with_size_arg=True,
+            pending_writes=partial_writes,
+            skips=skips,
+        )
+        counters["partial"] += len(partial_digests)
+        heartbeat()
+
+        # Same-size files that also share a partial hash are the only full-hash candidates.
+        bucket_subsets: list[tuple[int, list[list[FileRecord]]]] = []
+        full_needed: list[FileRecord] = []
+        full_digests: dict[Path, str] = {}
+        for size, members in window:
             partial_groups: dict[str, list[FileRecord]] = defaultdict(list)
             for record in members:
-                digest = _hash_member(
-                    index=index,
-                    executor=executor,
-                    hash_cache=hash_cache,
-                    record=record,
-                    stage="partial",
-                    cached_lookup=_cached_partial_lookup,
-                    compute=_compute_partial_hash,
-                    compute_args=(record.size_bytes,),
-                    pending_writes=partial_writes,
-                    skips=skips,
-                )
-                if digest is None:
-                    continue
-                partial_groups[digest].append(record)
-                partial_hashed += 1
-                if len(partial_writes) >= _WRITE_BATCH_SIZE:
-                    index.store_partial_hashes(partial_writes)
-                    partial_writes.clear()
-                now = time.monotonic()
-                if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
-                    logger.info(
-                        "dedup.progress",
-                        buckets_seen=buckets_seen,
-                        partial_hashed=partial_hashed,
-                        full_hashed=full_hashed,
-                        candidate_files=candidate_count,
-                        clusters_found=len(clusters),
-                    )
-                    last_heartbeat = now
+                digest = partial_digests.get(record.path)
+                if digest is not None:
+                    partial_groups[digest].append(record)
+            subsets = [subset for subset in partial_groups.values() if len(subset) >= 2]
+            bucket_subsets.append((size, subsets))
+            for subset in subsets:
+                for record in subset:
+                    if size <= _PARTIAL_HASH_WHOLE_FILE_THRESHOLD:
+                        # A file this small is hashed WHOLE by `_compute_partial_hash`, so its
+                        # partial digest already IS the full-file BLAKE3 digest; reading it a
+                        # second time cannot learn anything. Larger files still get a real
+                        # full read below -- a partial match alone never makes a duplicate.
+                        full_digests[record.path] = partial_digests[record.path]
+                        entry = hash_cache.get(record.path.as_posix())
+                        if _cached_full_lookup(entry, record.size_bytes, record.mtime) is None:
+                            full_writes.append(
+                                (
+                                    record.path,
+                                    record.size_bytes,
+                                    record.mtime,
+                                    full_digests[record.path],
+                                )
+                            )
+                    else:
+                        full_needed.append(record)
+        # Stage 2: full BLAKE3 of the remaining candidates (the final arbiter), concurrently.
+        full_digests.update(
+            _hash_stage(
+                executor,
+                full_needed,
+                stage="full",
+                hash_cache=hash_cache,
+                cached_lookup=_cached_full_lookup,
+                compute=lambda path: _compute_full_hash(path),
+                with_size_arg=False,
+                pending_writes=full_writes,
+                skips=skips,
+            )
+        )
+        counters["full"] += len(full_digests)
+        flush_writes()
+        heartbeat()
 
-            for subset in partial_groups.values():
-                if len(subset) < 2:
-                    continue
+        # Cluster assembly, in the same bucket / partial-group / digest order as always.
+        for size, subsets in bucket_subsets:
+            for subset in subsets:
                 full_groups: dict[str, list[FileRecord]] = defaultdict(list)
                 for record in subset:
-                    digest = _hash_member(
-                        index=index,
-                        executor=executor,
-                        hash_cache=hash_cache,
-                        record=record,
-                        stage="full",
-                        cached_lookup=_cached_full_lookup,
-                        compute=_compute_full_hash,
-                        compute_args=(),
-                        pending_writes=full_writes,
-                        skips=skips,
-                    )
-                    if digest is None:
-                        continue
-                    full_groups[digest].append(record)
-                    full_hashed += 1
-                    if len(full_writes) >= _WRITE_BATCH_SIZE:
-                        index.store_full_hashes(full_writes)
-                        full_writes.clear()
-                    now = time.monotonic()
-                    if _due(last=last_heartbeat, now=now, interval=_HEARTBEAT_INTERVAL_SECONDS):
-                        logger.info(
-                            "dedup.progress",
-                            buckets_seen=buckets_seen,
-                            partial_hashed=partial_hashed,
-                            full_hashed=full_hashed,
-                            candidate_files=candidate_count,
-                            clusters_found=len(clusters),
-                        )
-                        last_heartbeat = now
-
+                    digest = full_digests.get(record.path)
+                    if digest is not None:
+                        full_groups[digest].append(record)
                 for full_hash, final_members in full_groups.items():
                     if len(final_members) < 2:
                         continue
@@ -594,10 +723,25 @@ def find_duplicate_clusters(
                             full_hash=full_hash, size_bytes=size, keep=keep, duplicates=duplicates
                         )
                     )
-    if partial_writes:
-        index.store_partial_hashes(partial_writes)
-    if full_writes:
-        index.store_full_hashes(full_writes)
+
+    with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
+        window: list[tuple[int, list[FileRecord]]] = []
+        window_files = 0
+        for size, members_iter in itertools.groupby(
+            index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes),
+            key=lambda record: record.size_bytes,
+        ):
+            counters["buckets"] += 1
+            members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
+            window.append((size, members))
+            window_files += len(members)
+            if window_files >= _WINDOW_FILES:
+                process_window(executor, window)
+                window, window_files = [], 0
+        if window:
+            process_window(executor, window)
+    flush_writes()
+    buckets_seen = counters["buckets"]
 
     logger.info(
         "dedup.done",
