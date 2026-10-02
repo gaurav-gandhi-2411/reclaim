@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from reclaim.config import Config
+from reclaim.config import Config, exclusion_patterns
 from reclaim.models import FileRecord, SafetyResult, Verdict
 
 REASON_PROTECTED_SYSTEM_ROOT = "PROTECTED_SYSTEM_ROOT"
@@ -19,6 +20,7 @@ REASON_VM_IMAGE = "VM_IMAGE"
 REASON_DOCKER_WSL_ROOT = "DOCKER_WSL_DATA_ROOT"
 REASON_CLOUD_PLACEHOLDER = "CLOUD_PLACEHOLDER"
 REASON_USER_DENY_LIST = "USER_DENY_LIST"
+REASON_USER_EXCLUSION = "USER_EXCLUSION"
 REASON_FINANCE_LEGAL_DOCUMENT = "FINANCE_LEGAL_DOCUMENT"
 REASON_USER_ALLOW_LIST_OVERRIDE = "USER_ALLOW_LIST_OVERRIDE"
 REASON_USER_ALLOW_LIST = "USER_ALLOW_LIST"
@@ -55,6 +57,55 @@ def _pattern_matches(path: Path, pattern: str) -> bool:
 
 def _any_pattern_matches(path: Path, patterns: Sequence[str]) -> bool:
     return any(_pattern_matches(path, pattern) for pattern in patterns)
+
+
+def first_matching_pattern(
+    path: Path | str, patterns: Sequence[str], *, is_dir: bool = False
+) -> str | None:
+    """The first of `patterns` (user deny/exclusion globs or `re:` regexes) that `path` matches,
+    else None. For a directory the trailing-slash form is tried too, so a `*/proj/*` glob also
+    matches the directory `proj` itself -- deleting a directory deletes everything under it.
+    Pure string matching, no I/O: shared by the generic pipeline, the executor's last-line check
+    and the regenerable tier (ADR-0037)."""
+    base = Path(path)
+    for pattern in patterns:
+        if _pattern_matches(base, pattern):
+            return pattern
+        if is_dir and _pattern_matches(Path(str(base) + "/"), pattern):
+            return pattern
+    return None
+
+
+def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | None:
+    """First pattern matched by `root` or by ANY entry (file or directory, by full path) beneath
+    it, else None. Name-only `os.scandir` walk (no stat), reparse points are not followed. Used
+    before deleting a whole directory: a directory that merely CONTAINS an excluded tree (e.g.
+    `%TEMP%/claude` holding `.../C--Users-...-<project>`) must not be deleted wholesale.
+    Unreadable directories are skipped, not treated as clean-and-safe-to-delete-silently: the
+    caller still gets every match found in what could be listed. No patterns -> no walk."""
+    if not patterns:
+        return None
+    hit = first_matching_pattern(root, patterns, is_dir=True)
+    if hit is not None:
+        return hit
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    hit = first_matching_pattern(entry.path, patterns, is_dir=is_dir)
+                    if hit is not None:
+                        return hit
+                    if is_dir:
+                        stack.append(entry.path)
+        except OSError:
+            continue
+    return None
 
 
 def _canonical_path(path: Path) -> Path:
@@ -157,6 +208,28 @@ class SafetyValidator:
     def __init__(self, config: Config) -> None:
         self._safety = config.safety
         self._dev_artifacts_enabled = config.categories.dev_artifacts.enabled
+        # ADR-0037: `[safety] deny` + one glob per `[exclusions] project_names` entry.
+        self._user_exclusions = exclusion_patterns(config)
+
+    @property
+    def exclusion_patterns(self) -> tuple[str, ...]:
+        """The live user deny/exclusion patterns this validator enforces (for callers that need
+        the same list outside `evaluate`, e.g. the regenerable tier and the apply report)."""
+        return tuple(self._user_exclusions)
+
+    def exclusion_match(self, path: Path, *, is_dir: bool = False) -> str | None:
+        """The user deny/exclusion pattern `path` matches (canonicalised first, like
+        `evaluate`), or -- for a directory -- one matched by anything beneath it; else None.
+        Stat-free for files; a directory costs one name-only subtree walk, and only when any
+        pattern is configured. Never consults the built-in deny list or the allow-list."""
+        patterns = self._user_exclusions
+        if not patterns:
+            return None
+        canonical = _canonical_path(path)
+        hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
+        if hit is None and is_dir:
+            hit = subtree_exclusion_match(canonical, patterns)
+        return hit
 
     def evaluate(self, record: FileRecord) -> SafetyResult:
         # D13 second pass: resolved ONCE per record (not once per pattern -- `_canonical_path`
@@ -178,6 +251,21 @@ class SafetyValidator:
                 rationale=(
                     "Path matches a user-configured deny-list pattern in config.toml "
                     "[safety.deny] — blocked regardless of any allow-list entry."
+                ),
+            )
+
+        # ADR-0037: `[exclusions] project_names` (and, for a directory candidate, a user pattern
+        # matched by anything INSIDE it -- deleting the directory would delete that content).
+        exclusion_hit = self.exclusion_match(record.path, is_dir=record.is_dir)
+        if exclusion_hit is not None:
+            return SafetyResult(
+                record=record,
+                verdict=Verdict.BLOCKED,
+                reason_code=REASON_USER_EXCLUSION,
+                rationale=(
+                    f"Path (or, for a directory, something inside it) matches the user "
+                    f"exclusion '{exclusion_hit}' from config.toml [exclusions]/[safety] — "
+                    "off-limits to every cleanup, blocked regardless of any allow-list entry."
                 ),
             )
 

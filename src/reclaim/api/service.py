@@ -1120,7 +1120,9 @@ def list_candidates(
         cluster_by_path = (
             _index_clusters_by_duplicate_path(
                 find_duplicate_clusters(
-                    index, min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes
+                    index,
+                    min_reclaim_bytes=state.config.categories.duplicates.min_reclaim_bytes,
+                    exclusion_patterns=state.safety.exclusion_patterns,
                 )
             )
             if needs_cluster_info
@@ -1240,7 +1242,9 @@ def list_duplicate_cluster_review(
         # function would otherwise recompute clusters itself, hashing every candidate file a
         # second time (see `generate_duplicate_candidates`'s `clusters` param docstring).
         clusters = find_duplicate_clusters(
-            index, min_reclaim_bytes=config.categories.duplicates.min_reclaim_bytes
+            index,
+            min_reclaim_bytes=config.categories.duplicates.min_reclaim_bytes,
+            exclusion_patterns=state.safety.exclusion_patterns,
         )
         duplicate_candidates = generate_duplicate_candidates(
             index, config, state.safety, clusters=clusters
@@ -2508,12 +2512,14 @@ def _regenerable_item_out(item: regenerable.RegenerableItemResult) -> Regenerabl
         files_skipped_in_use=item.files_skipped_in_use,
         detail=item.detail,
         skipped_paths=item.skipped_paths,
+        excluded=item.excluded,
     )
 
 
 def _execute_regenerable_clean(
     *,
     apply: bool,
+    excluded_patterns: Sequence[str],
     audit_log_path: Path | None,
     on_item_start: Callable[[str, str, bool], None] | None = None,
     on_item_done: Callable[[regenerable.RegenerableItemResult], None] | None = None,
@@ -2521,6 +2527,8 @@ def _execute_regenerable_clean(
 ) -> RegenerableCleanResponse:
     """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`."""
     env = regenerable_clean_env()
+    # ADR-0037: required (no default) so no caller can run the tier without stating its exclusions.
+    env.excluded_patterns = tuple(excluded_patterns)
     report = regenerable.run_regenerable_clean(
         env,
         apply=apply,
@@ -2550,6 +2558,10 @@ def _execute_regenerable_clean(
         disk_free_delta_bytes=report.disk_free_delta_bytes,
         percent_used_after=percent_used,
         duration_seconds=round(report.duration_seconds, 2),
+        excluded=report.excluded,
+        excluded_applied=regenerable.count_excluded_applied(
+            report.applied_paths, env.excluded_patterns
+        ),
     )
 
 
@@ -2563,7 +2575,11 @@ def run_regenerable_clean(
     if not _regenerable_clean_lock.acquire(blocking=False):
         raise RegenerableCleanBusyError("a clean is already running")
     try:
-        return _execute_regenerable_clean(apply=apply, audit_log_path=audit_log_path)
+        return _execute_regenerable_clean(
+            apply=apply,
+            audit_log_path=audit_log_path,
+            excluded_patterns=state.safety.exclusion_patterns,
+        )
     finally:
         _regenerable_clean_lock.release()
 
@@ -2596,6 +2612,7 @@ def start_regenerable_clean(
     global _regenerable_job
     if not _regenerable_clean_lock.acquire(blocking=False):
         raise RegenerableCleanBusyError("a clean is already running")
+    excluded_patterns = state.safety.exclusion_patterns
     job = _RegenerableJob(run_id=uuid.uuid4().hex[:12], started_monotonic=time.monotonic())
     with _regenerable_job_lock:
         _regenerable_job = job
@@ -2620,6 +2637,7 @@ def start_regenerable_clean(
             response = _execute_regenerable_clean(
                 apply=True,
                 audit_log_path=audit_log_path,
+                excluded_patterns=excluded_patterns,
                 on_item_start=on_start,
                 on_item_done=on_done,
                 run_id=job.run_id,
@@ -2681,14 +2699,16 @@ def get_regenerable_status() -> RegenerableStatusResponse:
 
 
 def regenerable_clean_response(
-    *, apply: bool, audit_log_path: Path | None = None
+    *, apply: bool, excluded_patterns: Sequence[str], audit_log_path: Path | None = None
 ) -> RegenerableCleanResponse:
     """State-free synchronous run shared by `reclaim auto-clean` (which blocks, so it may wait on
     uv's lock) and the preview: same shape, same audit log as the dashboard endpoint."""
     if not _regenerable_clean_lock.acquire(blocking=False):
         raise RegenerableCleanBusyError("a clean is already running")
     try:
-        return _execute_regenerable_clean(apply=apply, audit_log_path=audit_log_path)
+        return _execute_regenerable_clean(
+            apply=apply, audit_log_path=audit_log_path, excluded_patterns=excluded_patterns
+        )
     finally:
         _regenerable_clean_lock.release()
 
