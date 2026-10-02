@@ -269,7 +269,9 @@ def test_hash_cache_entry_is_reused_only_when_fresh_stat_matches(
 
     assert len(find_duplicate_clusters(index, min_reclaim_bytes=0)) == 1
     first = dict(calls)
-    assert first == {"partial": 2, "full": 2}
+    # perf/dedup-warmup: a file this small is hashed whole by the partial stage, so its partial
+    # digest is reused as the full digest instead of being read a second time.
+    assert first == {"partial": 2, "full": 0}
 
     # Unchanged on disk: every digest is reused, nothing rehashed (no needless work).
     assert len(find_duplicate_clusters(index, min_reclaim_bytes=0)) == 1
