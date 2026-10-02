@@ -342,6 +342,25 @@ def file_row(
     )
 
 
+# One row per distinct on-disk file (`dev`, `ino`) within each size, so a bucket's member count is
+# the number of DISTINCT files, not of path names: N names hardlinked to one inode are one file and
+# can reclaim nothing. `ino = 0` means "identity unknown" (synthetic rows; `dedup._hash_stage`
+# never collapses them either), so each such row keeps its own `rowid` as identity. SQLite has no
+# `COUNT(DISTINCT dev, ino)`, hence the GROUP BY subquery. Consumers add `HAVING` on the count.
+_DISTINCT_INODES_PER_SIZE_SQL = """
+    SELECT size FROM files
+    WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+    GROUP BY size, (ino = 0), CASE WHEN ino = 0 THEN 0 ELSE dev END,
+             CASE WHEN ino = 0 THEN rowid ELSE ino END
+"""
+# Sizes whose bucket clears the materiality floor at distinct-inode level (param: the floor).
+# S608: only module-level constants are interpolated, never a caller-supplied value.
+_QUALIFYING_SIZES_SQL = f"""
+    SELECT size FROM ({_DISTINCT_INODES_PER_SIZE_SQL})
+    GROUP BY size HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size >= ?
+"""  # noqa: S608
+
+
 class ScanIndex:
     """SQLite-backed inventory of every filesystem entry the scanner has seen.
 
@@ -845,8 +864,10 @@ class ScanIndex:
         Python `FileRecord`.
 
         `min_reclaim_bytes` is the materiality gate (2026-07-17 real-disk finding): a bucket's
-        *theoretical* best-case reclaim is `(member_count - 1) * size` (every non-kept member
-        turning out to be an exact duplicate) — below `min_reclaim_bytes`, the bucket is
+        *theoretical* best-case reclaim is `(distinct_inodes - 1) * size` (every non-kept file
+        turning out to be an exact duplicate; names hardlinked to one inode are ONE file, so a
+        bucket made only of hardlink names has a best case of 0 -- ADR-0002 addendum) — below
+        `min_reclaim_bytes`, the bucket is
         excluded from this stream entirely, before a single byte is read. On one real `C:\\`,
         80% of files shared a size with another file, but the collision list was dominated by
         empty/near-empty files (333K zero-byte, thousands of 2/4/17-byte files) whose full
@@ -862,16 +883,12 @@ class ScanIndex:
         bucket at a time (`itertools.groupby`) instead of collecting every candidate row into
         memory before processing any of them.
         """
-        sql = """
+        sql = f"""
             SELECT * FROM files
             WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-            AND size IN (
-                SELECT size FROM files
-                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-                GROUP BY size HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size >= ?
-            )
+            AND size IN ({_QUALIFYING_SIZES_SQL})
             ORDER BY size
-        """
+        """  # noqa: S608 -- constants only; floor is a bound parameter
         for row in self._conn.execute(sql, (min_reclaim_bytes,)):
             yield _row_to_record(row)
 
@@ -879,35 +896,31 @@ class ScanIndex:
         """A cheap `COUNT(*)` over the same filter `duplicate_size_candidates()` streams —
         logged once up front so a heartbeat can report "N of M processed" instead of just a
         running count with no sense of how much work remains."""
-        sql = """
+        sql = f"""
             SELECT COUNT(*) AS total FROM files
             WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-            AND size IN (
-                SELECT size FROM files
-                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
-                GROUP BY size HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size >= ?
-            )
-        """
+            AND size IN ({_QUALIFYING_SIZES_SQL})
+        """  # noqa: S608 -- constants only; floor is a bound parameter
         row = self._conn.execute(sql, (min_reclaim_bytes,)).fetchone()
         return int(row["total"])
 
     def immaterial_duplicate_bucket_stats(self, *, min_reclaim_bytes: int) -> tuple[int, int]:
         """Returns `(bucket_count, theoretical_bytes)` for size buckets that collide (>= 2
-        members) but were excluded from `duplicate_size_candidates()` for falling below
-        `min_reclaim_bytes` — surfaced so the report can show what was skipped and why, rather
+        distinct files, not merely >= 2 hardlink names of one) but were excluded from
+        `duplicate_size_candidates()` for falling below `min_reclaim_bytes` — surfaced so the
+        report can show what was skipped and why, rather
         than the exclusion being silent. `theoretical_bytes` is a labeled upper bound (every
         member turning out to be an exact duplicate), never a claim about real measured
         reclaim — this tool never fabricates confidence it hasn't earned by actually hashing.
         """
-        sql = """
+        sql = f"""
             SELECT COUNT(*) AS bucket_count, COALESCE(SUM((c - 1) * size), 0) AS theoretical_bytes
             FROM (
-                SELECT size, COUNT(*) AS c FROM files
-                WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+                SELECT size, COUNT(*) AS c FROM ({_DISTINCT_INODES_PER_SIZE_SQL})
                 GROUP BY size
                 HAVING COUNT(*) >= 2 AND (COUNT(*) - 1) * size < ?
             )
-        """
+        """  # noqa: S608 -- constants only; floor is a bound parameter
         row = self._conn.execute(sql, (min_reclaim_bytes,)).fetchone()
         return int(row["bucket_count"]), int(row["theoretical_bytes"])
 
