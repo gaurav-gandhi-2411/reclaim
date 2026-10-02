@@ -1,5 +1,5 @@
 """Pins the dedup hash cache's persistence contract, from the "installed index had ZERO stored
-hashes" investigation (2026-10-02, docs/architecture/adr/0037-hash-persistence-contract.md):
+hashes" investigation (2026-10-02, docs/architecture/adr/0038-hash-persistence-contract.md):
 
 1. A rescan (incremental or full) never wipes stored hashes -- a changed file keeps its row but its
    (size, mtime) key no longer matches, so the cache refuses to serve it.

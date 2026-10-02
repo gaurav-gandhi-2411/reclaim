@@ -1,4 +1,4 @@
-# ADR-0037: Dedup hash cache persistence contract (and why the installed index had zero hashes)
+# ADR-0038: Dedup hash cache persistence contract (and why the installed index had zero hashes)
 
 Status: Accepted (2026-10-02). Code change: none. Tests only.
 
