@@ -377,3 +377,100 @@ def test_duplicate_member_requested_by_path_keeps_the_user_selected_category(
     client, _state, tree, _root = warm_env
     result = _apply(client, [tree.dup_copy.as_posix()], dry_run=True)
     assert _item(result, tree.dup_copy)["category_group"] == "user_selected"
+
+
+# --- 4. warm-status recomputes the key: "ready" only while the cache is actually valid --------
+
+
+def _warm_status(client: TestClient) -> dict[str, object]:
+    response = client.get("/api/candidates/warm-status")
+    assert response.status_code == 200
+    return response.json()  # type: ignore[no-any-return]
+
+
+def test_warm_status_ready_reports_no_stale_reason(
+    warm_env: tuple[TestClient, AppState, _Tree, Path],
+) -> None:
+    client, _state, _tree, _root = warm_env
+    body = _warm_status(client)
+    assert body["status"] == "ready"
+    assert body["stale_reason"] is None
+
+
+def test_warm_status_goes_stale_with_reason_mode_in_both_directions(
+    warm_env: tuple[TestClient, AppState, _Tree, Path],
+) -> None:
+    client, _state, _tree, _root = warm_env
+    assert client.post("/api/mode/safe").status_code == 200
+    body = _warm_status(client)
+    assert (body["status"], body["stale_reason"]) == ("stale", "mode")  # POWER -> SAFE
+    _warm(client)
+    assert _warm_status(client)["stale_reason"] is None
+    response = client.post(
+        "/api/mode/power", json={"confirmation_text": REQUIRED_POWER_MODE_CONFIRMATION}
+    )
+    assert response.status_code == 200
+    body = _warm_status(client)
+    assert (body["status"], body["stale_reason"]) == ("stale", "mode")  # SAFE -> POWER
+    _warm(client)
+    assert _warm_status(client)["status"] == "ready"
+
+
+def test_warm_status_goes_stale_with_reason_config_on_category_toggle(
+    warm_env: tuple[TestClient, AppState, _Tree, Path],
+) -> None:
+    client, _state, _tree, _root = warm_env
+    response = client.post("/api/settings/categories/duplicates", json={"enabled": True})
+    assert response.status_code == 200
+    body = _warm_status(client)
+    assert (body["status"], body["stale_reason"]) == ("stale", "config")
+    _warm(client)
+    assert _warm_status(client)["status"] == "ready"
+
+
+def test_warm_status_goes_stale_with_reason_scan_on_new_scan(
+    warm_env: tuple[TestClient, AppState, _Tree, Path],
+) -> None:
+    client, _state, _tree, root = warm_env
+    _scan(client, root)
+    body = _warm_status(client)
+    assert (body["status"], body["stale_reason"]) == ("stale", "scan")
+    _warm(client)
+    assert _warm_status(client)["status"] == "ready"
+
+
+def test_warm_status_goes_stale_with_reason_scope_on_allowed_roots_change(
+    warm_env: tuple[TestClient, AppState, _Tree, Path],
+) -> None:
+    from reclaim.api.state import ScanStatus
+
+    client, state, _tree, _root = warm_env
+    with state.lock:
+        state.scan_status = ScanStatus()
+        state.scan_status.root = Path("D:/elsewhere")
+        state.scan_status.finished_at = time.time()
+    body = _warm_status(client)
+    assert (body["status"], body["stale_reason"]) == ("stale", "scope")
+
+
+def test_warm_status_recompute_never_runs_detectors(
+    warm_env: tuple[TestClient, AppState, _Tree, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _state, _tree, _root = warm_env
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise AssertionError("warm-status ran a detector -- it must only recompute the key")
+
+    monkeypatch.setattr(service, "generate_candidates", _boom)
+    monkeypatch.setattr(service, "generate_duplicate_candidates", _boom)
+    assert _warm_status(client)["status"] == "ready"
+    assert client.post("/api/mode/safe").status_code == 200
+    assert _warm_status(client)["status"] == "stale"
+
+
+def test_warm_status_non_ready_states_pass_through_without_a_reason(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    _Tree(root)
+    client = _make_app(tmp_path, root)
+    body = _warm_status(client)  # never warmed
+    assert (body["status"], body["stale_reason"]) == ("idle", None)
