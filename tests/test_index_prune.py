@@ -380,3 +380,51 @@ def test_junction_whose_target_is_gone_keeps_its_row(tmp_path: Path, index: Scan
     prune_dead_rows(index, apply=True)
 
     assert link.as_posix() in _paths(index, root)
+
+
+def test_pruned_row_means_not_in_index_for_the_apply_time_identity_rules(
+    tmp_path: Path, index: ScanIndex
+) -> None:
+    """ADR-0036/AN5 after a prune: a path whose row was pruned is simply 'not in the index'.
+    Inside `home` it gets a fresh baseline from disk; outside `home` it is refused."""
+    from reclaim.api import service
+    from reclaim.config import load_config
+    from reclaim.safety import SafetyValidator
+    from reclaim.scanner import GitRepoCache
+
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    inside_file = home / "photo.jpg"
+    outside_file = outside / "photo.jpg"
+    for f in (inside_file, outside_file):
+        f.write_bytes(b"x" * 100)
+    scan_tree(home, index)
+    scan_tree(outside, index)
+    assert index.record_exists(inside_file)
+    assert index.record_exists(outside_file)
+
+    # Both files vanish and the index is pruned, then both paths come back (a new file at the
+    # same path): neither has an index row any more.
+    shutil.rmtree(home)
+    shutil.rmtree(outside)
+    prune_dead_rows(index, apply=True)
+    assert not index.record_exists(inside_file)
+    assert not index.record_exists(outside_file)
+    home.mkdir()
+    outside.mkdir()
+    for f in (inside_file, outside_file):
+        f.write_bytes(b"y" * 7)
+
+    cfg = load_config(None)
+    kwargs = {
+        "safety": SafetyValidator(cfg),
+        "git_cache": GitRepoCache(),
+        "home": home,
+        "scan_index": index,
+    }
+    built = service._build_user_selected_candidate(str(inside_file), **kwargs)
+    assert built is not None
+    assert built.size_bytes == 7  # fresh baseline from disk, not a stale indexed size
+    assert service._build_user_selected_candidate(str(outside_file), **kwargs) is None
