@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -592,7 +593,12 @@ def _captured_sql(index: ScanIndex, action: Callable[[], None]) -> str:
 def _assert_query_uses_index(index: ScanIndex, sql: str) -> None:
     plan_rows = index._conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
     plan_text = " | ".join(str(tuple(row)) for row in plan_rows)
-    assert "SCAN" not in plan_text, f"expected no full scan, got: {plan_text}"
+    # `SCAN (subquery-N)` reads a materialized subquery RESULT (e.g. one row per distinct inode per
+    # size in `duplicate_size_candidates`), whose own source is the indexed SEARCH asserted below;
+    # it is not a table scan, so it is not what this tripwire guards against.
+    assert "SCAN" not in re.sub(r"SCAN \(subquery-\d+\)", "", plan_text), (
+        f"expected no full scan, got: {plan_text}"
+    )
     assert "SEARCH" in plan_text and "USING" in plan_text and "INDEX" in plan_text, plan_text
 
 
