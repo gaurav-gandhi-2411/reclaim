@@ -121,3 +121,26 @@ candidate set each query returns — never over the whole table:
   already encodes the expected candidate set per category from real fixture data and was
   written against the old implementation; it passing unmodified after the rewrite is direct
   evidence of parity without needing to keep dead code around just to diff against it.
+
+## Addendum 2026-10-02 -- the materiality floor counts distinct files, not path names
+
+The duplicate prefilter's floor was `(COUNT(*) - 1) * size >= min_reclaim_bytes` over ROWS
+(path names). N names hardlinked to one inode are one file with 0 reclaimable bytes, yet a bucket
+of them cleared the floor and was hashed and reported (a uv cache or a venv tree is mostly such
+names). The floor is now `(distinct (dev, ino) - 1) * size >= min_reclaim_bytes`
+(`index._QUALIFYING_SIZES_SQL`; SQLite has no `COUNT(DISTINCT dev, ino)`, so a GROUP BY subquery
+builds one row per distinct inode; `ino = 0` -- identity unknown -- stays one file per row).
+`immaterial_duplicate_bucket_stats` uses the same count, so a hardlink-only bucket is no longer
+reported as a size collision.
+
+Decided consequences:
+
+- A bucket that still qualifies streams EVERY name of every inode, so `_hash_stage`'s hardlink
+  borrowing and the hardlink-aware reclaim accounting see exactly what they saw before.
+- A bucket is dropped as a whole or not at all. Dropped buckets are of two kinds: hardlink-only
+  (0 reclaimable bytes) and buckets with >= 2 inodes whose real best case is below the floor but
+  whose extra names used to push the row count over it. The second kind is the floor doing what
+  it always claimed to do; those clusters were real (each < 1 MiB reclaimable) and are no longer
+  proposed. Lower `min_reclaim_bytes` to get them back.
+- `find_duplicate_clusters`/`generate_duplicate_candidates` are otherwise unchanged: a cluster
+  inside a qualifying bucket that is hardlink-only is still emitted and reports 0 reclaimable.
