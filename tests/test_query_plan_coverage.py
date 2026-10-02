@@ -209,6 +209,29 @@ _CASES: dict[str, Case] = {
         expect_index=False,
         reason="existence probe on sqlite_master/sqlite_stat1 (LIMIT 1) -- never touches `files`",
     ),
+    "protect_under": Case(
+        action=None,
+        expect_index=False,
+        reason="INSERT OR IGNORE ... SELECT over a prefix range (same `path = ? OR (path >= ? "
+        "AND path < ?)` shape as prune_unseen_under_root) + COMMIT -- the trace callback's last "
+        "captured statement is the COMMIT, which has no plan rows (same shape as record_seen)",
+    ),
+    "page_rows_after": Case(
+        lambda idx: idx.page_rows_after("", limit=10, prefix=_SCOPE.as_posix()),
+        expect_index=True,
+        reason="keyset page: `path > ?` (+ prefix range) ORDER BY path LIMIT -- primary-key range",
+    ),
+    "delete_paths": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE ... WHERE path = ? (primary-key point delete, as prune_missing above) + "
+        "COMMIT -- the last captured statement is the COMMIT, which has no plan rows",
+    ),
+    "vacuum": Case(
+        action=None,
+        expect_index=False,
+        reason="VACUUM / wal_checkpoint -- maintenance statements, not data queries over `files`",
+    ),
     "end_scan_tracking": Case(
         action=None,
         expect_index=False,
