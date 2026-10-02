@@ -329,7 +329,7 @@ def test_safety_blocks_directory_that_contains_an_excluded_tree(world: World) ->
 # --- purge -------------------------------------------------------------------------------------
 
 
-def test_purge_leaves_vault_entries_from_excluded_paths_and_still_purges_others(
+def test_purge_refuses_the_whole_run_when_an_eligible_entry_came_from_an_excluded_path(
     world: World, tmp_path: Path
 ) -> None:
     from reclaim.executor import QuarantineManifestEntry, append_manifest_entries
@@ -364,16 +364,29 @@ def test_purge_leaves_vault_entries_from_excluded_paths_and_still_purges_others(
         )
     append_manifest_entries(manifest, entries)
     cfg = _config()
-    report = purge_expired(
+    # Existing ADR-0001 semantics, now reached through [exclusions]: any eligible entry failing the
+    # fresh safety re-check aborts the WHOLE purge run (deleting nothing) -- the excluded-origin
+    # entry is never purged, and neither is its non-excluded neighbour, until the user restores
+    # the entry or removes the exclusion.
+    with pytest.raises(SafetyInvariantError, match="pre-purge safety re-check"):
+        purge_expired(
+            apply=True,
+            manifest_path=manifest,
+            vault_dir=vault,
+            safety=SafetyValidator(cfg),
+            mode=Mode.POWER,
+        )
+    assert (vault / "excluded.bin").exists()
+    assert (vault / "other.bin").exists()
+    # Negative control: without the exclusion the same run purges both.
+    purge_expired(
         apply=True,
         manifest_path=manifest,
         vault_dir=vault,
-        safety=SafetyValidator(cfg),
+        safety=SafetyValidator(_config(names=())),
         mode=Mode.POWER,
     )
-    assert (vault / "excluded.bin").exists(), "excluded-origin vault entry must stay"
-    assert not (vault / "other.bin").exists()
-    assert report is not None
+    assert not (vault / "excluded.bin").exists() and not (vault / "other.bin").exists()
 
 
 # --- (b) review queue / dashboard API ----------------------------------------------------------

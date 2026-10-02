@@ -8,14 +8,15 @@ project, e.g. `%TEMP%\claude\C--Users-<u>-ml-projects-<project>`). The product m
 list on every delete path and be able to prove it. Those names are the owner's configuration, never
 a product default.
 
-Reading the code first (see the tests named below): `[safety] deny` already reached everything that
+Reading the code first (probe results and tests: `tests/test_exclusions.py`): `[safety] deny` already reached everything that
 goes through `SafetyValidator.evaluate` (detectors, duplicate members, `_build_user_selected_candidate`,
 the executor's direct-delete re-check, the purge re-check). It did NOT reach (1) the regenerable tier
 (ADR-0034 -- no `SafetyValidator`, its own closed-world code path), (2) duplicate keeper selection
 and hashing (an excluded file could be the surviving "keeper" that justified deleting another copy,
 and was read and hashed), (3) a directory candidate that merely CONTAINS an excluded path (deleting
-the directory deletes the excluded content), (4) `apply_batch` for a candidate that bypassed
-generation, (5) purge, where an excluded-origin vault entry aborted the whole run.
+the directory deletes the excluded content), (4) `apply_batch` for a vaulted candidate that bypassed
+generation (only direct-delete candidates were re-checked). Purge already aborted the whole run
+for an excluded-origin entry (ADR-0001's re-check) and still does.
 
 ## Decision
 
@@ -25,8 +26,8 @@ generation, (5) purge, where an excluded-origin vault entry aborted the whole ru
   list, one matcher (`safety.first_matching_pattern`), used everywhere.
 - `SafetyValidator` blocks (`USER_EXCLUSION`) a path matching, and for a directory also one that
   has any entry beneath it matching (name-only `os.scandir` walk, only when patterns exist).
-- `apply_batch` re-checks every candidate against the exclusions (whole-batch
-  `SafetyInvariantError`, dry run included) -- last line of defence independent of generation.
+- `apply_batch` (real runs) re-checks every candidate, vaulted or direct-delete, against the
+  exclusions (whole-batch `SafetyInvariantError`) -- last line of defence independent of generation.
 - Dedup: excluded files are dropped from size buckets before any hashing, so they are never read,
   never cluster members, never a keeper. They are treated as if they did not exist: no other copy is
   proposed because "a copy survives in the excluded tree". Chosen over "keep them as keepers"
@@ -42,12 +43,15 @@ generation, (5) purge, where an excluded-origin vault entry aborted the whole ru
   `auto-clean --json` carries `excluded` and `excluded_applied`; `excluded_applied` is
   `|applied_paths ∩ excluded|` (`regenerable.count_excluded_applied`) and a non-zero value is a hard
   failure (exit 1).
-- Purge: a vault entry whose original path is excluded is left in the vault (logged), not purged, and
-  does not abort the run. The weekly auto-clean never touches the vault (ADR-0034, unchanged).
+- Purge: unchanged. An eligible vault entry whose original path is excluded fails the fresh
+  re-check and aborts the whole purge run, deleting nothing (ADR-0001). The weekly auto-clean never
+  touches the vault (ADR-0034), so it cannot purge such an entry.
 - Restore is unchanged: it writes the user's own file back and is not a cleanup.
 
 ## Consequences
 
+- A purge run stays blocked while any eligible vault entry came from an excluded path; restore that
+  entry or remove the exclusion to unblock it.
 - A name is a substring token: `intent-router` also excludes `~/Downloads/intent-router-notes.pdf`.
   Deliberately over-inclusive for a hard exclusion; use a precise `[safety] deny` glob to be narrower.
 - Config is read at startup by the dashboard (`AppState.safety`): editing exclusions needs a restart.
