@@ -415,25 +415,76 @@ def start_candidates_warm(
     return service.to_candidates_warm_status_out(status_snapshot)
 
 
+def _not_warm_response(
+    state: AppState, background_tasks: BackgroundTasks, exc: service.CandidatesNotWarmError
+) -> JSONResponse:
+    """409 "cache not warm" shared by every candidate-cache reader (summary, treemap, candidates,
+    one-click summary, blanket apply). Same single-flight courtesy POST /api/candidates/warm's
+    own route gives the frontend: kick off a warm-up here too (if one isn't already running) so
+    a caller that didn't know to call that endpoint first still converges on a retry.
+
+    Returns a JSONResponse directly (background attached to it) rather than `raise
+    HTTPException` -- BackgroundTasks registered via `background_tasks.add_task` are only
+    executed if attached to the Response object FastAPI actually returns; on an exception path,
+    FastAPI's own exception handler builds an independent Response for the HTTPException, which
+    never sees this function's `background_tasks` instance, so the warm-up would silently never
+    run (confirmed live: `warm-status` stayed "computing" indefinitely). Body is additive:
+    `detail` as before plus `code` and `stale_reason`."""
+    response_background = None
+    with state.lock:
+        if state.candidates_warm_status.status != "computing":
+            state.candidates_warm_status = CandidatesWarmStatus(
+                status="computing",
+                scan_generation=state.scan_generation,
+                started_at=time.time(),
+            )
+            background_tasks.add_task(service.run_candidates_warm, state)
+            response_background = background_tasks
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "code": "candidates_not_warm",
+            "stale_reason": exc.stale_reason,
+        },
+        background=response_background,
+    )
+
+
 @router.get("/summary", response_model=SummaryResponse)
-def summary(request: Request) -> SummaryResponse:
-    return service.build_summary(get_state(request))
+def summary(request: Request, background_tasks: BackgroundTasks) -> SummaryResponse | JSONResponse:
+    state = get_state(request)
+    try:
+        return service.build_summary(state)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)
 
 
 @router.get("/treemap", response_model=TreemapResponse)
-def treemap(request: Request) -> TreemapResponse:
-    return service.build_treemap(get_state(request))
+def treemap(request: Request, background_tasks: BackgroundTasks) -> TreemapResponse | JSONResponse:
+    state = get_state(request)
+    try:
+        return service.build_treemap(state)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)
 
 
 @router.get("/candidates", response_model=CandidatesResponse)
 def candidates(
-    request: Request, tier: str = "both", category: str | None = None
-) -> CandidatesResponse:
+    request: Request,
+    background_tasks: BackgroundTasks,
+    tier: str = "both",
+    category: str | None = None,
+) -> CandidatesResponse | JSONResponse:
     if tier not in ("A", "B", "both"):
         raise HTTPException(
             status_code=400, detail=f"tier must be one of A, B, both (got {tier!r})"
         )
-    return service.list_candidates(get_state(request), tier=tier, category_group=category)
+    state = get_state(request)
+    try:
+        return service.list_candidates(state, tier=tier, category_group=category)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)
 
 
 @router.post(
@@ -469,8 +520,14 @@ def clean_regenerable_status() -> RegenerableStatusResponse:
 
 
 @router.get("/clean/one-click-summary", response_model=OneClickCleanSummaryResponse)
-def clean_one_click_summary(request: Request) -> OneClickCleanSummaryResponse:
-    return service.build_one_click_summary(get_state(request))
+def clean_one_click_summary(
+    request: Request, background_tasks: BackgroundTasks
+) -> OneClickCleanSummaryResponse | JSONResponse:
+    state = get_state(request)
+    try:
+        return service.build_one_click_summary(state)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)
 
 
 @router.get("/duplicate-clusters/review", response_model=DuplicateClusterReviewResponse)
@@ -503,32 +560,7 @@ def apply(
         # tier-apply with no explicit paths — a real 400, not a sign anything is broken.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except service.CandidatesNotWarmError as exc:
-        # Same single-flight courtesy POST /api/candidates/warm's own route already gives the
-        # frontend: kick off a warm-up here too (if one isn't already running) so a caller that
-        # didn't know to call that endpoint first still converges on a retry, instead of needing
-        # its own separate warm-up trigger.
-        #
-        # Returns a JSONResponse directly (background attached to it) rather than `raise
-        # HTTPException` -- BackgroundTasks registered via `background_tasks.add_task` are only
-        # executed if attached to the Response object FastAPI actually returns; on an exception
-        # path, FastAPI's own exception handler builds an independent Response for the
-        # HTTPException, which never sees this function's `background_tasks` instance, so the
-        # warm-up would silently never run. Confirmed live: with `raise HTTPException(...)`, the
-        # courtesy warm-up never started (`warm-status` stayed "computing" indefinitely, not
-        # merely slow) -- caught by this fix's own regression test before it shipped.
-        response_background = None
-        with state.lock:
-            if state.candidates_warm_status.status != "computing":
-                state.candidates_warm_status = CandidatesWarmStatus(
-                    status="computing",
-                    scan_generation=state.scan_generation,
-                    started_at=time.time(),
-                )
-                background_tasks.add_task(service.run_candidates_warm, state)
-                response_background = background_tasks
-        return JSONResponse(
-            status_code=409, content={"detail": str(exc)}, background=response_background
-        )
+        return _not_warm_response(state, background_tasks, exc)
 
     started_at = time.time()
     with state.lock:

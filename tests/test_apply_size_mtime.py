@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _warming_client import WarmingTestClient
 from fastapi.testclient import TestClient
 from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -332,7 +333,7 @@ def _make_client(tmp_path: Path, *, power: bool) -> TestClient:
         host="127.0.0.1",
         port=8420,
     )
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url="http://127.0.0.1:8420",
         headers={security.CSRF_HEADER_NAME: app.state.reclaim.csrf_token},

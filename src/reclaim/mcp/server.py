@@ -231,7 +231,9 @@ def build_mcp_server(state: AppState) -> FastMCP:
         if tier not in _TIER_CHOICES:
             raise ValueError(f"tier must be one of {_TIER_CHOICES} (got {tier!r})")
 
-        response = service.list_candidates(state, tier=tier, category_group=category)
+        response = service.list_candidates(
+            state, tier=tier, category_group=category, require_warm=False
+        )
         summaries = [
             CandidateSummary(
                 path=c.path,

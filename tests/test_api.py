@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _warming_client import WarmingTestClient
 from fastapi.testclient import TestClient
 
 import reclaim.scanner as scanner_module
@@ -94,7 +95,7 @@ def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
@@ -117,7 +118,7 @@ def _make_app_safe_mode(tmp_path: Path, *, config: Config) -> TestClient:
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
@@ -2062,7 +2063,7 @@ def test_mutating_request_without_csrf_token_is_rejected(tmp_path: Path) -> None
     # No default headers at all — simulates any request that never read the dashboard's own
     # <meta> tag (a cross-origin page has no way to read it; this is the exact case CSRF
     # protection exists for).
-    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.post("/api/scan", json={"path": str(tmp_path)})
     assert response.status_code == 403
@@ -2079,7 +2080,7 @@ def test_mutating_request_with_wrong_csrf_token_is_rejected(tmp_path: Path) -> N
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
-    client = TestClient(
+    client = WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: "not-the-real-token"},
@@ -2103,7 +2104,7 @@ def test_read_only_request_needs_no_csrf_token(tmp_path: Path) -> None:
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
-    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.get("/api/summary")
     assert response.status_code == 200
@@ -2150,7 +2151,7 @@ def test_non_api_paths_are_not_guarded(tmp_path: Path) -> None:
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
-    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.get("/", headers={"host": "evil.example.com"})
     assert response.status_code == 200
@@ -2297,7 +2298,7 @@ def _make_app_with_config_path(tmp_path: Path, *, config: Config, config_path: P
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
@@ -2385,7 +2386,7 @@ def test_post_settings_category_without_csrf_token_is_rejected(tmp_path: Path) -
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
-    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.post("/api/settings/categories/old_installers", json={"enabled": True})
 
@@ -2490,7 +2491,7 @@ def test_post_settings_notifications_without_csrf_token_is_rejected(tmp_path: Pa
         host=_TEST_HOST,
         port=_TEST_PORT,
     )
-    bare_client = TestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.post("/api/settings/notifications", json={"enabled": True})
 
