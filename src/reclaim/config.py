@@ -581,6 +581,18 @@ class NotificationsConfig(BaseModel):
     snooze_days: int = 7
 
 
+class AutoCleanConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Opt-in, default OFF (ADR-0034): a recurring background delete is exactly the kind of thing a
+    # user must choose, not discover. When true the Settings-tab toggle has registered a per-
+    # account weekly Task Scheduler entry (see reclaim.autoclean_schedule) that runs
+    # `reclaim auto-clean --apply --notify --scheduled` -- the regenerable safe tier ONLY
+    # (reclaim.regenerable's closed allow-list). `--scheduled` re-reads this flag at run time, so a
+    # stale task left behind after the user toggled this off does nothing.
+    enabled: bool = False
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -588,6 +600,7 @@ class Config(BaseSettings):
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    autoclean: AutoCleanConfig = Field(default_factory=AutoCleanConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not
@@ -831,15 +844,13 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
 # that trip's Step 10 output matches no default anywhere in this codebase (the shipped default is
 # 80.0), which only a manual edit could have produced.
 #
-# Deliberate near-duplicate of `_set_category_enabled_in_toml_text`/`set_category_enabled` above,
-# not a shared/generalized helper: two call sites (categories, notifications) is this codebase's
-# own stated threshold for "duplicate, don't abstract yet" (see engineering defaults) -- and the
-# category version's docstring/tests are the working, tested contract this mirrors; refactoring it
-# to serve a second section wasn't asked for and would touch code this fix doesn't need to touch.
-def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
-    """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to the
-    single `[notifications]` section instead of a per-category one."""
-    section_header = "[notifications]"
+# Generalised to `_set_section_enabled_in_toml_text` when the third call site (the weekly
+# auto-clean toggle, ADR-0034) arrived -- the "abstract on the third occurrence" threshold. The
+# per-category variant above is left as-is (it addresses a nested `[categories.<name>]` header).
+def _set_section_enabled_in_toml_text(text: str, section: str, *, enabled: bool) -> str:
+    """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to one
+    top-level `[<section>]` (notifications, autoclean) instead of a per-category one."""
+    section_header = f"[{section}]"
     value_literal = "true" if enabled else "false"
     enabled_line = f"enabled = {value_literal}\n"
 
@@ -865,11 +876,28 @@ def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
     return "".join(lines)
 
 
+def _set_notifications_enabled_in_toml_text(text: str, *, enabled: bool) -> str:
+    """Pure text transform for the single `[notifications]` section (named wrapper kept so its
+    existing callers/tests are unchanged)."""
+    return _set_section_enabled_in_toml_text(text, "notifications", enabled=enabled)
+
+
 def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
     """Persists the `[notifications]` section's `enabled` flag to `config_path`'s on-disk TOML
     text, creating the file (and its parent directory) if it doesn't exist yet -- the write side
     of the Settings-tab notifications toggle (BH5)."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_notifications_enabled_in_toml_text(text, enabled=enabled)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_text, encoding="utf-8")
+
+
+def set_autoclean_enabled(config_path: Path, *, enabled: bool) -> None:
+    """Persists the `[autoclean]` section's `enabled` flag to `config_path`'s on-disk TOML text,
+    creating the file (and its parent directory) if it doesn't exist yet -- the write side of the
+    Settings-tab weekly auto-clean toggle (ADR-0034), built exactly like
+    `set_notifications_enabled`."""
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")

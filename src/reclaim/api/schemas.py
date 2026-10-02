@@ -755,6 +755,28 @@ class UpdateNotificationsSettingRequest(BaseModel):
     enabled: bool
 
 
+# ADR-0034: the weekly auto-clean toggle. The task fields come from a live typed ScheduledTasks
+# query, not from config -- `enabled` (what the user chose) and `task_registered` (what
+# Windows actually has) can disagree, and the UI shows both. Times are ISO-8601 strings
+# (locale-independent; the UI formats them) and `task_state` is the TaskState enum name.
+class AutoCleanSettingOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    task_registered: bool
+    task_name: str
+    task_state: str | None = None
+    last_run_time: str | None = None
+    last_result: int | None = None
+    next_run_time: str | None = None
+
+
+class UpdateAutoCleanSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section and reclaim.update_check) --------
 
 
