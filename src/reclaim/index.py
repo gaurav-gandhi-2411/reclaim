@@ -713,11 +713,19 @@ class ScanIndex:
         (the dedup pipeline only ever hashes files already present in the index). Leaves
         `full_hash` untouched so a partial-hash pass never clobbers a previously cached
         full-hash value for the same row."""
-        rows = [(size, mtime, digest, path.as_posix()) for path, size, mtime, digest in entries]
+        # The sibling hash column is kept ONLY if it was computed against this same (size, mtime):
+        # hash_size/hash_mtime are shared by both hashes, so re-stamping them for a changed file
+        # would otherwise make the OLD full_hash look valid for the NEW content on the next load.
+        rows = [
+            (size, mtime, digest, path.as_posix(), size, mtime)
+            for path, size, mtime, digest in entries
+        ]
         if not rows:
             return 0
         self._conn.executemany(
-            "UPDATE files SET hash_size = ?, hash_mtime = ?, partial_hash = ? WHERE path = ?",
+            "UPDATE files SET full_hash = CASE WHEN hash_size IS ?5 AND hash_mtime IS ?6 "
+            "THEN full_hash ELSE NULL END, hash_size = ?1, hash_mtime = ?2, partial_hash = ?3 "
+            "WHERE path = ?4",
             rows,
         )
         self._conn.commit()
@@ -725,11 +733,16 @@ class ScanIndex:
 
     def store_full_hashes(self, entries: Iterable[tuple[Path, int, float, str]]) -> int:
         """Batch-writes `(path, size, mtime, full_hash)` tuples; see `store_partial_hashes`."""
-        rows = [(size, mtime, digest, path.as_posix()) for path, size, mtime, digest in entries]
+        rows = [
+            (size, mtime, digest, path.as_posix(), size, mtime)
+            for path, size, mtime, digest in entries
+        ]
         if not rows:
             return 0
         self._conn.executemany(
-            "UPDATE files SET hash_size = ?, hash_mtime = ?, full_hash = ? WHERE path = ?",
+            "UPDATE files SET partial_hash = CASE WHEN hash_size IS ?5 AND hash_mtime IS ?6 "
+            "THEN partial_hash ELSE NULL END, hash_size = ?1, hash_mtime = ?2, full_hash = ?3 "
+            "WHERE path = ?4",
             rows,
         )
         self._conn.commit()
