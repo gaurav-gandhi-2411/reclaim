@@ -493,10 +493,15 @@ def _delete_tree_contents(
     env: RegenerableEnv,
     result: RegenerableItemResult,
     remove_top: bool,
+    enforce_age: bool = False,
 ) -> None:
     """Deletes files under `top` one at a time. Never descends into a reparse point (the entry
     itself is removed, its target untouched). A file with an open handle, or one that fails to
-    delete, is skipped and counted -- never forced. Empty directories are removed bottom-up."""
+    delete, is skipped and counted -- never forced. Empty directories are removed bottom-up.
+
+    `enforce_age` (ADR-0036): the caller's selection rule was "newest content older than
+    `env.min_age_seconds`" (aged TEMP / crash dumps), so each file is re-checked against that
+    rule right before its unlink -- a file touched since the plan is skipped, not deleted."""
     dirs_to_try: list[str] = []
     stack = [top]
     while stack:
@@ -513,12 +518,12 @@ def _delete_tree_contents(
             except OSError:
                 continue
             if _is_reparse(est):
-                _remove_reparse_entry(entry.path, est, result)
+                _remove_reparse_entry(entry.path, est, result, env=env, enforce_age=enforce_age)
                 continue
             if entry.is_dir(follow_symlinks=False):
                 stack.append(entry.path)
                 continue
-            _delete_one_file(entry.path, est.st_size, env=env, result=result)
+            _delete_one_file(entry.path, est, env=env, result=result, enforce_age=enforce_age)
     for directory in reversed(dirs_to_try):
         if directory == top and not remove_top:
             continue
@@ -527,8 +532,44 @@ def _delete_tree_contents(
             os.rmdir(directory)  # noqa: PTH106 -- str path, may be long
 
 
-def _remove_reparse_entry(path: str, st: os.stat_result, result: RegenerableItemResult) -> None:
+def _changed_since_plan(
+    path: str, planned: os.stat_result, *, env: RegenerableEnv, enforce_age: bool
+) -> bool | None:
+    """ADR-0036: re-stat `path` immediately before an unlink. True means "do not delete":
+    its mtime or size differs from `planned` (the stat the walk took), or, when `enforce_age`,
+    its live mtime is younger than `env.min_age_seconds` relative to `env.now()` (the age floor
+    the plan was selected under). None means the path is already gone (nothing to delete or
+    skip). Fail-closed: a stat error other than "gone" counts as changed."""
+    try:
+        live = Path(path).lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return True
+    if live.st_mtime != planned.st_mtime or live.st_size != planned.st_size:
+        return True
+    if _is_reparse(live) != _is_reparse(planned) or stat.S_ISDIR(live.st_mode) != stat.S_ISDIR(
+        planned.st_mode
+    ):
+        return True
+    return enforce_age and (env.now() - live.st_mtime) < env.min_age_seconds
+
+
+def _remove_reparse_entry(
+    path: str,
+    st: os.stat_result,
+    result: RegenerableItemResult,
+    *,
+    env: RegenerableEnv,
+    enforce_age: bool = False,
+) -> None:
     """A junction/symlink inside an allow-listed tree: remove the link itself only."""
+    changed = _changed_since_plan(path, st, env=env, enforce_age=enforce_age)
+    if changed is None:
+        return
+    if changed:
+        _record_skip(result, path)
+        return
     try:
         if stat.S_ISDIR(st.st_mode):
             os.rmdir(path)  # noqa: PTH106
@@ -539,9 +580,23 @@ def _remove_reparse_entry(path: str, st: os.stat_result, result: RegenerableItem
 
 
 def _delete_one_file(
-    path: str, size: int, *, env: RegenerableEnv, result: RegenerableItemResult
+    path: str,
+    planned: os.stat_result,
+    *,
+    env: RegenerableEnv,
+    result: RegenerableItemResult,
+    enforce_age: bool = False,
 ) -> None:
+    size = planned.st_size
     if env.has_open_handle(path):
+        _record_skip(result, path)
+        return
+    # ADR-0036: re-stat AFTER the (slow) handle probe and immediately before the unlink -- a file
+    # appended to or touched since the plan is in active use, even when no handle is open now.
+    changed = _changed_since_plan(path, planned, env=env, enforce_age=enforce_age)
+    if changed is None:
+        return
+    if changed:
         _record_skip(result, path)
         return
     try:
@@ -699,11 +754,11 @@ def _aged_children(
         except OSError:
             continue
         if _is_reparse(st):
-            _remove_reparse_entry(child, st, result)
+            _remove_reparse_entry(child, st, result, env=env, enforce_age=True)
         elif stat.S_ISDIR(st.st_mode):
-            _delete_tree_contents(child, env=env, result=result, remove_top=True)
+            _delete_tree_contents(child, env=env, result=result, remove_top=True, enforce_age=True)
         else:
-            _delete_one_file(child, st.st_size, env=env, result=result)
+            _delete_one_file(child, st, env=env, result=result, enforce_age=True)
     if guarded:
         result.detail = (
             f"left {len(guarded)} entr{'y' if len(guarded) == 1 else 'ies'} that contain a "
