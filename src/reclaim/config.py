@@ -600,7 +600,7 @@ class ExclusionsConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
     # Project/folder NAMES the user has declared permanently off-limits to every Reclaim delete
-    # path (ADR-0037). Each name is a case-insensitive substring token matched against the whole
+    # path (ADR-0039). Each name is a case-insensitive substring token matched against the whole
     # path -- so it covers the project tree, its worktrees (`<name>-wt-x`), venvs, envs, caches,
     # AND temp scratch directories whose name embeds the project (`...-ml-projects-<name>`).
     # Empty by default: the product ships with no opinion about anyone's projects.
@@ -746,7 +746,7 @@ def apply_safe_mode_category_overrides(categories: CategoriesConfig) -> Categori
 
 def exclusion_patterns(config: Config) -> list[str]:
     """Every user pattern that makes a path untouchable by any Reclaim delete path: `[safety]
-    deny` plus one `*<name>*` glob per `[exclusions] project_names` entry (ADR-0037). Shared by
+    deny` plus one `*<name>*` glob per `[exclusions] project_names` entry (ADR-0039). Shared by
     `SafetyValidator` (generic pipeline) and the regenerable tier so both honour one list."""
     return [*config.safety.deny, *(f"*{name.lower()}*" for name in config.exclusions.project_names)]
 

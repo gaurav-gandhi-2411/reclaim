@@ -614,7 +614,7 @@ def find_duplicate_clusters(
     them all at once — before a single hash ran. Peak memory here is bounded by the *largest
     single size bucket*, not the total candidate count.
 
-    `exclusion_patterns` (ADR-0037, `SafetyValidator.exclusion_patterns`): a file whose path
+    `exclusion_patterns` (ADR-0039, `SafetyValidator.exclusion_patterns`): a file whose path
     matches one is dropped from its size bucket BEFORE any hashing -- never read, never hashed,
     never a cluster member, and so never the keeper either. Deliberate: an excluded file is
     treated as if it did not exist, so no other copy can be proposed for deletion "because a

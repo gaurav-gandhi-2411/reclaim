@@ -1689,7 +1689,7 @@ def apply_batch(
 
     if apply:
         _reverify_direct_delete_candidates(candidates, safety)
-        # ADR-0037 last line of defence, independent of candidate generation and of the retention
+        # ADR-0039 last line of defence, independent of candidate generation and of the retention
         # window (the re-check above only covers direct-delete): a candidate -- even a hand-built or
         # stale-cached one carrying a non-BLOCKED verdict -- whose path, or for a directory anything
         # inside it, matches a user exclusion is never applied. Whole-batch refusal, same

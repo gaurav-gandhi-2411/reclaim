@@ -34,7 +34,7 @@ from reclaim.regenerable import CommandResult, RegenerableEnv
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import scan_tree
 
-# ADR-0037: the product honours a user exclusion list on EVERY delete path. These tests build a
+# ADR-0039: the product honours a user exclusion list on EVERY delete path. These tests build a
 # fake `ml-projects` with the three owner-declared names (owner config, never a product default),
 # each with a worktree, a venv, caches, data, and TEMP scratch directories named after the
 # project, plus a non-excluded sibling that MUST still be cleaned -- so a fixture that merely
@@ -615,13 +615,13 @@ def test_dashboard_one_click_preview_uses_config_exclusions(
     assert all(p.exists() for p in _excluded_temp_files(world))
 
 
-# --- what `[safety] deny` ALREADY covered before ADR-0037 (kept as regression tests) -----------
+# --- what `[safety] deny` ALREADY covered before ADR-0039 (kept as regression tests) -----------
 
 
 def test_deny_alone_already_blocks_generic_candidates_and_user_selected_paths(
     world: World, index: ScanIndex, tmp_path: Path
 ) -> None:
-    """Probed against the pre-ADR-0037 code (same assertions held there): a plain `[safety] deny`
+    """Probed against the pre-ADR-0039 code (same assertions held there): a plain `[safety] deny`
     glob keeps scan-driven candidates and an explicitly named path out of the pipeline. What it
     did NOT cover is pinned by the other tests in this file (hashing, keeper trap, containing
     directories, apply_batch's last line, the regenerable tier, purge)."""
