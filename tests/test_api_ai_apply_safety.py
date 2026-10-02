@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from _warming_client import WarmingTestClient
 from fastapi.testclient import TestClient
 
 from reclaim.api import security
@@ -51,7 +52,7 @@ def _make_app(tmp_path: Path, *, config: Config) -> TestClient:
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
@@ -71,7 +72,7 @@ def _make_app_safe_mode(tmp_path: Path, *, config: Config) -> TestClient:
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
