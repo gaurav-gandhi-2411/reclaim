@@ -75,7 +75,7 @@ listing's "would be proposed / would be reused" set, never the index. A path tha
 `stat`ed carries no evidence of a live writer, so the listing's value stands. Residual: a
 temp-root child directory with more than 2000 files re-`stat`s only its newest 2000 by listing
 mtime, so an open-for-write file with an old listing mtime outside that window is not caught
-there (the apply-time preflight identity check still compares live `(dev, ino, mtime)`). No
+there (correction, ADR-0036: until that ADR the apply-time preflight compared only `(dev, ino)`, never mtime or size; it now also skips a file candidate whose live size or mtime differs from the scan's record). No
 other detector compares an mtime to a threshold (`detect_crash_dumps`, `detect_archive_pairs`,
 dev/package/model caches have no age rule). Separately, entries directly under the scan root are
 always built by the legacy `os.scandir` + `os.stat` path (`scan_tree`'s top level), so they were
