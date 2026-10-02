@@ -30,6 +30,18 @@ every reading):** C: free 53.17 -> 85.04 GB. Deleted: 7 `C:\adk*` venvs 4.68 GB 
 (dirty=3), `adk6725_repro`/`adkrel060-scratch` (tiny, no git), `triage-iq-wt-groq-model-fix`.
 Stray 0-byte `scratch_patch.py` appeared in the main checkout at 19:25 (not mine; left).
 
+## HARD EXCLUSION (permanent, owner-set 2026-10-02) -- read first
+
+**Do not touch `fr-en-transformer`, `shipdoc-extract` or `intent-router`**: no deletions, no
+cache/data/model removal, no git operations (not even fetch/status), no tags, no worktree changes.
+They are the owner's active work. The `v0.2.2-colab` tag task is DROPPED. Every reclaim cleanup run
+(one-click, weekly auto-clean, review apply) keeps them on its exclusion list, and its report must
+state that none of their paths appear among applied candidates (the product-side list is
+implemented in `feat/cleanup-exclusion-list`; the installed `config.toml` carries the list).
+Other sessions must work in their own worktrees, never in reclaim's main checkout (see `CLAUDE.md`).
+Earlier in this session (before the directive) read-only `git status/fetch/tag -l/ls-remote` and
+`gh` queries were run against `fr-en-transformer`; nothing was written, pushed or tagged there.
+
 ## WORKING RULES LEARNED 2026-10-01 (read before touching this repo)
 
 - **Never work in reclaim's MAIN checkout (`C:\Users\gaura\ml-projects\reclaim`).** Every session and
