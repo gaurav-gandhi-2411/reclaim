@@ -89,6 +89,8 @@ tiny (see ADR-0034):
 
 By hand: `reclaim auto-clean` previews (a dry run); `reclaim auto-clean --apply` really cleans.
 Every item is recorded in `data/regenerable_audit.jsonl`.
+`--json` always prints exactly one JSON document on stdout (human text goes to stderr): the run
+report, or `{"status": "skipped" | "error", "reason": ..., "applied": false}` when nothing ran.
 
 ## How to restore something
 
