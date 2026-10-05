@@ -1,0 +1,42 @@
+sqlite 3.45.3 stat1 rows: 0
+ANALYZE s 171.4
+[('files', 'idx_files_path_lower', '5862980 1'), ('files', 'idx_files_name', '5862980 7'), ('files', 'idx_files_size', '5862980 25'), ('files', 'idx_files_ext', '5862980 2174'), ('files', 'idx_files_is_cloud_placeholder', '5862980 5862980'), ('files', 'idx_files_dev_ino', '5862980 5862980 2'), ('files', 'sqlite_autoindex_files_1', '5862980 1')]
+sqlite 3.45.3 stat1 rows: 7
+== count
+   4 0 0 SEARCH files USING INDEX idx_files_size (size=?)
+   8 0 0 LIST SUBQUERY 2
+   10 8 0 CO-ROUTINE (subquery-1)
+   17 10 0 SEARCH files USING INDEX idx_files_size (size>?)
+   25 10 0 USE TEMP B-TREE FOR GROUP BY
+   78 8 0 SCAN (subquery-1)
+   81 8 0 USE TEMP B-TREE FOR GROUP BY
+== stream
+   4 0 0 SEARCH files USING INDEX idx_files_size (size=?)
+   8 0 0 LIST SUBQUERY 2
+   10 8 0 CO-ROUTINE (subquery-1)
+   17 10 0 SEARCH files USING INDEX idx_files_size (size>?)
+   25 10 0 USE TEMP B-TREE FOR GROUP BY
+   78 8 0 SCAN (subquery-1)
+   81 8 0 USE TEMP B-TREE FOR GROUP BY
+== immaterial
+   2 0 0 CO-ROUTINE (subquery-2)
+   4 2 0 CO-ROUTINE (subquery-1)
+   11 4 0 SEARCH files USING INDEX idx_files_size (size>?)
+   19 4 0 USE TEMP B-TREE FOR GROUP BY
+   72 2 0 SCAN (subquery-1)
+   75 2 0 USE TEMP B-TREE FOR GROUP BY
+   114 0 0 SCAN (subquery-2)
+== qualifying
+   2 0 0 CO-ROUTINE (subquery-1)
+   9 2 0 SEARCH files USING INDEX idx_files_size (size>?)
+   17 2 0 USE TEMP B-TREE FOR GROUP BY
+   70 0 0 SCAN (subquery-1)
+   73 0 0 USE TEMP B-TREE FOR GROUP BY
+== old_count
+   4 0 0 SEARCH files USING INDEX idx_files_size (size=?)
+   8 0 0 LIST SUBQUERY 1
+   15 8 0 SEARCH files USING INDEX idx_files_size (size>?)
+old_count rows 1 wall_s 1162.9 cpu_s 208.8
+count rows 1 wall_s 174.1 cpu_s 143.9
+
+[exited with code 0]

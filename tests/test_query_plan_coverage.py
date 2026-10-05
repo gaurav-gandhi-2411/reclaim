@@ -116,18 +116,20 @@ _CASES: dict[str, Case] = {
     ),
     "duplicate_size_candidates": Case(
         _consume(lambda idx: idx.duplicate_size_candidates(min_reclaim_bytes=0)),
-        expect_index=True,
-        reason="indexed via the `size` column (GROUP BY/IN)",
+        expect_index=False,
+        reason="the distinct-inode GROUP BY reads every row once, so its inner scan is a "
+        "deliberate `NOT INDEXED` table scan (an index only adds a random row lookup per entry "
+        "and made the query 4-7x slower once ANALYZE existed); the outer is still indexed",
     ),
     "duplicate_size_candidate_count": Case(
         lambda idx: idx.duplicate_size_candidate_count(min_reclaim_bytes=0),
-        expect_index=True,
-        reason="same query shape as duplicate_size_candidates",
+        expect_index=False,
+        reason="same query shape as duplicate_size_candidates (pinned whole-table aggregate)",
     ),
     "immaterial_duplicate_bucket_stats": Case(
         lambda idx: idx.immaterial_duplicate_bucket_stats(min_reclaim_bytes=0),
-        expect_index=True,
-        reason="same query shape as duplicate_size_candidates",
+        expect_index=False,
+        reason="same query shape as duplicate_size_candidates (pinned whole-table aggregate)",
     ),
     "subtree_size_bytes": Case(
         lambda idx: idx.subtree_size_bytes(_SCOPE),
