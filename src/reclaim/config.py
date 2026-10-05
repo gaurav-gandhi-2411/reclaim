@@ -593,6 +593,18 @@ class AutoCleanConfig(BaseModel):
     enabled: bool = False
 
 
+class RegenerableConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # ADR-0034 addendum "pytest temp": delete `%TEMP%\pytest-of-<user>\pytest-<N>` folders whose
+    # newest file is over 7 days old. OFF by default and not offered in the one-click/weekly clean
+    # until the user turns it on, because pytest keeps the runs of EVERY project that user tests
+    # in that one folder and Reclaim cannot tell whose run a given folder is -- so it cannot prove
+    # none belongs to a project on the `[exclusions]` list. Turn on only if none of the projects
+    # you test is one you are protecting (or protect them with a `[safety] deny` path pattern).
+    pytest_temp: bool = False
+
+
 class DedupConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -642,6 +654,7 @@ class Config(BaseSettings):
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     autoclean: AutoCleanConfig = Field(default_factory=AutoCleanConfig)
+    regenerable: RegenerableConfig = Field(default_factory=RegenerableConfig)
     exclusions: ExclusionsConfig = Field(default_factory=ExclusionsConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change

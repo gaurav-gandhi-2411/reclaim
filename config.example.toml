@@ -135,6 +135,14 @@ disk_threshold_percent = 80.0
 [autoclean]
 enabled = false
 
+# ADR-0034 addendum "pytest temp": also clean old pytest-<N> folders in %TEMP%\pytest-of-<you> (newest
+# file over 7 days old). Off by default: pytest temp folders are shared by every project you test;
+# turn on only if none of them is a project you are protecting. Reclaim cannot tell whose folder is
+# whose, so [exclusions] project_names cannot reliably protect them -- a [safety] deny path pattern can.
+# `reclaim auto-clean --include-pytest-temp` previews it (dry run) without turning it on.
+[regenerable]
+pytest_temp = false
+
 # ADR-0040: background dedup warm-up. After a completed full scan the duplicate hash pass runs in
 # the background at low priority so the dashboard is ready when you open it. A new scan or closing
 # Reclaim cancels it; already-computed hashes are kept. false = warm only on first dashboard open.
@@ -147,6 +155,11 @@ warm_after_scan = true
 # tree, its worktrees, venvs/envs, caches, and TEMP scratch directories whose name embeds the
 # project). Plain names only (no slashes or glob characters); use [safety] deny for globs.
 # Empty by default. Edits take effect on the next run / dashboard restart.
+# Exception: `[regenerable] pytest_temp = true` (above) is the ONE opt-in category these names
+# cannot reliably protect. A pytest-<N> folder is shared by every project you test; a name only
+# matches when a folder or file name inside it embeds the project name, and hyphen vs underscore
+# does not match ("my-proj" does not match test_my_proj0). If you turn it on, add a [safety]
+# deny path pattern.
 # Example:
 # [exclusions]
 # project_names = ["my-private-project", "client-work"]
