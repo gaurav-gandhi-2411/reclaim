@@ -169,6 +169,11 @@ warm_after_scan = true
 # tree, its worktrees, venvs/envs, caches, and TEMP scratch directories whose name embeds the
 # project). Plain names only (no slashes or glob characters); use [safety] deny for globs.
 # Empty by default. Edits take effect on the next run / dashboard restart.
+# Exception: `[regenerable] pytest_temp = true` (above) is the ONE opt-in category these names
+# cannot reliably protect. A pytest-<N> folder is shared by every project you test; a name only
+# matches when a folder or file name inside it embeds the project name, and hyphen vs underscore
+# does not match ("my-proj" does not match test_my_proj0). If you turn it on, add a [safety]
+# deny path pattern.
 # Example:
 # [exclusions]
 # project_names = ["my-private-project", "client-work"]

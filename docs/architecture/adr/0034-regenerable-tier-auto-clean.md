@@ -166,7 +166,7 @@ unlinked, its target untouched, as for every other category).
 ADR-0039) -> `excluded`, status `skipped_excluded` when nothing else happened; (2) the existing
 guard names (`.git`, venv, `node_modules`) -> left for review; (3) on apply, every file is probed
 with the same `has_open_handle` the other categories use and ONE open or un-probeable file skips the
-whole directory (`skipped_in_use`, with a reason; a detector that raises is treated as in use,
+whole directory when the handle is present at probe time (`skipped_in_use`, with a reason; a detector that raises is treated as in use,
 fail-closed); (4) ADR-0036: the directory is re-scanned after the (slow) handle probe and immediately
 before the delete, and kept if anything is newer; each file is again re-stat'ed against the age floor
 as it is unlinked. A dry run does NOT probe handles (that would open every file); it reports what the
@@ -186,6 +186,18 @@ patterns are matched against every path inside the directory, so a run whose fil
 embed the project name is skipped, but a run that merely used `tmp_path` fixtures with generic names
 cannot be matched; the user can protect those only by writing a `[safety] deny` path pattern for the
 folder (or by leaving the flag off).
+
+**Races after the probe.** A handle, touch or working-directory process that appears AFTER the
+probe is not caught by (3): the rescan keeps a touched dir (`skipped_in_use`, "touched since it
+was planned"), and if the delete phase still leaves the top-level dir behind (an in-use file, or
+a process whose cwd is inside it, which leaves an empty skeleton) the item is `skipped_in_use`
+with a detail naming the dir and why. `cleaned` is never reported while any qualifying dir
+remains (even if other dirs were removed; bytes/files removed are still counted).
+
+**Name matching limits.** Exclusion name tokens match literally: a hyphen does not match an
+underscore (`my-proj` does not match `test_my_proj0`), so pytest's own sanitised test-dir names
+usually escape `project_names`. As for aged TEMP, a `%TEMP%` that has been re-pointed
+(junction) is followed.
 
 **A change to aged TEMP that this required.** Before this addendum the generic aged-TEMP category
 could delete `%TEMP%\pytest-of-<user>` wholesale whenever every file in it was over 7 days old, which
