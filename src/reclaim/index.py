@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -915,7 +915,9 @@ class ScanIndex:
         for row in self._conn.execute(sql, params):
             yield _row_to_record(row)
 
-    def duplicate_size_candidates(self, *, min_reclaim_bytes: int) -> Iterator[FileRecord]:
+    def duplicate_size_candidates(
+        self, *, min_reclaim_bytes: int
+    ) -> Generator[FileRecord, None, None]:
         """Streams every non-directory, non-empty, non-cloud-placeholder file whose `size`
         collides with at least one other such file *and* whose bucket clears the materiality
         floor — the SQL-pushed equivalent of the old in-memory `_size_buckets()` prefilter in

@@ -788,23 +788,27 @@ def find_duplicate_clusters(
 
     window: list[tuple[int, list[FileRecord]]] = []
     window_files = 0
-    for size, members_iter in itertools.groupby(
-        index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes),
-        key=lambda record: record.size_bytes,
-    ):
-        counters["buckets"] += 1
-        members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
-        if exclusion_patterns:
-            members = [
-                m for m in members if first_matching_pattern(m.path, exclusion_patterns) is None
-            ]
-        window.append((size, members))
-        window_files += len(members)
-        if window_files >= _WINDOW_FILES:
+    rows = index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes)
+    try:
+        for size, members_iter in itertools.groupby(rows, key=lambda record: record.size_bytes):
+            counters["buckets"] += 1
+            members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
+            if exclusion_patterns:
+                members = [
+                    m for m in members if first_matching_pattern(m.path, exclusion_patterns) is None
+                ]
+            window.append((size, members))
+            window_files += len(members)
+            if window_files >= _WINDOW_FILES:
+                run_window(window)
+                window, window_files = [], 0
+        if window:
             run_window(window)
-            window, window_files = [], 0
-    if window:
-        run_window(window)
+    finally:
+        # Close the SELECT cursor NOW, not whenever the traceback releases the generator: a
+        # cancel (or any error) unwinding out of the loop otherwise leaves the cursor open and
+        # ScanIndex.close()'s WAL checkpoint then fails with "database table is locked".
+        rows.close()
     flush_writes()
     buckets_seen = counters["buckets"]
 

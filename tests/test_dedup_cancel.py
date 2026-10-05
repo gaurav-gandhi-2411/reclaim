@@ -178,3 +178,21 @@ def test_worker_initializer_runs_in_pool_threads_not_the_calling_thread(
         dedup.find_duplicate_clusters(index, min_reclaim_bytes=0, worker_initializer=initializer)
     assert thread_ids
     assert threading.get_ident() not in thread_ids
+
+
+def test_index_can_be_closed_while_the_cancel_traceback_is_still_alive(
+    db: Path, hash_calls: list[Path]
+) -> None:
+    """Teeth: without closing the candidates cursor in a `finally`, the unwinding exception's
+    traceback keeps the SELECT generator alive and `ScanIndex.close()`'s WAL checkpoint raises
+    "database table is locked" (found by the API-level cancel test)."""
+    index = ScanIndex(db)
+    caught: dedup.DedupCancelled | None = None
+    try:
+        dedup.find_duplicate_clusters(
+            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(5)
+        )
+    except dedup.DedupCancelled as exc:
+        caught = exc  # keeps exc.__traceback__ (and its frames) referenced past the except block
+    assert caught is not None
+    index.close()  # must not raise
