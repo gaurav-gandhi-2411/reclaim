@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+src, db, label = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, src)
+import reclaim  # noqa: E402
+from reclaim.index import ScanIndex  # noqa: E402
+
+FLOOR = 1024 * 1024
+print(f"[{label}] code={Path(reclaim.__file__).parent} sqlite={sqlite3.sqlite_version}", flush=True)
+idx = ScanIndex(Path(db))
+print(f"[{label}] has_planner_stats={idx.has_planner_stats()}", flush=True)
+
+
+def timed(name: str, fn):  # type: ignore[no-untyped-def]
+    t, c = time.perf_counter(), time.process_time()
+    out = fn()
+    print(
+        f"[{label}] {name}: wall {time.perf_counter() - t:.1f} s, cpu {time.process_time() - c:.1f} s"
+        f" -> {out}",
+        flush=True,
+    )
+
+
+timed("count", lambda: idx.duplicate_size_candidate_count(min_reclaim_bytes=FLOOR))
+timed("immaterial", lambda: idx.immaterial_duplicate_bucket_stats(min_reclaim_bytes=FLOOR))
+timed("stream", lambda: sum(1 for _ in idx.duplicate_size_candidates(min_reclaim_bytes=FLOOR)))
+idx._conn.close()

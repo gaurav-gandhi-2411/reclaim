@@ -1,0 +1,8 @@
+sqlite 3.45.3 stat1 rows: 7
+v1_count rows 1 wall_s 38.9 cpu_s 35.2
+v2_count rows 1 wall_s 39.0 cpu_s 29.9
+v1_immaterial rows 1 wall_s 41.7 cpu_s 26.0
+v1_count rows 1 wall_s 63.2 cpu_s 42.9
+v2_count rows 1 wall_s 53.5 cpu_s 33.0
+v1_stream rows 914970 wall_s 66.9 cpu_s 47.3
+count rows 1 wall_s 147.2 cpu_s 119.5
