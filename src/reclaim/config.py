@@ -593,6 +593,17 @@ class AutoCleanConfig(BaseModel):
     enabled: bool = False
 
 
+class DedupConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # ADR-0040: after a COMPLETED full scan (and, once, shortly after dashboard start when the
+    # candidates cache is cold) warm the candidates cache -- the duplicate hash pass -- in the
+    # background at low OS priority, so the dashboard is ready when the user opens it instead of
+    # making them wait. Cancelled automatically by a new scan or by shutdown; hashes already
+    # computed are kept. Set false to warm only on demand (first dashboard open).
+    warm_after_scan: bool = True
+
+
 _EXCLUSION_NAME_FORBIDDEN_CHARS = "/\\*?[]"
 
 
@@ -632,6 +643,7 @@ class Config(BaseSettings):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     autoclean: AutoCleanConfig = Field(default_factory=AutoCleanConfig)
     exclusions: ExclusionsConfig = Field(default_factory=ExclusionsConfig)
+    dedup: DedupConfig = Field(default_factory=DedupConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not

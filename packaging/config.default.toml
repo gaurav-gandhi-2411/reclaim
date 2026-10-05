@@ -149,6 +149,12 @@ disk_threshold_percent = 80.0
 [autoclean]
 enabled = false
 
+# ADR-0040: background dedup warm-up. After a completed full scan the duplicate hash pass runs in
+# the background at low priority so the dashboard is ready when you open it. A new scan or closing
+# Reclaim cancels it; already-computed hashes are kept. false = warm only on first dashboard open.
+[dedup]
+warm_after_scan = true
+
 # ADR-0039: projects/folders that must NEVER be touched by any Reclaim cleanup -- the scan-driven
 # candidates, duplicate detection, one-click apply, purge, and the weekly regenerable auto-clean.
 # Each name is a case-insensitive substring token matched against the whole path (the project
