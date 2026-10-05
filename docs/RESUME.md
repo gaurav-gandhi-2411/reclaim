@@ -3,7 +3,41 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-02 (owner shutting down) -- READ THIS FIRST, it supersedes the sections below
+## CHECKPOINT 2026-10-05 -- READ THIS FIRST (section 1 of the owner's resume prompt; supersedes the 10-02 section where they differ)
+
+**Main** = `8bb8fc0` (#129 merged; #132 #116 #127 #131 merged 2026-10-02). `scripts/verify.py` on main and on
+main+#129: 1508 / 1529 passed, 35 skipped, coverage 89.72 / 89.74 %. C: free fluctuates 68-80 GB with
+pagefile/commit pressure from other sessions (pagefile.sys 15 GB, commit 33.9 GB on 31.2 GB RAM at 13:50).
+
+**Section 1 PRs (each from main `8bb8fc0`; none merged -- merge order below):**
+- **(a) `perf/dedup-analyze-plan`**: root cause of the post-ANALYZE dedup slowdown: with `sqlite_stat1` the
+  planner moves the distinct-inode GROUP BY from a rowid scan to the non-covering `idx_files_size`, one random row
+  lookup per entry. Fix = `FROM files NOT INDEXED` on the inner scan (#117's subtree-count gain is a different
+  query, untouched). Real-index copy, SQLite 3.50.4, CPU-contended (95-100 %): with stats count/immaterial/stream
+  153.6 / 110.1 / 126.5 s -> 36.0 / 15.6 / 43.7 s; no stats 21.6 / 12.2 / 30.6 -> 16.3 / 11.7 / 27.3 s; results
+  identical. Provenance: `reports/dedup-analyze-plan-2026-10-05/`.
+- **(b) #134 `feat/background-dedup-warmup`** (ADR-0040): auto warm-up after a full scan (home or an ancestor),
+  Windows background mode on the worker and hash-pool threads, cancel endpoint, resume from per-window hashes.
+- **(c) `chore/scratch-index-helper`**: `scripts/scratch_index.py` (copy the real index only with guaranteed cleanup)
+  + CLAUDE.md 3a. The sweep of this workstream's own paths found exactly one index copy (mine, 4.56 GiB, deleted);
+  the recurring "~14 GB drops" are BELIEVED to be pagefile/commit pressure, not copies (pagefile.sys is 15 GB).
+- **(e) #133 `fix/autoclean-uv-lock-retry`** (ADR-0034 addendum): VERIFIED that any live `uv run` holds a shared
+  lock on `%LOCALAPPDATA%\uv\cache\.lock` (exclusive `uv cache prune` blocks for its lifetime; Restart Manager names
+  the holder). Fix = delayed LogonTrigger + state file (`data/autoclean_state.json`) so a sign-in run retries only the
+  tools left pending. NOT verified: that a real sign-in obtains the lock; who held it during the 3,300 s failure
+  (unrecoverable, BELIEVED other sessions' `uv run`). Existing registered tasks keep one trigger until the
+  Settings toggle is switched off and on.
+
+**Worktrees (d):** 36 -> 24 (before this round's new ones). Removed 12 clean, fully-pushed ones of this workstream
+(branches kept). 22 pre-existing kept: each holds commits on no remote ref (mostly pre-squash/pre-rebase
+shas of merged work, content NOT individually verified) and/or dirty files (LFS `.onnx`), plus
+`rebase-mcp-q3` (another session, untouched) and the main checkout. Per-worktree table: see the section 1 report.
+
+**Still to do (section 2, after the owner merges section 1):** rebuild, smoke tests + DLL check, 2 h soak, install +
+exclusions in the installed `config.toml`, fresh full scan (+ confirm warm-up starts), real-browser 409 check, owner
+reboots BEFORE Phase C (pagefile reset), Phase C one-click, weekly task Ready, B6 toast, how-to paragraph.
+
+## CHECKPOINT 2026-10-02 (owner shutting down) -- superseded where it differs from the section above
 
 **State at this checkpoint (VERIFIED by `git`/`gh` at the time of writing; re-check with `git fetch origin`
 + `gh pr list` before trusting it):** `origin/main` = `aba6043`. Nothing of this workstream is running:

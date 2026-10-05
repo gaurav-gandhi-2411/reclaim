@@ -1,0 +1,29 @@
+=== WITH STATS ===
+system CPU% (3 s avg) = 100
+[before/main, stats] code=C:\Users\gaura\ml-projects\reclaim\src\reclaim sqlite=3.50.4
+[before/main, stats] has_planner_stats=True
+[before/main, stats] count: wall 153.6 s, cpu 108.1 s -> 914970
+[before/main, stats] immaterial: wall 110.1 s, cpu 87.0 s -> (165476, 59306327255)
+[before/main, stats] stream: wall 126.5 s, cpu 111.7 s -> 914970
+system CPU% (3 s avg) = 95
+[after/fix, stats] code=C:\Users\gaura\ml-projects\reclaim-wt-analyze\src\reclaim sqlite=3.50.4
+[after/fix, stats] has_planner_stats=True
+[after/fix, stats] count: wall 36.0 s, cpu 31.3 s -> 914970
+[after/fix, stats] immaterial: wall 15.6 s, cpu 13.6 s -> (165476, 59306327255)
+[after/fix, stats] stream: wall 43.7 s, cpu 41.0 s -> 914970
+=== DROP STATS ===
+stat1 rows now 0
+=== NO STATS ===
+system CPU% (3 s avg) = 94
+[before/main, no stats] code=C:\Users\gaura\ml-projects\reclaim\src\reclaim sqlite=3.50.4
+[before/main, no stats] has_planner_stats=False
+[before/main, no stats] count: wall 21.6 s, cpu 18.9 s -> 914970
+[before/main, no stats] immaterial: wall 12.2 s, cpu 12.0 s -> (165476, 59306327255)
+[before/main, no stats] stream: wall 30.6 s, cpu 28.9 s -> 914970
+system CPU% (3 s avg) = 57
+[after/fix, no stats] code=C:\Users\gaura\ml-projects\reclaim-wt-analyze\src\reclaim sqlite=3.50.4
+[after/fix, no stats] has_planner_stats=False
+[after/fix, no stats] count: wall 16.3 s, cpu 15.9 s -> 914970
+[after/fix, no stats] immaterial: wall 11.7 s, cpu 11.5 s -> (165476, 59306327255)
+[after/fix, no stats] stream: wall 27.3 s, cpu 26.6 s -> 914970
+DONE
