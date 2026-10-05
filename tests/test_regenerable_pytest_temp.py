@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from reclaim import cli
+from reclaim import cli, logging_config
 from reclaim import regenerable as rg
 from reclaim.api import service
 from reclaim.config import Config, load_config
@@ -318,13 +320,24 @@ def test_config_default_is_off_and_toml_opt_in_parses(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def cli_world(world: World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
+def cli_world(world: World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[World]:
     monkeypatch.setattr(service, "regenerable_clean_env", world.env)
     monkeypatch.setattr(rg, "DEFAULT_AUDIT_LOG_PATH", tmp_path / "audit.jsonl")
     monkeypatch.setattr(cli, "DEFAULT_LOG_PATH", tmp_path / "reclaim.log")
     monkeypatch.setattr(cli, "assert_not_elevated", lambda: None)
+    # `cli.main` re-points the ROOT logger's stderr handler at this test's capsys stream; left
+    # attached, a later test in the same process logs into a closed file (and the "Logging error"
+    # traceback's own os.stat calls break tests/test_restat_decision_points.py's stat counter).
+    handlers_before = list(logging.getLogger().handlers)
+    configured_before = logging_config._configured_for_path
     # The default env fixture mode is "delete"; the service overrides it per run.
-    return world
+    yield world
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        if handler not in handlers_before:
+            root_logger.removeHandler(handler)
+            handler.close()
+    logging_config._configured_for_path = configured_before
 
 
 def _cfg(tmp_path: Path, body: str) -> Path:
