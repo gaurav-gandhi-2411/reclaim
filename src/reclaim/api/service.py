@@ -13,6 +13,7 @@ from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
+from typing import Literal
 
 import structlog
 
@@ -82,7 +83,9 @@ from reclaim.api.state import (
     AIAnalysisStatus,
     ApplyStatus,
     AppState,
+    CandidatesWarmSourceLiteral,
     CandidatesWarmStatus,
+    CandidatesWarmStatusLiteral,
     RestoreStatus,
     ScanStatus,
 )
@@ -93,6 +96,7 @@ from reclaim.config import (
     set_notifications_enabled,
 )
 from reclaim.dedup import (
+    DedupCancelled,
     cluster_needs_manual_review,
     find_duplicate_clusters,
     generate_duplicate_candidates,
@@ -132,6 +136,7 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
+from reclaim.thread_priority import BackgroundScope, set_background_mode
 
 logger = structlog.get_logger(__name__)
 
@@ -206,7 +211,13 @@ def resolve_allowed_apply_roots(
     return roots
 
 
-def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
+def _all_candidates(
+    index: ScanIndex,
+    state: AppState,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    worker_initializer: Callable[[], None] | None = None,
+) -> list[Candidate]:
     """Combined detector + exact-duplicate candidate list — the same two-function contract
     `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
 
@@ -226,10 +237,21 @@ def _all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
     UNCACHED — this is the expensive pass `_cached_all_candidates` below memoizes per scan
     generation. Call sites that need every candidate for the CURRENT scan should go through that
     wrapper instead; call this directly only when scoping to a smaller universe already avoids
-    the cost (see `resolve_apply_selection`'s `request.paths is not None` branch)."""
+    the cost (see `resolve_apply_selection`'s `request.paths is not None` branch).
+
+    `checkpoint` (ADR-0040) is called before the detector stage, between it and the duplicate
+    stage and, via `generate_duplicate_candidates`, at every dedup batch boundary; it may raise
+    `DedupCancelled`, in which case nothing is returned (and `_cached_all_candidates` caches
+    nothing). `worker_initializer` runs in each hashing pool thread."""
     config = state.effective_config
+    if checkpoint is not None:
+        checkpoint()
     candidates = generate_candidates(index, config, state.safety)
-    candidates += generate_duplicate_candidates(index, config, state.safety)
+    if checkpoint is not None:
+        checkpoint()
+    candidates += generate_duplicate_candidates(
+        index, config, state.safety, checkpoint=checkpoint, worker_initializer=worker_initializer
+    )
     allowed_roots = resolve_allowed_apply_roots(state)
     return [
         c for c in candidates if check_within_allowed_scope(c.path, allowed_roots=allowed_roots)
@@ -265,7 +287,13 @@ def _candidates_cache_key(state: AppState) -> tuple[int, str, str, tuple[str, ..
     )
 
 
-def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]:
+def _cached_all_candidates(
+    index: ScanIndex,
+    state: AppState,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+    worker_initializer: Callable[[], None] | None = None,
+) -> list[Candidate]:
     """Cached, concurrency-guarded wrapper around `_all_candidates` (perf/dedup-cache,
     docs/AUDIT-2026-08.md P0-3) — every call site that needs the full candidate universe for the
     CURRENT scan (`build_summary`, `build_treemap`, `list_candidates`,
@@ -285,7 +313,14 @@ def _cached_all_candidates(index: ScanIndex, state: AppState) -> list[Candidate]
         key = _candidates_cache_key(state)
         if state.candidates_cache is not None and state.candidates_cache_key == key:
             return state.candidates_cache
-        candidates = _all_candidates(index, state)
+        # A cancelled compute raises out of here BEFORE the three assignments below, so a
+        # cancelled warm-up never leaves partial candidates (or a warm key) behind (ADR-0040).
+        if checkpoint is None and worker_initializer is None:
+            candidates = _all_candidates(index, state)
+        else:
+            candidates = _all_candidates(
+                index, state, checkpoint=checkpoint, worker_initializer=worker_initializer
+            )
         state.candidates_cache = candidates
         state.candidates_cache_generation = key[0]
         state.candidates_cache_key = key
@@ -384,6 +419,63 @@ def require_warm_candidates(state: AppState) -> None:
     )
 
 
+WarmBeginOutcome = Literal["started", "promoted", "already_running", "refused"]
+
+
+def begin_candidates_warm(
+    state: AppState, *, source: CandidatesWarmSourceLiteral, refuse_during_scan: bool = False
+) -> tuple[WarmBeginOutcome, CandidatesWarmStatus]:
+    """THE single-flight check-and-set for every warm-up start (on-demand route, the 409 courtesy
+    kick, the post-scan auto-start, the dashboard-start auto-start), under `state.lock`. Returns
+    `(outcome, status snapshot)`:
+
+    - "started": no warm-up was computing; one is now marked "computing" (cancel event cleared)
+      and the CALLER must schedule `run_candidates_warm`.
+    - "promoted": a "user" request arrived while an "auto" run was computing -- no second run is
+      started; the auto run is marked `promoted` so its worker leaves OS background mode at the
+      next batch boundary (best effort: a batch already in flight finishes at low priority).
+    - "already_running": a warm-up is computing (a second "user" kick on a user run, any "auto"
+      while another is running, or a user request while a cancel is pending).
+    - "refused": `refuse_during_scan` and a scan is running (warm AFTER a scan, not during it).
+    """
+    with state.lock:
+        current = state.candidates_warm_status
+        if refuse_during_scan and state.scan_status.status == "running":
+            return "refused", current
+        if current.status == "computing":
+            if source == "user" and current.source == "auto" and not current.cancel_requested:
+                if not current.promoted:
+                    state.candidates_warm_status = _dataclass_replace(current, promoted=True)
+                return "promoted", state.candidates_warm_status
+            return "already_running", current
+        state.candidates_warm_cancel_event.clear()
+        state.candidates_warm_status = CandidatesWarmStatus(
+            status="computing",
+            scan_generation=state.scan_generation,
+            started_at=time.time(),
+            source=source,
+        )
+        return "started", state.candidates_warm_status
+
+
+def cancel_candidates_warm_locked(state: AppState) -> None:
+    """Request a cooperative stop of a computing warm-up. CALLER HOLDS `state.lock`. A no-op when
+    nothing is computing. The status turns "cancelled" when the worker reaches its next batch
+    boundary (until then `cancel_requested` is true); hashes already committed stay."""
+    status = state.candidates_warm_status
+    if status.status != "computing":
+        return
+    state.candidates_warm_cancel_event.set()
+    state.candidates_warm_status = _dataclass_replace(status, cancel_requested=True)
+
+
+def cancel_candidates_warm(state: AppState) -> CandidatesWarmStatus:
+    """`POST /api/candidates/warm/cancel`: idempotent; returns the current status either way."""
+    with state.lock:
+        cancel_candidates_warm_locked(state)
+        return state.candidates_warm_status
+
+
 def run_candidates_warm(state: AppState) -> None:
     """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
     real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
@@ -392,37 +484,160 @@ def run_candidates_warm(state: AppState) -> None:
     against a concurrent `GET /api/candidates/warm-status` poll, same convention every other
     status dataclass in this module already follows.
 
-    Deliberately does NOT itself decide whether a warm-up is needed or already running — the
-    route handler (`POST /api/candidates/warm`) owns that single-flight check-and-set, under
-    `state.lock`, BEFORE scheduling this as a background task (same reasoning `POST /api/scan`'s
-    own route handler documents for why `cancel_scan_event` is cleared there and not here: a
-    client polling immediately after the response could otherwise race this function's own
-    "mark as computing" step).
+    Deliberately does NOT itself decide whether a warm-up is needed or already running — every
+    starter goes through `begin_candidates_warm` (the single-flight check-and-set, under
+    `state.lock`) BEFORE scheduling this (same reasoning `POST /api/scan`'s own route handler
+    documents for why `cancel_scan_event` is cleared there and not here: a client polling
+    immediately after the response could otherwise race this function's own "mark as computing"
+    step).
+
+    ADR-0040: an "auto" run (source stamped by `begin_candidates_warm`) executes in Windows
+    background mode -- on THIS thread (detectors, cluster assembly) and in every hashing pool
+    thread (`worker_initializer`; the pool is where the file reads happen). `promoted` (a user
+    asked for the result meanwhile) ends it: this thread leaves at the next batch boundary and
+    pool threads started afterwards never enter it. A cancel (`candidates_warm_cancel_event`) is
+    observed at the same boundaries: status becomes "cancelled", the cache is NOT marked warm,
+    and committed hashes stay for the next run to reuse.
     """
+    low_priority = state.candidates_warm_status.source == "auto"
+    scope = BackgroundScope(state.background_mode_setter)
+
+    def checkpoint() -> None:
+        if state.candidates_warm_cancel_event.is_set():
+            raise DedupCancelled
+        # Lock-free read of one bool on a dataclass that is replaced, never mutated: atomic in
+        # CPython, and this runs on the hot batch path.
+        if scope.active and state.candidates_warm_status.promoted:
+            scope.leave()
+
+    def worker_initializer() -> None:
+        # Pool threads end (and with them background mode) when their window's pool shuts down.
+        if not state.candidates_warm_status.promoted:
+            set_background_mode(True, state.background_mode_setter)
+
+    def finish(status: CandidatesWarmStatusLiteral, error: str | None = None) -> None:
+        with state.lock:
+            state.candidates_warm_status = _dataclass_replace(
+                state.candidates_warm_status,
+                status=status,
+                scan_generation=state.scan_generation,
+                finished_at=time.time(),
+                error=error,
+                cancel_requested=False,
+            )
+
     try:
+        if low_priority:
+            scope.enter()
         with ScanIndex(state.db_path) as index:
-            _cached_all_candidates(index, state)
+            _cached_all_candidates(
+                index,
+                state,
+                checkpoint=checkpoint,
+                worker_initializer=worker_initializer if low_priority else None,
+            )
+    except DedupCancelled:
+        logger.info("api.candidates_warm_cancelled")
+        finish("cancelled")
+        return
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery —
         # same posture `run_apply`/`run_scan` already use for their own background bodies.
         logger.warning("api.candidates_warm_failed", error=str(exc))
+        finish("failed", str(exc))
+        return
+    finally:
+        scope.leave()
+
+    finish("ready")
+
+
+def _spawn_daemon_thread(target: Callable[[], None]) -> None:
+    threading.Thread(target=target, name="candidates-warm", daemon=True).start()
+
+
+def start_auto_warm(state: AppState) -> bool:
+    """Start an "auto" warm-up now if `[dedup] warm_after_scan` is on, no scan is running, the
+    candidates cache is not already warm, and none is already computing. True iff one started."""
+    if not state.config.dedup.warm_after_scan:
+        return False
+    if candidates_cache_stale_reason(state) is None:
+        return False
+    outcome, _ = begin_candidates_warm(state, source="auto", refuse_during_scan=True)
+    if outcome != "started":
+        return False
+    spawn = state.warm_spawner or _spawn_daemon_thread
+    try:
+        spawn(lambda: run_candidates_warm(state))
+    except Exception as exc:  # e.g. cannot start a thread: never leave status "computing"
+        logger.warning("api.candidates_warm_spawn_failed", error=str(exc))
         with state.lock:
-            state.candidates_warm_status = CandidatesWarmStatus(
+            state.candidates_warm_status = _dataclass_replace(
+                state.candidates_warm_status,
                 status="failed",
-                scan_generation=state.scan_generation,
-                started_at=state.candidates_warm_status.started_at,
                 finished_at=time.time(),
                 error=str(exc),
             )
-        return
+        return False
+    return True
 
-    with state.lock:
-        state.candidates_warm_status = CandidatesWarmStatus(
-            status="ready",
-            scan_generation=state.scan_generation,
-            started_at=state.candidates_warm_status.started_at,
-            finished_at=time.time(),
-        )
+
+def scan_roots_cover_home(roots: Sequence[Path], *, home: Path | None = None) -> bool:
+    """True iff any scanned root IS the user's profile or an ancestor of it (a drive root): the
+    "full scan" definition for the post-scan warm-up. A scan of one subfolder (Downloads, a
+    project) is scoped -- it does not refresh enough of the index to justify an hour of hashing.
+    Compared case-insensitively on path parts (Windows)."""
+    home_parts = [part.lower() for part in (home if home is not None else Path.home()).parts]
+    for root in roots:
+        root_parts = [part.lower() for part in root.parts]
+        if home_parts[: len(root_parts)] == root_parts:
+            return True
+    return False
+
+
+def auto_warm_after_scan(
+    state: AppState, roots: Sequence[Path], *, home: Path | None = None
+) -> bool:
+    """`run_scan`'s success hook (ADR-0040). Never raises: a failure here must not turn a good
+    scan into a failed one."""
+    try:
+        if not scan_roots_cover_home(roots, home=home):
+            logger.info("api.candidates_auto_warm_skipped", reason="scoped_scan")
+            return False
+        return start_auto_warm(state)
+    except Exception as exc:  # see docstring
+        logger.warning("api.candidates_auto_warm_error", error=str(exc))
+        return False
+
+
+def schedule_startup_warm(state: AppState) -> None:
+    """One-shot, after `state.startup_warm_delay_seconds` (so startup itself is not slowed): warm
+    the cold cache from the persisted index. No-op when `[dedup] warm_after_scan` is off."""
+    if not state.config.dedup.warm_after_scan:
+        return
+    timer = threading.Timer(state.startup_warm_delay_seconds, _startup_warm_tick, args=(state,))
+    timer.daemon = True
+    state.startup_warm_timer = timer
+    timer.start()
+
+
+def _startup_warm_tick(state: AppState) -> None:
+    try:
+        with ScanIndex(state.db_path) as index:
+            has_records = index.has_any_records()
+        if has_records:
+            start_auto_warm(state)
+    except Exception as exc:  # a timer thread must not die noisily; the on-demand path remains
+        logger.warning("api.candidates_startup_warm_error", error=str(exc))
+
+
+def shutdown_candidates_warm(state: AppState) -> None:
+    """App shutdown: drop the pending startup timer and cancel a running warm-up so the process
+    exits promptly (the worker is a daemon thread; it stops at its next batch boundary)."""
+    timer = state.startup_warm_timer
+    if timer is not None:
+        timer.cancel()
+    cancel_candidates_warm(state)
 
 
 def to_candidates_warm_status_out(
@@ -446,6 +661,9 @@ def to_candidates_warm_status_out(
         elapsed_seconds=elapsed_seconds,
         error=status.error,
         stale_reason=stale_reason,
+        source=status.source,
+        promoted=status.promoted,
+        cancel_requested=status.cancel_requested,
     )
 
 
@@ -823,6 +1041,9 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
         # ADR-0025: a new completed scan invalidates any cached AI analysis -- callers compare
         # this against `AIAnalysisStatus.scan_generation` to detect a stale cache.
         state.scan_generation += 1
+
+    # ADR-0040: warm the candidates cache in the background AFTER (never during) a full scan.
+    auto_warm_after_scan(state, roots)
 
 
 # --- Summary / category cards -------------------------------------------------------------

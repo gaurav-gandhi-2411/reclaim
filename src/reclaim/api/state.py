@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -15,12 +16,16 @@ from reclaim.logging_config import DEFAULT_LOG_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
 from reclaim.models import Candidate, Mode
 from reclaim.safety import SafetyValidator
+from reclaim.thread_priority import BackgroundModeSetter
 
 ScanStatusLiteral = Literal["idle", "running", "completed", "failed", "cancelled"]
 AIAnalysisStatusLiteral = Literal["idle", "running", "completed", "failed"]
 ApplyStatusLiteral = Literal["idle", "running", "completed", "failed"]
 RestoreStatusLiteral = Literal["idle", "running", "completed", "failed"]
-CandidatesWarmStatusLiteral = Literal["idle", "computing", "ready", "failed"]
+CandidatesWarmStatusLiteral = Literal["idle", "computing", "ready", "failed", "cancelled"]
+# ADR-0040: who started the warm-up. "auto" = after a completed full scan / at dashboard start
+# (runs at low OS priority); "user" = `POST /api/candidates/warm` or the 409 courtesy kick.
+CandidatesWarmSourceLiteral = Literal["auto", "user"]
 # full-drive-scan-eta: which of `api.service.run_scan`'s two phases (per root) is currently
 # active -- "estimating" while `scanner.count_entries_fast` is deriving `entries_estimated_total`,
 # "scanning" while the real `scanner.scan_tree` walk is running, "done" once every root has
@@ -151,6 +156,12 @@ class CandidatesWarmStatus:
     started_at: float | None = None
     finished_at: float | None = None
     error: str | None = None
+    # ADR-0040. `promoted`: a user asked for the result while an "auto" run was computing, so the
+    # worker leaves OS background mode at its next batch boundary. `cancel_requested`: a cancel
+    # arrived and the worker has not yet reached its next boundary (status turns "cancelled" then).
+    source: CandidatesWarmSourceLiteral = "user"
+    promoted: bool = False
+    cancel_requested: bool = False
 
 
 @dataclass(slots=True)
@@ -283,6 +294,17 @@ class AppState:
     # `CandidatesWarmStatus`'s own docstring for the real cold-start cost this exists to make
     # non-blocking/visible instead of silent.
     candidates_warm_status: CandidatesWarmStatus = field(default_factory=CandidatesWarmStatus)
+    # ADR-0040: cooperative cancellation of the warm-up above, checked at dedup batch boundaries.
+    # Set by `POST /api/candidates/warm/cancel`, by a new scan starting, and by app shutdown;
+    # cleared (under `lock`) by `service.begin_candidates_warm` when the next warm-up starts.
+    candidates_warm_cancel_event: threading.Event = field(default_factory=threading.Event)
+    # ADR-0040 injectable seams (tests): the OS background-mode setter (None = the real kernel32
+    # one), how an auto warm-up gets its thread (None = a daemon thread), and the delay before
+    # the one-shot dashboard-start warm-up.
+    background_mode_setter: BackgroundModeSetter | None = None
+    warm_spawner: Callable[[Callable[[], None]], None] | None = None
+    startup_warm_delay_seconds: float = 30.0
+    startup_warm_timer: threading.Timer | None = None
     # R2: where the DPAPI-encrypted Anthropic API key blob lives, and where per-category
     # explanation cache entries are written -- overridable the same way every other path on
     # this dataclass is (test isolation; see `create_app`'s matching constructor parameters).

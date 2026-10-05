@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -91,7 +93,19 @@ def create_app(
     """
     resolved_log_path = log_path if log_path is not None else DEFAULT_LOG_PATH
     configure_logging(resolved_log_path)
-    app = FastAPI(title="Reclaim", version=service.installed_version())
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # ADR-0040: warm a cold candidates cache shortly after start (delayed so startup is not
+        # slowed), and on shutdown cancel a running warm-up so the process exits promptly.
+        reclaim_state: AppState = app.state.reclaim
+        service.schedule_startup_warm(reclaim_state)
+        try:
+            yield
+        finally:
+            service.shutdown_candidates_warm(reclaim_state)
+
+    app = FastAPI(title="Reclaim", version=service.installed_version(), lifespan=_lifespan)
     # Created eagerly (not lazily inside a route) so every read-only endpoint (summary,
     # treemap, candidates) can open `ScanIndex(db_path)` even before the first scan has run —
     # `sqlite3.connect` fails outright if the parent directory doesn't exist yet.

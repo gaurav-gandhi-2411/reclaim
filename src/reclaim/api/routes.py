@@ -54,7 +54,6 @@ from reclaim.api.state import (
     AIAnalysisStatus,
     ApplyStatus,
     AppState,
-    CandidatesWarmStatus,
     RestoreStatus,
     ScanStatus,
 )
@@ -136,6 +135,8 @@ def start_scan(
         # `AppState.cancel_scan_event`'s docstring for why this avoids a real race against an
         # immediate `POST /api/scan/cancel`.
         state.cancel_scan_event.clear()
+        # ADR-0040: a warm-up against the previous scan is wasted work now.
+        service.cancel_candidates_warm_locked(state)
         state.scan_status = ScanStatus(
             status="running",
             root=root,
@@ -228,6 +229,8 @@ def start_my_files_scan(background_tasks: BackgroundTasks, request: Request) -> 
         # Scan cancellation: see the matching comment in `start_scan` above -- same race
         # avoided the same way.
         state.cancel_scan_event.clear()
+        # ADR-0040: a warm-up against the previous scan is wasted work now.
+        service.cancel_candidates_warm_locked(state)
         state.scan_status = ScanStatus(
             status="running",
             root=root,
@@ -358,6 +361,8 @@ def start_full_drive_scan(
         # Scan cancellation: see the matching comment in `start_scan` above -- same race
         # avoided the same way.
         state.cancel_scan_event.clear()
+        # ADR-0040: a warm-up against the previous scan is wasted work now.
+        service.cancel_candidates_warm_locked(state)
         state.scan_status = ScanStatus(
             status="running",
             root=roots[0],
@@ -406,16 +411,24 @@ def start_candidates_warm(
     directly is already fast and this endpoint is unnecessary; this exists for the COLD-cache
     case, so that cost is visible and non-blocking instead of hanging the request thread."""
     state = get_state(request)
-    with state.lock:
-        if state.candidates_warm_status.status == "computing":
-            raise HTTPException(status_code=409, detail="a candidates warm-up is already running")
-        state.candidates_warm_status = CandidatesWarmStatus(
-            status="computing", scan_generation=state.scan_generation, started_at=time.time()
-        )
-        status_snapshot = state.candidates_warm_status
-
-    background_tasks.add_task(service.run_candidates_warm, state)
+    outcome, status_snapshot = service.begin_candidates_warm(state, source="user")
+    if outcome == "already_running":
+        raise HTTPException(status_code=409, detail="a candidates warm-up is already running")
+    if outcome == "started":
+        background_tasks.add_task(service.run_candidates_warm, state)
+    # "promoted" (ADR-0040): an automatic background warm-up is already computing -- no second
+    # one is started; it is moved to foreground priority and this call reports its progress.
     return service.to_candidates_warm_status_out(status_snapshot)
+
+
+@router.post("/candidates/warm/cancel", response_model=CandidatesWarmStatusOut)
+def cancel_candidates_warm(request: Request) -> CandidatesWarmStatusOut:
+    """ADR-0040: cooperative stop of a running warm-up (auto or user), observed at the next dedup
+    batch boundary. Idempotent: a no-op, not an error, when nothing is computing (same posture as
+    `POST /api/scan/cancel`). Hashes already computed stay, so the next warm-up resumes. While the
+    worker is still unwinding, the status is `computing` with `cancel_requested: true`."""
+    state = get_state(request)
+    return service.to_candidates_warm_status_out(service.cancel_candidates_warm(state))
 
 
 def _not_warm_response(
@@ -434,15 +447,10 @@ def _not_warm_response(
     run (confirmed live: `warm-status` stayed "computing" indefinitely). Body is additive:
     `detail` as before plus `code` and `stale_reason`."""
     response_background = None
-    with state.lock:
-        if state.candidates_warm_status.status != "computing":
-            state.candidates_warm_status = CandidatesWarmStatus(
-                status="computing",
-                scan_generation=state.scan_generation,
-                started_at=time.time(),
-            )
-            background_tasks.add_task(service.run_candidates_warm, state)
-            response_background = background_tasks
+    outcome, _ = service.begin_candidates_warm(state, source="user")
+    if outcome == "started":
+        background_tasks.add_task(service.run_candidates_warm, state)
+        response_background = background_tasks
     return JSONResponse(
         status_code=409,
         content={

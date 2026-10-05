@@ -195,8 +195,8 @@ class CandidatesWarmStatusOut(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # "idle" | "computing" | "ready" | "failed" | "stale". "stale" is computed at read time: a
-    # warm-up finished but the cache key (scan/mode/config/scope) no longer matches.
+    # "idle" | "computing" | "ready" | "failed" | "cancelled" | "stale". "stale" is computed at
+    # read time: a warm-up finished but the cache key (scan/mode/config/scope) no longer matches.
     status: str
     started_at: float | None
     finished_at: float | None
@@ -205,6 +205,11 @@ class CandidatesWarmStatusOut(BaseModel):
     # Set only with status "stale": "scan" | "mode" | "config" | "scope" | "cold". Additive and
     # defaulted, so existing clients that ignore it are unaffected.
     stale_reason: str | None = None
+    # ADR-0040, additive: who started the warm-up ("auto" | "user"), whether a user request has
+    # promoted an auto run out of background priority, and whether a cancel is pending.
+    source: str = "user"
+    promoted: bool = False
+    cancel_requested: bool = False
 
 
 class FixedDrivesResponse(BaseModel):
