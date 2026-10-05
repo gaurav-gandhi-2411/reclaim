@@ -347,8 +347,18 @@ def file_row(
 # can reclaim nothing. `ino = 0` means "identity unknown" (synthetic rows; `dedup._hash_stage`
 # never collapses them either), so each such row keeps its own `rowid` as identity. SQLite has no
 # `COUNT(DISTINCT dev, ino)`, hence the GROUP BY subquery. Consumers add `HAVING` on the count.
+#
+# `NOT INDEXED`: a deliberate plan pin. This is a whole-table aggregate (every row is read exactly
+# once), and the only plan that is cheap for that is a sequential table scan. Without `sqlite_stat1`
+# SQLite happens to pick one (the one-valued `idx_files_is_cloud_placeholder`, which walks rows in
+# rowid order); once the scan-end full ANALYZE (#117) exists it prefers `idx_files_size (size>?)`,
+# a NON-covering index, so every one of the ~5.8M entries costs a random row lookup for
+# `is_dir`/`dev`/`ino`. Measured on a copy of the real 4.89 GB index (CPU-contended box, so wall
+# times are inflated; CPU seconds are the cleaner signal): the candidate count went 53 s ->
+# 147-174 s wall (45 -> 120-144 s CPU) after ANALYZE, and 29 s -> 1,163 s (cold cache) for the
+# pre-#131 `GROUP BY size` form. Pinned, it is 39-63 s wall / 35-43 s CPU with or without stats.
 _DISTINCT_INODES_PER_SIZE_SQL = """
-    SELECT size FROM files
+    SELECT size FROM files NOT INDEXED
     WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
     GROUP BY size, (ino = 0), CASE WHEN ino = 0 THEN 0 ELSE dev END,
              CASE WHEN ino = 0 THEN rowid ELSE ino END

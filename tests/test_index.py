@@ -590,15 +590,17 @@ def _captured_sql(index: ScanIndex, action: Callable[[], None]) -> str:
     return captured[-1]
 
 
-def _assert_query_uses_index(index: ScanIndex, sql: str) -> None:
+def _assert_query_uses_index(index: ScanIndex, sql: str, *, pinned_table_scans: int = 0) -> None:
     plan_rows = index._conn.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
     plan_text = " | ".join(str(tuple(row)) for row in plan_rows)
     # `SCAN (subquery-N)` reads a materialized subquery RESULT (e.g. one row per distinct inode per
     # size in `duplicate_size_candidates`), whose own source is the indexed SEARCH asserted below;
     # it is not a table scan, so it is not what this tripwire guards against.
-    assert "SCAN" not in re.sub(r"SCAN \(subquery-\d+\)", "", plan_text), (
-        f"expected no full scan, got: {plan_text}"
-    )
+    # `pinned_table_scans`: how many deliberate `NOT INDEXED` whole-table aggregates the query is
+    # allowed (the dedup distinct-inode GROUP BY reads every row once, so an index only adds a
+    # random row lookup per entry -- see `_DISTINCT_INODES_PER_SIZE_SQL`). Any other SCAN fails.
+    scans = re.sub(r"SCAN \(subquery-\d+\)", "", plan_text).count("SCAN")
+    assert scans == pinned_table_scans, f"expected {pinned_table_scans} full scan(s): {plan_text}"
     assert "SEARCH" in plan_text and "USING" in plan_text and "INDEX" in plan_text, plan_text
 
 
@@ -659,7 +661,7 @@ def test_duplicate_size_candidates_query_plan_uses_an_index(indexed_bulk: ScanIn
     sql = _captured_sql(
         indexed_bulk, lambda: list(indexed_bulk.duplicate_size_candidates(min_reclaim_bytes=0))
     )
-    _assert_query_uses_index(indexed_bulk, sql)
+    _assert_query_uses_index(indexed_bulk, sql, pinned_table_scans=1)
 
 
 def test_duplicate_size_candidates_materiality_gated_query_plan_uses_an_index(
@@ -673,7 +675,7 @@ def test_duplicate_size_candidates_materiality_gated_query_plan_uses_an_index(
         indexed_bulk,
         lambda: list(indexed_bulk.duplicate_size_candidates(min_reclaim_bytes=1024 * 1024)),
     )
-    _assert_query_uses_index(indexed_bulk, sql)
+    _assert_query_uses_index(indexed_bulk, sql, pinned_table_scans=1)
 
 
 # --- Prefix-range queries: the real-disk regression -------------------------------------------
