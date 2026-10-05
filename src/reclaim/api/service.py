@@ -589,6 +589,10 @@ def scan_roots_cover_home(roots: Sequence[Path], *, home: Path | None = None) ->
     Compared case-insensitively on path parts (Windows)."""
     home_parts = [part.lower() for part in (home if home is not None else Path.home()).parts]
     for root in roots:
+        # A relative root ('.', '', 'sub') has no anchor to compare: `.parts == ()` would make the
+        # prefix test vacuously true and a scoped scan would look like a full one. Never covers.
+        if not root.is_absolute():
+            continue
         root_parts = [part.lower() for part in root.parts]
         if home_parts[: len(root_parts)] == root_parts:
             return True

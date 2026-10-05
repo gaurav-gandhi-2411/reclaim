@@ -197,6 +197,12 @@ def test_scan_roots_cover_home_means_profile_or_an_ancestor() -> None:
     assert not service.scan_roots_cover_home([Path("D:/")], home=home)
 
 
+@pytest.mark.parametrize("relative", [".", "", "sub", "sub/dir"])
+def test_a_relative_root_never_counts_as_covering_home(relative: str) -> None:
+    home = Path("C:/Users/Alice")
+    assert not service.scan_roots_cover_home([Path(relative)], home=home)
+
+
 def test_startup_tick_warms_a_cold_cache_from_the_persisted_index(
     env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
