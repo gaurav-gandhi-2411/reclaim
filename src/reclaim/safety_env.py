@@ -8,7 +8,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-# Hermetic-test guard (CLAUDE.md rule 19; ADR-0034 addendum "Hermetic tests"). A verifier probe
+# Hermetic-test guard (CLAUDE.md rule 7; ADR-0034 addendum "Hermetic tests"). A verifier probe
 # once ran a `regenerable` apply under pytest with `local_appdata`/`home` still pointing at the
 # REAL machine and deleted the owner's real browser caches. These functions make that
 # structurally impossible a second time: under pytest, every destructive choke point refuses a
@@ -28,8 +28,17 @@ _ROOT_ENV_VARS = (
     "PROGRAMDATA",
 )
 
+# A child process a test spawns (e.g. the crash-recovery harness) inherits PYTEST_CURRENT_TEST, so
+# the guard is active there too -- but it never imported the conftest and its inherited
+# environment is already the REDIRECTED one. The parent therefore publishes the real roots and the
+# sandbox in these variables, and a child reads them instead of re-deriving "real" from a
+# redirected environment.
+_INHERIT_REAL_ENV_VAR = "RECLAIM_TEST_REAL_ROOTS"
+_INHERIT_SANDBOX_ENV_VAR = "RECLAIM_TEST_SANDBOX_ROOTS"
+
 _real_roots: tuple[str, ...] | None = None
 _sandbox_roots: list[str] = []
+_sandbox_inherited = False
 
 
 class RealProfileAccessError(BaseException):
@@ -78,6 +87,10 @@ def capture_real_profile_roots(environ: Mapping[str, str] | None = None) -> tupl
     global _real_roots  # process-wide, capture-once by design
     if _real_roots is not None:
         return _real_roots
+    inherited = os.environ.get(_INHERIT_REAL_ENV_VAR)
+    if environ is None and inherited:
+        _real_roots = tuple(r for r in inherited.split(os.pathsep) if r)
+        return _real_roots
     env = os.environ if environ is None else environ
     candidates: list[str] = [env[v] for v in _ROOT_ENV_VARS if env.get(v)]
     if env.get("HOMEDRIVE") and env.get("HOMEPATH"):
@@ -94,6 +107,8 @@ def capture_real_profile_roots(environ: Mapping[str, str] | None = None) -> tupl
         if os.path.dirname(norm) != norm and norm not in roots:
             roots.append(norm)
     _real_roots = tuple(roots)
+    if environ is None:
+        os.environ[_INHERIT_REAL_ENV_VAR] = os.pathsep.join(_real_roots)
     return _real_roots
 
 
@@ -105,9 +120,23 @@ def real_profile_roots() -> tuple[str, ...]:
 def register_sandbox_root(path: str | os.PathLike[str]) -> None:
     """Marks a directory (pytest's basetemp) as test-owned: it lives under the real TEMP, but
     destroying things inside it is exactly what tests are allowed to do."""
+    global _sandbox_inherited  # a registration supersedes anything inherited
+    _sandbox_inherited = True
     norm = _norm(path)
     if norm not in _sandbox_roots:
         _sandbox_roots.append(norm)
+    # Rewritten on EVERY call (not only the first): a test that swaps the list out must not leave
+    # a stale value in the environment for the next test's children.
+    os.environ[_INHERIT_SANDBOX_ENV_VAR] = os.pathsep.join(_sandbox_roots)
+
+
+def _sandboxes() -> list[str]:
+    global _sandbox_inherited  # load the parent's sandbox once, only in a fresh child process
+    if not _sandbox_inherited:
+        _sandbox_inherited = True
+        inherited = os.environ.get(_INHERIT_SANDBOX_ENV_VAR, "")
+        _sandbox_roots.extend(r for r in inherited.split(os.pathsep) if r)
+    return _sandbox_roots
 
 
 def assert_not_real_profile_under_pytest(
@@ -124,7 +153,7 @@ def assert_not_real_profile_under_pytest(
         raise RealProfileAccessError(
             f"refusing to {operation} {path!r} under pytest: cannot resolve it ({exc!r})"
         ) from exc
-    if any(_within(target, s) for s in _sandbox_roots):
+    if any(_within(target, s) for s in _sandboxes()):
         return
     for root in real_profile_roots():
         if _within(target, root):
