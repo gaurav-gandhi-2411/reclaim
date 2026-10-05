@@ -445,6 +445,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Report what would be cleaned and delete nothing (this is the default).",
     )
     auto_clean_parser.add_argument(
+        "--include-pytest-temp",
+        action="store_true",
+        help="Dry run only: also REPORT old pytest-<N> folders under pytest-of-<user> in %%TEMP%% "
+        "(ADR-0034 addendum). It never enables deletion; that needs config.toml's "
+        "[regenerable] pytest_temp = true, because those folders are shared by every project "
+        "you test and Reclaim cannot tell whose is whose.",
+    )
+    auto_clean_parser.add_argument(
         "--json", action="store_true", help="Print the run as JSON (the dashboard API's shape)."
     )
     auto_clean_parser.add_argument(
@@ -1148,6 +1156,20 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         return 0
 
     apply: bool = args.apply
+    # ADR-0034 addendum "pytest temp": deletion only on the config opt-in; the CLI flag can only
+    # ADD the category to a dry run, so it can never widen what an --apply run deletes.
+    if args.include_pytest_temp and apply and not config.regenerable.pytest_temp:
+        print(  # noqa: T201
+            "reclaim auto-clean: --include-pytest-temp is dry-run only; to delete pytest temp "
+            "folders set [regenerable] pytest_temp = true in config.toml.",
+            file=sys.stderr,
+        )
+        return 2
+    pytest_temp: regenerable.PytestTempMode = "off"
+    if config.regenerable.pytest_temp:
+        pytest_temp = "delete"
+    elif args.include_pytest_temp:
+        pytest_temp = "report"
     # ADR-0034 addendum: the task also fires shortly after sign-in. A scheduled apply run asks the
     # state file whether to run the whole tier, only the tools left in use last time, or nothing.
     scheduled_state: autoclean_state.AutoCleanState | None = None
@@ -1175,6 +1197,7 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
             apply=apply,
             excluded_patterns=exclusion_patterns(config),
             only_keys=plan.only_keys if plan is not None else None,
+            pytest_temp=pytest_temp,
         )
     except service.RegenerableCleanBusyError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201

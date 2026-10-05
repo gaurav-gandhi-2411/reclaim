@@ -2799,9 +2799,12 @@ def _execute_regenerable_clean(
     on_item_done: Callable[[regenerable.RegenerableItemResult], None] | None = None,
     run_id: str | None = None,
     only_keys: frozenset[str] | None = None,
+    pytest_temp: regenerable.PytestTempMode = "off",
 ) -> RegenerableCleanResponse:
-    """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`."""
+    """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`.
+    `pytest_temp` (ADR-0034 addendum) is "off" unless the caller was told the user opted in."""
     env = regenerable_clean_env()
+    env.pytest_temp_mode = pytest_temp
     # ADR-0039: required (no default) so no caller can run the tier without stating its exclusions.
     env.excluded_patterns = tuple(excluded_patterns)
     report = regenerable.run_regenerable_clean(
@@ -2841,6 +2844,13 @@ def _execute_regenerable_clean(
     )
 
 
+def _pytest_temp_mode(state: AppState) -> regenerable.PytestTempMode:
+    """The dashboard has no `--include-pytest-temp`: the category runs (preview and clean) only
+    when the user turned `[regenerable] pytest_temp` on (ADR-0034 addendum)."""
+    with state.lock:
+        return "delete" if state.config.regenerable.pytest_temp else "off"
+
+
 def run_regenerable_clean(
     state: AppState, *, apply: bool, audit_log_path: Path | None = None
 ) -> RegenerableCleanResponse:
@@ -2855,6 +2865,7 @@ def run_regenerable_clean(
             apply=apply,
             audit_log_path=audit_log_path,
             excluded_patterns=state.safety.exclusion_patterns,
+            pytest_temp=_pytest_temp_mode(state),
         )
     finally:
         _regenerable_clean_lock.release()
@@ -2889,6 +2900,7 @@ def start_regenerable_clean(
     if not _regenerable_clean_lock.acquire(blocking=False):
         raise RegenerableCleanBusyError("a clean is already running")
     excluded_patterns = state.safety.exclusion_patterns
+    pytest_temp = _pytest_temp_mode(state)
     job = _RegenerableJob(run_id=uuid.uuid4().hex[:12], started_monotonic=time.monotonic())
     with _regenerable_job_lock:
         _regenerable_job = job
@@ -2917,6 +2929,7 @@ def start_regenerable_clean(
                 on_item_start=on_start,
                 on_item_done=on_done,
                 run_id=job.run_id,
+                pytest_temp=pytest_temp,
             )
         except Exception as exc:
             logger.warning("regenerable.job_failed", run_id=job.run_id, exc_info=True)
@@ -2980,6 +2993,7 @@ def regenerable_clean_response(
     excluded_patterns: Sequence[str],
     audit_log_path: Path | None = None,
     only_keys: frozenset[str] | None = None,
+    pytest_temp: regenerable.PytestTempMode = "off",
 ) -> RegenerableCleanResponse:
     """State-free synchronous run shared by `reclaim auto-clean` (which blocks, so it may wait on
     uv's lock) and the preview: same shape, same audit log as the dashboard endpoint."""
@@ -2991,6 +3005,7 @@ def regenerable_clean_response(
             audit_log_path=audit_log_path,
             excluded_patterns=excluded_patterns,
             only_keys=only_keys,
+            pytest_temp=pytest_temp,
         )
     finally:
         _regenerable_clean_lock.release()
