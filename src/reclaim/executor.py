@@ -1689,6 +1689,23 @@ def apply_batch(
 
     if apply:
         _reverify_direct_delete_candidates(candidates, safety)
+        # ADR-0039 last line of defence, independent of candidate generation and of the retention
+        # window (the re-check above only covers direct-delete): a candidate -- even a hand-built or
+        # stale-cached one carrying a non-BLOCKED verdict -- whose path, or for a directory anything
+        # inside it, matches a user exclusion is never applied. Whole-batch refusal, same
+        # philosophy as the BLOCKED check. Real runs only, like the re-check above: a dry run
+        # touches nothing.
+        excluded_hits = [
+            (c.path, hit)
+            for c in candidates
+            if (hit := safety.exclusion_match(c.path, is_dir=c.is_dir)) is not None
+        ]
+        if excluded_hits:
+            raise SafetyInvariantError(
+                f"apply_batch received {len(excluded_hits)} candidate(s) matching a user "
+                "exclusion ([exclusions]/[safety] deny in config.toml) — refusing the entire "
+                f"batch, touching nothing: {[f'{p} ({pat})' for p, pat in excluded_hits[:5]]}"
+            )
 
     disk_free_before = (
         _measure_disk_free(_disk_usage_anchor(resolved_vault_dir, candidates)) if apply else None

@@ -134,3 +134,13 @@ disk_threshold_percent = 80.0
 # you also manage that task yourself. `reclaim auto-clean --scheduled` re-checks this flag.
 [autoclean]
 enabled = false
+
+# ADR-0039: projects/folders that must NEVER be touched by any Reclaim cleanup -- the scan-driven
+# candidates, duplicate detection, one-click apply, purge, and the weekly regenerable auto-clean.
+# Each name is a case-insensitive substring token matched against the whole path (the project
+# tree, its worktrees, venvs/envs, caches, and TEMP scratch directories whose name embeds the
+# project). Plain names only (no slashes or glob characters); use [safety] deny for globs.
+# Empty by default. Edits take effect on the next run / dashboard restart.
+# Example:
+# [exclusions]
+# project_names = ["my-private-project", "client-work"]

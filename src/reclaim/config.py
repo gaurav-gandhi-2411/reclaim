@@ -593,6 +593,36 @@ class AutoCleanConfig(BaseModel):
     enabled: bool = False
 
 
+_EXCLUSION_NAME_FORBIDDEN_CHARS = "/\\*?[]"
+
+
+class ExclusionsConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Project/folder NAMES the user has declared permanently off-limits to every Reclaim delete
+    # path (ADR-0039). Each name is a case-insensitive substring token matched against the whole
+    # path -- so it covers the project tree, its worktrees (`<name>-wt-x`), venvs, envs, caches,
+    # AND temp scratch directories whose name embeds the project (`...-ml-projects-<name>`).
+    # Empty by default: the product ships with no opinion about anyone's projects.
+    project_names: list[str] = Field(default_factory=list)
+
+    @field_validator("project_names")
+    @classmethod
+    def _names_are_plain_tokens(cls, names: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for raw in names:
+            name = raw.strip()
+            # A separator or glob metacharacter would silently turn a name into a different
+            # pattern than the user wrote; an empty token would match every path. Fail loudly.
+            if not name or any(ch in name for ch in _EXCLUSION_NAME_FORBIDDEN_CHARS):
+                raise ValueError(
+                    f"[exclusions] project_names entry {raw!r} must be a plain, non-empty name "
+                    "(no path separators or glob characters); use [safety] deny for globs"
+                )
+            cleaned.append(name)
+        return cleaned
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -601,6 +631,7 @@ class Config(BaseSettings):
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     autoclean: AutoCleanConfig = Field(default_factory=AutoCleanConfig)
+    exclusions: ExclusionsConfig = Field(default_factory=ExclusionsConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not
@@ -711,6 +742,13 @@ def apply_safe_mode_category_overrides(categories: CategoriesConfig) -> Categori
         for group in SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS
     }
     return categories.model_copy(update=updates)
+
+
+def exclusion_patterns(config: Config) -> list[str]:
+    """Every user pattern that makes a path untouchable by any Reclaim delete path: `[safety]
+    deny` plus one `*<name>*` glob per `[exclusions] project_names` entry (ADR-0039). Shared by
+    `SafetyValidator` (generic pipeline) and the regenerable tier so both honour one list."""
+    return [*config.safety.deny, *(f"*{name.lower()}*" for name in config.exclusions.project_names)]
 
 
 def load_config(path: Path | None) -> Config:
