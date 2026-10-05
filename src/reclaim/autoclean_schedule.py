@@ -43,6 +43,11 @@ DIAGNOSTIC_LOG_NAME = "task_registration_diagnostic.log"
 # Fixed Sunday in the past, like the disk task's fixed StartBoundary: Task Scheduler derives the
 # next occurrence from the weekly pattern, and StartWhenAvailable catches up a missed run.
 _START_BOUNDARY = "2026-01-04T10:00:00"
+# ADR-0034 addendum: the second trigger. uv holds a SHARED lock on its cache for the whole life of
+# any `uv run`, so on a busy workstation the Sunday run never gets the exclusive lock `uv cache
+# prune` needs. Shortly after sign-in no session has started `uv` yet; the scheduled invocation
+# is cheap there (see reclaim.autoclean_state: a no-op unless something is pending or overdue).
+_LOGON_DELAY = "PT3M"
 
 
 class AutoCleanScheduleError(RuntimeError):
@@ -95,9 +100,23 @@ def task_name(username: str | None = None) -> str:
     return f"{TASK_NAME_PREFIX} ({username if username is not None else getpass.getuser()})"
 
 
-def build_task_xml(exe_path: str, workdir: str, task_description: str = TASK_DESCRIPTION) -> bytes:
+def current_user_id() -> str:
+    """`DOMAIN\\user` of the signed-in account (the LogonTrigger's UserId), or the bare username
+    when no domain is set."""
+    domain = os.environ.get("USERDOMAIN")
+    user = getpass.getuser()
+    return f"{domain}\\{user}" if domain else user
+
+
+def build_task_xml(
+    exe_path: str,
+    workdir: str,
+    task_description: str = TASK_DESCRIPTION,
+    user_id: str | None = None,
+) -> bytes:
     """The task definition as the exact bytes `schtasks /create /xml` accepts: UTF-16LE with a
     BOM. Every interpolated value is XML-escaped (a username/path may contain `&`)."""
+    logon_user = user_id if user_id is not None else current_user_id()
     xml = (
         '<?xml version="1.0" encoding="UTF-16"?>\r\n'
         '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
@@ -113,6 +132,11 @@ def build_task_xml(exe_path: str, workdir: str, task_description: str = TASK_DES
         "        <WeeksInterval>1</WeeksInterval>\r\n"
         "      </ScheduleByWeek>\r\n"
         "    </CalendarTrigger>\r\n"
+        "    <LogonTrigger>\r\n"
+        "      <Enabled>true</Enabled>\r\n"
+        f"      <UserId>{escape(logon_user)}</UserId>\r\n"
+        f"      <Delay>{_LOGON_DELAY}</Delay>\r\n"
+        "    </LogonTrigger>\r\n"
         "  </Triggers>\r\n"
         "  <Principals>\r\n"
         '    <Principal id="Author">\r\n'
