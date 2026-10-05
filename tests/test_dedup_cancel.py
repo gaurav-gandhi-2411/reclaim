@@ -65,12 +65,15 @@ def hash_calls(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     return calls
 
 
-def _cancel_on_nth_checkpoint(n: int) -> Callable[[], None]:
-    seen = [0]
+def _cancel_once_hashed(hash_calls: list[Path], target: int) -> Callable[[], None]:
+    """Checkpoint that cancels once `target` files (a multiple of the window size) have been
+    submitted for hashing. Checkpoints fire at window boundaries AND while a stage collects
+    results, so the trigger is the hash count, not the checkpoint count: at any checkpoint where
+    the count has reached a window multiple, that whole window's reads are already started, and
+    the cancel path waits for and keeps them -- so exactly `target` hashes are committed."""
 
     def checkpoint() -> None:
-        seen[0] += 1
-        if seen[0] >= n:
+        if len(hash_calls) >= target and len(hash_calls) % _WINDOW == 0:
             raise dedup.DedupCancelled
 
     return checkpoint
@@ -79,11 +82,10 @@ def _cancel_on_nth_checkpoint(n: int) -> Callable[[], None]:
 def test_cancel_mid_pass_stops_early_and_keeps_committed_hashes(
     db: Path, hash_calls: list[Path]
 ) -> None:
-    # Checkpoints per window: before it, and after its partial stage. #5 = before window 3, so
-    # windows 1-2 (8 files) are fully hashed and flushed.
+    # Cancel once windows 1-2 (8 files) are hashed.
     with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(5)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, 2 * _WINDOW)
         )
     assert len(hash_calls) == 2 * _WINDOW
     assert _hashed_rows(db) == 2 * _WINDOW  # durable, not lost with the cancelled pass
@@ -92,10 +94,10 @@ def test_cancel_mid_pass_stops_early_and_keeps_committed_hashes(
 def test_cancel_between_stages_flushes_the_partial_hashes_already_computed(
     db: Path, hash_calls: list[Path]
 ) -> None:
-    # #2 = after window 1's partial stage, BEFORE that window's own end-of-window flush.
+    # Cancel right after window 1's partial stage, before its own end-of-window flush.
     with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(2)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, _WINDOW)
         )
     assert len(hash_calls) == _WINDOW
     assert _hashed_rows(db) == _WINDOW
@@ -106,7 +108,7 @@ def test_second_pass_after_cancel_hashes_exactly_the_remainder(
 ) -> None:
     with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(5)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, 2 * _WINDOW)
         )
     already_hashed = _hashed_rows(db)
     hash_calls.clear()
@@ -124,7 +126,7 @@ def test_restart_on_the_same_db_file_resumes_the_same_way(db: Path, hash_calls: 
     committed -- nothing lives only in memory."""
     with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(7)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, 3 * _WINDOW)
         )
     committed = len(hash_calls)
     assert committed == 3 * _WINDOW
@@ -145,7 +147,7 @@ def test_a_file_changed_after_cancel_is_rehashed_not_served_stale(
     (size, mtime); a same-size rewrite (new mtime, new content) is hashed again on resume."""
     with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(5)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, 2 * _WINDOW)
         )
     already_hashed = _hashed_rows(db)
     victim = tmp_path / "tree" / "d0" / "f0.bin"  # bucket 0: inside the flushed windows
@@ -190,9 +192,61 @@ def test_index_can_be_closed_while_the_cancel_traceback_is_still_alive(
     caught: dedup.DedupCancelled | None = None
     try:
         dedup.find_duplicate_clusters(
-            index, min_reclaim_bytes=0, checkpoint=_cancel_on_nth_checkpoint(5)
+            index, min_reclaim_bytes=0, checkpoint=_cancel_once_hashed(hash_calls, 2 * _WINDOW)
         )
     except dedup.DedupCancelled as exc:
         caught = exc  # keeps exc.__traceback__ (and its frames) referenced past the except block
     assert caught is not None
     index.close()  # must not raise
+
+
+def test_cancel_inside_a_hash_stage_runs_only_the_in_flight_reads_and_keeps_them(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One window holds all 24 files and the pool has 2 workers. The two workers block inside the
+    hasher; the cancel arrives while 22 reads are still queued. Only the 2 in-flight reads may
+    run (the queued ones are cancelled), and their digests are committed -- so the resume pass
+    hashes exactly the other 22."""
+    monkeypatch.setattr(dedup, "_WINDOW_FILES", 10_000)
+    monkeypatch.setattr(dedup, "_HASH_TIMEOUT_WORKERS", 2)
+    calls: list[Path] = []
+    lock = threading.Lock()
+    two_started = threading.Event()
+    gate = threading.Event()
+    real = dedup._compute_partial_hash
+
+    def blocking(path: Path, size: int) -> str:
+        with lock:
+            calls.append(path)
+            if len(calls) == 2:
+                two_started.set()
+        assert gate.wait(timeout=30)
+        return real(path, size)
+
+    monkeypatch.setattr(dedup, "_compute_partial_hash", blocking)
+    seen = [0]
+
+    def checkpoint() -> None:
+        seen[0] += 1
+        if seen[0] == 2:  # the first checkpoint inside the partial stage's result loop
+            assert two_started.wait(timeout=30)  # both workers are mid-read
+            gate.set()  # let the in-flight reads finish; the 22 queued ones must never start
+            raise dedup.DedupCancelled
+
+    with ScanIndex(db) as index, pytest.raises(dedup.DedupCancelled):
+        dedup.find_duplicate_clusters(index, min_reclaim_bytes=0, checkpoint=checkpoint)
+
+    assert len(calls) == 2
+    assert _hashed_rows(db) == 2  # the in-flight digests were committed, not lost
+
+    counted: list[Path] = []
+
+    def counting(path: Path, size: int) -> str:
+        counted.append(path)
+        return real(path, size)
+
+    monkeypatch.setattr(dedup, "_compute_partial_hash", counting)
+    with ScanIndex(db) as index:
+        clusters = dedup.find_duplicate_clusters(index, min_reclaim_bytes=0)
+    assert len(counted) == _FILES - 2
+    assert len(clusters) == _SIZES

@@ -55,8 +55,8 @@ Facts read from the code before deciding:
 5. **Cancellable.** `AppState.candidates_warm_cancel_event` is checked through a `checkpoint`
    callback passed down (`run_candidates_warm` -> `_cached_all_candidates` -> `_all_candidates` ->
    `generate_duplicate_candidates` -> `find_duplicate_clusters`), not a global: before the
-   detectors, between detectors and duplicates, before each hash window, and between a window's
-   partial and full stages. On cancel pending hashes are flushed first, `DedupCancelled`
+   detectors, between detectors and duplicates, before each hash window, between a window's
+   partial and full stages, and while a stage collects results (one check per file group). On cancel pending hashes are flushed first, `DedupCancelled`
    propagates, the status becomes `cancelled`, and because `_cached_all_candidates` assigns the
    cache only after a complete compute, nothing partial is cached and the cache stays cold.
    `POST /api/candidates/warm/cancel` is idempotent (200 + current status; a no-op when idle);
@@ -93,8 +93,9 @@ Status additions (all additive): `status` may be `cancelled`; fields `source`, `
     is injectable and `[dedup] warm_after_scan = false` disables the feature.
   - Promotion is best effort at batch granularity (up to 2048 files of I/O may complete at low
     priority after a user asks).
-  - Cancellation granularity is the window: a cancel waits for the in-flight window's hashes to
-    finish (they are then flushed, not wasted).
+  - Cancellation latency is bounded by the reads already in flight (at most the pool size, 16):
+    not-yet-started reads of the window are cancelled, in-flight ones finish and are flushed, not
+    wasted. A single huge file in flight still has to finish reading.
   - A thread already blocked on a stuck read is not interrupted (existing 30 s per-file guard).
   - No UI for the new status fields or a cancel button; the API and status are the contract.
   - Scoped scans never auto-warm, so a user who only scans subfolders still warms on first open.

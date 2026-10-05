@@ -476,6 +476,27 @@ def _same_file_now(record: FileRecord) -> bool:
     return (st.st_dev, st.st_ino, st.st_size) == (record.dev, record.ino, record.size_bytes)
 
 
+def _drain_on_cancel(
+    remaining: Sequence[tuple[list[FileRecord], Future[tuple[str, bool]], list[Future[bool]]]],
+    pending_writes: list[tuple[Path, int, float, str]],
+) -> None:
+    """Cancel path of `_hash_stage`: stop every read that has not started, wait for the ones in
+    flight, and keep their finished digests (a read that errored is simply not kept)."""
+    in_flight: list[tuple[FileRecord, Future[tuple[str, bool]]]] = []
+    for group, future, sibling_checks in remaining:
+        for check in sibling_checks:
+            check.cancel()
+        if not future.cancel():
+            in_flight.append((group[0], future))
+    for first, future in in_flight:
+        try:
+            digest, from_cache = future.result()
+        except Exception:  # noqa: S112 -- an unreadable file is just not committed
+            continue
+        if not from_cache:
+            pending_writes.append((first.path, first.size_bytes, first.mtime, digest))
+
+
 def _hash_stage(
     executor: ThreadPoolExecutor,
     records: Sequence[FileRecord],
@@ -488,6 +509,7 @@ def _hash_stage(
     pending_writes: list[tuple[Path, int, float, str]],
     skips: list[HashSkip] | None,
     collapse_hardlinks: bool = True,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[Path, str]:
     """Hashes `records` concurrently on `executor` (cache check, else compute, else skip) and
     returns `{path: digest}` for every record that produced one.
@@ -497,7 +519,13 @@ def _hash_stage(
     stat confirms it still points at the same inode (`_same_file_now`). A name that fails that
     check -- or whose group's first member is unreadable -- is hashed on its own in a second
     pass, so the skips, cache rows and clusters equal what hashing every name separately gives.
-    `ino == 0` means "identity unknown" (synthetic/test records) and is never collapsed."""
+    `ino == 0` means "identity unknown" (synthetic/test records) and is never collapsed.
+
+    `checkpoint` (ADR-0040) is called before collecting each group's result. If it raises
+    `DedupCancelled`, every not-yet-started read is cancelled, the reads already in flight (at most
+    the pool size) are awaited, every digest computed so far is appended to `pending_writes` for
+    the caller to flush, and the exception propagates -- so a cancel's latency is bounded by the
+    in-flight reads, not by the rest of a 2048-file window of large files."""
     by_identity: dict[object, list[FileRecord]] = {}
     for record in records:
         key: object = (record.dev, record.ino) if record.ino and collapse_hardlinks else record.path
@@ -521,7 +549,13 @@ def _hash_stage(
     ]
     digests: dict[Path, str] = {}
     fallback: list[FileRecord] = []
-    for group, future, sibling_checks in submitted:
+    for position, (group, future, sibling_checks) in enumerate(submitted):
+        if checkpoint is not None:
+            try:
+                checkpoint()
+            except DedupCancelled:
+                _drain_on_cancel(submitted[position:], pending_writes)
+                raise
         first = group[0]
         reason: str | None = None
         try:
@@ -567,6 +601,7 @@ def _hash_stage(
                 pending_writes=pending_writes,
                 skips=skips,
                 collapse_hardlinks=False,
+                checkpoint=checkpoint,
             )
         )
     return digests
@@ -693,10 +728,14 @@ def find_duplicate_clusters(
 
     def run_window(window: list[tuple[int, list[FileRecord]]]) -> None:
         check_cancel()
-        with ThreadPoolExecutor(
-            max_workers=_HASH_TIMEOUT_WORKERS, initializer=worker_initializer
-        ) as executor:
-            process_window(executor, window)
+        try:
+            with ThreadPoolExecutor(
+                max_workers=_HASH_TIMEOUT_WORKERS, initializer=worker_initializer
+            ) as executor:
+                process_window(executor, window)
+        except DedupCancelled:
+            flush_writes()  # a cancel raised from inside a hash stage: keep its drained digests
+            raise
 
     def process_window(
         executor: ThreadPoolExecutor, window: list[tuple[int, list[FileRecord]]]
@@ -712,6 +751,7 @@ def find_duplicate_clusters(
             with_size_arg=True,
             pending_writes=partial_writes,
             skips=skips,
+            checkpoint=checkpoint,
         )
         counters["partial"] += len(partial_digests)
         heartbeat()
@@ -761,6 +801,7 @@ def find_duplicate_clusters(
                 with_size_arg=False,
                 pending_writes=full_writes,
                 skips=skips,
+                checkpoint=checkpoint,
             )
         )
         counters["full"] += len(full_digests)

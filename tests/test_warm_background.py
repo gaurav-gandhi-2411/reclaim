@@ -246,7 +246,7 @@ def test_cancel_mid_pass_leaves_cache_cold_and_keeps_committed_hashes(
     env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env.scan()
-    _cancel_after_hash_calls(env, monkeypatch, 9)  # cancel arrives during window 3
+    _cancel_after_hash_calls(env, monkeypatch, 3 * _WINDOW)  # fires in the last read of window 3
     _run_spawned(env)
 
     status = env.warm_status()
@@ -263,7 +263,7 @@ def test_second_pass_after_cancel_hashes_exactly_the_remainder(
     env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env.scan()
-    _cancel_after_hash_calls(env, monkeypatch, 9)
+    _cancel_after_hash_calls(env, monkeypatch, 3 * _WINDOW)
     _run_spawned(env)
     already_hashed = env.hashed_rows()
     env.hash_calls.clear()
@@ -279,7 +279,7 @@ def test_restart_resumes_from_the_same_db_file(
     env: _Env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     env.scan()
-    _cancel_after_hash_calls(env, monkeypatch, 9)
+    _cancel_after_hash_calls(env, monkeypatch, 3 * _WINDOW)
     _run_spawned(env)
     committed = env.hashed_rows()
     assert committed == 3 * _WINDOW
