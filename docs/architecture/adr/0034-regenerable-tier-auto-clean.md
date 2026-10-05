@@ -216,4 +216,6 @@ the machine (see the PR that added this for a metadata-only dry run on one).
 
 **Account.** Setup is `PrivilegesRequired=lowest`, so the disk-space task step (`RegisterDiskSpaceTask`, `[Code]`) already runs as the installing user. `runasoriginaluser` keeps the new step on that same user even if Setup were launched elevated, because the task is a per-user `InteractiveToken` task and `auto-clean` refuses to run elevated.
 
-**Not verified.** A real installer upgrade over a real old task has not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.
+**Uninstall.** The uninstaller (`UnregisterAutoCleanTask`) also deletes `Reclaim Weekly Auto-Clean (<user>)`, with the same BM3 guard as the disk-space task (only if absent or pointing at this install's exe), failure ignored; without it the task outlived the exe and every upgrade re-registered it.
+
+**Not verified.** A real installer upgrade over a real old task, and a real uninstall, have not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.

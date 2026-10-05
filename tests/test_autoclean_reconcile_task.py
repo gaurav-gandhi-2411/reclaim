@@ -189,3 +189,29 @@ def test_installer_run_entry_reconciles_task_as_original_user_and_ignores_failur
     assert {"runasoriginaluser", "runhidden", "nowait", "skipifdoesntexist"} <= flag_set
     # Must run on every install/upgrade: not an opt-in checkbox, not skipped on silent installs.
     assert not flag_set & {"postinstall", "skipifsilent", "unchecked"}
+
+
+def test_uninstaller_removes_weekly_task_with_matching_name_and_ownership_guard() -> None:
+    text = _ISS.read_text(encoding="utf-8")
+    proc = re.search(
+        r"procedure UnregisterAutoCleanTask\(\);.*?^end;", text, re.MULTILINE | re.DOTALL
+    )
+    assert proc is not None, "UnregisterAutoCleanTask missing from packaging/reclaim.iss"
+    body = proc.group(0)
+    # The name the installer deletes must be exactly what the app registers.
+    name_expr = re.search(
+        r"TaskName := '([^']*)' \+ ExpandConstant\('\{username\}'\) \+ '([^']*)';", body
+    )
+    assert name_expr is not None
+    assert name_expr.group(1) + "{user}" + name_expr.group(2) == sched.task_name("{user}")
+    assert name_expr.group(1).startswith(sched.TASK_NAME_PREFIX)
+    # BM3 guard (same as the disk-space task) + delete + failure ignored (ResultCode unchecked).
+    assert "GetRegisteredTaskCommandPath(TaskName)" in body
+    assert "CurrentOwnerPath = ThisExePath" in body
+    assert "'/delete /tn \"' + TaskName + '\" /f'" in body
+    assert "ResultCode <>" not in body
+    uninstall_step = re.search(
+        r"procedure CurUninstallStepChanged.*?^end;", text, re.MULTILINE | re.DOTALL
+    )
+    assert uninstall_step is not None
+    assert "UnregisterAutoCleanTask();" in uninstall_step.group(0)

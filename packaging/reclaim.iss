@@ -459,6 +459,26 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// ADR-0034 'Upgrade path': the weekly auto-clean task is registered by reclaim.exe itself (the
+// Settings toggle, or the [Run] --reconcile-task step), not by [Code], so nothing removed it on
+// uninstall -- it was left pointing at a deleted exe and every upgrade re-registered it. Same
+// BM3 guard as UnregisterDiskSpaceTask: only delete it when it is unregistered (harmless no-op) or
+// currently points at THIS install's exe; if another still-installed copy owns it, leave it alone.
+// The name must equal autoclean_schedule.task_name() (tests/test_autoclean_reconcile_task.py).
+procedure UnregisterAutoCleanTask();
+var
+  ResultCode: Integer;
+  TaskName, ThisExePath, CurrentOwnerPath: String;
+begin
+  TaskName := 'Reclaim Weekly Auto-Clean (' + ExpandConstant('{username}') + ')';
+  ThisExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
+  CurrentOwnerPath := GetRegisteredTaskCommandPath(TaskName);
+  if (CurrentOwnerPath = '') or (CurrentOwnerPath = ThisExePath) then
+    // Best-effort: an absent task or a failed delete never fails the uninstall.
+    Exec('schtasks.exe', '/delete /tn "' + TaskName + '" /f',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   // ssPostInstall fires after [Files] has finished copying, so {app}\{#MyAppExeName} already
@@ -536,6 +556,7 @@ var
   Response: Integer;
 begin
   if CurUninstallStep = usUninstall then
+  begin
     // R5: remove the per-user scheduled task registered by RegisterDiskSpaceTask above. Run at
     // usUninstall (before file removal / the data-folder prompt below) rather than
     // usPostUninstall -- no ordering dependency on either, but this keeps "undo everything this
@@ -544,6 +565,8 @@ begin
     // handler needs no equivalent call here -- Flags: uninsdeletekey in [Registry] above already
     // removes it automatically.
     UnregisterDiskSpaceTask();
+    UnregisterAutoCleanTask();
+  end;
 
   if CurUninstallStep = usPostUninstall then
   begin
