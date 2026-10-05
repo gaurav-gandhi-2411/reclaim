@@ -138,9 +138,12 @@ Dry runs and manual (non-`--scheduled`) runs never read or write the state.
 - A retry still waits for the same lock; it merely runs at a moment when it is likely free. If the
   user signs in and immediately starts `uv run`, it can still expire and stay pending until the next
   sign-in or the next full run.
-- A full run at sign-in (state older than 6 days) moves the weekly cadence to whenever the user
-  signs in; the next Sunday run is then a no-op or a retry. Cleaning still happens at most about
-  once per 6 days.
+- **Cadence drift.** A full run at sign-in (state older than 6 days) moves the weekly cadence to
+  whenever the user signs in: a full run on, say, a Tuesday makes the following Sunday run a
+  no-op (or a retry), so full runs are roughly 6-7 days apart, not strictly weekly.
+- **`failed` tools are not retried.** A full run stamps `last_full_run_utc` even when some native
+  tools ended `failed`; only `skipped_in_use` is retried, so a failed tool waits for the next full
+  run (the state is still not stamped by a run that violates the `excluded_applied` invariant).
 - Already-registered tasks keep their single weekly trigger until re-registered (`register_task`
   uses `/f`, so toggling the Settings switch off and on re-registers with both). Nothing
   re-registers on app start.
