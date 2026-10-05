@@ -9,7 +9,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from reclaim import autoclean_state, regenerable
+from reclaim import autoclean_schedule, autoclean_state, regenerable
 from reclaim.app_paths import data_root
 from reclaim.config import Config, exclusion_patterns, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
@@ -444,6 +444,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Report what would be cleaned and delete nothing (this is the default).",
+    )
+    auto_clean_mode.add_argument(
+        "--reconcile-task",
+        action="store_true",
+        help="Installer hook (ADR-0034 'Upgrade path'): if config.toml's [autoclean] enabled is "
+        "true, (re)register this account's weekly task with the current definition; if false, do "
+        "nothing and create no task. Idempotent; cleans nothing.",
     )
     auto_clean_parser.add_argument(
         "--include-pytest-temp",
@@ -1153,6 +1160,49 @@ def _auto_clean_status_json(
     args.json_emitted = True
 
 
+def _run_reconcile_autoclean_task(
+    args: argparse.Namespace,
+    *,
+    exe_path: Path | None = None,
+    runner: autoclean_schedule.SchtasksRunner | None = None,
+    diag_log_path: Path | None = None,
+) -> int:
+    """`auto-clean --reconcile-task`: makes an existing install's task match the current
+    definition after an upgrade (ADR-0034 'Upgrade path'). Enabled -> `register_task` (schtasks
+    `/f` overwrite, so an old single-trigger task gains the logon trigger). Disabled -> nothing at
+    all, never a new task. Source/dev run -> a message and exit 0 (nothing to schedule is not a
+    failure). A real failure prints the actionable error and returns 1; it never raises."""
+    try:
+        assert_not_elevated()
+    except ElevatedProcessError as exc:
+        print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+    config = _load_config_or_none("auto-clean", args.config)
+    if config is None:
+        return 1
+    if not config.autoclean.enabled:
+        print(  # noqa: T201
+            "reclaim auto-clean: nothing to do -- weekly auto-clean is off in config.toml "
+            "([autoclean] enabled = false); no task was created or changed."
+        )
+        return 0
+    try:
+        name = autoclean_schedule.register_task(
+            exe_path=exe_path,
+            # Resolved at call time (not a default argument) so tests can substitute the seam.
+            runner=runner if runner is not None else autoclean_schedule.run_schtasks,
+            diag_log_path=diag_log_path,
+        )
+    except autoclean_schedule.NotAnInstalledBuildError as exc:
+        print(f"reclaim auto-clean: nothing to do -- {exc}", file=sys.stderr)  # noqa: T201
+        return 0
+    except (autoclean_schedule.AutoCleanScheduleError, OSError) as exc:
+        print(f"reclaim auto-clean: could not update the weekly task: {exc}", file=sys.stderr)  # noqa: T201
+        return 1
+    print(f"reclaim auto-clean: weekly task '{name}' is up to date.")  # noqa: T201
+    return 0
+
+
 def _run_auto_clean(args: argparse.Namespace) -> int:
     """Outer wrapper: any Exception that escapes before a JSON document was written becomes the
     `run_failed` error document (exit 1, full text on stderr) instead of an empty stdout."""
@@ -1654,6 +1704,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "check-disk-space":
         return _run_check_disk_space(args)
     if args.command == "auto-clean":
+        if args.reconcile_task:
+            return _run_reconcile_autoclean_task(args)
         return _run_auto_clean(args)
     if args.command == "serve":
         return _run_serve(args)

@@ -71,6 +71,18 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+; ADR-0034 'Upgrade path': an upgraded install keeps the OLD weekly auto-clean task (one trigger)
+; until the user toggles Settings off/on. This re-registers it with the current definition on every
+; install/upgrade, and only when [autoclean] enabled is true in this user's config.toml (disabled
+; => the command does nothing and creates no task). Runs in {app} so the relative config.toml is
+; the installed one. Same account as the disk-space task: Setup is PrivilegesRequired=lowest, so
+; RegisterDiskSpaceTask (in [Code]) already runs as the installing user; `runasoriginaluser` keeps
+; this step on that user too even if Setup were ever launched elevated over-the-shoulder
+; (autoclean_schedule registers a per-user InteractiveToken task). Best-effort like that task:
+; Inno never fails the install on a [Run] exit code, `nowait` + `runhidden` keep it silent and off
+; the critical path, `skipifdoesntexist` skips it if the exe is somehow absent, and the command's
+; own failure detail goes to data\task_registration_diagnostic.log.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "auto-clean --reconcile-task"; WorkingDir: "{app}"; Flags: runhidden nowait skipifdoesntexist runasoriginaluser
 Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent unchecked
 
 [Registry]
