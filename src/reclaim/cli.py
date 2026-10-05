@@ -1146,8 +1146,9 @@ def _auto_clean_status_json(
     one JSON document to stdout (argparse usage errors and `--help` are printed by argparse and
     are not JSON; KeyboardInterrupt/SystemExit are deliberately not caught). Paths that never
     reach the run's own response write this minimal, schema-stable object instead: `status`
-    ("skipped" | "error"), `reason` (autoclean_disabled | nothing_to_do | busy | config_invalid |
-    elevated | run_failed), `applied` (always false -- nothing ran) and, for exceptions,
+    ("skipped" | "error"; `--reconcile-task` adds "ok"), `reason` (autoclean_disabled |
+    nothing_to_do | busy | config_invalid | elevated | run_failed; `--reconcile-task` adds
+    task_registered), `applied` (always false -- nothing ran) and, for exceptions,
     `error_type` (the exception class name only: the text may hold paths, so it stays on
     stderr). The normal-path document is the `RegenerableCleanResponse` and has no `status` key.
     Human text goes to stderr."""
@@ -1167,24 +1168,52 @@ def _run_reconcile_autoclean_task(
     runner: autoclean_schedule.SchtasksRunner | None = None,
     diag_log_path: Path | None = None,
 ) -> int:
+    """Outer wrapper (same contract as `_run_auto_clean`): with `--json`, an exception that
+    escapes before a document was written becomes the `run_failed` error document (exit 1, full
+    text on stderr) instead of an empty stdout. Without `--json` the traceback behaviour stays."""
+    try:
+        return _reconcile_autoclean_task_inner(
+            args, exe_path=exe_path, runner=runner, diag_log_path=diag_log_path
+        )
+    except Exception as exc:
+        if not args.json or getattr(args, "json_emitted", False):
+            raise
+        print(f"reclaim auto-clean: run failed: {type(exc).__name__}: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "run_failed", type(exc).__name__)
+        return 1
+
+
+def _reconcile_autoclean_task_inner(
+    args: argparse.Namespace,
+    *,
+    exe_path: Path | None,
+    runner: autoclean_schedule.SchtasksRunner | None,
+    diag_log_path: Path | None,
+) -> int:
     """`auto-clean --reconcile-task`: makes an existing install's task match the current
     definition after an upgrade (ADR-0034 'Upgrade path'). Enabled -> `register_task` (schtasks
     `/f` overwrite, so an old single-trigger task gains the logon trigger). Disabled -> nothing at
     all, never a new task. Source/dev run -> a message and exit 0 (nothing to schedule is not a
-    failure). A real failure prints the actionable error and returns 1; it never raises."""
+    failure). A real failure prints the actionable error and returns 1. With `--json`, human text
+    goes to stderr and `_auto_clean_status_json` writes the one stdout document."""
+    out = sys.stderr if args.json else sys.stdout
     try:
         assert_not_elevated()
     except ElevatedProcessError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "elevated", type(exc).__name__)
         return 1
     config = _load_config_or_none("auto-clean", args.config)
     if config is None:
+        _auto_clean_status_json(args, "error", "config_invalid")
         return 1
     if not config.autoclean.enabled:
-        print(  # noqa: T201
+        print(
             "reclaim auto-clean: nothing to do -- weekly auto-clean is off in config.toml "
-            "([autoclean] enabled = false); no task was created or changed."
+            "([autoclean] enabled = false); no task was created or changed.",
+            file=out,
         )
+        _auto_clean_status_json(args, "skipped", "autoclean_disabled")
         return 0
     try:
         name = autoclean_schedule.register_task(
@@ -1195,11 +1224,14 @@ def _run_reconcile_autoclean_task(
         )
     except autoclean_schedule.NotAnInstalledBuildError as exc:
         print(f"reclaim auto-clean: nothing to do -- {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "skipped", "nothing_to_do")
         return 0
     except (autoclean_schedule.AutoCleanScheduleError, OSError) as exc:
         print(f"reclaim auto-clean: could not update the weekly task: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "run_failed", type(exc).__name__)
         return 1
-    print(f"reclaim auto-clean: weekly task '{name}' is up to date.")  # noqa: T201
+    print(f"reclaim auto-clean: weekly task '{name}' is up to date.", file=out)
+    _auto_clean_status_json(args, "ok", "task_registered")
     return 0
 
 

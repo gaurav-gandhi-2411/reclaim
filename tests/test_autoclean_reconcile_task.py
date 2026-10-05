@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
@@ -48,10 +49,10 @@ class FakeTaskScheduler:
         return self.create_result
 
 
-def _config(tmp_path: Path, *, enabled: bool) -> argparse.Namespace:
+def _config(tmp_path: Path, *, enabled: bool, as_json: bool = False) -> argparse.Namespace:
     path = tmp_path / "config.toml"
     path.write_text(f"[autoclean]\nenabled = {str(enabled).lower()}\n", encoding="utf-8")
-    return argparse.Namespace(config=path)
+    return argparse.Namespace(config=path, json=as_json)
 
 
 def _run(
@@ -98,7 +99,7 @@ def test_disabled_makes_no_schtasks_call_and_exits_zero(
 
 def test_missing_config_counts_as_disabled(tmp_path: Path) -> None:
     fake = FakeTaskScheduler()
-    args = argparse.Namespace(config=tmp_path / "does_not_exist.toml")
+    args = argparse.Namespace(config=tmp_path / "does_not_exist.toml", json=False)
 
     assert _run(args, fake, tmp_path) == 0
     assert fake.calls == []
@@ -215,3 +216,160 @@ def test_uninstaller_removes_weekly_task_with_matching_name_and_ownership_guard(
     )
     assert uninstall_step is not None
     assert "UnregisterAutoCleanTask();" in uninstall_step.group(0)
+
+
+# --- `--json`: stdout is exactly one document on every path (#137's contract/vocabulary) ----------
+
+
+def _one_doc(capsys: pytest.CaptureFixture[str]) -> tuple[dict[str, object], str]:
+    captured = capsys.readouterr()
+    return json.loads(captured.out), captured.err  # raises if stdout is not exactly one document
+
+
+def test_json_registered_is_one_ok_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = _run(_config(tmp_path, enabled=True, as_json=True), FakeTaskScheduler(), tmp_path)
+
+    doc, err = _one_doc(capsys)
+    assert code == 0
+    assert doc == {"status": "ok", "reason": "task_registered", "applied": False}
+    assert "is up to date" in err  # the human line moved to stderr
+
+
+def test_json_disabled_is_skipped_and_calls_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeTaskScheduler()
+
+    code = _run(_config(tmp_path, enabled=False, as_json=True), fake, tmp_path)
+
+    doc, _ = _one_doc(capsys)
+    assert code == 0
+    assert doc == {"status": "skipped", "reason": "autoclean_disabled", "applied": False}
+    assert fake.calls == []
+
+
+def test_json_not_an_installed_build_is_nothing_to_do(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sched, "compiled_exe_dir", lambda: None)
+
+    code = _run(
+        _config(tmp_path, enabled=True, as_json=True), FakeTaskScheduler(), tmp_path, exe=None
+    )
+
+    doc, err = _one_doc(capsys)
+    assert code == 0
+    assert doc == {"status": "skipped", "reason": "nothing_to_do", "applied": False}
+    assert "installed Reclaim app" in err
+
+
+def test_json_registration_failure_has_class_name_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeTaskScheduler(
+        create_result=SchtasksOutcome(1, r"ERROR: Access is denied. C:\secret")
+    )
+
+    code = _run(_config(tmp_path, enabled=True, as_json=True), fake, tmp_path)
+
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert code == 1
+    assert doc == {
+        "status": "error",
+        "reason": "run_failed",
+        "applied": False,
+        "error_type": "TaskRegistrationError",
+    }
+    assert "secret" not in captured.out  # no raw text in JSON ...
+    assert "Access is denied" in captured.err  # ... full text on stderr
+
+
+def test_json_invalid_config_is_config_invalid(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _config(tmp_path, enabled=True, as_json=True)
+    args.config.write_text("[autoclean\nenabled = ", encoding="utf-8")
+
+    code = _run(args, FakeTaskScheduler(), tmp_path)
+
+    doc, err = _one_doc(capsys)
+    assert code == 1
+    assert doc == {"status": "error", "reason": "config_invalid", "applied": False}
+    assert "config.toml is invalid" in err
+
+
+def test_json_elevated_is_elevated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _elevated() -> None:
+        raise cli.ElevatedProcessError("running elevated")
+
+    monkeypatch.setattr(cli, "assert_not_elevated", _elevated)
+
+    code = _run(_config(tmp_path, enabled=True, as_json=True), FakeTaskScheduler(), tmp_path)
+
+    doc, _ = _one_doc(capsys)
+    assert code == 1
+    assert doc == {
+        "status": "error",
+        "reason": "elevated",
+        "applied": False,
+        "error_type": "ElevatedProcessError",
+    }
+
+
+def test_json_unexpected_exception_is_run_failed_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _boom(_argv: Sequence[str]) -> SchtasksOutcome:
+        raise RuntimeError(r"kaboom C:\private")
+
+    code = cli._run_reconcile_autoclean_task(
+        _config(tmp_path, enabled=True, as_json=True),
+        exe_path=_EXE,
+        runner=_boom,
+        diag_log_path=tmp_path / "diag.log",
+    )
+
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert code == 1
+    assert doc == {
+        "status": "error",
+        "reason": "run_failed",
+        "applied": False,
+        "error_type": "RuntimeError",
+    }
+    assert "private" not in captured.out
+    assert "kaboom" in captured.err
+
+
+def test_without_json_unexpected_exception_still_propagates(tmp_path: Path) -> None:
+    def _boom(_argv: Sequence[str]) -> SchtasksOutcome:
+        raise RuntimeError("kaboom")
+
+    with pytest.raises(RuntimeError):
+        cli._run_reconcile_autoclean_task(
+            _config(tmp_path, enabled=True),
+            exe_path=_EXE,
+            runner=_boom,
+            diag_log_path=tmp_path / "diag.log",
+        )
+
+
+def test_json_flag_through_main_prints_one_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sched, "run_schtasks", FakeTaskScheduler())
+    monkeypatch.setattr(sched, "compiled_exe_dir", lambda: _EXE.parent)
+    monkeypatch.setattr(sched, "default_diagnostic_log_path", lambda: tmp_path / "diag.log")
+    config = _config(tmp_path, enabled=True).config
+
+    code = cli.main(["auto-clean", "--reconcile-task", "--json", "--config", str(config)])
+
+    doc, _ = _one_doc(capsys)
+    assert code == 0
+    assert doc["status"] == "ok"
