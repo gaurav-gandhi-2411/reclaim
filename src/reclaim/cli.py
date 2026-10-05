@@ -1216,9 +1216,6 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
                 f"Would free {response.bytes_removed_human} (dry run -- pass --apply to clean)"
             )
 
-    if plan is not None and scheduled_state is not None:
-        _record_autoclean_state(scheduled_state, plan, response)
-
     if response.excluded_applied > 0:
         # Mechanical form of "no excluded project appeared among applied paths": a
         # non-zero count means the skip logic itself failed -- never report success.
@@ -1227,6 +1224,11 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Fail closed: only a run that passed the invariant above may mark the full run done / clear
+    # pending tools.
+    if plan is not None and scheduled_state is not None:
+        _record_autoclean_state(scheduled_state, plan, response)
 
     if apply and args.notify and (response.bytes_removed > 0 or response.files_skipped_in_use > 0):
         send_autoclean_toast(

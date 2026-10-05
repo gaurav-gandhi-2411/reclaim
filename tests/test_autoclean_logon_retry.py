@@ -391,6 +391,29 @@ def test_unwritable_state_does_not_fail_the_run(
     assert rig.native_commands == ["pip", "uv"]
 
 
+def test_invariant_violation_does_not_record_state(
+    rig: Rig, config_on: Path, toast: ToastRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    earlier = NOW - timedelta(days=1)
+    before = AutoCleanState(earlier, frozenset({"uv"}))
+    write_state(before, autoclean_state.default_state_path())
+    monkeypatch.setattr(regenerable, "count_excluded_applied", lambda *_a: 1)
+
+    assert _scheduled(config_on) == 1
+
+    assert _state() == before, "a violating run must not stamp the run or clear pending"
+
+
+def test_invariant_violation_on_first_run_leaves_no_state(
+    rig: Rig, config_on: Path, toast: ToastRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(regenerable, "count_excluded_applied", lambda *_a: 1)
+
+    assert _scheduled(config_on) == 1
+
+    assert not autoclean_state.default_state_path().exists()
+
+
 def test_dry_run_and_manual_runs_never_touch_the_state(rig: Rig, config_on: Path) -> None:
     assert cli.main(["auto-clean", "--scheduled", "--config", str(config_on)]) == 0  # dry run
     assert cli.main(["auto-clean", "--apply", "--config", str(config_on)]) == 0  # manual
