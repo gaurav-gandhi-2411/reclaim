@@ -941,6 +941,7 @@ def _run_pytest_temp(
     listing: list[str] = []
     found = qualifying = in_use = dirs_removed = 0
     guarded: list[str] = []
+    left_reasons: list[str] = []  # apply only: why a qualifying dir was not fully removed
     for entry in sorted(entries, key=lambda e: e.name):
         if _PYTEST_BASETEMP_RE.fullmatch(entry.name) is None:
             continue  # includes the `pytest-current` link and every unrelated sibling
@@ -960,7 +961,10 @@ def _run_pytest_temp(
         age = now - info.newest_mtime
         qualifies = age >= env.pytest_temp_min_age_seconds and info.newest_mtime > 0
         if len(listing) < _MAX_LISTED_PYTEST_DIRS:
-            verdict = "older than the floor" if qualifies else "too recent"
+            if info.newest_mtime <= 0:
+                verdict = "unknown age (mtime 0), left alone"
+            else:
+                verdict = "older than the floor" if qualifies else "too recent"
             listing.append(f"{entry.name} ({age / 86400:.1f} d, {info.size} B, {verdict})")
         if not qualifies:
             continue
@@ -976,7 +980,7 @@ def _run_pytest_temp(
         if reason is not None:
             in_use += 1
             _record_skip(result, child)
-            result.detail = reason[:300]
+            left_reasons.append(f"{entry.name} left whole: {reason[:200]}")
             continue
         # ADR-0036: re-scan AFTER the (slow) handle probe, immediately before the delete -- a
         # directory touched since the plan (any file newer) is in use, even with no handle now.
@@ -984,12 +988,25 @@ def _run_pytest_temp(
         if live.newest_mtime != info.newest_mtime or (
             env.now() - live.newest_mtime < env.pytest_temp_min_age_seconds
         ):
+            in_use += 1
             _record_skip(result, child)
+            left_reasons.append(f"{entry.name} left whole: touched since it was planned")
             continue
         result.applied_paths.append(child)
+        skipped_before = result.files_skipped_in_use
         _delete_tree_contents(child, env=penv, result=result, remove_top=True, enforce_age=True)
         if not Path(child).exists():
             dirs_removed += 1
+        else:
+            # All-or-nothing was only guaranteed for a handle present at probe time: anything
+            # that appeared after it (a new handle, a touched file, a process whose cwd is in the
+            # folder) leaves a partial dir, which must never be reported as cleaned.
+            in_use += 1
+            held = result.files_skipped_in_use - skipped_before
+            why = (
+                f"{held} file(s) in use or touched" if held else "folder still in use by a process"
+            )
+            left_reasons.append(f"{entry.name} only partly removed, remainder left: {why}")
 
     notes = [
         f"{found} pytest-<N> folder(s), {qualifying} at least "
@@ -1002,14 +1019,14 @@ def _run_pytest_temp(
         notes.append(f"left {len(guarded)} with a git repo / virtualenv inside: {guarded[:5]}")
     if result.excluded:
         notes.append(f"left {len(result.excluded)} excluded folder(s) alone")
-    if result.detail:
-        notes.append(f"in use: {result.detail}")
+    notes.extend(left_reasons)
     result.detail = " | ".join(notes)
     cleaned = bool(result.files_removed or dirs_removed) if apply else qualifying > 0
-    if cleaned:
-        result.status = "cleaned" if apply else "would_clean"
-    elif in_use:
+    if in_use:
+        # Even if other dirs were removed: never say "cleaned" while any qualifying dir remains.
         result.status = "skipped_in_use"
+    elif cleaned:
+        result.status = "cleaned" if apply else "would_clean"
     elif result.excluded:
         result.status = "skipped_excluded"
     return result

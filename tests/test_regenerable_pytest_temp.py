@@ -281,8 +281,55 @@ def test_touched_after_planning_is_kept(world: World) -> None:
 
     item = _item(_run(world.env(has_open_handle=touch_then_report_free)))
     assert victim.exists() and base.exists()
-    assert item.status == "nothing_to_clean"
+    assert item.status == "skipped_in_use"
+    assert item.files_skipped_in_use == 1
     assert item.skipped_paths == [str(base)]
+    assert "touched since it was planned" in item.detail
+
+
+def test_handle_appearing_after_probe_is_partial_never_cleaned(world: World) -> None:
+    base = world.basetemp(40)
+    held = _write(base / "test_b0" / "held.bin", 7, age_days=30)
+    _age_tree(base, 30)
+    calls: dict[str, int] = {}
+
+    def late_handle(path: str) -> bool:
+        calls[path] = calls.get(path, 0) + 1
+        return path == str(held) and calls[path] >= 2  # free at probe, open at delete time
+
+    item = _item(_run(world.env(has_open_handle=late_handle)))
+    assert held.exists()
+    assert item.status == "skipped_in_use"
+    assert item.files_skipped_in_use >= 1
+    assert "pytest-40 only partly removed" in item.detail
+
+
+def test_empty_skeleton_left_by_process_cwd_is_reported_not_cleaned(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = world.basetemp(41)
+    real_rmdir = os.rmdir
+
+    def rmdir_refuses_top(path: str, *a: object, **k: object) -> None:
+        if str(path) == str(base):
+            raise PermissionError("in use as a working directory")
+        real_rmdir(path, *a, **k)
+
+    monkeypatch.setattr(rg.os, "rmdir", rmdir_refuses_top)
+    item = _item(_run(world.env()))
+    assert base.exists() and not list(base.rglob("*.bin"))
+    assert item.status == "skipped_in_use"
+    assert "folder still in use by a process" in item.detail
+
+
+def test_epoch_zero_mtime_is_labelled_unknown_age(world: World) -> None:
+    base = world.basetemp(42)
+    for p in [*base.rglob("*"), base]:
+        os.utime(p, (0, 0))
+    item = _item(_run(world.env(), apply=False))
+    assert "unknown age (mtime 0), left alone" in item.detail
+    assert "too recent" not in item.detail.split("pytest-42")[1]
+    assert base.exists()
 
 
 def test_directory_with_virtualenv_is_left_for_review(world: World) -> None:
