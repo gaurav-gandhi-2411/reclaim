@@ -46,6 +46,11 @@ Want more control — custom folders, duplicate detection, AI-powered suggestion
 review of every item before it's touched? Click **Switch to Advanced** in the header at any
 time. Nothing in Simple mode is a one-way door; you can move between the two freely.
 
+Right after a full scan of your profile, Reclaim quietly prepares duplicate detection in the
+background at low priority so the dashboard is ready when you open it; a new scan or closing
+Reclaim cancels it and already-computed work is kept (`[dedup] warm_after_scan`, default on;
+[ADR-0040](docs/architecture/adr/0040-background-dedup-warmup.md)).
+
 ## Safe mode
 
 Safe mode is on for every fresh install, and it isn't just a default that could quietly slip —

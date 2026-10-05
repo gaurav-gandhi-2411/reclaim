@@ -165,6 +165,7 @@ def build_mcp_server(state: AppState) -> FastMCP:
             # scan is ever started -- see `AppState.cancel_scan_event`'s docstring for the race
             # this ordering avoids.
             state.cancel_scan_event.clear()
+            service.cancel_candidates_warm_locked(state)  # ADR-0040
             state.scan_status = ScanStatus(
                 status="running",
                 root=root,

@@ -79,6 +79,12 @@ _WINDOW_FILES = 2048
 _DEFAULT_MIN_RECLAIM_BYTES = 1024 * 1024
 
 
+class DedupCancelled(Exception):
+    """Raised by a caller-supplied `checkpoint` to stop `find_duplicate_clusters` at the next
+    batch boundary (ADR-0040). Every hash already flushed to the index stays -- that is the resume
+    mechanism -- but no clusters are returned."""
+
+
 def _is_downloads_or_temp(path: Path) -> bool:
     """Spec's keep-heuristic rule 1: "prefer copy outside Downloads/Temp"."""
     return any(part.lower() in _KEEP_HEURISTIC_LOCATION_SEGMENTS for part in path.parts)
@@ -470,6 +476,27 @@ def _same_file_now(record: FileRecord) -> bool:
     return (st.st_dev, st.st_ino, st.st_size) == (record.dev, record.ino, record.size_bytes)
 
 
+def _drain_on_cancel(
+    remaining: Sequence[tuple[list[FileRecord], Future[tuple[str, bool]], list[Future[bool]]]],
+    pending_writes: list[tuple[Path, int, float, str]],
+) -> None:
+    """Cancel path of `_hash_stage`: stop every read that has not started, wait for the ones in
+    flight, and keep their finished digests (a read that errored is simply not kept)."""
+    in_flight: list[tuple[FileRecord, Future[tuple[str, bool]]]] = []
+    for group, future, sibling_checks in remaining:
+        for check in sibling_checks:
+            check.cancel()
+        if not future.cancel():
+            in_flight.append((group[0], future))
+    for first, future in in_flight:
+        try:
+            digest, from_cache = future.result()
+        except Exception:  # noqa: S112 -- an unreadable file is just not committed
+            continue
+        if not from_cache:
+            pending_writes.append((first.path, first.size_bytes, first.mtime, digest))
+
+
 def _hash_stage(
     executor: ThreadPoolExecutor,
     records: Sequence[FileRecord],
@@ -482,6 +509,7 @@ def _hash_stage(
     pending_writes: list[tuple[Path, int, float, str]],
     skips: list[HashSkip] | None,
     collapse_hardlinks: bool = True,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[Path, str]:
     """Hashes `records` concurrently on `executor` (cache check, else compute, else skip) and
     returns `{path: digest}` for every record that produced one.
@@ -491,7 +519,13 @@ def _hash_stage(
     stat confirms it still points at the same inode (`_same_file_now`). A name that fails that
     check -- or whose group's first member is unreadable -- is hashed on its own in a second
     pass, so the skips, cache rows and clusters equal what hashing every name separately gives.
-    `ino == 0` means "identity unknown" (synthetic/test records) and is never collapsed."""
+    `ino == 0` means "identity unknown" (synthetic/test records) and is never collapsed.
+
+    `checkpoint` (ADR-0040) is called before collecting each group's result. If it raises
+    `DedupCancelled`, every not-yet-started read is cancelled, the reads already in flight (at most
+    the pool size) are awaited, every digest computed so far is appended to `pending_writes` for
+    the caller to flush, and the exception propagates -- so a cancel's latency is bounded by the
+    in-flight reads, not by the rest of a 2048-file window of large files."""
     by_identity: dict[object, list[FileRecord]] = {}
     for record in records:
         key: object = (record.dev, record.ino) if record.ino and collapse_hardlinks else record.path
@@ -515,7 +549,13 @@ def _hash_stage(
     ]
     digests: dict[Path, str] = {}
     fallback: list[FileRecord] = []
-    for group, future, sibling_checks in submitted:
+    for position, (group, future, sibling_checks) in enumerate(submitted):
+        if checkpoint is not None:
+            try:
+                checkpoint()
+            except DedupCancelled:
+                _drain_on_cancel(submitted[position:], pending_writes)
+                raise
         first = group[0]
         reason: str | None = None
         try:
@@ -561,6 +601,7 @@ def _hash_stage(
                 pending_writes=pending_writes,
                 skips=skips,
                 collapse_hardlinks=False,
+                checkpoint=checkpoint,
             )
         )
     return digests
@@ -587,6 +628,8 @@ def find_duplicate_clusters(
     min_reclaim_bytes: int = _DEFAULT_MIN_RECLAIM_BYTES,
     skips: list[HashSkip] | None = None,
     exclusion_patterns: Sequence[str] = (),
+    checkpoint: Callable[[], None] | None = None,
+    worker_initializer: Callable[[], None] | None = None,
 ) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
     cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
@@ -620,6 +663,17 @@ def find_duplicate_clusters(
     never a cluster member, and so never the keeper either. Deliberate: an excluded file is
     treated as if it did not exist, so no other copy can be proposed for deletion "because a
     copy survives in the excluded tree".
+
+    `checkpoint` (ADR-0040): called on the calling thread at every batch boundary -- before each
+    window of up to `_WINDOW_FILES` files and between a window's partial and full stages. It may
+    raise `DedupCancelled` to stop; pending hashes are flushed first, so the next pass over the
+    same index hashes only the remainder (hashes are durable per batch, ADR-0038). It may also do
+    housekeeping (the API layer leaves background priority there when a user asks for the result).
+
+    `worker_initializer` (ADR-0040): run once in each hashing pool thread as it starts. The pool
+    is created per window (threads are lazy, so this is cheap), so an initializer evaluated at
+    that moment sees the CURRENT state -- e.g. enter OS background mode only while the warm-up
+    has not been promoted to a user request.
     """
     candidate_count = index.duplicate_size_candidate_count(min_reclaim_bytes=min_reclaim_bytes)
     if candidate_count == 0:
@@ -663,6 +717,26 @@ def find_duplicate_clusters(
             index.store_full_hashes(full_writes)
             full_writes.clear()
 
+    def check_cancel() -> None:
+        if checkpoint is None:
+            return
+        try:
+            checkpoint()
+        except DedupCancelled:
+            flush_writes()  # keep what this window already hashed: the resume mechanism
+            raise
+
+    def run_window(window: list[tuple[int, list[FileRecord]]]) -> None:
+        check_cancel()
+        try:
+            with ThreadPoolExecutor(
+                max_workers=_HASH_TIMEOUT_WORKERS, initializer=worker_initializer
+            ) as executor:
+                process_window(executor, window)
+        except DedupCancelled:
+            flush_writes()  # a cancel raised from inside a hash stage: keep its drained digests
+            raise
+
     def process_window(
         executor: ThreadPoolExecutor, window: list[tuple[int, list[FileRecord]]]
     ) -> None:
@@ -677,9 +751,11 @@ def find_duplicate_clusters(
             with_size_arg=True,
             pending_writes=partial_writes,
             skips=skips,
+            checkpoint=checkpoint,
         )
         counters["partial"] += len(partial_digests)
         heartbeat()
+        check_cancel()
 
         # Same-size files that also share a partial hash are the only full-hash candidates.
         bucket_subsets: list[tuple[int, list[list[FileRecord]]]] = []
@@ -725,6 +801,7 @@ def find_duplicate_clusters(
                 with_size_arg=False,
                 pending_writes=full_writes,
                 skips=skips,
+                checkpoint=checkpoint,
             )
         )
         counters["full"] += len(full_digests)
@@ -750,13 +827,11 @@ def find_duplicate_clusters(
                         )
                     )
 
-    with ThreadPoolExecutor(max_workers=_HASH_TIMEOUT_WORKERS) as executor:
-        window: list[tuple[int, list[FileRecord]]] = []
-        window_files = 0
-        for size, members_iter in itertools.groupby(
-            index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes),
-            key=lambda record: record.size_bytes,
-        ):
+    window: list[tuple[int, list[FileRecord]]] = []
+    window_files = 0
+    rows = index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes)
+    try:
+        for size, members_iter in itertools.groupby(rows, key=lambda record: record.size_bytes):
             counters["buckets"] += 1
             members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
             if exclusion_patterns:
@@ -766,10 +841,15 @@ def find_duplicate_clusters(
             window.append((size, members))
             window_files += len(members)
             if window_files >= _WINDOW_FILES:
-                process_window(executor, window)
+                run_window(window)
                 window, window_files = [], 0
         if window:
-            process_window(executor, window)
+            run_window(window)
+    finally:
+        # Close the SELECT cursor NOW, not whenever the traceback releases the generator: a
+        # cancel (or any error) unwinding out of the loop otherwise leaves the cursor open and
+        # ScanIndex.close()'s WAL checkpoint then fails with "database table is locked".
+        rows.close()
     flush_writes()
     buckets_seen = counters["buckets"]
 
@@ -809,6 +889,8 @@ def generate_duplicate_candidates(
     *,
     skips: list[HashSkip] | None = None,
     clusters: Sequence[DuplicateCluster] | None = None,
+    checkpoint: Callable[[], None] | None = None,
+    worker_initializer: Callable[[], None] | None = None,
 ) -> list[Candidate]:
     """Mirrors `detectors.py::generate_candidates()`'s contract/shape: runs every non-keep
     cluster member through `SafetyValidator.evaluate()` before it is ever tagged a tier.
@@ -816,7 +898,8 @@ def generate_duplicate_candidates(
     is enabled, else Tier B. The kept member of a cluster is never evaluated for a tier and
     never appears in the output — it isn't being proposed for any action.
 
-    `skips` is forwarded to `find_duplicate_clusters` unchanged — see its docstring.
+    `skips`, `checkpoint` and `worker_initializer` are forwarded to `find_duplicate_clusters`
+    unchanged — see its docstring (ADR-0040 for the latter two).
     `min_reclaim_bytes` comes from `config.categories.duplicates.min_reclaim_bytes` — the
     materiality gate is config-driven, not hardcoded, same as every other category threshold.
 
@@ -864,6 +947,8 @@ def generate_duplicate_candidates(
             min_reclaim_bytes=min_reclaim_bytes,
             skips=skips,
             exclusion_patterns=safety.exclusion_patterns,
+            checkpoint=checkpoint,
+            worker_initializer=worker_initializer,
         )
     )
     model_cache_roots = [Path(p) for p in config.categories.model_caches.paths]

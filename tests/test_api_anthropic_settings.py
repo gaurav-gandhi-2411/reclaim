@@ -200,7 +200,7 @@ def _seed_dev_artifacts_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         safety_reason_code="ok",
         retention_days=None,
     )
-    monkeypatch.setattr(service, "_all_candidates", lambda index, state: [candidate])
+    monkeypatch.setattr(service, "_all_candidates", lambda index, state, **_kw: [candidate])
 
 
 def test_category_explanation_unavailable_with_no_scan(tmp_path: Path) -> None:

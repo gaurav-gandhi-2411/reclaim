@@ -779,3 +779,19 @@ def test_unknown_autoclean_lookalike_top_level_section_is_still_rejected(tmp_pat
 
     with pytest.raises(UnknownConfigKeyError):
         load_config(config_path)
+
+
+def test_bare_config_defaults_dedup_warm_after_scan_to_true() -> None:
+    assert Config().dedup.warm_after_scan is True
+
+
+def test_dedup_warm_after_scan_can_be_turned_off_in_toml(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[dedup]\nwarm_after_scan = false\n", encoding="utf-8")
+    assert load_config(config_path).dedup.warm_after_scan is False
+
+
+@pytest.mark.parametrize("name", ["config.example.toml", "packaging/config.default.toml"])
+def test_shipped_config_templates_enable_dedup_warm_after_scan(name: str) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    assert load_config(repo_root / name).dedup.warm_after_scan is True
