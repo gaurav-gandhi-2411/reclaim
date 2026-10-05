@@ -150,3 +150,48 @@ Dry runs and manual (non-`--scheduled`) runs never read or write the state.
 - Rejected: `--force` or killing `uv` processes (ADR-0034's rule is to wait, never race). Not
   taken: raising `ExecutionTimeLimit` or the wait further; the 3,300 s attempt shows a longer wait
   does not help while the lock holders are long-lived.
+
+## Addendum: pytest temp (opt-in, off by default)
+
+**What.** A new category `pytest_temp` deletes whole `%TEMP%\pytest-of-<user>\pytest-<N>` basetemp
+directories whose NEWEST content (live recursive scan, the same rule #110 uses for aged TEMP; a
+directory with one recent file inside is not old whatever its own mtime says) is at least
+`PYTEST_TEMP_MIN_AGE_SECONDS` (7 days; `>=`, so exactly 7 d qualifies, same as aged TEMP) old.
+Unit of deletion is one `pytest-<N>` directory (`fullmatch` on `pytest-[0-9]+`). `pytest-current`,
+anything else in the parent, a link or file named like a basetemp, and the `pytest-of-<user>` parent
+itself are never candidates; reparse points are never followed (a link *inside* a basetemp is
+unlinked, its target untouched, as for every other category).
+
+**Safety checks, per directory, all-or-nothing.** (1) user exclusions (`subtree_exclusion_match`,
+ADR-0039) -> `excluded`, status `skipped_excluded` when nothing else happened; (2) the existing
+guard names (`.git`, venv, `node_modules`) -> left for review; (3) on apply, every file is probed
+with the same `has_open_handle` the other categories use and ONE open or un-probeable file skips the
+whole directory (`skipped_in_use`, with a reason; a detector that raises is treated as in use,
+fail-closed); (4) ADR-0036: the directory is re-scanned after the (slow) handle probe and immediately
+before the delete, and kept if anything is newer; each file is again re-stat'ed against the age floor
+as it is unlinked. A dry run does NOT probe handles (that would open every file); it reports what the
+apply path would attempt.
+
+**The ownership caveat, and the decision.** A pytest basetemp is shared by every project the user
+runs pytest for, and the directory records nothing about which project created it. Reclaim therefore
+cannot prove that a given `pytest-<N>` is not a run of a project on the user's `[exclusions]` list.
+Decision: the category is **off by default**. `[regenerable] pytest_temp = true` (config file only;
+no Settings toggle) is the only thing that lets `--apply`, the weekly task or the dashboard's one-click
+clean touch it; with the flag off the item is not even planned (not listed, not deleted). To preview
+without opting in, `reclaim auto-clean --include-pytest-temp` adds the item to a DRY RUN only
+(`pytest_temp_mode = "report"`: even if `apply` were forced the runner downgrades to a report, and
+the CLI refuses `--apply --include-pytest-temp` without the config flag, exit 2). Each report line
+states that ownership is unknown. **Exclusions only help partially:** `project_names` and path
+patterns are matched against every path inside the directory, so a run whose file or directory names
+embed the project name is skipped, but a run that merely used `tmp_path` fixtures with generic names
+cannot be matched; the user can protect those only by writing a `[safety] deny` path pattern for the
+folder (or by leaving the flag off).
+
+**A change to aged TEMP that this required.** Before this addendum the generic aged-TEMP category
+could delete `%TEMP%\pytest-of-<user>` wholesale whenever every file in it was over 7 days old, which
+contradicts "off by default". Aged TEMP now always skips direct children named `pytest-of-*` (noted
+in its `detail`), whether or not the new category is on.
+
+**Consequences / limits.** A basetemp holding a virtualenv is left for review (the common
+"venv built inside tmp_path" test pattern), so it never frees that space. How much it frees depends entirely on
+the machine (see the PR that added this for a metadata-only dry run on one).

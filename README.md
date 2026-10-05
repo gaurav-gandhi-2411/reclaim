@@ -90,6 +90,14 @@ tiny (see ADR-0034):
 By hand: `reclaim auto-clean` previews (a dry run); `reclaim auto-clean --apply` really cleans.
 Every item is recorded in `data/regenerable_audit.jsonl`.
 
+**Pytest temp folders (a separate opt-in, config file only).** Old `pytest-<N>` folders in
+`%TEMP%\pytest-of-<you>` (newest file over 7 days old, nothing open) are *not* in the list above
+and are never touched unless you set `[regenerable] pytest_temp = true` in `config.toml` (there is
+no Settings toggle for it). Pytest temp folders are shared by every project you test, and Reclaim
+cannot tell which project made a given folder: turn it on only if none of them is a project you
+are protecting (your `[exclusions]` names cannot reliably protect them; a `[safety] deny` path
+pattern can). `reclaim auto-clean --include-pytest-temp` previews it without turning it on.
+
 ## How to restore something
 
 **Primary path: Windows' own Recycle Bin.** In safe mode (the default for every install),

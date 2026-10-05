@@ -135,6 +135,14 @@ disk_threshold_percent = 80.0
 [autoclean]
 enabled = false
 
+# ADR-0034 addendum "pytest temp": also clean old pytest-<N> folders in %TEMP%\pytest-of-<you> (newest
+# file over 7 days old). Off by default: pytest temp folders are shared by every project you test;
+# turn on only if none of them is a project you are protecting. Reclaim cannot tell whose folder is
+# whose, so [exclusions] project_names cannot reliably protect them -- a [safety] deny path pattern can.
+# `reclaim auto-clean --include-pytest-temp` previews it (dry run) without turning it on.
+[regenerable]
+pytest_temp = false
+
 # ADR-0040: background dedup warm-up. After a completed full scan the duplicate hash pass runs in
 # the background at low priority so the dashboard is ready when you open it. A new scan or closing
 # Reclaim cancels it; already-computed hashes are kept. false = warm only on first dashboard open.
