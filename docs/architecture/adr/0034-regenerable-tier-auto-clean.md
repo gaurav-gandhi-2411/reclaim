@@ -207,3 +207,13 @@ in its `detail`), whether or not the new category is on.
 **Consequences / limits.** A basetemp holding a virtualenv is left for review (the common
 "venv built inside tmp_path" test pattern), so it never frees that space. How much it frees depends entirely on
 the machine (see the PR that added this for a metadata-only dry run on one).
+
+## Addendum: Upgrade path
+
+*Added 2026-10-05. Closes the last Consequences bullet of the addendum above (an existing install kept a single-trigger task until the user toggled Settings off/on).*
+
+**Decision.** `reclaim auto-clean --reconcile-task` (mutually exclusive with `--apply`/`--dry-run`; cleans nothing) reads `[autoclean] enabled` from the user's `config.toml`. Enabled: `register_task()` (schtasks `/f`, so an old single-trigger task is replaced by the current weekly + logon definition). Disabled or no config: no schtasks call at all and no task is created. Source/dev run: message, exit 0. Real failure (schtasks error, invalid config, elevated): actionable message on stderr, exit 1, details in `task_registration_diagnostic.log`. Safe to repeat. `packaging/reclaim.iss` runs it from `[Run]` on every install and upgrade, in `{app}`, with `runhidden nowait skipifdoesntexist runasoriginaluser`. Inno does not fail an install on a `[Run]` exit code (BELIEVED from Inno's documented behaviour, not exercised here), so a failure never blocks the install; the Settings toggle remains the manual path.
+
+**Account.** Setup is `PrivilegesRequired=lowest`, so the disk-space task step (`RegisterDiskSpaceTask`, `[Code]`) already runs as the installing user. `runasoriginaluser` keeps the new step on that same user even if Setup were launched elevated, because the task is a per-user `InteractiveToken` task and `auto-clean` refuses to run elevated.
+
+**Not verified.** A real installer upgrade over a real old task has not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.

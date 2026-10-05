@@ -84,6 +84,7 @@ tiny (see ADR-0034):
 - **Per Windows account:** the task is named `Reclaim Weekly Auto-Clean (<your username>)`, runs
   without administrator rights, and only while you are signed in. Turning the toggle off removes
   it, and a leftover task does nothing once the setting is off.
+- **Upgrades keep it current:** installing a new version re-registers the task (only if the toggle is on), so you never have to switch it off and on again.
 - **Needs the installed app** (a source checkout has no `reclaim.exe` to schedule; the toggle
   explains this instead of failing silently).
 
