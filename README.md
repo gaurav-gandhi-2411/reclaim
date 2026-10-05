@@ -89,6 +89,13 @@ tiny (see ADR-0034):
 
 By hand: `reclaim auto-clean` previews (a dry run); `reclaim auto-clean --apply` really cleans.
 Every item is recorded in `data/regenerable_audit.jsonl`.
+With `--json`, every path of a run that starts executing the command prints exactly one JSON
+document on stdout (human text goes to stderr): the run report, or
+`{"status": "skipped" | "error", "reason": ..., "applied": false}` when nothing ran. `reason` is
+one of `autoclean_disabled`, `nothing_to_do`, `busy`, `config_invalid`, `elevated`, `run_failed`;
+errors caused by an exception add `error_type` (the exception class name only -- the full text is
+on stderr). argparse usage errors and `--help` are printed by argparse and are not JSON, and
+Ctrl+C / `SystemExit` are deliberately not caught.
 
 ## How to restore something
 
