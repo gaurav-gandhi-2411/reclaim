@@ -236,6 +236,7 @@ def test_scan_cancel_endpoint_stops_a_running_scan_with_a_consistent_partial_ind
     `POST /api/scan/cancel` once the scan has demonstrably made progress -- not before it starts,
     not after it's already finished."""
     import threading
+    from typing import Any
 
     import reclaim.scanner as scanner_module
     from reclaim.api import service
@@ -274,25 +275,39 @@ def test_scan_cancel_endpoint_stops_a_running_scan_with_a_consistent_partial_ind
             drives_done=0,
         )
 
+    # Deterministic rendezvous instead of polling a status field against a fast scan (on a
+    # CPU-contended machine every worker could finish its whole directory between two polls, so
+    # "cancel while mid-flight" was a race). The root listing passes through (its 8 subdirectories
+    # are pushed, so the partial index is non-empty); every worker that then lists a subdirectory
+    # parks BEFORE processing any of its files. The test issues the real POST /api/scan/cancel
+    # while the scan is provably mid-flight, then releases the workers, which observe the
+    # cancel at their first per-entry check.
+    reached = threading.Event()
+    release = threading.Event()
+    real_listing = scanner_module._list_directory_or_none
+    listing_calls = [0]
+    calls_lock = threading.Lock()
+
+    def gated_listing(*args: Any, **kwargs: Any) -> Any:
+        with calls_lock:
+            listing_calls[0] += 1
+            is_root = listing_calls[0] == 1
+        if not is_root:
+            reached.set()
+            release.wait(timeout=30)
+        return real_listing(*args, **kwargs)
+
+    monkeypatch.setattr(scanner_module, "_list_directory_or_none", gated_listing)
+
     thread = threading.Thread(target=service.run_scan, args=(state, [root], started_at))
     thread.start()
-
-    deadline = time.monotonic() + 10.0
-    made_progress = False
-    while time.monotonic() < deadline:
-        with state.lock:
-            processed = state.scan_status.entries_processed or 0
-            still_running = state.scan_status.status == "running"
-        if not still_running:
-            break
-        if processed >= 20:
-            made_progress = True
-            break
-        time.sleep(0.005)
-    assert made_progress, "scan never reached the progress threshold before finishing/timing out"
+    assert reached.wait(timeout=30), "scan never reached its first subdirectory"
+    with state.lock:
+        assert state.scan_status.status == "running"
 
     response = client.post("/api/scan/cancel")
     assert response.status_code == 200
+    release.set()
 
     thread.join(timeout=30)
     assert not thread.is_alive(), "run_scan did not stop within 30s of being cancelled"
