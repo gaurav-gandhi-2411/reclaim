@@ -154,7 +154,7 @@ def test_busy_emits_error_json_exit_1(
         "status": "error",
         "reason": "busy",
         "applied": False,
-        "message": "a clean is already running",
+        "error_type": "RegenerableCleanBusyError",
     }
     assert "already running" in err
 
@@ -173,7 +173,7 @@ def test_uncaught_run_error_emits_error_json_exit_1(
         "status": "error",
         "reason": "run_failed",
         "applied": False,
-        "message": "OSError: disk on fire",
+        "error_type": "OSError",
     }
     assert "run failed: OSError: disk on fire" in err
 
@@ -203,7 +203,7 @@ def test_elevated_emits_error_json_exit_1(
         "status": "error",
         "reason": "elevated",
         "applied": False,
-        "message": "running as Administrator",
+        "error_type": "ElevatedProcessError",
     }
     assert "running as Administrator" in err
 
@@ -225,3 +225,83 @@ def test_disabled_without_json_keeps_the_human_line_on_stdout(
     cfg = _config(tmp_path, enabled=False)
     assert cli.main(["auto-clean", "--apply", "--scheduled", "--config", str(cfg)]) == 0
     assert "turned off" in capsys.readouterr().out
+
+
+def _assert_run_failed_document(doc: object, err: str, error_type: str) -> None:
+    secret = "SECRET-PATH"
+    assert doc == {
+        "status": "error",
+        "reason": "run_failed",
+        "applied": False,
+        "error_type": error_type,
+    }
+    assert secret in err, "the full exception text stays on stderr"
+
+
+def test_unreadable_config_emits_config_invalid_json_exit_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def denied(_path: object) -> object:
+        raise PermissionError("denied: SECRET-PATH")
+
+    monkeypatch.setattr(cli, "load_config", denied)
+    code, _out, err, doc = _run(capsys, ["--config", str(_config(tmp_path, enabled=True))])
+    assert code == 1
+    assert isinstance(doc, dict) and doc["reason"] == "config_invalid"
+    assert "SECRET-PATH" in err
+
+
+def test_state_read_failure_emits_run_failed_json_exit_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fake_service(monkeypatch)
+
+    def broken(*_a: object, **_k: object) -> object:
+        raise RuntimeError("state SECRET-PATH")
+
+    monkeypatch.setattr(autoclean_state, "read_state", broken)
+    cfg = _config(tmp_path, enabled=True)
+    code, _out, err, doc = _run(capsys, ["--apply", "--scheduled", "--config", str(cfg)])
+    assert code == 1
+    _assert_run_failed_document(doc, err, "RuntimeError")
+
+
+def test_serialization_failure_emits_run_failed_json_exit_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Unserializable:
+        excluded_applied = 0
+
+        def model_dump_json(self, **_k: object) -> str:
+            raise ValueError("cannot serialize SECRET-PATH")
+
+    monkeypatch.setattr(service, "regenerable_clean_response", lambda **_k: Unserializable())
+    code, _out, err, doc = _run(capsys, ["--config", str(_config(tmp_path, enabled=True))])
+    assert code == 1
+    _assert_run_failed_document(doc, err, "ValueError")
+
+
+def test_exception_after_the_document_is_written_is_not_followed_by_a_second_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fake_service(monkeypatch)
+
+    def toast_boom(*_a: object) -> bool:
+        raise RuntimeError("toast")
+
+    monkeypatch.setattr(notifications, "send_autoclean_toast", toast_boom)
+    cfg = _config(tmp_path, enabled=True)
+    with pytest.raises(RuntimeError):
+        cli.main(["auto-clean", "--apply", "--notify", "--config", str(cfg), "--json"])
+    assert json.loads(capsys.readouterr().out)["run_id"] == "run-1"
+
+
+def test_json_error_documents_never_carry_exception_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(**_kwargs: object) -> RegenerableCleanResponse:
+        raise OSError("C:/Users/x/SECRET-PATH")
+
+    monkeypatch.setattr(service, "regenerable_clean_response", boom)
+    _code, out, _err, _doc = _run(capsys, ["--config", str(_config(tmp_path, enabled=True))])
+    assert "SECRET-PATH" not in out

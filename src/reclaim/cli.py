@@ -628,7 +628,7 @@ def _load_config_or_none(
         if effective:
             return load_effective_config(resolved_path, mode=mode)
         return load_config(resolved_path)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:  # OSError: unreadable file (e.g. PermissionError)
         print(  # noqa: T201
             f"reclaim {command}: config.toml is invalid ({config_path}): {exc}",
             file=sys.stderr,
@@ -1125,22 +1125,46 @@ def _record_autoclean_state(
 
 
 def _auto_clean_status_json(
-    args: argparse.Namespace, status: str, reason: str, message: str | None = None
+    args: argparse.Namespace, status: str, reason: str, error_type: str | None = None
 ) -> None:
-    """`auto-clean --json` always writes exactly one JSON document to stdout. Paths that never
-    reach the run's own response (skipped / failed early) write this minimal, schema-stable
-    object instead: `status` ("skipped" | "error"), `reason` (machine code), `applied` (always
-    false -- nothing ran) and, for errors, `message`. The normal-path document is the
-    `RegenerableCleanResponse` and has no `status` key. Human text goes to stderr."""
+    """Every path of an `auto-clean --json` run that starts executing the command writes exactly
+    one JSON document to stdout (argparse usage errors and `--help` are printed by argparse and
+    are not JSON; KeyboardInterrupt/SystemExit are deliberately not caught). Paths that never
+    reach the run's own response write this minimal, schema-stable object instead: `status`
+    ("skipped" | "error"), `reason` (autoclean_disabled | nothing_to_do | busy | config_invalid |
+    elevated | run_failed), `applied` (always false -- nothing ran) and, for exceptions,
+    `error_type` (the exception class name only: the text may hold paths, so it stays on
+    stderr). The normal-path document is the `RegenerableCleanResponse` and has no `status` key.
+    Human text goes to stderr."""
     if not args.json:
         return
     doc: dict[str, object] = {"status": status, "reason": reason, "applied": False}
-    if message is not None:
-        doc["message"] = message
+    if error_type is not None:
+        doc["error_type"] = error_type
     print(json.dumps(doc))  # noqa: T201
+    args.json_emitted = True
 
 
 def _run_auto_clean(args: argparse.Namespace) -> int:
+    """Outer wrapper: any Exception that escapes before a JSON document was written becomes the
+    `run_failed` error document (exit 1, full text on stderr) instead of an empty stdout."""
+    try:
+        return _run_auto_clean_inner(args)
+    except Exception as exc:
+        if not args.json or getattr(args, "json_emitted", False):
+            raise  # not --json, or the document is already out: keep the traceback behaviour
+        print(f"reclaim auto-clean: run failed: {type(exc).__name__}: {exc}", file=sys.stderr)  # noqa: T201
+        # Literal fallback: this path must not be able to raise (the class name is a plain str).
+        name = type(exc).__name__
+        safe = name if name.isidentifier() else "Exception"
+        print(  # noqa: T201
+            '{"status": "error", "reason": "run_failed", "applied": false, '
+            f'"error_type": "{safe}"}}'
+        )
+        return 1
+
+
+def _run_auto_clean_inner(args: argparse.Namespace) -> int:
     # Deferred imports, same reasoning as `_run_check_disk_space`: only this subcommand needs the
     # API service module (shared with the dashboard's one-click clean so the two report the exact
     # same shape and write the same audit log) and the toast stack.
@@ -1152,7 +1176,7 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         assert_not_elevated()
     except ElevatedProcessError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
-        _auto_clean_status_json(args, "error", "elevated", str(exc))
+        _auto_clean_status_json(args, "error", "elevated", type(exc).__name__)
         return 1
     config = _load_config_or_none("auto-clean", args.config)
     if config is None:
@@ -1200,16 +1224,18 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         )
     except service.RegenerableCleanBusyError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
-        _auto_clean_status_json(args, "error", "busy", str(exc))
+        _auto_clean_status_json(args, "error", "busy", type(exc).__name__)
         return 1
     except Exception as exc:
         # The run itself crashed (per-item failures never reach here -- they are reported below).
         print(f"reclaim auto-clean: run failed: {type(exc).__name__}: {exc}", file=sys.stderr)  # noqa: T201
-        _auto_clean_status_json(args, "error", "run_failed", f"{type(exc).__name__}: {exc}")
+        _auto_clean_status_json(args, "error", "run_failed", type(exc).__name__)
         return 1
 
     if args.json:
-        print(response.model_dump_json(indent=2))  # noqa: T201
+        document = response.model_dump_json(indent=2)  # serialize first: a failure prints nothing
+        print(document)  # noqa: T201
+        args.json_emitted = True
     else:
         for item in response.items:
             print(  # noqa: T201
