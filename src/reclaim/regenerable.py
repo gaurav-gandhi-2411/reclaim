@@ -918,7 +918,17 @@ class _PlannedItem:
     waits_on_lock: bool = False
 
 
-def _plan_items(resolved: RegenerableEnv, *, apply: bool) -> list[_PlannedItem]:
+def _plan_items(
+    resolved: RegenerableEnv, *, apply: bool, only_keys: frozenset[str] | None = None
+) -> list[_PlannedItem]:
+    planned = _plan_all_items(resolved, apply=apply)
+    if only_keys is None:
+        return planned
+    # Narrowing only: a key can never add an item the allow-list does not already plan.
+    return [item for item in planned if item.key in only_keys]
+
+
+def _plan_all_items(resolved: RegenerableEnv, *, apply: bool) -> list[_PlannedItem]:
     planned: list[_PlannedItem] = [
         _PlannedItem(
             spec.key,
@@ -986,6 +996,7 @@ def run_regenerable_clean(
     on_item_start: Callable[[str, str, bool], None] | None = None,
     on_item_done: Callable[[RegenerableItemResult], None] | None = None,
     run_id: str | None = None,
+    only_keys: frozenset[str] | None = None,
 ) -> RegenerableReport:
     """Runs the whole allow-list. NEVER raises for a per-item problem: each item reports its own
     status. Every item (and every skipped/failed path, up to a cap) is appended to the audit
@@ -994,14 +1005,17 @@ def run_regenerable_clean(
     Items that may wait on a tool's own lock (uv) run last. The optional callbacks let a caller
     show live progress: `on_item_start(key, label, waits_on_lock)` before each item and
     `on_item_done(result)` after it. They are observers only -- an exception raised by one is
-    logged and swallowed so a UI bug can never abort a clean."""
+    logged and swallowed so a UI bug can never abort a clean.
+
+    `only_keys` (the scheduled logon retry) restricts the run to the allow-list items with those
+    keys; it can only narrow the plan, never add to it."""
     resolved = env if env is not None else RegenerableEnv.from_os_environment()
     run_id = run_id or uuid.uuid4().hex[:12]
     started = resolved.now()
     free_before = _measure_free(resolved.disk_anchor)
 
     items: list[RegenerableItemResult] = []
-    for planned in _plan_items(resolved, apply=apply):
+    for planned in _plan_items(resolved, apply=apply, only_keys=only_keys):
         if on_item_start is not None:
             _notify(on_item_start, planned.key, planned.label, planned.waits_on_lock)
         item = _guarded(planned.runner, planned.key, planned.kind, planned.label)

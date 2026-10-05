@@ -179,6 +179,31 @@ def test_bounded_analysis_is_not_enough(tmp_path: Path) -> None:
         assert any("idx_files_is_cloud_placeholder" in d for d in details), details
 
 
+def test_dedup_bucket_scan_is_pinned_to_a_table_scan_with_or_without_statistics(
+    tmp_path: Path,
+) -> None:
+    """Regression for the post-ANALYZE slowdown of the dedup candidate queries: once `ANALYZE`
+    ran, the planner swapped the distinct-inode GROUP BY from a rowid-order scan to the
+    non-covering `idx_files_size` (a random row lookup per entry; measured ~3x CPU on the real
+    index). The inner scan is `NOT INDEXED`, so its plan must not depend on statistics."""
+    from reclaim.index import _QUALIFYING_SIZES_SQL
+
+    unpinned = _QUALIFYING_SIZES_SQL.replace("FROM files NOT INDEXED", "FROM files")
+    assert unpinned != _QUALIFYING_SIZES_SQL  # the pin really is in the production SQL
+    with ScanIndex(tmp_path / "index.sqlite3") as idx:
+        _bulk(idx, 60_000)
+        for stage in ("no_stats", "analyzed"):
+            if stage == "analyzed":
+                idx.refresh_planner_stats()
+            pinned_plan = _plan(idx, _QUALIFYING_SIZES_SQL, (1,))
+            assert any(d == "SCAN files" for d in pinned_plan), (stage, pinned_plan)
+            assert not any("idx_files_size" in d for d in pinned_plan), (stage, pinned_plan)
+        # Control: the same SQL without the pin does take the index once statistics exist, so
+        # the assertions above are proven able to fail (planner behaviour of this SQLite build).
+        control = _plan(idx, unpinned, (1,))
+        assert any("idx_files_size" in d for d in control), control
+
+
 def test_stats_step_is_cheap_on_a_200k_row_index(tmp_path: Path) -> None:
     """Budget: generous bound (real 5.86M-row index measured at 11-17 s; this is 1/29th)."""
     with ScanIndex(tmp_path / "index.sqlite3") as idx:

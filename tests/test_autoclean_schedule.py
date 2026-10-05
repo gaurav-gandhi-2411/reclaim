@@ -94,6 +94,55 @@ def test_task_xml_is_utf16le_with_bom_and_least_privilege() -> None:
     assert exe.findtext("t:WorkingDirectory", namespaces=_NS) == r"C:\Apps"
 
 
+def test_task_xml_has_weekly_and_delayed_logon_triggers_for_the_current_user() -> None:
+    raw = build_task_xml(r"C:\Apps\reclaim.exe", r"C:\Apps", user_id=r"HOST\bob")
+
+    # Still real UTF-16LE with a BOM and still well-formed (schtasks rejects anything else).
+    assert raw[:2] == b"\xff\xfe"
+    text = raw.decode("utf-16")
+    assert raw[2:].decode("utf-16-le") == text
+    root = ET.fromstring(text.split("?>", 1)[1])  # noqa: S314 -- our own XML
+    triggers = root.find("t:Triggers", _NS)
+    assert triggers is not None
+    assert [child.tag.split("}")[1] for child in triggers] == ["CalendarTrigger", "LogonTrigger"]
+    weekly = triggers.find("t:CalendarTrigger", _NS)
+    assert weekly is not None and weekly.find(".//t:Sunday", _NS) is not None
+    logon = triggers.find("t:LogonTrigger", _NS)
+    assert logon is not None
+    assert logon.findtext("t:Enabled", namespaces=_NS) == "true"
+    assert logon.findtext("t:UserId", namespaces=_NS) == r"HOST\bob"
+    assert logon.findtext("t:Delay", namespaces=_NS) == "PT3M"
+    # Unchanged guarantees: catch-up, least privilege, the 45 min limit was NOT raised.
+    assert root.findtext(".//t:StartWhenAvailable", namespaces=_NS) == "true"
+    assert root.findtext(".//t:ExecutionTimeLimit", namespaces=_NS) == "PT45M"
+    assert root.find(".//t:RunLevel", _NS) is None
+
+
+def test_task_xml_escapes_the_logon_user_id() -> None:
+    text = build_task_xml(r"C:\a.exe", "C:\\", user_id=r"R&D\o<b>").decode("utf-16")
+
+    root = ET.fromstring(text.split("?>", 1)[1])  # noqa: S314 -- our own XML
+    assert root.findtext(".//t:LogonTrigger/t:UserId", namespaces=_NS) == r"R&D\o<b>"
+
+
+def test_register_task_sends_both_triggers_to_schtasks(tmp_path: Path) -> None:
+    captured: list[bytes] = []
+
+    def runner(argv: Sequence[str]) -> SchtasksOutcome:
+        captured.append(Path(argv[list(argv).index("/xml") + 1]).read_bytes())
+        return SchtasksOutcome(0, "SUCCESS")
+
+    register_task(
+        exe_path=Path(r"C:\Apps\reclaim.exe"),
+        username="bob",
+        runner=runner,
+        diag_log_path=tmp_path / "d.log",
+    )
+
+    text = captured[0].decode("utf-16")
+    assert "<CalendarTrigger>" in text and "<LogonTrigger>" in text
+
+
 def test_task_xml_escapes_paths() -> None:
     text = build_task_xml(r"C:\R&D <x>\reclaim.exe", r"C:\R&D <x>").decode("utf-16")
 

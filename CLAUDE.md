@@ -16,6 +16,11 @@ bit us. Read `docs/RESUME.md` first (it is the living checkpoint).
    data, models, caches): no deletions, no cache/data/model removal, no git operations, no tags, no
    worktree changes. Any reclaim cleanup run keeps them on its exclusion list and its report states
    that none appeared among applied candidates.
+3a. **Never copy the real index (`reclaim_index.sqlite3`, ~5 GB) with a bare `Copy-Item`/`shutil.copy`.**
+   Use `scripts/scratch_index.py` (`with scratch_index_copy(src) as db:` or
+   `python scripts/scratch_index.py SRC -- cmd {DB}`): it refuses without 2x free space and always
+   removes the copy plus its `-wal`/`-shm`/`-journal` afterwards. A copy grows a WAL the moment
+   anything writes to it (ANALYZE did), and an uncleaned copy is a multi-GB C: leak.
 4. **Verify with `scripts/verify.py`, never bare `pytest`** (`testpaths=["tests"]` silently skips the
    `evals/` safety gates). In a worktree `uv run` would sync a new environment: run its steps through
    `.venv\Scripts\python.exe` with the worktree's `src` first on `sys.path`; the CLIP `.onnx` files must

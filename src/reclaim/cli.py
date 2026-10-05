@@ -8,6 +8,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from reclaim import autoclean_state, regenerable
 from reclaim.app_paths import data_root
 from reclaim.config import Config, exclusion_patterns, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
@@ -1100,6 +1101,28 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_autoclean_state(
+    previous: autoclean_state.AutoCleanState,
+    plan: autoclean_state.ScheduledRunPlan,
+    response: object,
+) -> None:
+    """Persists what the scheduled run learned (last full run, tools still in use). A failure to
+    write is logged, never fatal: the worst case is one extra full run, which is safe."""
+    items = getattr(response, "items", [])
+    native = [(item.key, item.status) for item in items if item.kind == "native_command"]
+    new_state = autoclean_state.state_after_run(
+        previous,
+        plan,
+        native,
+        [spec.key for spec in regenerable.NATIVE_TOOLS],
+        autoclean_state.utc_now(),
+    )
+    try:
+        autoclean_state.write_state(new_state, autoclean_state.default_state_path())
+    except OSError as exc:
+        print(f"reclaim auto-clean: could not save run state: {exc}", file=sys.stderr)  # noqa: T201
+
+
 def _run_auto_clean(args: argparse.Namespace) -> int:
     # Deferred imports, same reasoning as `_run_check_disk_space`: only this subcommand needs the
     # API service module (shared with the dashboard's one-click clean so the two report the exact
@@ -1125,10 +1148,33 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         return 0
 
     apply: bool = args.apply
+    # ADR-0034 addendum: the task also fires shortly after sign-in. A scheduled apply run asks the
+    # state file whether to run the whole tier, only the tools left in use last time, or nothing.
+    scheduled_state: autoclean_state.AutoCleanState | None = None
+    plan: autoclean_state.ScheduledRunPlan | None = None
+    if args.scheduled and apply:
+        known_tools = [spec.key for spec in regenerable.NATIVE_TOOLS]
+        scheduled_state = autoclean_state.read_state(
+            autoclean_state.default_state_path(), known_tools=known_tools
+        )
+        plan = autoclean_state.decide_scheduled_run(scheduled_state, autoclean_state.utc_now())
+        if plan.mode == "noop":
+            # No toast: a sign-in with nothing to do must be invisible.
+            print(  # noqa: T201
+                f"reclaim auto-clean: nothing to do -- {plan.reason}.", file=sys.stderr
+            )
+            return 0
+        # stderr: stdout stays the machine-readable `--json` document.
+        print(  # noqa: T201
+            f"reclaim auto-clean: scheduled run mode={plan.mode} ({plan.reason}).",
+            file=sys.stderr,
+        )
     try:
         # ADR-0039: the weekly task reads the installed config.toml, so its exclusions apply.
         response = service.regenerable_clean_response(
-            apply=apply, excluded_patterns=exclusion_patterns(config)
+            apply=apply,
+            excluded_patterns=exclusion_patterns(config),
+            only_keys=plan.only_keys if plan is not None else None,
         )
     except service.RegenerableCleanBusyError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
@@ -1178,6 +1224,11 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Fail closed: only a run that passed the invariant above may mark the full run done / clear
+    # pending tools.
+    if plan is not None and scheduled_state is not None:
+        _record_autoclean_state(scheduled_state, plan, response)
 
     if apply and args.notify and (response.bytes_removed > 0 or response.files_skipped_in_use > 0):
         send_autoclean_toast(

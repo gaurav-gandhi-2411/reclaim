@@ -285,7 +285,7 @@
            (on/off with no task registered yet). -->
       <section class="rc-settings-panel" aria-labelledby="autoclean-heading">
         <h2 id="autoclean-heading">Weekly cache clean</h2>
-        <p>Every Sunday at 10:00, Reclaim permanently clears only what the apps themselves rebuild: package-manager download caches, temp files older than a week, crash dumps and the caches of browsers that are closed. It never touches your documents, the Recycle Bin or the quarantine vault, skips anything in use, and shows a notification with what it freed. Off by default.</p>
+        <p>Every Sunday at 10:00, Reclaim permanently clears only what the apps themselves rebuild: package-manager download caches, temp files older than a week, crash dumps and the caches of browsers that are closed. It never touches your documents, the Recycle Bin or the quarantine vault, skips anything in use, and shows a notification with what it freed. If a package-manager cache was busy, it also retries shortly after you next sign in. Off by default.</p>
         <label class="rc-checkbox-row">
           <input id="autoclean-enabled-checkbox" type="checkbox" disabled aria-label="Clean my regenerable caches weekly" />
           <span id="autoclean-enabled-text">Clean my regenerable caches weekly</span>

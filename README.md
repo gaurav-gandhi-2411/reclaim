@@ -77,7 +77,9 @@ tiny (see ADR-0034):
 - **Only a fixed list:** package-manager download caches (cleaned with each tool's own command),
   temp files untouched for 7+ days, old crash dumps, and caches of browsers that are *not
   running*. Never your documents, downloads, the Recycle Bin, or the quarantine vault.
-- **Skips anything in use,** and tells you how many files it left alone.
+- **Skips anything in use,** and tells you how many files it left alone. If a package-manager
+  cache (such as uv's) was busy, it also retries shortly after you next sign in; a sign-in
+  with nothing left to retry does nothing and shows no notification.
 - **Shows a notification** ("Freed X, C: now Y% used") only when something was freed or skipped.
 - **Per Windows account:** the task is named `Reclaim Weekly Auto-Clean (<your username>)`, runs
   without administrator rights, and only while you are signed in. Turning the toggle off removes
