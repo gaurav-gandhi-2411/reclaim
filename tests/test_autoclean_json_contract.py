@@ -228,14 +228,13 @@ def test_disabled_without_json_keeps_the_human_line_on_stdout(
 
 
 def _assert_run_failed_document(doc: object, err: str, error_type: str) -> None:
-    secret = "SECRET-PATH"
     assert doc == {
         "status": "error",
         "reason": "run_failed",
         "applied": False,
         "error_type": error_type,
     }
-    assert secret in err, "the full exception text stays on stderr"
+    assert "SECRET-PATH" in err, "the full exception text stays on stderr"
 
 
 def test_unreadable_config_emits_config_invalid_json_exit_1(
