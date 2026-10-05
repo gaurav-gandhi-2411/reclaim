@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import sqlite3
 import sys
 import time
@@ -1123,6 +1124,22 @@ def _record_autoclean_state(
         print(f"reclaim auto-clean: could not save run state: {exc}", file=sys.stderr)  # noqa: T201
 
 
+def _auto_clean_status_json(
+    args: argparse.Namespace, status: str, reason: str, message: str | None = None
+) -> None:
+    """`auto-clean --json` always writes exactly one JSON document to stdout. Paths that never
+    reach the run's own response (skipped / failed early) write this minimal, schema-stable
+    object instead: `status` ("skipped" | "error"), `reason` (machine code), `applied` (always
+    false -- nothing ran) and, for errors, `message`. The normal-path document is the
+    `RegenerableCleanResponse` and has no `status` key. Human text goes to stderr."""
+    if not args.json:
+        return
+    doc: dict[str, object] = {"status": status, "reason": reason, "applied": False}
+    if message is not None:
+        doc["message"] = message
+    print(json.dumps(doc))  # noqa: T201
+
+
 def _run_auto_clean(args: argparse.Namespace) -> int:
     # Deferred imports, same reasoning as `_run_check_disk_space`: only this subcommand needs the
     # API service module (shared with the dashboard's one-click clean so the two report the exact
@@ -1135,16 +1152,20 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         assert_not_elevated()
     except ElevatedProcessError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "elevated", str(exc))
         return 1
     config = _load_config_or_none("auto-clean", args.config)
     if config is None:
+        _auto_clean_status_json(args, "error", "config_invalid")
         return 1
     if args.scheduled and not config.autoclean.enabled:
         # Belt and braces: the toggle removes the task; a stale copy must still be inert.
-        print(  # noqa: T201
+        print(
             "reclaim auto-clean: skipped -- weekly auto-clean is turned off in config.toml "
-            "([autoclean] enabled = false); nothing was cleaned."
+            "([autoclean] enabled = false); nothing was cleaned.",
+            file=sys.stderr if args.json else sys.stdout,
         )
+        _auto_clean_status_json(args, "skipped", "autoclean_disabled")
         return 0
 
     apply: bool = args.apply
@@ -1163,6 +1184,7 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
             print(  # noqa: T201
                 f"reclaim auto-clean: nothing to do -- {plan.reason}.", file=sys.stderr
             )
+            _auto_clean_status_json(args, "skipped", "nothing_to_do")
             return 0
         # stderr: stdout stays the machine-readable `--json` document.
         print(  # noqa: T201
@@ -1178,10 +1200,12 @@ def _run_auto_clean(args: argparse.Namespace) -> int:
         )
     except service.RegenerableCleanBusyError as exc:
         print(f"reclaim auto-clean: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "busy", str(exc))
         return 1
     except Exception as exc:
         # The run itself crashed (per-item failures never reach here -- they are reported below).
         print(f"reclaim auto-clean: run failed: {type(exc).__name__}: {exc}", file=sys.stderr)  # noqa: T201
+        _auto_clean_status_json(args, "error", "run_failed", f"{type(exc).__name__}: {exc}")
         return 1
 
     if args.json:
