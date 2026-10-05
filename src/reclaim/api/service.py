@@ -2565,6 +2565,7 @@ def _execute_regenerable_clean(
     on_item_start: Callable[[str, str, bool], None] | None = None,
     on_item_done: Callable[[regenerable.RegenerableItemResult], None] | None = None,
     run_id: str | None = None,
+    only_keys: frozenset[str] | None = None,
 ) -> RegenerableCleanResponse:
     """Runs the allow-list and shapes the report. The caller owns `_regenerable_clean_lock`."""
     env = regenerable_clean_env()
@@ -2579,6 +2580,7 @@ def _execute_regenerable_clean(
         on_item_start=on_item_start,
         on_item_done=on_item_done,
         run_id=run_id,
+        only_keys=only_keys,
     )
     percent_used: float | None = None
     if env.disk_anchor is not None:
@@ -2740,7 +2742,11 @@ def get_regenerable_status() -> RegenerableStatusResponse:
 
 
 def regenerable_clean_response(
-    *, apply: bool, excluded_patterns: Sequence[str], audit_log_path: Path | None = None
+    *,
+    apply: bool,
+    excluded_patterns: Sequence[str],
+    audit_log_path: Path | None = None,
+    only_keys: frozenset[str] | None = None,
 ) -> RegenerableCleanResponse:
     """State-free synchronous run shared by `reclaim auto-clean` (which blocks, so it may wait on
     uv's lock) and the preview: same shape, same audit log as the dashboard endpoint."""
@@ -2748,7 +2754,10 @@ def regenerable_clean_response(
         raise RegenerableCleanBusyError("a clean is already running")
     try:
         return _execute_regenerable_clean(
-            apply=apply, audit_log_path=audit_log_path, excluded_patterns=excluded_patterns
+            apply=apply,
+            audit_log_path=audit_log_path,
+            excluded_patterns=excluded_patterns,
+            only_keys=only_keys,
         )
     finally:
         _regenerable_clean_lock.release()
