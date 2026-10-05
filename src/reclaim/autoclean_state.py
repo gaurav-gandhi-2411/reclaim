@@ -72,7 +72,9 @@ def read_state(path: Path | None = None, *, known_tools: Collection[str]) -> Aut
         data = json.loads(state_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return AutoCleanState()
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError: a pathologically nested file ("[" * 100000) overflows the JSON decoder;
+        # it is as corrupt as any other garbage. MemoryError is deliberately NOT swallowed.
         logger.warning("autoclean_state.unreadable", path=str(state_path), error=str(exc))
         return AutoCleanState()
     try:

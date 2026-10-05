@@ -73,6 +73,13 @@ def test_corrupt_state_reads_as_empty_never_raises(tmp_path: Path, text: str) ->
     assert read_state(path, known_tools=KNOWN) == AutoCleanState()
 
 
+def test_deeply_nested_json_reads_as_empty_not_recursion_error(tmp_path: Path) -> None:
+    path = tmp_path / "s.json"
+    path.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+
+    assert read_state(path, known_tools=KNOWN) == AutoCleanState()
+
+
 def test_unreadable_state_reads_as_empty(tmp_path: Path) -> None:
     # A directory where the file should be: read_text raises OSError (PermissionError on Windows).
     path = tmp_path / "s.json"
