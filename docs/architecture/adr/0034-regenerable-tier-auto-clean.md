@@ -91,3 +91,62 @@ only way anything outside the allow-list is ever offered for deletion.
   there for unrelated reasons.
 - **Do nothing and keep the review flow.** Rejected: the review flow cannot free space in safe
   mode at all, which is the defect.
+
+## Addendum: uv lock holder and the logon retry
+
+*Added 2026-10-05. Does not change the allow-list, the delete paths, the safety gate or the
+exclusions; it changes only WHEN the scheduled task runs and WHICH allow-listed tools it runs.*
+
+**Problem.** Limit 1 above made `uv cache prune` wait up to 30 min for uv's cache lock instead of
+skipping. A real scheduled attempt with `UV_LOCK_TIMEOUT` = 3300 s still never got the lock, and
+the weekly trigger (Sundays 10:00) fires exactly when sessions are most likely to be running, so on
+a busy workstation uv would be `skipped_in_use` every week.
+
+**Verified lock semantics (2026-10-05, Restart Manager + `LockFileEx` probe, on the owner's
+machine).** While a `uv run --no-project python -c "time.sleep(40)"` was alive, a non-blocking
+EXCLUSIVE `LockFileEx` on `%LOCALAPPDATA%\uv\cache\.lock` was refused (error 33,
+`ERROR_LOCK_VIOLATION`), a SHARED lock was granted, and Restart Manager listed that `uv.exe` pid as
+the holder. So uv holds a shared lock for the entire lifetime of any `uv run` / `uv pip` /
+`uv sync` process, not just while it touches the cache, and `uv cache prune` (exclusive) waits for
+every such process to exit. At an idle moment the same lock was free.
+
+**Not verified.** The identity of the process(es) that held the lock during the 3,300 s failure
+cannot be recovered after the fact. BELIEVED (not measured): long-lived `uv run` processes of other
+agent sessions. That is an inference from the semantics above, not an observation.
+
+**Decision.** The task gets a second trigger, `LogonTrigger` for the current user with
+`<Delay>PT3M</Delay>`, next to the weekly `CalendarTrigger` (`StartWhenAvailable` kept; the 45 min
+`ExecutionTimeLimit` is NOT raised). Shortly after sign-in no session has started `uv` yet. Both
+triggers run the identical command, so a sign-in run must be cheap and harmless:
+`data/autoclean_state.json` (`reclaim.autoclean_state`, schema-versioned per ADR-0027, written
+atomically via temp file + replace) holds `last_full_run_utc` and `pending_tools` (native tools
+whose item ended `skipped_in_use`). For `auto-clean --apply --scheduled`:
+
+| State | Run |
+|---|---|
+| missing / unreadable / corrupt / no `last_full_run_utc` / older than 6 days / in the future | the full regenerable tier, as before |
+| recent and `pending_tools` non-empty | ONLY those tools (retry) |
+| recent and nothing pending | nothing, exit 0, no toast |
+
+After a run, a tool that ended `skipped_in_use` is added to `pending_tools`; a tool that ran and
+ended any other way is removed (a retry run leaves `last_full_run_utc` alone; a full run sets it).
+Corrupt state fails toward the full run, which only touches provably-regenerable caches. The retry
+filter (`only_keys`) can only narrow the plan; unknown keys in the state file are dropped on read.
+Dry runs and manual (non-`--scheduled`) runs never read or write the state.
+
+**Consequences / limits.**
+- A retry still waits for the same lock; it merely runs at a moment when it is likely free. If the
+  user signs in and immediately starts `uv run`, it can still expire and stay pending until the next
+  sign-in or the next full run.
+- **Cadence drift.** A full run at sign-in (state older than 6 days) moves the weekly cadence to
+  whenever the user signs in: a full run on, say, a Tuesday makes the following Sunday run a
+  no-op (or a retry), so full runs are roughly 6-7 days apart, not strictly weekly.
+- **`failed` tools are not retried.** A full run stamps `last_full_run_utc` even when some native
+  tools ended `failed`; only `skipped_in_use` is retried, so a failed tool waits for the next full
+  run (the state is still not stamped by a run that violates the `excluded_applied` invariant).
+- Already-registered tasks keep their single weekly trigger until re-registered (`register_task`
+  uses `/f`, so toggling the Settings switch off and on re-registers with both). Nothing
+  re-registers on app start.
+- Rejected: `--force` or killing `uv` processes (ADR-0034's rule is to wait, never race). Not
+  taken: raising `ExecutionTimeLimit` or the wait further; the 3,300 s attempt shows a longer wait
+  does not help while the lock holders are long-lived.

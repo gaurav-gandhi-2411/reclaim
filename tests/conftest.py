@@ -22,3 +22,15 @@ def _tests_run_as_a_normal_unelevated_user(monkeypatch: pytest.MonkeyPatch) -> N
     to be.
     """
     monkeypatch.setattr("reclaim.elevation._raw_is_admin", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def _autoclean_state_file_is_per_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """ADR-0034 addendum: a `--scheduled --apply` run reads/writes `data/autoclean_state.json`.
+    Without this redirect the first such test would leave state behind in the working tree and
+    every later one would see a "recent full run" and become a no-op. Tests that exercise the
+    state itself pass their own path."""
+    state = tmp_path_factory.mktemp("autoclean_state") / "autoclean_state.json"
+    monkeypatch.setattr("reclaim.autoclean_state.default_state_path", lambda: state)
