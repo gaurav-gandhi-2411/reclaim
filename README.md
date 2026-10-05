@@ -95,7 +95,10 @@ document on stdout (human text goes to stderr): the run report, or
 `{"status": "skipped" | "error", "reason": ..., "applied": false}` when nothing ran. `reason` is
 one of `autoclean_disabled`, `nothing_to_do`, `busy`, `config_invalid`, `elevated`, `run_failed`;
 errors caused by an exception add `error_type` (the exception class name only -- the full text is
-on stderr). argparse usage errors and `--help` are printed by argparse and are not JSON, and
+on stderr). `auto-clean --reconcile-task --json` (the installer hook) follows the same contract and
+adds one status and one reason for its success path: `{"status": "ok", "reason":
+"task_registered", "applied": false}` (setting off: `skipped`/`autoclean_disabled`; source run:
+`skipped`/`nothing_to_do`; schtasks failure: `error`/`run_failed`). argparse usage errors and `--help` are printed by argparse and are not JSON, and
 Ctrl+C / `SystemExit` are deliberately not caught.
 
 **Pytest temp folders (a separate opt-in, config file only).** Old `pytest-<N>` folders in

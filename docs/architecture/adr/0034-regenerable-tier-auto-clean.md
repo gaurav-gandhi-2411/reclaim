@@ -218,4 +218,6 @@ the machine (see the PR that added this for a metadata-only dry run on one).
 
 **Uninstall.** The uninstaller (`UnregisterAutoCleanTask`) also deletes `Reclaim Weekly Auto-Clean (<user>)`, with the same BM3 guard as the disk-space task (only if absent or pointing at this install's exe), failure ignored; without it the task outlived the exe and every upgrade re-registered it.
 
+**`--json`.** `--reconcile-task --json` writes exactly one document on every path, via the same helper and vocabulary as the `--json` contract of `auto-clean` (human text to stderr, exception class name only in JSON). Two additions for its success path: status `ok` and reason `task_registered`; a source run maps to `skipped`/`nothing_to_do`, a schtasks failure to `error`/`run_failed`.
+
 **Not verified.** A real installer upgrade over a real old task, and a real uninstall, have not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.
