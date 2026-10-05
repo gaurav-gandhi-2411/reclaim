@@ -501,3 +501,23 @@ def test_typed_409_flow_while_an_auto_warmup_is_computing(env: _Env) -> None:
 
     _run_spawned(env)
     assert env.client.get("/api/summary").status_code == 200  # retry converges
+
+
+def test_a_base_exception_in_the_worker_never_leaves_status_computing(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Abort(BaseException):  # stands in for SystemExit / KeyboardInterrupt
+        pass
+
+    def abort(*_a: object, **_k: object) -> None:
+        raise _Abort
+
+    env.scan()
+    monkeypatch.setattr(service, "generate_candidates", abort)
+    with pytest.raises(_Abort):
+        _run_spawned(env)  # the BaseException still propagates
+
+    assert env.warm_status()["status"] == "failed"
+    assert [enable for enable, _ in env.priority] == [True, False]
+    monkeypatch.undo()  # a following warm-up runs normally; the mocks above are gone
+    assert env.client.post("/api/candidates/warm").status_code == 202

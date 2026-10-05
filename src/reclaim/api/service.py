@@ -515,7 +515,11 @@ def run_candidates_warm(state: AppState) -> None:
         if not state.candidates_warm_status.promoted:
             set_background_mode(True, state.background_mode_setter)
 
+    finished = False
+
     def finish(status: CandidatesWarmStatusLiteral, error: str | None = None) -> None:
+        nonlocal finished
+        finished = True
         with state.lock:
             state.candidates_warm_status = _dataclass_replace(
                 state.candidates_warm_status,
@@ -536,6 +540,7 @@ def run_candidates_warm(state: AppState) -> None:
                 checkpoint=checkpoint,
                 worker_initializer=worker_initializer if low_priority else None,
             )
+        finish("ready")
     except DedupCancelled:
         logger.info("api.candidates_warm_cancelled")
         finish("cancelled")
@@ -548,8 +553,11 @@ def run_candidates_warm(state: AppState) -> None:
         return
     finally:
         scope.leave()
-
-    finish("ready")
+        if not finished:
+            # A BaseException (SystemExit, KeyboardInterrupt, ...) skipped every handler above.
+            # Never leave "computing" behind: every reader would 409 and POST /warm would refuse
+            # until restart. The BaseException itself keeps propagating.
+            finish("failed", "warm-up aborted before completing")
 
 
 def _spawn_daemon_thread(target: Callable[[], None]) -> None:
