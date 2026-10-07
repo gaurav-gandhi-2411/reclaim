@@ -3,7 +3,82 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-05 -- READ THIS FIRST (section 1 of the owner's resume prompt; supersedes the 10-02 section where they differ)
+## CHECKPOINT 2026-10-05 END OF DAY (owner shutting down the laptop) -- READ THIS FIRST
+
+**Owner's goal (restated 2026-10-05):** use the Reclaim app directly -- one click, plus weekly automatic cleaning --
+without asking Claude. Priority tomorrow: get the new build onto the owner's machine.
+**HARD EXCLUSION restated:** never delete anything related to fr-en-transformer, shipdoc-extract, intent-router
+(their `%TEMP%\claude` scratch -- fr-en-transformer's alone is 34.7 GB --, `%TEMP%\pytest-of-gaura` runs, caches,
+worktrees, models, data, processes). Everything else may be deleted cautiously: check, read, then delete separately.
+
+**State (VERIFIED at 2026-10-05 evening; re-check with `git fetch origin` + `gh pr list`):** main = `67925c6`
+(CI was still running on it at last look; its predecessor was green). Merged today: #133 uv retry, #134 background
+warm-up, #135 ANALYZE plan pin, #136 scratch_index helper, #137 `--json` contract, #139 pytest-temp (opt-in).
+**Open, both CLEAN with 6/6 required checks green, rebased on `67925c6`:**
+- **#138** installer re-registers the weekly task on every install/upgrade, uninstaller removes it, `--reconcile-task`
+  honours the `--json` contract (rebased `0d3e7c4`).
+- **#140** P0 hermetic tests (root `conftest.py` redirects every profile root; `reclaim.safety_env` guard refuses
+  destructive ops / real runners against the real profile under pytest; 24 teeth tests, mutation-checked).
+  Conflicts textually with #138 in the ADR-0034 addendum only: whichever merges second needs a rebase.
+  Merge order suggestion: #140, then #138 (I rebase it).
+
+**#140 verifier findings still to fix (none is a blocker; the P0 mechanism is closed under pytest):**
+1. `safety_env.py:66-79` UNC loopback admin-share paths (`\\localhost\C$\...`) bypass the guard (normalise to drive).
+2. `safety_env.py:140-145` `RECLAIM_TEST_SANDBOX_ROOTS` entries are not normalised and a child trusts any value.
+3. Unguarded mutating sites reachable by a test with cwd in a real checkout: `anthropic_key_store.store_key`,
+   `index.py` (DELETE/VACUUM via `index-prune --apply`), `config.py` writers, `first_run.py`, `notifications.save_state`.
+   The "all destructive paths guarded" claim is therefore FALSE; decide whether to wire them or narrow the claim.
+4. `executor.py` ~1858-1880: a refusal (BaseException) leaves a dangling `phase="intent"` manifest entry.
+5. `api/service.py` 2926-2946: a refusal gives job `status=failed` with `error=None`.
+6. CI lost its only real-Task-Scheduler coverage (two tests skip unless `RECLAIM_TEST_ALLOW_REAL_PROFILE=1`); add a
+   manual/scheduled workflow that sets it for just those two tests.
+7. Gap that cannot be closed in code: a plain script outside pytest is not guarded; CLAUDE.md rule 7 + the new
+   HERMETIC PROBES RULE in `~/.claude/agents/{verifier,executor}.md` are the only control.
+
+**INCIDENT 2026-10-05:** a #139 verifier probe applied the regenerable tier against the real `%LOCALAPPDATA%` (it had
+redirected only TEMP) and deleted the owner's real browser caches (Chrome/Edge/Brave/Firefox Cache, Code Cache,
+GPUCache; amount not measured). Regenerable, but real. `%TEMP%\pytest-of-gaura` and the excluded projects were not
+touched. Fixed by #140 (pending merge).
+
+**Done today beyond the PRs:** 22 worktrees proven equivalent/backed up and removed (10 `backup/<worktree>` branches
+pushed: a066c8b9, a1d77a89, a4e1dc21, a583012a, a5c66aec, aba45063, ae79202b, reclaim-wt-b5, -ex, -main);
+prior-session scratchpad `b5824734…` deleted (2.32 GB, check then delete); merged-PR worktrees removed; agent
+definitions updated. Open worktrees now: main, `rebase-mcp-q3` (another session, untouched), `reclaim-wt-hermetic`
+(#140), `reclaim-wt-installer-task` (#138), `reclaim-wt-resume` (this PR).
+
+**Disk (VERIFIED readings):** C: free 71.7 GB (13:50) -> 42.2 -> 49.9 -> 30.0 GB (evening). `pagefile.sys` steady at
+15 GB, so it is not pagefile growth now. `%TEMP%\claude` = 67 GB (other projects' sessions, incl. 34.7 GB of an
+excluded project: DO NOT TOUCH); `%LOCALAPPDATA%\uv\cache` = 31 GB; `%TEMP%\pytest-of-gaura` = 8.4 GB (mostly the
+excluded project's 1.06 GB model copies). The cause of the evening drop to 30 GB is NOT attributed. Check C: free first
+thing tomorrow; the app build needs room.
+
+**Tomorrow, in order (owner's section 2-4):**
+1. Owner merges #140 and #138 (or says "rebase"). Fast-forward main, confirm CI green on `67925c6`+.
+2. REBUILD: `pwsh packaging/build_installer.ps1 -InnoSetupCompiler "C:\Program Files\Inno Setup 7\ISCC.exe"` (Inno 7 is
+   installed there; Inno 6 is also at `C:\Program Files (x86)\Inno Setup 6`; the script default is the 7 path).
+   Actual wall-clock (EXPECTED ~25 min warm). Both smoke tests (`packaging/test_packaged_serve.ps1`,
+   `test_packaged_safe_mode.ps1`) + `scripts/check_dist_dll_closure.py` (#108).
+3. INSTALL on the owner's account; write `[exclusions] project_names = ["fr-en-transformer","shipdoc-extract",
+   "intent-router"]` into the INSTALLED `config.toml` and confirm the app reads them; confirm the weekly task has BOTH
+   the weekly and the logon trigger and that the iscc-compiled installer's `auto-clean --reconcile-task` step ran.
+4. STOP and give the owner (a) a plain how-to (where to click, what one-click cleans, review screen, weekly cleaning and
+   the 80% alert, how to turn each on/off) and (b) the reboot instruction (pagefile reset). Wait for "rebooted".
+5. After reboot: CLI cold-start eval on the quiet machine vs 2,000 ms; fresh full scan (wall-clock, index size,
+   background warm-up start and time to completion); real-browser check of the 409 "not warm" flow with screenshots;
+   owner does the one-click, Claude measures (free before/after + pagefile size, audit log: cleaned/skipped, excluded
+   projects untouched); B6 80% notification (`PeriodicNotificationCount` before/after next to the owner's yes/no);
+   then the 2 h frozen soak (no longer blocks the owner).
+6. GAPS plan (plan only, ranked by GB): things cleaned by hand that the app cannot do -- Docker build cache /
+   dangling images / orphan volumes, stale agent clones and worktrees with no unpushed work, HF models no project
+   references, old `%TEMP%\claude` session scratch (the owner's own projects only), uv cache when locked.
+   For each: app feature?, tier (automatic vs review screen), the provable safety rule, effort.
+
+**Known unverified (carry forward):** the `.iss` has never been compiled with the new `[Run]`/uninstall code (first
+iscc compile happens at the rebuild); `runasoriginaluser` on a non-postinstall entry rests on Inno docs from memory;
+a real install over a real old single-trigger task; the real sign-in uv-lock retry; background-mode effect on a busy
+box; real-drive warm-up wall-clock; the pytest-temp delete under a real open handle.
+
+## CHECKPOINT 2026-10-05 (section 1 of the owner's resume prompt; supersedes the 10-02 section where they differ)
 
 **Main** = `8bb8fc0` (#129 merged; #132 #116 #127 #131 merged 2026-10-02). `scripts/verify.py` on main and on
 main+#129: 1508 / 1529 passed, 35 skipped, coverage 89.72 / 89.74 %. C: free fluctuates 68-80 GB with
