@@ -27,7 +27,10 @@ from xml.sax.saxutils import escape
 import structlog
 
 from reclaim.app_paths import compiled_exe_dir, data_root
-from reclaim.safety_env import refuse_real_side_effect_under_pytest
+from reclaim.safety_env import (
+    assert_not_real_profile_under_pytest,
+    refuse_real_side_effect_under_pytest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -237,6 +240,7 @@ def _run_logged(
 
 def _append_diag(action: str, command: str, outcome: SchtasksOutcome, diag_log_path: Path) -> None:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    assert_not_real_profile_under_pytest(diag_log_path, operation="append to the diagnostic log")
     try:
         diag_log_path.parent.mkdir(parents=True, exist_ok=True)
         with diag_log_path.open("a", encoding="utf-8") as fh:
@@ -264,6 +268,7 @@ def register_task(
     name = task_name(username)
     diag = diag_log_path if diag_log_path is not None else default_diagnostic_log_path()
     xml_bytes = build_task_xml(str(exe), str(exe.parent))
+    assert_not_real_profile_under_pytest(tempfile.gettempdir(), operation="write the task XML")
     fd, tmp = tempfile.mkstemp(suffix=".xml", prefix="reclaim_autoclean_task_")
     try:
         with os.fdopen(fd, "wb") as fh:

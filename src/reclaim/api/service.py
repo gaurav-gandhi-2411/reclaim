@@ -135,6 +135,7 @@ from reclaim.preflight import check_within_allowed_scope
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
 from reclaim.thread_priority import BackgroundScope, set_background_mode
 
@@ -905,6 +906,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     cancelled = False
 
     try:
+        assert_not_real_profile_under_pytest(state.db_path, operation="create the index directory")
         state.db_path.parent.mkdir(parents=True, exist_ok=True)
         with ScanIndex(state.db_path) as index:
             for drive_index, root in enumerate(roots):

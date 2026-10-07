@@ -26,6 +26,7 @@ from typing import Literal
 import structlog
 
 from reclaim.app_paths import data_root
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -111,6 +112,7 @@ def write_state(state: AutoCleanState, path: Path | None = None) -> None:
     """Atomic: temp file in the same directory + `Path.replace` (os.replace), so a crash or a
     concurrent reader sees either the old or the new file, never a torn one."""
     state_path = path if path is not None else default_state_path()
+    assert_not_real_profile_under_pytest(state_path, operation="write the auto-clean state")
     state_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": AUTOCLEAN_STATE_SCHEMA_VERSION,

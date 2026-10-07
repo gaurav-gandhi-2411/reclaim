@@ -130,6 +130,7 @@ def store_key(api_key: str, path: Path = DEFAULT_KEY_PATH) -> None:
     `logging_config.DEFAULT_LOG_PATH`/`mode.DEFAULT_MODE_LOG_PATH`). Overwrites any existing
     file at `path` -- this is the one write path (re-entering a key replaces the old one)."""
     encrypted = protect(api_key.encode("utf-8"))
+    assert_not_real_profile_under_pytest(path, operation="write the stored key")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(encrypted)
 

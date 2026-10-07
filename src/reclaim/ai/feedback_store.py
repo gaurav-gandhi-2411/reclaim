@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from reclaim.ai.eval_harness import current_commit_sha
 from reclaim.ai.models import AICluster, AIClusterMember
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Feature 3 (spec §4): "Feedback-Driven Clutter Prioritization." THIS MODULE IS ONLY THE
 # FEEDBACK STORE — logging every accept/reject/keep decision with its feature vector, so a
@@ -213,6 +214,7 @@ class FeedbackStore:
         self._path = path
 
     def append(self, decision: FeedbackDecision) -> None:
+        assert_not_real_profile_under_pytest(self._path, operation="append to the feedback log")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(_decision_to_dict(decision)))

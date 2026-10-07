@@ -12,7 +12,10 @@ import structlog
 
 from reclaim.app_paths import data_root
 from reclaim.config import NotificationsConfig
-from reclaim.safety_env import refuse_real_side_effect_under_pytest
+from reclaim.safety_env import (
+    assert_not_real_profile_under_pytest,
+    refuse_real_side_effect_under_pytest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -105,6 +108,7 @@ def save_state(state: NotificationState, path: Path | None = None) -> None:
     caller. Matches this module's "never raise" posture end to end (see module docstring)."""
     resolved = path if path is not None else DEFAULT_STATE_PATH
     try:
+        assert_not_real_profile_under_pytest(resolved, operation="write the notification state")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(
             json.dumps(
