@@ -32,6 +32,7 @@ from reclaim.mcp.selection import (
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
 from reclaim.preflight import check_within_allowed_scope
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # reclaim.mcp.server — the ONLY module in this package that talks to the outside world (stdio,
 # the MCP transport). Never imports `reclaim.executor` or `send2trash` (see this package's
@@ -76,6 +77,7 @@ def build_state(
     (exactly `reclaim.config.load_config`'s output, no safe-mode override baked in) for the same
     reason `create_app` requires it raw -- see `AppState.effective_config`'s docstring."""
     resolved_log_path = log_path if log_path is not None else DEFAULT_LOG_PATH
+    assert_not_real_profile_under_pytest(db_path, operation="create the index directory")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return AppState(
         db_path=db_path,
