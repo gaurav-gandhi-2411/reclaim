@@ -703,7 +703,12 @@ async function explainCategory(categoryGroup, buttonEl, resultEl) {
   resultEl.dataset.tone = "muted";
   resultEl.textContent = "Asking Anthropic…";
   try {
-    const data = await api(`/api/ai/category-explanation/${encodeURIComponent(categoryGroup)}`);
+    // Reads the warm candidates cache server-side: a cold/stale cache is a typed 409, so go
+    // through the shared wait-and-retry-once path (a wait, not a red error).
+    const data = await readCandidateCache(
+      resultEl,
+      `/api/ai/category-explanation/${encodeURIComponent(categoryGroup)}`
+    );
     if (data.status === "ok") {
       resultEl.dataset.tone = "";
       resultEl.textContent = data.explanation;
@@ -1988,6 +1993,7 @@ export {
   loadReviewQueue,
   loadSimpleResults,
   loadDuplicateClusterReview,
+  explainCategory,
   openQuickCleanDialogIfFresh,
   refreshActiveView,
   switchToSafeMode,
