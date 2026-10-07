@@ -38,7 +38,7 @@ from reclaim.preflight import (
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
-from reclaim.safety_env import assert_not_real_profile_under_pytest
+from reclaim.safety_env import RealProfileAccessError, assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
@@ -1898,6 +1898,15 @@ def apply_batch(
                     )
                 )
                 continue
+            except RealProfileAccessError:
+                # Hermetic-test refusal (a BaseException, so the handler above never sees it). The
+                # guard runs BEFORE any mutation, so nothing happened: close the intent as aborted
+                # rather than leave it dangling for `reclaim.recovery`, then let the refusal
+                # propagate and stop the batch. Deliberately NOT a blanket `BaseException`: after
+                # a KeyboardInterrupt the mutation may or may not have run, and only recovery,
+                # which inspects the disk, can classify that.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                raise
 
             # K2a (audit finding): the mutation call above raised no exception -- but on this
             # platform that is NOT sufficient evidence anything actually happened (K2b's
@@ -2007,6 +2016,12 @@ def apply_batch(
                         manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
                     )
                     continue
+                except RealProfileAccessError:
+                    # Same as the apply loop's refusal handler: pre-mutation, close, re-raise.
+                    _append_and_sync(
+                        manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
+                    )
+                    raise
                 _append_and_sync(
                     manifest_fh,
                     purge_intent.model_copy(
@@ -2352,6 +2367,10 @@ def restore_batch(
                     )
                 )
                 continue
+            except RealProfileAccessError:
+                # Same as the apply loop's refusal handler: pre-mutation, close, re-raise.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                raise
 
             # ADR-0026, phase 2: the file is now back at original_path — log it done, fsynced.
             # A kill between the two `_append_and_sync` calls above leaves an intent whose
