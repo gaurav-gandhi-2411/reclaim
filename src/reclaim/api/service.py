@@ -131,7 +131,7 @@ from reclaim.models import (
     Tier,
     Verdict,
 )
-from reclaim.preflight import check_within_allowed_scope
+from reclaim.preflight import check_identity_unchanged_since_scan, check_within_allowed_scope
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
@@ -2052,6 +2052,8 @@ def select_candidates_for_selector(
     # whole-index dedup pass on the same index (incident 2026-10-08). Deliberately NOT a
     # not-warm refusal: a scoped MCP scan never auto-warms, so refusing would make preview_apply
     # unusable until someone warmed by hand. Scope-filtered identically to `_all_candidates`.
+    # Known limit: a user cancel of the warm-up does not stop a selector already blocked
+    # on the lock; once the warm-up ends cancelled, the selector computes the cache itself.
     with ScanIndex(state.db_path) as index:
         candidates = _cached_all_candidates(index, state)
     tiers = _TIER_SELECTIONS[tier]
@@ -2061,6 +2063,33 @@ def select_candidates_for_selector(
         if c.tier in tiers
         and (c.category == rule_id_or_category or c.category_group == rule_id_or_category)
     ]
+
+
+def stale_selected_candidates(selected: Sequence[Candidate]) -> list[Candidate]:
+    """MCP `delete` freshness check: the selected FILE candidates whose live `(dev, ino)`, size
+    or mtime no longer match the scan-time baseline the (cached) candidate carries. One `stat`
+    per file candidate, same comparison and exemptions as the executor's pre-flight
+    (`size_or_mtime_changed_since_scan`: directories and baseline-less candidates exempt; a
+    vanished path is not stale here, `apply_batch` reports it itself).
+
+    `select_candidates_for_selector` reads the shared warm cache, so its recomputed
+    `selection_hash` can no longer notice an on-disk change since the scan; this restores a
+    refuse-before-executing check at the MCP layer instead of leaving only the executor's
+    per-item skip as the backstop."""
+    stale: list[Candidate] = []
+    for candidate in selected:
+        if candidate.is_dir or candidate.mtime == 0.0:
+            continue
+        check = check_identity_unchanged_since_scan(
+            candidate.path,
+            recorded_dev=candidate.dev,
+            recorded_ino=candidate.ino,
+            recorded_mtime=candidate.mtime,
+            recorded_size_bytes=candidate.size_bytes,
+        )
+        if check.identity_changed or check.size_or_mtime_changed:
+            stale.append(candidate)
+    return stale
 
 
 def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyResponse:
@@ -2807,7 +2836,9 @@ def build_category_explanation(state: AppState, category_group: str) -> Category
     """`GET /api/ai/category-explanation/{category_group}`. Degrades gracefully in every
     failure mode (no scan data, no matching category, no API key, a corrupted key file, or a
     real Anthropic API failure) — every branch returns a typed `CategoryExplanationResponse`,
-    never a raised exception reaching the route (see that response's own docstring)."""
+    never a raised exception reaching the route (see that response's own docstring) -- with
+    one deliberate exception: a cold or stale candidates cache raises
+    `CandidatesNotWarmError`, which the route turns into the typed 409 + courtesy warm-up."""
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return CategoryExplanationResponse(

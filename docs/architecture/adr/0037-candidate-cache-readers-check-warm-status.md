@@ -63,3 +63,14 @@ hashing anything. Visible difference: the rows now honour the same scope filter 
 view (the cached candidates are scope-filtered). `run_candidates_warm` also gets a 60 s busy
 timeout, bounded retry of hash flushes on `database is locked`, a non-masking `close()` and a
 logged traceback.
+
+Other private-pass readers (same addendum): `GET /api/ai/category-explanation/{group}` now reads
+the warm cache (typed 409). The MCP selector (`select_candidates_for_selector`) goes through
+`_cached_all_candidates` instead, serializing on `candidates_cache_lock` and reusing an in-flight
+warm-up's result, because a scoped MCP scan never auto-warms and a refusal would make
+`preview_apply` unusable. Two consequences, stated plainly: (1) a user cancel of the warm-up does
+not stop a selector already blocked on that lock (when the warm-up ends cancelled, the selector
+computes the cache itself); (2) the MCP `selection_hash` is now derived from the cache, so it can no
+longer notice an on-disk change since the scan -- `delete` therefore re-stats each selected file
+(`service.stale_selected_candidates`: identity, size, mtime, same comparison as the executor's
+pre-flight) and refuses with `SelectionMismatchError` before executing anything.
