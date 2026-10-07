@@ -3,7 +3,81 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-07 (full-delegation mode; interim, written while the integration build runs) -- READ THIS FIRST
+## CHECKPOINT 2026-10-08 ~02:40 IST (full delegation; app BUILT, INSTALLED, scanned, one-click run) -- READ THIS FIRST
+
+**Where things stand (VERIFIED unless marked):** the integration build `integration/2026-10-07` (head `250f40d` = main `d2948c2` + #140
++ #143 + #144 + #145 + #138) is **built and installed on the owner's account**. Main is `d663439`. Open PRs: #138, #140, #142, #143, #144, #145
+(see the older section below for their evidence) plus two new fix PRs from the real-index run (below).
+
+### Build / smoke / install (evidence)
+- **Build wall-clock 292.3 min** (18:54:09 -> 23:46:27 IST on 10-07), NOT the 25 min "warm" estimate: the Nuitka ccache under
+  `%LOCALAPPDATA%\Nuitka\Nuitka\Cache\ccache` had been emptied since September (0.2 GB, cap 5 GB), so all 2,482 C files compiled; `--jobs=1` (free RAM
+  ~10 GB at start). Installer `packaging\dist\reclaim-setup.exe` 292.3 MB, SHA-256 `55c34c7f3dfc5689a66ea245dceac3d2b9a229bfa4f80adb94f1459abf37feb5`,
+  built from `250f40df631b12af2e7ebfe4a1fac0a47603aaba` (Inno Setup 7 compiled the new `[Run]`/uninstall code: first real compile).
+  A rebuild now should be much faster IF the ccache survives (it is warm again; do not clear it).
+- `scripts/check_dist_dll_closure.py` (#108 gate): OK. `test_packaged_safe_mode.ps1`: 14 PASS. `test_packaged_serve.ps1`: all PASS (serve, scan, AI tracks run).
+- `scripts/verify.py` on `250f40d`: exit 0, 1755 passed, 38 skipped, coverage 90.45 %.
+- **Installed** over the 09-24 build with `/VERYSILENT` (79 s). Installer's `[Run] auto-clean --reconcile-task` ran as the original user at install time and,
+  with `[autoclean] enabled = true`, registered the weekly task 1 s later (diag log `18:21:07Z`): the upgrade path WORKS. Uninstall step compiled, runtime NOT tested.
+- Installed `config.toml` edited (backup `scratchpad\config.toml.before-install`): `[exclusions] project_names = ["fr-en-transformer","shipdoc-extract","intent-router"]`,
+  `[autoclean] enabled = true`, `[notifications] enabled = true` (threshold 80). **The app reads the exclusions** (dry run: aged-temp skipped `*fr-en-transformer*` /
+  `*intent-router*` entries, incl. the whole `%TEMP%\claude`).
+- **Tasks:** `Reclaim Weekly Auto-Clean (gaura)` = CalendarTrigger Sunday 10:00 weekly + LogonTrigger delay PT3M (user LEGION\gaura), PT45M limit,
+  `reclaim.exe auto-clean --apply --notify --scheduled`, InteractiveToken, next run 2026-10-11 10:00; `Reclaim Disk Space Check (gaura)` Ready (the 80 % alert).
+  The first-run "Before you start" screen is still **unacknowledged** on the owner's install (server-side `acknowledged:false`): the owner clicks it once.
+
+### Fresh scan + warm-up (installed app, real index)
+- "Scan my files" (`/api/scan/my-files`, root `C:\Users\gaura`): POST to complete **2,655.5 s** (8 min estimating + 2,174.5 s scanning); entries 6,919,832;
+  files written 3,295,122, unchanged 3,624,710, **pruned 2,072,603**; 117 unreadable paths. Index file 4.89 GB -> **7.18 GB** (free pages; `reclaim index-prune
+  --apply --vacuum` would shrink it, not run). Background warm-up started **at the scan-end second** (`source=auto`): VERIFIED.
+- **Warm-up did NOT complete**: first run FAILED after 2,051 s with `database table is locked`; second run cancelled by me at 61 min (disk emergency). Two real bugs, below.
+- **Real-Chrome 409 check (Playwright + installed Chrome, first-run response stubbed in the browser only):** while the warm-up computed, Overview and Review Queue
+  showed "Indexing your files... This can take a few minutes the first time after a large scan - 114s so far. The page is not stuck", no error alert, no console
+  error. The typed 409 (`code: candidates_not_warm`) was observed on `/api/summary` and `/api/clean/one-click-summary` of the real server. Screenshots:
+  `scratchpad\shots\409-installed-0{1,2,3}-*.png` (to be committed under `docs/assets/`). Cosmetic defect: an EMPTY peach alert bar with a "Dismiss" button under the header.
+
+### Two serious bugs found on the real index (both new, fixes dispatched)
+1. **Review Queue starts its own whole-index dedup pass.** `GET /api/duplicate-clusters/review` (`service.list_duplicate_cluster_review`) is not covered by ADR-0037's
+   warm check: every request recomputes `find_duplicate_clusters` + `generate_duplicate_candidates` (1.6 M candidate files, ~30 min). Opening the Review Queue
+   during warm-up ran a second pass concurrently (3 `dedup.start` lines ~29 min apart) -> two writers -> `database is locked`, then `close()` raised `table is locked`
+   and masked the real error. Fix PR: branch `fix/review-clusters-use-warm-cache` (cache clusters with candidates, typed 409, frontend handling, failure hygiene).
+   **Until it ships: do not open the Review Queue tab right after a scan.**
+2. **WAL grows without bound during dedup hashing:** `reclaim_index.sqlite3-wal` reached **13.15 GB** and C: free fell to **0.97 GB** (a streaming read cursor pins the
+   WAL). Cancelling the warm-up checkpointed it (free 13.9 GB). Also `dedup.member_excluded` logged at INFO per member: 618,466+ lines (223 MB log). Fix PR: branch
+   `fix/dedup-bounded-wal` (short-lived batches, checkpoints, disk-full guard, aggregated logging).
+3. Minor: dry-run `would_clean` for uv shows the whole cache (32.5 GB) but `uv cache prune` frees ~19 MB-2 GB; npm shows 1.59 GB, `cache clean` freed 70 MB. Estimates overstate.
+
+### One-click ("Clean My Computer"), run by me through the installed app (`POST /api/clean/regenerable apply=true`)
+- Wall-clock **248.9 s**. Report: `bytes_removed` **479,398,200** (457.2 MiB): pip 390,199,294; npm 69,863,647; uv 19,254,769; crash dump 80,490. Skipped: conda
+  (not present), yarn (not installed), `C:\Windows\Temp` (needs admin), Chrome and Edge (running), Brave/Firefox (not present); `files_skipped_in_use` 0;
+  **`excluded_applied` 0**, 10 excluded paths listed (all `*fr-en-transformer*` / `*intent-router*`); aged temp left 5 entries holding git repos/venvs.
+- Free space during the run: 1,031,503,872 -> 1,421,590,528 bytes (the report's own snapshot), `percent_used_after` 99.86 %. `pagefile.sys` read 18.25 GB before and 17.00 GB after
+  (auto-managed). **The later jump to 13.9 GB free was the WAL truncation at 02:26:54, not the clean.** No reboot was done (owner's instruction): free-space readings carry
+  the pagefile caveat. Audit: `...\Reclaim\data\regenerable_audit.jsonl` (run `56e43ba311fa`).
+
+### 80 % toast
+`check-disk-space` at C: 97.8 % used returned `status=ok reason=would_notify`, updated `notification_state.json`, `send_disk_space_toast` returned without raising (source
+probe too). **`PeriodicNotificationCount` did not move** on any AUMID key (`{1AC14E77-...}\cmd.exe` stayed 18; `Reclaim` key has no count): the counter cannot decide delivery for
+the `"Reclaim"` identity the current code uses. VERDICT: UNDETERMINED; visual confirmation pending (two toasts were fired ~23:54: "Disk space is running low" and a "Reclaim probe").
+
+### Soak (calibration, frozen exe from the NEW dist)
+Started 02:30 IST with `soak_serve.py --exe ...\entry_point.dist\reclaim.exe --duration-minutes 120 --out-dir %TEMP%\reclaim_soak\2026-10-08-calibration` (own data dir). Ends ~04:35.
+Result: PENDING (see `soak_samples.csv`, report in the out-dir).
+
+### Disk (this checkpoint)
+C: free 13.9 GB at 02:30 (was 1.0 GB at 02:18). `pagefile.sys` 17 GB. Docker VHDX still 50.6 GB. Do not start another full scan before `fix/dedup-bounded-wal` merges and the
+index is pruned+vacuumed (a rescan grows the index and WAL).
+
+### WHEN GG HAS TIME (exact steps)
+1. **Merge the batch** (existing gate refuses me): order `#140, #143, #144, #145, #142, #138`, then the two new fix PRs (`fix/review-clusters-use-warm-cache`, `fix/dedup-bounded-wal`).
+   For each: `gh pr merge <N> --squash` (stacked PRs: after #140 merges run `gh pr edit <N> --base main` first). Then tell me; I rebuild from main (ccache is warm).
+2. **Click through the first-run screen once** in Reclaim (Start Menu -> Reclaim -> "I understand, continue"); I deliberately did not accept the terms for you.
+3. **Tell me whether you saw two Windows toasts around 23:54 on 10-07** ("Disk space is running low" with a Snooze button, and "Reclaim probe"). If none, the toast identity needs registering (small PR).
+4. **(Admin, optional) Compact Docker's disk** to return ~30 GB to C: after pruning unused images (`docker system df` shows 20.5 GB reclaimable; NOT `intent-router:v1`): 1) quit Docker Desktop;
+   2) in an elevated PowerShell `wsl --shutdown`; 3) `Optimize-VHD -Path "$env:LOCALAPPDATA\Docker\wsl\disk\docker_data.vhdx" -Mode Full` (or `diskpart` -> `select vdisk file=...` -> `compact vdisk`); 4) restart Docker Desktop.
+5. **(Optional) reboot** to reset the 17 GB pagefile (auto-managed); I did not reboot per your instruction.
+
+## CHECKPOINT 2026-10-07 (full-delegation mode; interim, written while the integration build runs) -- superseded where it differs from the section above
 
 **Operating mode (owner, 2026-10-07):** full delegation. Self-merge ONLY a PR that passes the EXISTING merge gate
 (`~/.claude/scripts/merge_gate.py`, under 400 reviewable lines, no sensitive paths) once: rebased/up to date with
