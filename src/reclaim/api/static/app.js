@@ -1729,6 +1729,12 @@ const selectedPaths = new Set();
 let lastCandidates = [];
 
 async function loadReviewQueue() {
+  // Back to the loading state now (as before this panel waited on the warm-up), so it never
+  // keeps showing the previous clusters while the cache re-warms.
+  const clustersStateEl = document.getElementById("duplicate-review-state");
+  document.getElementById("duplicate-review-content").hidden = true;
+  renderState(clustersStateEl, "loading", { title: "Loading largest duplicate clusters…" });
+
   const stateEl = document.getElementById("review-state");
   const contentEl = document.getElementById("review-content");
   contentEl.hidden = true;
