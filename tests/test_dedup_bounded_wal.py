@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-import structlog
 
 from reclaim import dedup
 from reclaim.index import ScanIndex
@@ -340,6 +339,26 @@ def test_unmeasurable_volume_does_not_block_the_pass(
     assert len(clusters) == _BUCKETS
 
 
+class _RecordingLogger:
+    """Stands in for `dedup.logger`: structlog's global configuration (and `capture_logs`) depends
+    on which tests ran before, a stub does not."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def _record(self, level: str, event: str, **fields: object) -> None:
+        self.events.append({"log_level": level, "event": event, **fields})
+
+    def debug(self, event: str, **fields: object) -> None:
+        self._record("debug", event, **fields)
+
+    def info(self, event: str, **fields: object) -> None:
+        self._record("info", event, **fields)
+
+    def warning(self, event: str, **fields: object) -> None:
+        self._record("warning", event, **fields)
+
+
 def test_excluded_members_log_one_info_summary_not_one_line_each(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -353,13 +372,15 @@ def test_excluded_members_log_one_info_summary_not_one_line_each(
             duplicates=tuple(_record(f"C:/dup/f{i}.bin", 10) for i in range(10_000)),
         )
     ]
-    with structlog.testing.capture_logs() as logs:
-        out = dedup.generate_duplicate_candidates(
-            None,  # type: ignore[arg-type]  # clusters are supplied: the index is never touched
-            _Config(),  # type: ignore[arg-type]
-            None,  # type: ignore[arg-type]
-            clusters=clusters,
-        )
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(dedup, "logger", recorder)
+    logs = recorder.events
+    out = dedup.generate_duplicate_candidates(
+        None,  # type: ignore[arg-type]  # clusters are supplied: the index is never touched
+        _Config(),  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        clusters=clusters,
+    )
     assert out == []
     info = [e for e in logs if e["log_level"] == "info"]
     assert len(info) <= 3
@@ -397,7 +418,10 @@ def test_unreadable_files_log_one_summary_with_a_sample(
         raise OSError(f"cannot read {path.name}")
 
     monkeypatch.setattr(dedup, "_compute_partial_hash", unreadable)
-    with ScanIndex(db) as index, structlog.testing.capture_logs() as logs:
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(dedup, "logger", recorder)
+    logs = recorder.events
+    with ScanIndex(db) as index:
         assert dedup.find_duplicate_clusters(index, min_reclaim_bytes=0) == []
     summary = [e for e in logs if e["event"] == "dedup.hash_unreadable"]
     assert len(summary) == 1 and summary[0]["log_level"] == "info"
