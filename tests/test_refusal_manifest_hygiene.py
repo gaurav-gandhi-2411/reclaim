@@ -28,6 +28,20 @@ _NOW = 1_700_000_000.0
 _DAY = 86400.0
 
 
+def _real_zone(tmp_path: Path) -> Path:
+    """The stand-in 'real profile': only the files under test live here."""
+    return tmp_path / "realzone"
+
+
+def _sandbox(tmp_path: Path) -> Path:
+    """Manifest and vault live here, deliberately NOT under the stand-in real root: the manifest
+    writers are guarded too, so a manifest under the real root is refused before any intent
+    exists and there would be nothing to abort. (See the dedicated test at the end.)"""
+    path = tmp_path / "sandbox"
+    path.mkdir(exist_ok=True)
+    return path
+
+
 def _refuse_everything_under(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     monkeypatch.setattr(safety_env, "_real_roots", (safety_env._norm(root),))
     monkeypatch.setattr(safety_env, "_sandbox_roots", [])
@@ -57,8 +71,8 @@ def _phases(manifest: Path, operation: str) -> list[str]:
 
 
 def _two_files(tmp_path: Path) -> tuple[Path, Path]:
-    tree = tmp_path / "tree"
-    tree.mkdir()
+    tree = _real_zone(tmp_path) / "tree"
+    tree.mkdir(parents=True)
     first, second = tree / "a.bin", tree / "b.bin"
     first.write_bytes(b"a" * 10)
     second.write_bytes(b"b" * 10)
@@ -75,8 +89,8 @@ def test_apply_refusal_closes_the_intent_as_aborted_and_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: Any, retention_days: int | None
 ) -> None:
     first, second = _two_files(tmp_path)
-    manifest = tmp_path / "manifest.jsonl"
-    _refuse_everything_under(monkeypatch, tmp_path)
+    manifest = _sandbox(tmp_path) / "manifest.jsonl"
+    _refuse_everything_under(monkeypatch, _real_zone(tmp_path))
 
     with pytest.raises(RealProfileAccessError):
         apply_batch(
@@ -84,7 +98,7 @@ def test_apply_refusal_closes_the_intent_as_aborted_and_propagates(
             safety=SafetyValidator(Config()),
             apply=True,
             method=method,
-            vault_dir=tmp_path / "vault",
+            vault_dir=_sandbox(tmp_path) / "vault",
             manifest_path=manifest,
             now=_NOW,
         )
@@ -92,7 +106,7 @@ def test_apply_refusal_closes_the_intent_as_aborted_and_propagates(
     # Nothing moved or deleted, and the batch stopped at the first item (never reached `second`).
     assert first.read_bytes() == b"a" * 10
     assert second.read_bytes() == b"b" * 10
-    assert not (tmp_path / "vault").exists() or not any((tmp_path / "vault").rglob("*.bin"))
+    assert not any((_sandbox(tmp_path) / "vault").rglob("*.bin"))
     # The one intent that was written is closed, not left for recovery to classify.
     assert _phases(manifest, "apply") == ["intent", "aborted"]
     intent, aborted = read_manifest_entries(manifest)
@@ -166,8 +180,8 @@ def test_restore_refusal_closes_the_intent_as_aborted_and_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first, _second = _two_files(tmp_path)
-    manifest = tmp_path / "manifest.jsonl"
-    vault = tmp_path / "vault"
+    manifest = _sandbox(tmp_path) / "manifest.jsonl"
+    vault = _sandbox(tmp_path) / "vault"
     report = apply_batch(
         [_candidate(first)],
         safety=SafetyValidator(Config()),
@@ -180,7 +194,7 @@ def test_restore_refusal_closes_the_intent_as_aborted_and_propagates(
     vaulted = report.items[0].vault_path
     assert vaulted is not None
 
-    _refuse_everything_under(monkeypatch, tmp_path)
+    _refuse_everything_under(monkeypatch, _real_zone(tmp_path))  # restore target is under it
     with pytest.raises(RealProfileAccessError):
         restore_batch(
             report.batch_id,
@@ -196,9 +210,10 @@ def test_restore_refusal_closes_the_intent_as_aborted_and_propagates(
 def test_purge_refusal_closes_the_intent_as_aborted_and_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manifest = tmp_path / "manifest.jsonl"
-    vault_file = tmp_path / "vault" / "item.bin"
-    vault_file.parent.mkdir()
+    manifest = _sandbox(tmp_path) / "manifest.jsonl"
+    # The purge target (the vault copy) is what the guard refuses, so it sits under the real root.
+    vault_file = _real_zone(tmp_path) / "vault" / "item.bin"
+    vault_file.parent.mkdir(parents=True)
     vault_file.write_bytes(b"x" * 10)
     entry = QuarantineManifestEntry(
         batch_id="batch_test",
@@ -217,16 +232,43 @@ def test_purge_refusal_closes_the_intent_as_aborted_and_propagates(
         retention_until=_NOW - 10 * _DAY,
     )
     append_manifest_entries(manifest, [entry])
-    _refuse_everything_under(monkeypatch, tmp_path)
+    _refuse_everything_under(monkeypatch, _real_zone(tmp_path))
 
     with pytest.raises(RealProfileAccessError):
         purge_expired(
             apply=True,
             manifest_path=manifest,
-            vault_dir=tmp_path / "vault",
+            vault_dir=_real_zone(tmp_path) / "vault",
             safety=SafetyValidator(Config()),
             now=_NOW,
         )
 
     assert vault_file.exists()
     assert _phases(manifest, "purge") == ["intent", "aborted"]
+
+
+def test_a_manifest_under_the_real_root_is_refused_before_any_entry_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Documents the behaviour once the manifest writers are guarded as well: if the manifest
+    itself is under the real root, the refusal propagates before the first intent, nothing is
+    moved, and no manifest file (not even a partial one) is left behind. Holds with or without
+    that guard: either the writer refuses, or the move guard refuses after an intent that is then
+    closed, and in both cases the target is untouched and the refusal propagates."""
+    first, _second = _two_files(tmp_path)
+    manifest = _real_zone(tmp_path) / "manifest.jsonl"
+    _refuse_everything_under(monkeypatch, _real_zone(tmp_path))
+
+    with pytest.raises(RealProfileAccessError):
+        apply_batch(
+            [_candidate(first)],
+            safety=SafetyValidator(Config()),
+            apply=True,
+            vault_dir=_sandbox(tmp_path) / "vault",
+            manifest_path=manifest,
+            now=_NOW,
+        )
+
+    assert first.read_bytes() == b"a" * 10
+    if manifest.exists():  # pre-#145 behaviour: an intent was written and then closed
+        assert _phases(manifest, "apply") == ["intent", "aborted"]
