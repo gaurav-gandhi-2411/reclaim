@@ -113,3 +113,46 @@ Status additions (all additive): `status` may be `cancelled`; fields `source`, `
   hides the resume story; cooperative boundaries are safe because every boundary is a commit point.
 - **Explicit `full`/`partial` flag on `ScanStatus`:** more precise than deriving it from roots but
   a wider change for no extra behavior today.
+
+## Addendum 2026-10-08: bounded WAL during dedup
+
+**Incident (VERIFIED on the owner's installed build, 2026-10-08).** During a ~35 min background
+warm-up on the real 7.18 GB index (1,613,253 candidate files, ~1.2M partial / ~966k full hashes) the
+SQLite WAL `reclaim_index.sqlite3-wal` grew to 13.15 GB and C: free space fell from 19 GB to 0.97 GB.
+Only a cancel plus closing the index checkpointed it. Separately the pass wrote 618,466+
+`dedup.member_excluded` INFO lines (223 MB of server log).
+
+**Mechanism.** `ScanIndex.duplicate_size_candidates` streamed one SELECT cursor over the whole pass
+while `flush_writes` committed hash updates on the same connection. The open cursor pins the oldest
+read snapshot, so neither `wal_autocheckpoint` nor an explicit checkpoint can advance past it and no
+WAL frame is recycled for the whole pass. Reproduced hermetically with
+`tests/test_dedup_bounded_wal.py` (45k synthetic rows in 3k size buckets, hashing stubbed, 44
+flushes): before the change the max WAL was **20,628,872 bytes** and 42 of 44 flushes found a cursor
+still open; after it **984,712 bytes** and 0 flushes with an open cursor. The growth is linear in
+updates, which is why 2M real updates reach GBs; the real-index figure is the incident measurement
+above, not something this fixture predicts.
+
+**Decision.**
+- The qualifying-size list (the expensive `_QUALIFYING_SIZES_SQL` subquery) is computed once
+  (`ScanIndex.duplicate_qualifying_sizes`); rows come from short SELECTs of `_SIZES_PER_FETCH` = 256
+  sizes (`duplicate_candidates_for_sizes`, `ORDER BY size, rowid`, `fetchall`), so no cursor is open
+  across a flush. Bucket grouping, hardlink/inode handling, windows, the ADR-0040 cancel points and
+  ADR-0038 hash persistence are unchanged; row-for-row equality with the old streaming query is
+  tested on randomized fixtures.
+- After every flush `ScanIndex.checkpoint_wal` runs a `PASSIVE` checkpoint, and a `TRUNCATE` one if
+  the WAL file exceeds `_WAL_CEILING_BYTES` (256 MB). A busy checkpoint (another reader) is not an
+  error; the next flush retries.
+- Disk guard: before the pass and at each window boundary, free space on the index volume must be at
+  least `_MIN_FREE_DISK_BYTES` (2 GB) plus the current WAL size, else the pass flushes what it has
+  hashed and raises `DedupAborted` ("not enough free disk space on C: ..."). The warm status already
+  reports any exception as `failed` with its text as `error`. Resume keeps the hashes. If the volume
+  cannot be measured the guard is skipped with one warning (fail open: it is a safety net).
+- Logging: per-member `dedup.member_excluded`, `dedup.cluster_excluded_protected_member`, the
+  per-file unreadable line (now `dedup.hash_unreadable_file`) and `dedup.hash_cache_stale_listing`
+  are DEBUG. Each pass logs one INFO summary with a count, per-reason counts and the first 5 samples:
+  `dedup.members_excluded`, `dedup.clusters_excluded_protected_member`, `dedup.hash_unreadable`.
+  The stale-listing line has no summary.
+
+**Not measured.** Real-index wall-clock and peak WAL after the change (no run against the 7 GB index
+was made); the cost of the extra `duplicate_qualifying_sizes` query (it repeats the 15-60 s subquery
+already paid by the candidate count); the best `_SIZES_PER_FETCH`.
