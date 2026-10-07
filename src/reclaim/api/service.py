@@ -824,6 +824,19 @@ def _compute_eta_seconds(
 _AGGREGATE_SKIPPED_PATHS_SAMPLE_LIMIT = 20
 
 
+def _background_error_text(exc: BaseException) -> str:
+    """The `error` string a background job records for whatever escaped its body.
+
+    An `Exception` keeps its bare message (the established wording the dashboard already shows).
+    A non-`Exception` `BaseException` (the hermetic-test `RealProfileAccessError`, `SystemExit`,
+    ...) is prefixed with its class name and capped: a status of "failed" with `error=None` is
+    what the UI otherwise shows. No secrets: it is the exception's own message, same as every
+    other recorded error."""
+    if isinstance(exc, Exception):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
 def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     """Background-task body for both `POST /api/scan` (`roots=[the one path]`, `drives_total=1`)
     and `POST /api/scan/full-drive` (`roots=list_fixed_drives()`) -- ONE orchestration path
@@ -975,16 +988,20 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                 if stats.cancelled:
                     cancelled = True
                     break
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.scan_failed", roots=[str(r) for r in roots], error=str(exc))
+        # BaseException (not Exception): a refusal such as `RealProfileAccessError` must not leave
+        # "running" behind; it is recorded as failed below and then re-raised.
+        logger.warning(
+            "api.scan_failed", roots=[str(r) for r in roots], error=_background_error_text(exc)
+        )
         with state.lock:
             state.scan_status = ScanStatus(
                 status="failed",
                 root=state.scan_status.root,
                 started_at=started_at,
                 finished_at=time.time(),
-                error=str(exc),
+                error=_background_error_text(exc),
                 dirs_visited=dirs_visited_total,
                 entries_total=entries_total_total,
                 files_written=files_written_total,
@@ -998,6 +1015,8 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                 drives_total=drives_total,
                 drives_done=state.scan_status.drives_done,
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     if cancelled:
@@ -1873,13 +1892,17 @@ def run_apply(
                 on_progress=_on_progress,
                 scan_index=apply_scan_index,
             )
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.apply_failed", error=str(exc))
+        # BaseException, re-raised below when it is not an Exception: see `run_scan`.
+        error_text = _background_error_text(exc)
+        logger.warning("api.apply_failed", error=error_text)
         with state.lock:
             state.apply_status = ApplyStatus(
-                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+                status="failed", started_at=started_at, finished_at=time.time(), error=error_text
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -2110,12 +2133,16 @@ def run_ai_analysis(state: AppState, scan_generation: int, started_at: float) ->
         with ScanIndex(state.db_path) as index:
             records = index.full_inventory(under=root)
         analysis = ai_orchestration.run_ai_analysis(records=records, safety=state.safety)
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.ai_analysis_failed", error=str(exc))
+        # BaseException, re-raised below when it is not an Exception: see `run_scan`.
+        error_text = _background_error_text(exc)
+        logger.warning("api.ai_analysis_failed", error=error_text)
         _fail_ai_analysis(
-            state, scan_generation=scan_generation, started_at=started_at, error=str(exc)
+            state, scan_generation=scan_generation, started_at=started_at, error=error_text
         )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -2388,12 +2415,15 @@ def run_restore(state: AppState, batch_id: str, started_at: float) -> None:
             safety=state.safety,
             on_progress=_on_progress,
         )
-    except Exception as exc:  # broad on purpose: see run_apply's identical reasoning above.
-        logger.warning("api.restore_failed", batch_id=batch_id, error=str(exc))
+    except BaseException as exc:  # broad on purpose: see run_apply's identical reasoning above.
+        error_text = _background_error_text(exc)
+        logger.warning("api.restore_failed", batch_id=batch_id, error=error_text)
         with state.lock:
             state.restore_status = RestoreStatus(
-                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+                status="failed", started_at=started_at, finished_at=time.time(), error=error_text
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -2934,6 +2964,13 @@ def start_regenerable_clean(
         except Exception as exc:
             logger.warning("regenerable.job_failed", run_id=job.run_id, exc_info=True)
             error = f"{type(exc).__name__}: {exc}"[:300]
+        except BaseException as exc:
+            # A refusal (`RealProfileAccessError`) or SystemExit: without this `error` stays None
+            # and the UI shows "failed" with no message. Recorded, then re-raised; the `finally`
+            # below still releases the lock and publishes the terminal status.
+            logger.warning("regenerable.job_aborted", run_id=job.run_id, exc_info=True)
+            error = _background_error_text(exc)
+            raise
         finally:
             # Release first, publish the terminal status second: a client that sees "done" can
             # immediately start the next clean without a spurious 409.
