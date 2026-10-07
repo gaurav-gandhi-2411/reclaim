@@ -9,6 +9,7 @@ import httpx
 import structlog
 
 from reclaim.app_paths import data_root
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -149,6 +150,7 @@ def _read_cache(path: Path) -> CategoryExplanation | None:
 
 
 def _write_cache(path: Path, explanation: CategoryExplanation) -> None:
+    assert_not_real_profile_under_pytest(path, operation="write the explanation cache")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"category_group": explanation.category_group, "explanation": explanation.explanation}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

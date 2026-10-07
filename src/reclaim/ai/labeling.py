@@ -14,6 +14,7 @@ from reclaim.ai.image_similarity import build_near_identical_clusters
 from reclaim.ai.models import AICluster, AIClusterMember, AITrack
 from reclaim.ai.phash import ImageHashRecord, compute_image_hashes, hamming_distance
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Gold-set labeling tool (spec §7.1 / the explicit autonomy-boundary instruction: "build a
 # gold-set labeling tool ... so GG can label a few hundred real image/doc pairs + keep-best
@@ -267,6 +268,7 @@ class LabelStore:
         self._path = path
 
     def append(self, decision: LabelDecision) -> None:
+        assert_not_real_profile_under_pytest(self._path, operation="append to the label log")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as fh:
             fh.write(

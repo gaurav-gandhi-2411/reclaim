@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from reclaim.app_paths import data_root
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Marker file, not a log — "acknowledged" is a one-way, one-time transition (spec: "First-run
 # screen (shown once)"), so there is no history to fold, unlike mode_log.jsonl/manifest.jsonl.
@@ -30,6 +31,7 @@ def acknowledge(path: Path | None = None, *, now: float | None = None) -> float:
     twice just overwrites the timestamp, never errors — the dashboard calls this once per real
     acknowledgment, but a caller retrying a dropped request must not be punished for it."""
     resolved = path if path is not None else DEFAULT_FIRST_RUN_STATE_PATH
+    assert_not_real_profile_under_pytest(resolved, operation="write the first-run state")
     resolved.parent.mkdir(parents=True, exist_ok=True)
     acknowledged_at = now if now is not None else time.time()
     resolved.write_text(json.dumps({"acknowledged_at": acknowledged_at}), encoding="utf-8")

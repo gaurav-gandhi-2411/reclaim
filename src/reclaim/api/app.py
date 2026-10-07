@@ -23,6 +23,7 @@ from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 _PACKAGE_DIR = Path(__file__).parent
 _STATIC_DIR = _PACKAGE_DIR / "static"
@@ -109,6 +110,7 @@ def create_app(
     # Created eagerly (not lazily inside a route) so every read-only endpoint (summary,
     # treemap, candidates) can open `ScanIndex(db_path)` even before the first scan has run —
     # `sqlite3.connect` fails outright if the parent directory doesn't exist yet.
+    assert_not_real_profile_under_pytest(db_path, operation="create the index directory")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     app.state.reclaim = AppState(
         db_path=db_path,
