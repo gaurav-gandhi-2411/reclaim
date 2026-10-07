@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import itertools
+import shutil
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 import blake3
 import structlog
@@ -77,12 +79,53 @@ _WINDOW_FILES = 2048
 # layer's direct `find_duplicate_clusters` call) without silently reverting to "hash
 # everything" if a caller forgets to pass it.
 _DEFAULT_MIN_RECLAIM_BYTES = 1024 * 1024
+# Qualifying sizes fetched per short SELECT (ADR-0040 addendum, bounded WAL). Big enough that the
+# per-chunk query overhead is negligible next to hashing; small enough that one chunk's rows stay a
+# few thousand `FileRecord`s on a real index (~19 files per size bucket on average).
+_SIZES_PER_FETCH = 256
+# Above this the index WAL is TRUNCATE-checkpointed at the next flush (the 2026-10-08 incident:
+# 13.15 GB). 256 MB: far above one window's frames, far below a disk-fill.
+_WAL_CEILING_BYTES = 256 * 1024 * 1024
+# A pass stops cleanly when the index volume has less than this free, plus the current WAL size.
+_MIN_FREE_DISK_BYTES = 2 * 1024**3
+# Samples kept per aggregated log line (support gets counts plus the first few examples).
+_LOG_SAMPLE_SIZE = 5
 
 
 class DedupCancelled(Exception):
     """Raised by a caller-supplied `checkpoint` to stop `find_duplicate_clusters` at the next
     batch boundary (ADR-0040). Every hash already flushed to the index stays -- that is the resume
     mechanism -- but no clusters are returned."""
+
+
+class DiskUsage(Protocol):
+    """The slice of `shutil.disk_usage`'s result the free-space guard reads."""
+
+    @property
+    def free(self) -> int: ...
+
+
+class DedupAborted(Exception):
+    """Raised by `find_duplicate_clusters` when it must stop for a reason other than a caller's
+    cancel (currently: the index volume is nearly full). The message is user-readable -- the warm
+    status surfaces `str(exc)` as its `error`. Hashes already computed are flushed first, so the
+    next pass resumes from them (ADR-0038)."""
+
+
+class _Tally:
+    """Per-pass counter with a few samples: replaces one INFO line per member (the 2026-10-08
+    real-index pass logged 618,466+ `dedup.member_excluded` lines, 223 MB) with one summary."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.by_key: Counter[str] = Counter()
+        self.samples: list[str] = []
+
+    def add(self, key: str, sample: str) -> None:
+        self.count += 1
+        self.by_key[key] += 1
+        if len(self.samples) < _LOG_SAMPLE_SIZE:
+            self.samples.append(sample)
 
 
 def _is_downloads_or_temp(path: Path) -> bool:
@@ -460,7 +503,7 @@ def _resolve_one(
         fresh = fresh_stat_signature(record.path)
         if fresh is None or (fresh.size, fresh.mtime) == (record.size_bytes, record.mtime):
             return digest, True
-        logger.info("dedup.hash_cache_stale_listing", stage=stage, path=str(record.path))
+        logger.debug("dedup.hash_cache_stale_listing", stage=stage, path=str(record.path))
     return compute(record.path, *compute_args), False
 
 
@@ -510,6 +553,7 @@ def _hash_stage(
     skips: list[HashSkip] | None,
     collapse_hardlinks: bool = True,
     checkpoint: Callable[[], None] | None = None,
+    unreadable: _Tally | None = None,
 ) -> dict[Path, str]:
     """Hashes `records` concurrently on `executor` (cache check, else compute, else skip) and
     returns `{path: digest}` for every record that produced one.
@@ -565,9 +609,12 @@ def _hash_stage(
         except OSError as exc:
             digest, from_cache, reason = None, False, str(exc)
         if digest is None:
-            logger.warning(
-                "dedup.hash_unreadable", stage=stage, path=str(first.path), reason=reason
+            # Per file at DEBUG only; the pass logs one `dedup.hash_unreadable` summary.
+            logger.debug(
+                "dedup.hash_unreadable_file", stage=stage, path=str(first.path), reason=reason
             )
+            if unreadable is not None:
+                unreadable.add(stage, f"{first.path}: {reason}")
             if skips is not None:
                 skips.append(HashSkip(path=first.path, stage=stage, reason=reason or ""))
             fallback.extend(group[1:])
@@ -602,6 +649,7 @@ def _hash_stage(
                 skips=skips,
                 collapse_hardlinks=False,
                 checkpoint=checkpoint,
+                unreadable=unreadable,
             )
         )
     return digests
@@ -630,6 +678,7 @@ def find_duplicate_clusters(
     exclusion_patterns: Sequence[str] = (),
     checkpoint: Callable[[], None] | None = None,
     worker_initializer: Callable[[], None] | None = None,
+    disk_usage: Callable[[Path], DiskUsage] = shutil.disk_usage,
 ) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
     cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
@@ -674,6 +723,16 @@ def find_duplicate_clusters(
     is created per window (threads are lazy, so this is cheap), so an initializer evaluated at
     that moment sees the CURRENT state -- e.g. enter OS background mode only while the warm-up
     has not been promoted to a user request.
+
+    Bounded WAL (ADR-0040 addendum): candidate rows are fetched in short, fully consumed SELECTs
+    of `_SIZES_PER_FETCH` sizes each, so NO read cursor is open when hashes are flushed; each flush
+    is followed by `ScanIndex.checkpoint_wal`. (A single streaming cursor pinned the oldest read
+    snapshot for the whole pass and the WAL grew to 13.15 GB on the real index.)
+
+    `disk_usage` (test seam, default `shutil.disk_usage`): measured on the index's volume before
+    the pass and at every window boundary; below `_MIN_FREE_DISK_BYTES` + the current WAL size the
+    pass flushes what it has hashed and raises `DedupAborted`. If the volume cannot be measured the
+    guard is skipped with a warning (it is a safety net, not a gate on correctness).
     """
     candidate_count = index.duplicate_size_candidate_count(min_reclaim_bytes=min_reclaim_bytes)
     if candidate_count == 0:
@@ -694,6 +753,26 @@ def find_duplicate_clusters(
     full_writes: list[tuple[Path, int, float, str]] = []
     counters = {"partial": 0, "full": 0, "buckets": 0}
     last_heartbeat = time.monotonic()
+    unreadable = _Tally()
+    disk_warned: list[bool] = []
+
+    def check_disk() -> None:
+        try:
+            free = disk_usage(index.db_path.parent).free
+        except OSError as exc:
+            if not disk_warned:
+                disk_warned.append(True)  # once per pass, not once per window
+                logger.warning("dedup.disk_usage_unavailable", error=str(exc))
+            return
+        needed = _MIN_FREE_DISK_BYTES + index.wal_size_bytes()
+        if free < needed:
+            flush_writes()  # keep what is hashed: the next pass resumes from it
+            volume = index.db_path.drive or str(index.db_path.parent)
+            raise DedupAborted(
+                f"not enough free disk space on {volume}: {free / 1024**3:.1f} GB free, need at "
+                f"least {needed / 1024**3:.1f} GB. Free up space and run again; the files "
+                "already hashed are kept."
+            )
 
     def heartbeat() -> None:
         nonlocal last_heartbeat
@@ -716,6 +795,7 @@ def find_duplicate_clusters(
         if full_writes:
             index.store_full_hashes(full_writes)
             full_writes.clear()
+        index.checkpoint_wal(truncate_above_bytes=_WAL_CEILING_BYTES)
 
     def check_cancel() -> None:
         if checkpoint is None:
@@ -728,6 +808,7 @@ def find_duplicate_clusters(
 
     def run_window(window: list[tuple[int, list[FileRecord]]]) -> None:
         check_cancel()
+        check_disk()
         try:
             with ThreadPoolExecutor(
                 max_workers=_HASH_TIMEOUT_WORKERS, initializer=worker_initializer
@@ -752,6 +833,7 @@ def find_duplicate_clusters(
             pending_writes=partial_writes,
             skips=skips,
             checkpoint=checkpoint,
+            unreadable=unreadable,
         )
         counters["partial"] += len(partial_digests)
         heartbeat()
@@ -802,6 +884,7 @@ def find_duplicate_clusters(
                 pending_writes=full_writes,
                 skips=skips,
                 checkpoint=checkpoint,
+                unreadable=unreadable,
             )
         )
         counters["full"] += len(full_digests)
@@ -829,27 +912,40 @@ def find_duplicate_clusters(
 
     window: list[tuple[int, list[FileRecord]]] = []
     window_files = 0
-    rows = index.duplicate_size_candidates(min_reclaim_bytes=min_reclaim_bytes)
+    check_disk()
+    # The qualifying-size subquery is expensive (15-60 s on a real index): run it once, not per
+    # fetch. Each fetch below is a short SELECT consumed in full before anything is written, so
+    # no cursor is ever open across a flush (and none can be left open by a cancel unwinding).
+    qualifying_sizes = index.duplicate_qualifying_sizes(min_reclaim_bytes=min_reclaim_bytes)
     try:
-        for size, members_iter in itertools.groupby(rows, key=lambda record: record.size_bytes):
-            counters["buckets"] += 1
-            members = list(members_iter)  # bounded by this one bucket, not the whole candidate set
-            if exclusion_patterns:
-                members = [
-                    m for m in members if first_matching_pattern(m.path, exclusion_patterns) is None
-                ]
-            window.append((size, members))
-            window_files += len(members)
-            if window_files >= _WINDOW_FILES:
-                run_window(window)
-                window, window_files = [], 0
+        for offset in range(0, len(qualifying_sizes), _SIZES_PER_FETCH):
+            rows = index.duplicate_candidates_for_sizes(
+                qualifying_sizes[offset : offset + _SIZES_PER_FETCH]
+            )
+            for size, members_iter in itertools.groupby(rows, key=lambda r: r.size_bytes):
+                counters["buckets"] += 1
+                members = list(members_iter)  # bounded by this one bucket
+                if exclusion_patterns:
+                    members = [
+                        m
+                        for m in members
+                        if first_matching_pattern(m.path, exclusion_patterns) is None
+                    ]
+                window.append((size, members))
+                window_files += len(members)
+                if window_files >= _WINDOW_FILES:
+                    run_window(window)
+                    window, window_files = [], 0
         if window:
             run_window(window)
     finally:
-        # Close the SELECT cursor NOW, not whenever the traceback releases the generator: a
-        # cancel (or any error) unwinding out of the loop otherwise leaves the cursor open and
-        # ScanIndex.close()'s WAL checkpoint then fails with "database table is locked".
-        rows.close()
+        if unreadable.count:
+            logger.info(
+                "dedup.hash_unreadable",
+                count=unreadable.count,
+                by_stage=dict(unreadable.by_key),
+                sample=unreadable.samples,
+            )
     flush_writes()
     buckets_seen = counters["buckets"]
 
@@ -953,6 +1049,9 @@ def generate_duplicate_candidates(
     )
     model_cache_roots = [Path(p) for p in config.categories.model_caches.paths]
     env_root_cache: dict[Path, bool] = {}  # one pass only -- see `_is_environment_root`
+    # Per-member lines are DEBUG; a pass logs one summary each (a real pass had 618k of them).
+    excluded_members = _Tally()
+    protected_clusters = _Tally()
     for cluster in resolved_clusters:
         eligible_duplicates: list[FileRecord] = []
         for duplicate in cluster.duplicates:
@@ -960,12 +1059,13 @@ def generate_duplicate_candidates(
                 duplicate, cluster.keep, model_cache_roots, env_root_cache
             )
             if reason is not None:
-                logger.info(
+                logger.debug(
                     "dedup.member_excluded",
                     path=str(duplicate.path),
                     keep=str(cluster.keep.path),
                     reason=reason,
                 )
+                excluded_members.add(reason, str(duplicate.path))
                 continue
             eligible_duplicates.append(duplicate)
         if not eligible_duplicates:
@@ -981,11 +1081,12 @@ def generate_duplicate_candidates(
                 for path, result in member_results.items()
                 if result.verdict == Verdict.BLOCKED
             ]
-            logger.info(
+            logger.debug(
                 "dedup.cluster_excluded_protected_member",
                 keep=str(cluster.keep.path),
                 blocked_paths=blocked_paths,
             )
+            protected_clusters.add("protected_member", str(cluster.keep.path))
             continue
 
         rationale = _keep_rationale(cluster)
@@ -1041,4 +1142,17 @@ def generate_duplicate_candidates(
                     mtime=duplicate.mtime,
                 )
             )
+    if excluded_members.count:
+        logger.info(
+            "dedup.members_excluded",
+            count=excluded_members.count,
+            reasons=dict(excluded_members.by_key),
+            sample=excluded_members.samples,
+        )
+    if protected_clusters.count:
+        logger.info(
+            "dedup.clusters_excluded_protected_member",
+            count=protected_clusters.count,
+            sample=protected_clusters.samples,
+        )
     return candidates
