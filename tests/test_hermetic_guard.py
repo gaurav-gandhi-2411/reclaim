@@ -4,6 +4,7 @@ from __future__ import annotations
 # These tests exercise str/os.path based code paths on purpose.
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -340,3 +341,120 @@ def test_a_child_process_inherits_the_real_roots_and_sandbox_not_the_redirected_
     )
     assert refused.returncode != 0
     assert "RealProfileAccessError" in refused.stderr
+
+
+# --- (g) UNC / device / loopback spellings cannot bypass a real root; sandbox env hardening ----
+# Every "real" root here is a stand-in dir under tmp_path registered through the module's own
+# attribute; the real profile is never involved and nothing is deleted (the guard only raises).
+
+
+def _stand_in_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    real = tmp_path / "pretend-real-profile"
+    real.mkdir()
+    monkeypatch.setattr(safety_env, "_real_roots", (safety_env._norm(real),))
+    monkeypatch.setattr(safety_env, "_sandbox_roots", [])
+    monkeypatch.setattr(safety_env, "_sandbox_inherited", True)  # do not load the env var
+    return real
+
+
+def _spellings(path: Path) -> list[str]:
+    """The same local path through every UNC/device/loopback form (path must be on a drive)."""
+    drive, rest = os.path.splitdrive(str(path))
+    letter = drive[0]
+    host = socket.gethostname()
+    return [
+        f"\\\\localhost\\{letter}$" + rest,
+        f"\\\\LocalHost\\{letter}$" + rest,
+        f"\\\\?\\UNC\\localhost\\{letter}$" + rest,
+        f"\\\\127.0.0.1\\{letter}$" + rest,
+        f"\\\\[::1]\\{letter}$" + rest,
+        f"\\\\0--1.ipv6-literal.net\\{letter}$" + rest,
+        f"\\\\{host}\\{letter}$" + rest,
+        f"\\\\.\\{letter}:" + rest,
+        f"\\\\?\\{letter}:" + rest,
+        f"//localhost/{letter}$" + rest.replace("\\", "/"),
+    ]
+
+
+def test_unc_device_and_loopback_spellings_of_a_real_root_are_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    for spelling in _spellings(real / "Cache" / "f_000001"):
+        assert safety_env._norm(spelling).startswith(safety_env._norm(real)), (
+            f"{spelling!r} did not normalise to the local drive path"
+        )
+        with pytest.raises(RealProfileAccessError):
+            safety_env.assert_not_real_profile_under_pytest(spelling)
+
+
+def test_unmappable_device_paths_naming_a_real_root_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    tail = os.path.splitdrive(str(real))[1] + "\\Cache"
+    for spelling in (
+        "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3" + tail,
+        "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}" + tail,
+        "\\\\otherhost\\share" + tail,
+    ):
+        with pytest.raises(RealProfileAccessError):
+            safety_env.assert_not_real_profile_under_pytest(spelling)
+    # ...but an unmappable path that names no real root is not refused (and never touches the net).
+    safety_env.assert_not_real_profile_under_pytest("\\\\otherhost\\share\\unrelated\\x")
+
+
+def test_unc_spellings_are_a_no_op_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    monkeypatch.setattr(safety_env, "running_under_pytest", lambda: False)
+    for spelling in _spellings(real / "x"):
+        safety_env.assert_not_real_profile_under_pytest(spelling)
+    safety_env.assert_not_real_profile_under_pytest("\\\\?\\GLOBALROOT" + str(real)[2:])
+
+
+def _load_env_sandboxes(monkeypatch: pytest.MonkeyPatch, raw: str) -> list[str]:
+    monkeypatch.setattr(safety_env, "_sandbox_roots", [])
+    monkeypatch.setattr(safety_env, "_sandbox_inherited", False)
+    monkeypatch.setenv(safety_env._INHERIT_SANDBOX_ENV_VAR, raw)
+    return list(safety_env._sandboxes())
+
+
+def test_sandbox_env_entries_are_normalised_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    box = real / "pytest-of-me" / "pytest-1"
+    raw = os.pathsep.join(["", str(box).swapcase(), "  "])
+    sandboxes = _load_env_sandboxes(monkeypatch, raw)
+    assert sandboxes == [safety_env._norm(box)]
+    safety_env.assert_not_real_profile_under_pytest(box / "t")  # allowed inside a real root
+    with pytest.raises(RealProfileAccessError):
+        safety_env.assert_not_real_profile_under_pytest(real / "pytest-of-me" / "pytest-2")
+
+
+def test_sandbox_env_entry_that_is_or_contains_a_real_root_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    drive = os.path.splitdrive(str(real))[0] + "\\"
+    ancestors = [str(real), str(real.parent), str(real.parent.parent), drive]
+    assert _load_env_sandboxes(monkeypatch, os.pathsep.join(ancestors)) == []
+    with pytest.raises(RealProfileAccessError):
+        safety_env.assert_not_real_profile_under_pytest(real / "Cache" / "f")
+    # a UNC spelling of the real root as a "sandbox" is no way around it either
+    assert _load_env_sandboxes(monkeypatch, _spellings(real)[0]) == []
+    with pytest.raises(RealProfileAccessError):
+        safety_env.assert_not_real_profile_under_pytest(real / "Cache" / "f")
+
+
+def test_sandbox_env_is_not_consulted_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real = _stand_in_real(monkeypatch, tmp_path)
+    monkeypatch.setattr(safety_env, "running_under_pytest", lambda: False)
+    monkeypatch.setattr(safety_env, "_sandbox_inherited", False)
+    monkeypatch.setenv(safety_env._INHERIT_SANDBOX_ENV_VAR, str(real))
+    safety_env.assert_not_real_profile_under_pytest(real / "x")
+    assert safety_env._sandbox_inherited is False  # production never even parsed it
