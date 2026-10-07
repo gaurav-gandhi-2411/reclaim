@@ -245,3 +245,7 @@ categories: read-only subprocesses (`git rev-parse`, `git status`) and SQL on a 
 only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open. Limits:
 the scanner is lexical (a guard in the function, not proof it covers the right path), and a
 `Path.open(mode_variable)` is not detected.
+
+The two real-scheduler tests are run in CI by `.github/workflows/real-task-scheduler.yml` (manual,
+weekly, and on PRs touching the scheduler code, its tests or `packaging/reclaim.iss`) on a throwaway
+GitHub runner with the opt-in set on that one step only. It is not a required check.
