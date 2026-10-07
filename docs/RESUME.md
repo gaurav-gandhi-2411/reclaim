@@ -34,7 +34,8 @@ Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2
 - **Real-Chrome 409 check (Playwright + installed Chrome, first-run response stubbed in the browser only):** while the warm-up computed, Overview and Review Queue
   showed "Indexing your files... This can take a few minutes the first time after a large scan - 114s so far. The page is not stuck", no error alert, no console
   error. The typed 409 (`code: candidates_not_warm`) was observed on `/api/summary` and `/api/clean/one-click-summary` of the real server. Screenshots:
-  `scratchpad\shots\409-installed-0{1,2,3}-*.png` (to be committed under `docs/assets/`). Cosmetic defect: an EMPTY peach alert bar with a "Dismiss" button under the header.
+  `docs/assets/409-installed-01-simple.png`, `-02-advanced-overview.png` (the progress panel), `-03-review-queue.png`, and
+  `-01-simple-while-warming.png` (headless Chrome, fresh profile: shows the one-time "Before you start" modal). Cosmetic defect: an EMPTY peach alert bar with a "Dismiss" button under the header.
 
 ### Two serious bugs found on the real index (both new, fixes dispatched)
 1. **Review Queue starts its own whole-index dedup pass.** `GET /api/duplicate-clusters/review` (`service.list_duplicate_cluster_review`) is not covered by ADR-0037's
