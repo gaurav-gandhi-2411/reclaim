@@ -850,10 +850,16 @@ def test_anthropic_key(
 
 
 @router.get("/ai/category-explanation/{category_group}", response_model=CategoryExplanationResponse)
-def category_explanation(category_group: str, request: Request) -> CategoryExplanationResponse:
+def category_explanation(
+    category_group: str, request: Request, background_tasks: BackgroundTasks
+) -> CategoryExplanationResponse | JSONResponse:
     """Per-category prose explanation (R2) — recommend-only, same as everything else under
     `reclaim.ai`: this can never influence a delete decision (see
     `reclaim.ai.category_explainer`'s module docstring). Degrades gracefully in every failure
     mode (no scan, no matching category, no key configured, an Anthropic API failure) — never a
     500, see `service.build_category_explanation`'s docstring."""
-    return service.build_category_explanation(get_state(request), category_group)
+    state = get_state(request)
+    try:
+        return service.build_category_explanation(state, category_group)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)

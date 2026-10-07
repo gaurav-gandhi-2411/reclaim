@@ -325,7 +325,11 @@ def _cached_all_candidates(
     """
     with state.candidates_cache_lock:
         key = _candidates_cache_key(state)
-        if state.candidates_cache is not None and state.candidates_cache_key == key:
+        if (
+            state.candidates_cache is not None
+            and state.candidates_clusters_cache is not None
+            and state.candidates_cache_key == key
+        ):
             return state.candidates_cache
         # A cancelled compute raises out of here BEFORE the assignments below, so a cancelled or
         # failed warm-up never leaves partial candidates, clusters (or a warm key) behind
@@ -388,8 +392,11 @@ def is_candidates_cache_warm(state: AppState) -> bool:
     if not state.candidates_cache_lock.acquire(blocking=False):
         return False
     try:
+        # The clusters are part of "warm": candidates cached without them (only possible by
+        # direct assignment) would otherwise leave the review endpoint at 409 "computing" forever.
         return (
             state.candidates_cache is not None
+            and state.candidates_clusters_cache is not None
             and state.candidates_cache_key == _candidates_cache_key(state)
         )
     finally:
@@ -418,7 +425,8 @@ def candidates_cache_stale_reason(state: AppState) -> str | None:
             return name
     # Same key but an explicit invalidation dropped the list (the category-toggle handler does
     # this, leaving the old key behind) -- the key diff above names the real cause when it can.
-    return "cold" if state.candidates_cache is None else None
+    cold = state.candidates_cache is None or state.candidates_clusters_cache is None
+    return "cold" if cold else None
 
 
 def require_warm_candidates(state: AppState) -> None:
@@ -1995,8 +2003,13 @@ def select_candidates_for_selector(
     tier validation, so this function must be the one to fail clearly)."""
     if tier not in _TIER_SELECTIONS:
         raise ValueError(f"tier must be one of {sorted(_TIER_SELECTIONS)} (got {tier!r})")
+    # Single-flight cache, not a private `_all_candidates` pass: with a warm-up in flight this
+    # blocks on `candidates_cache_lock` and reuses its result instead of starting a second
+    # whole-index dedup pass on the same index (incident 2026-10-08). Deliberately NOT a
+    # not-warm refusal: a scoped MCP scan never auto-warms, so refusing would make preview_apply
+    # unusable until someone warmed by hand. Scope-filtered identically to `_all_candidates`.
     with ScanIndex(state.db_path) as index:
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
     tiers = _TIER_SELECTIONS[tier]
     return [
         c
@@ -2760,7 +2773,9 @@ def build_category_explanation(state: AppState, category_group: str) -> Category
                 explanation=None,
                 cached=False,
             )
-        candidates = _all_candidates(index, state)
+    # Warm cache only (typed 409 via the route): a private `_all_candidates` pass here ran a
+    # second whole-index dedup pass while a warm-up was in flight (incident 2026-10-08).
+    candidates, _clusters = _read_warm_candidates_and_clusters(state)
 
     descriptor = _category_descriptor_for_group(category_group, candidates)
     if descriptor is None:

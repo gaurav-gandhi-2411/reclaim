@@ -323,3 +323,110 @@ def test_warm_failure_reports_the_original_error_not_the_close_error(
     assert failed[0]["exc_info"] is True, "the traceback must be logged"
     secondary = [e for e in logs if e["event"] == "index.close_failed_while_handling_exception"]
     assert [e["error"] for e in secondary] == ["database table is locked"]
+
+
+# Other readers that used to run a private dedup pass (verifier finding D1) ----------------------
+
+
+def _blocked_warm(
+    client: object, monkeypatch: pytest.MonkeyPatch
+) -> tuple[list[int], threading.Event, threading.Thread]:
+    """Starts a warm-up on its own thread, blocked inside its (counted) dedup pass."""
+    calls = [0]
+    started = threading.Event()
+    release = threading.Event()
+    real = service.find_duplicate_clusters
+
+    def _blocking(*args: object, **kwargs: object) -> object:
+        calls[0] += 1
+        started.set()
+        assert release.wait(timeout=30), "warm-up never released"
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "find_duplicate_clusters", _blocking)
+    thread = threading.Thread(target=lambda: client.post("/api/candidates/warm"))  # type: ignore[attr-defined]
+    thread.start()
+    assert started.wait(timeout=10), "warm-up never reached the dedup pass"
+    return calls, release, thread
+
+
+def test_category_explanation_during_an_in_flight_warm_is_409_without_a_second_dedup_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client, _state = _cold_client(tmp_path, root)
+    calls, release, warm_thread = _blocked_warm(client, monkeypatch)
+
+    response = client.get("/api/ai/category-explanation/duplicates")
+    release.set()
+    warm_thread.join(timeout=60)
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "candidates_not_warm"
+    assert calls[0] == 1, "only the warm-up's own dedup pass may run"
+
+
+def test_category_explanation_after_warm_does_not_recompute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client, _state = _cold_client(tmp_path, root)
+    calls = _count_calls(monkeypatch, "find_duplicate_clusters")
+    assert client.post("/api/candidates/warm").status_code == 202
+    response = client.get("/api/ai/category-explanation/duplicates")
+    assert response.status_code == 200
+    assert calls[0] == 1
+
+
+def test_mcp_selector_during_an_in_flight_warm_reuses_it_instead_of_a_second_dedup_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client, state = _cold_client(tmp_path, root)
+    calls, release, warm_thread = _blocked_warm(client, monkeypatch)
+
+    selected: list[object] = []
+    selector = threading.Thread(
+        target=lambda: selected.extend(
+            service.select_candidates_for_selector(
+                state, tier="both", rule_id_or_category="duplicates"
+            )
+        )
+    )
+    selector.start()
+    release.set()
+    warm_thread.join(timeout=60)
+    selector.join(timeout=60)
+    assert not selector.is_alive()
+
+    assert calls[0] == 1, "the selector started its own dedup pass"
+    assert len(selected) == 1, "selector output differs from the warm candidates"
+
+
+# Verifier finding D3 -----------------------------------------------------------------------------
+
+
+def test_candidates_cached_without_clusters_count_as_cold_and_the_next_warm_recomputes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    client, state = _cold_client(tmp_path, root)
+    calls = _count_calls(monkeypatch, "find_duplicate_clusters")
+    assert client.post("/api/candidates/warm").status_code == 202
+    assert service.is_candidates_cache_warm(state)
+    assert calls[0] == 1
+
+    state.candidates_clusters_cache = None  # candidates cached, clusters missing
+    assert not service.is_candidates_cache_warm(state)
+    assert service.candidates_cache_stale_reason(state) == "cold"
+    with pytest.raises(service.CandidatesNotWarmError):
+        service.require_warm_candidates(state)
+
+    assert client.post("/api/candidates/warm").status_code == 202
+    assert calls[0] == 2, "the warm POST must recompute the missing clusters"
+    assert state.candidates_clusters_cache is not None
+    assert client.get("/api/duplicate-clusters/review").status_code == 200
