@@ -7,12 +7,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
+import structlog
+
 from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
 )
 from reclaim.safety_env import assert_not_real_profile_under_pytest
+
+logger = structlog.get_logger(__name__)
+
+# Hash-batch flush retry (`ScanIndex._flush_hash_rows`): total attempts and the pause before each
+# retry. Bounded on purpose -- a lock held longer than ~busy_timeout * 3 is not transient.
+_HASH_FLUSH_TRIES = 3
+_HASH_FLUSH_BACKOFF_SECONDS = (0.5, 2.0)
+
+
+def _backoff_sleep(seconds: float) -> None:
+    """Module-level seam so tests can observe/skip the pause without real sleeping."""
+    time.sleep(seconds)
+
 
 # Migration/backfill batch size for `_backfill_name_and_path_lower` — streamed via
 # `fetchmany`/`executemany` in chunks rather than loading every legacy row at once, so
@@ -385,12 +400,21 @@ class ScanIndex:
     about the entry, not a safety-policy decision), never anything policy-driven.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, busy_timeout_ms: int | None = None) -> None:
         # Hermetic-test guard (ADR-0034 addendum): the ONLY place a connection is opened, so no
         # ScanIndex can exist for a real-profile database under pytest.
         assert_not_real_profile_under_pytest(db_path, operation="open the scan index at")
         self._db_path = Path(db_path)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # `busy_timeout_ms` (None = sqlite3's 5 s default): how long a statement waits on another
+        # connection's write lock before `database is locked`. The candidates warm-up passes a
+        # long one -- its dedup hash flushes are the writes most likely to meet a concurrent
+        # writer (incident 2026-10-08: warm-up died after 2,051 s on a 5 s timeout).
+        if busy_timeout_ms is None:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(
+                db_path, check_same_thread=False, timeout=busy_timeout_ms / 1000
+            )
         self._conn.row_factory = sqlite3.Row
         # Wave 1 finding #4 (2026-07-30 real-disk diagnosis): default rollback-journal mode
         # fsyncs on every commit, which made the batched-transaction rewrite in scanner.py's
@@ -466,7 +490,16 @@ class ScanIndex:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+            return
+        # Another exception is already propagating. A failing close() (e.g. `database table is
+        # locked` from the checkpoint after a failed write) must not replace it: that masked the
+        # real `database is locked` error in the 2026-10-08 incident. Log it as secondary instead.
+        try:
+            self.close()
+        except sqlite3.Error as close_exc:
+            logger.warning("index.close_failed_while_handling_exception", error=str(close_exc))
 
     def has_planner_stats(self) -> bool:
         """True iff `ANALYZE` has populated `sqlite_stat1` for the `files` table."""
@@ -536,8 +569,12 @@ class ScanIndex:
         # TRUNCATE checkpoint reclaims whatever the session's writes left in the WAL (see the
         # `journal_size_limit` comment in __init__) -- without this, closing never shrinks the
         # file, only SQLite's own automatic checkpoints do, and those don't truncate either.
-        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        self._conn.close()
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            # Release the file handle even when the checkpoint fails (it can, right after a
+            # failed write), otherwise the failed connection lingers holding its locks.
+            self._conn.close()
 
     def upsert_records(self, records: Iterable[FileRecord], *, scanned_at: float) -> int:
         """Full upsert (all columns) for new or changed records. Returns rows written."""
@@ -853,14 +890,32 @@ class ScanIndex:
         ]
         if not rows:
             return 0
-        self._conn.executemany(
+        self._flush_hash_rows(
             "UPDATE files SET full_hash = CASE WHEN hash_size IS ?5 AND hash_mtime IS ?6 "
             "THEN full_hash ELSE NULL END, hash_size = ?1, hash_mtime = ?2, partial_hash = ?3 "
             "WHERE path = ?4",
             rows,
         )
-        self._conn.commit()
         return len(rows)
+
+    def _flush_hash_rows(self, sql: str, rows: Sequence[tuple[object, ...]]) -> None:
+        """executemany + commit for a hash batch, retrying `database is locked` (another writer
+        held the index past the busy timeout) up to `_HASH_FLUSH_TRIES` times with backoff. Safe
+        to repeat: the UPDATEs are idempotent and the failed attempt is rolled back first. The
+        final failure re-raises the ORIGINAL error. Hashes are the expensive part of a dedup
+        pass; losing a multi-minute pass to one transient lock is what this exists to prevent."""
+        for attempt in range(_HASH_FLUSH_TRIES):
+            try:
+                self._conn.executemany(sql, rows)
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc) or attempt == _HASH_FLUSH_TRIES - 1:
+                    raise
+                self._conn.rollback()
+                logger.warning("index.hash_flush_locked_retrying", attempt=attempt + 1)
+                _backoff_sleep(_HASH_FLUSH_BACKOFF_SECONDS[attempt])
+            else:
+                return
 
     def store_full_hashes(self, entries: Iterable[tuple[Path, int, float, str]]) -> int:
         """Batch-writes `(path, size, mtime, full_hash)` tuples; see `store_partial_hashes`."""
@@ -870,13 +925,12 @@ class ScanIndex:
         ]
         if not rows:
             return 0
-        self._conn.executemany(
+        self._flush_hash_rows(
             "UPDATE files SET partial_hash = CASE WHEN hash_size IS ?5 AND hash_mtime IS ?6 "
             "THEN partial_hash ELSE NULL END, hash_size = ?1, hash_mtime = ?2, full_hash = ?3 "
             "WHERE path = ?4",
             rows,
         )
-        self._conn.commit()
         return len(rows)
 
     def get_record(self, path: Path) -> FileRecord | None:

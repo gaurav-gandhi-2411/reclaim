@@ -34,8 +34,8 @@ refreshes the SIMPLE results screen.
 - Clients that read these four endpoints with a cold cache now see 409 + a started warm-up where
   they previously got a (slow) 200; they must poll `GET /api/candidates/warm-status` and retry.
   The dashboard does. Existing Python tests use a retrying `WarmingTestClient`.
-- `GET /api/duplicate-clusters/review` does not read this cache (it computes its own clusters,
-  uncached) and is unchanged; it can still be slow on a large index.
+- ~~`GET /api/duplicate-clusters/review` does not read this cache~~ -- superseded, see the
+  addendum "review clusters" below.
 - A category toggle changes the key only; the Settings view itself does not read the cache, so the
   other views re-warm when they are next activated.
 
@@ -44,3 +44,33 @@ refreshes the SIMPLE results screen.
 - Warm in the request on demand (the old behaviour): blocks the request thread for minutes.
 - Trigger the warm and return 202 with a body: breaks the response schema of four endpoints.
 - Warm at the end of every scan inside `run_scan`: delays "scan complete" by the compute time.
+
+## Addendum 2026-10-08: review clusters
+
+`GET /api/duplicate-clusters/review` was the one candidate-cache reader this ADR missed: it ran
+`find_duplicate_clusters` and `generate_duplicate_candidates` itself on every request (an uncached
+whole-index BLAKE3 pass on its own connection, in the request thread; about 30 minutes for the 1.6
+million candidate files of the owner's real index) and the Review Queue tab calls it on load.
+Incident, owner's installed build 2026-10-08: opening the Review Queue while the background warm-up
+was computing started a second concurrent dedup pass (three `dedup.start` lines about 29 minutes
+apart for two warm-ups); both wrote hashes into the same index and the warm-up failed after 2,051 s
+with `database table is locked` (`ScanIndex.close()`'s checkpoint raised after the failed write and
+masked the real `database is locked`). Now the warm pass computes the clusters once, stores them in
+`AppState.candidates_clusters_cache` next to `candidates_cache` (same key, same lock, assigned only
+after a complete compute), and the endpoint answers the typed 409 `candidates_not_warm` (with the
+courtesy warm-up) until then, and builds its rows from the cached clusters and candidates without
+hashing anything. Visible difference: the rows now honour the same scope filter as every other
+view (the cached candidates are scope-filtered). `run_candidates_warm` also gets a 60 s busy
+timeout, bounded retry of hash flushes on `database is locked`, a non-masking `close()` and a
+logged traceback.
+
+Other private-pass readers (same addendum): `GET /api/ai/category-explanation/{group}` now reads
+the warm cache (typed 409). The MCP selector (`select_candidates_for_selector`) goes through
+`_cached_all_candidates` instead, serializing on `candidates_cache_lock` and reusing an in-flight
+warm-up's result, because a scoped MCP scan never auto-warms and a refusal would make
+`preview_apply` unusable. Two consequences, stated plainly: (1) a user cancel of the warm-up does
+not stop a selector already blocked on that lock (when the warm-up ends cancelled, the selector
+computes the cache itself); (2) the MCP `selection_hash` is now derived from the cache, so it can no
+longer notice an on-disk change since the scan -- `delete` therefore re-stats each selected file
+(`service.stale_selected_candidates`: identity, size, mtime, same comparison as the executor's
+pre-flight) and refuses with `SelectionMismatchError` before executing anything.

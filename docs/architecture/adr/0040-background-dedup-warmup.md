@@ -84,6 +84,9 @@ Status additions (all additive): `status` may be `cancelled`; fields `source`, `
 - The pool is created per window instead of once per pass: negligible thread-spawn overhead, but
   a deliberate change to `find_duplicate_clusters`'s structure.
 - The MCP server process also auto-warms after a full-home MCP scan (it shares `run_scan`).
+- The warm-up never competes with another dedup pass: every reader of the clusters, including
+  `GET /api/duplicate-clusters/review`, uses the cache the warm-up fills (ADR-0037 addendum
+  "review clusters").
 - **NOT done / NOT measured (be honest):**
   - Real-drive wall-clock was not measured. The "about an hour" figure is the owner's earlier
     estimate, not re-measured here. Tests count hash calls, never time.

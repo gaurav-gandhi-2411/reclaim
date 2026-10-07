@@ -263,6 +263,14 @@ _CASES: dict[str, Case] = {
         expect_index=True,
         reason="UPDATE ... WHERE path = ? — primary-key point update",
     ),
+    "_flush_hash_rows": Case(
+        lambda idx: idx.store_partial_hashes(
+            [(Path("C:/Data/dir1/file1.bin"), 100, 1.0, "digest")]
+        ),
+        expect_index=True,
+        reason="shared executemany+commit+retry helper behind store_partial_hashes/"
+        "store_full_hashes; exercised through the former (UPDATE ... WHERE path = ?)",
+    ),
     "store_full_hashes": Case(
         lambda idx: idx.store_full_hashes([(Path("C:/Data/dir1/file1.bin"), 100, 1.0, "digest")]),
         expect_index=True,
