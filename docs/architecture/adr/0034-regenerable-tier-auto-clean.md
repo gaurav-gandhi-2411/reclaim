@@ -207,3 +207,27 @@ in its `detail`), whether or not the new category is on.
 **Consequences / limits.** A basetemp holding a virtualenv is left for review (the common
 "venv built inside tmp_path" test pattern), so it never frees that space. How much it frees depends entirely on
 the machine (see the PR that added this for a metadata-only dry run on one).
+## Addendum: Hermetic tests
+
+**Incident.** An independent verifier's probe ran a `regenerable` apply under pytest with only
+`TEMP` redirected; `local_appdata` and `home` still pointed at the real machine, and the apply
+deleted the owner's real Chrome/Edge/Brave/Firefox `Cache`/`Code Cache`/`GPUCache` directories under
+`%LOCALAPPDATA%`. The tier's own safety (allow-list, age floor, open-handle probe) worked as
+designed; the failure was that nothing stopped a test from handing it the real roots.
+
+**Decision.** Two independent layers. (1) The repo-root `conftest.py` has an autouse fixture that
+points every profile root variable at pytest's basetemp for every test (`tests/` and `evals/`), and
+captures the real values once at import. (2) `reclaim.safety_env` is called from every destructive
+choke point (`regenerable._delete_one_file`/`_delete_tree_contents`/`_remove_reparse_entry`, the
+pre-flight of `run_regenerable_clean(apply=True)`, `executor.unlink_clear_readonly`/
+`rmtree_reparse_point_safe`/`_atomic_move`/the Recycle Bin call, `anthropic_key_store.delete_key`)
+and from the real subprocess runners (`regenerable._run_command`, `run_schtasks`, `run_powershell`,
+a genuine `windows_toasts`). Under pytest (`PYTEST_CURRENT_TEST` set OR `pytest` in `sys.modules`)
+a target resolving under a real root is refused with `RealProfileAccessError`, a `BaseException` so
+that the per-item `except Exception` isolation cannot turn it into a "failed item". Outside pytest
+it is a no-op. `RECLAIM_TEST_ALLOW_REAL_PROFILE=1` bypasses it for deliberate manual use.
+
+**Consequences / limits.** The two tests that drive the real Task Scheduler are skipped unless
+that opt-in is set. `SYSTEMROOT` is not redirected (Windows and child interpreters need it), so
+`C:\Windows\Temp` is protected by the guard, not by the redirect. A subprocess a test spawns is
+not covered by the in-process guard. The guard is a backstop, not a licence to skip the redirect.

@@ -325,7 +325,17 @@ def test_hostile_task_name_never_enters_the_script(tmp_path: Path) -> None:
     assert "$env:RECLAIM_TASK_NAME" in script
 
 
+# These two drive the REAL Task Scheduler (throwaway task names). Under pytest the real
+# `schtasks.exe`/`powershell.exe` runners refuse (reclaim.safety_env), so they run only on a
+# deliberate manual opt-in: RECLAIM_TEST_ALLOW_REAL_PROFILE=1 pytest -k real_
+_REAL_SCHEDULER_OPT_IN = pytest.mark.skipif(
+    os.environ.get("RECLAIM_TEST_ALLOW_REAL_PROFILE") != "1",
+    reason="drives the real Task Scheduler; set RECLAIM_TEST_ALLOW_REAL_PROFILE=1 to run",
+)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows-only")
+@_REAL_SCHEDULER_OPT_IN
 def test_real_query_of_hostile_unregistered_name_is_registered_false(tmp_path: Path) -> None:
     status = query_task(
         username="Reclaim-pytest (O'Brien $x) [a*]", diag_log_path=tmp_path / "d.log"
@@ -340,6 +350,7 @@ def test_default_diag_path_is_under_data_root() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows-only")
+@_REAL_SCHEDULER_OPT_IN
 def test_real_task_scheduler_round_trip(tmp_path: Path) -> None:
     """Registers a throwaway task (unique name, harmless exe), queries it, removes it, and
     proves it is gone -- try/finally so a failure can never leave a task behind."""
