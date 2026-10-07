@@ -1004,7 +1004,9 @@ class ScanIndex:
 
     def duplicate_candidates_for_sizes(self, sizes: Sequence[int]) -> list[FileRecord]:
         """The same rows `duplicate_size_candidates()` yields, restricted to `sizes` and ordered
-        `(size, rowid)` -- the order the streaming query visits `idx_files_size` in. Fully
+        `(size, rowid)`. This is NOT claimed to be the streaming query's visit order: on an
+        un-ANALYZEd index the old plan used `idx_files_is_cloud_placeholder` plus a temp b-tree
+        for ORDER BY; the rowid order within a size was identical empirically. Fully
         consumed (`fetchall`) before returning: dedup writes hashes between calls, and an open
         cursor would pin a read snapshot so the WAL could not be checkpointed (13 GB incident,
         2026-10-08). `sizes` must be a bounded chunk (SQLite's bound-variable limit applies)."""

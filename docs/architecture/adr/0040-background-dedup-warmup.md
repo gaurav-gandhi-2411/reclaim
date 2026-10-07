@@ -142,7 +142,8 @@ above, not something this fixture predicts.
 - After every flush `ScanIndex.checkpoint_wal` runs a `PASSIVE` checkpoint, and a `TRUNCATE` one if
   the WAL file exceeds `_WAL_CEILING_BYTES` (256 MB). A busy checkpoint (another reader) is not an
   error; the next flush retries.
-- Disk guard: before the pass and at each window boundary, free space on the index volume must be at
+- Disk guard: immediately before a stage that has uncached files to hash (never on a fully cached
+  window or pass, so hot-cache reads such as `GET /api/candidates` never trip it), free space on the index volume must be at
   least `_MIN_FREE_DISK_BYTES` (2 GB) plus the current WAL size, else the pass flushes what it has
   hashed and raises `DedupAborted` ("not enough free disk space on C: ..."). The warm status already
   reports any exception as `failed` with its text as `error`. Resume keeps the hashes. If the volume
@@ -152,6 +153,21 @@ above, not something this fixture predicts.
   are DEBUG. Each pass logs one INFO summary with a count, per-reason counts and the first 5 samples:
   `dedup.members_excluded`, `dedup.clusters_excluded_protected_member`, `dedup.hash_unreadable`.
   The stale-listing line has no summary.
+
+**Limits and deliberate trade-offs (adversarial review of PR #151).**
+- (a) A long-held foreign read transaction still lets the WAL grow. Measured with a reader held for
+  the whole pass: max WAL 21,119,152 bytes new == old (without a reader: 984,712 new vs 20,628,872
+  old). This change removes the pass's own cursor, not other connections'; the disk guard is the
+  backstop.
+- (b) Sizes are snapshotted up front, so a concurrent writer can now produce a stale view (in theory
+  the same path in two clusters), never a crash; the old code crashed with `database is locked`.
+- (c) The guard fails open when `disk_usage` raises `OSError` (one warning per pass), a deliberate
+  departure from fail-closed: it is a safety net, not a gate. It also only runs when a stage has
+  uncached files, and the two read endpoints that can reach it answer a typed 503
+  (`code: dedup_insufficient_disk`) instead of 500. Messages use MB (exact bytes when free and need
+  round to the same MB).
+- (d) `dedup.hash_unreadable` changed from a per-file WARNING to a single INFO summary;
+  `dedup.hash_cache_stale_listing` is DEBUG with no summary count.
 
 **Not measured.** Real-index wall-clock and peak WAL after the change (no run against the 7 GB index
 was made); the cost of the extra `duplicate_qualifying_sizes` query (it repeats the 15-60 s subquery
