@@ -542,10 +542,16 @@ def clean_one_click_summary(
 
 
 @router.get("/duplicate-clusters/review", response_model=DuplicateClusterReviewResponse)
-def duplicate_cluster_review(request: Request, limit: int = 15) -> DuplicateClusterReviewResponse:
+def duplicate_cluster_review(
+    request: Request, background_tasks: BackgroundTasks, limit: int = 15
+) -> DuplicateClusterReviewResponse | JSONResponse:
     if limit < 1:
         raise HTTPException(status_code=400, detail=f"limit must be >= 1 (got {limit!r})")
-    return service.list_duplicate_cluster_review(get_state(request), limit=limit)
+    state = get_state(request)
+    try:
+        return service.list_duplicate_cluster_review(state, limit=limit)
+    except service.CandidatesNotWarmError as exc:
+        return _not_warm_response(state, background_tasks, exc)
 
 
 @router.post("/apply", response_model=ApplyStatusOut, status_code=202)
