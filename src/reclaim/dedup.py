@@ -655,6 +655,18 @@ def _hash_stage(
     return digests
 
 
+def _any_uncached(
+    records: list[FileRecord],
+    hash_cache: dict[str, HashCacheEntry],
+    cached_lookup: Callable[[HashCacheEntry | None, int, float], str | None],
+) -> bool:
+    """True when at least one record has no valid cached digest, i.e. hashing will read disk."""
+    return any(
+        cached_lookup(hash_cache.get(r.path.as_posix()), r.size_bytes, r.mtime) is None
+        for r in records
+    )
+
+
 def materiality_exclusion_stats(
     index: ScanIndex, *, min_reclaim_bytes: int = _DEFAULT_MIN_RECLAIM_BYTES
 ) -> MaterialityExclusionStats:
@@ -670,6 +682,11 @@ def materiality_exclusion_stats(
     )
 
 
+def _default_disk_usage(path: Path) -> DiskUsage:
+    # Looked up at call time (not bound as a default) so tests can patch `shutil.disk_usage`.
+    return shutil.disk_usage(path)
+
+
 def find_duplicate_clusters(
     index: ScanIndex,
     *,
@@ -678,7 +695,7 @@ def find_duplicate_clusters(
     exclusion_patterns: Sequence[str] = (),
     checkpoint: Callable[[], None] | None = None,
     worker_initializer: Callable[[], None] | None = None,
-    disk_usage: Callable[[Path], DiskUsage] = shutil.disk_usage,
+    disk_usage: Callable[[Path], DiskUsage] = _default_disk_usage,
 ) -> list[DuplicateCluster]:
     """Size bucket -> 64KB partial hash -> full BLAKE3 hash, exactly in that order, reusing
     cached hashes from a prior run wherever a file's (size, mtime) hasn't changed since.
@@ -768,10 +785,12 @@ def find_duplicate_clusters(
         if free < needed:
             flush_writes()  # keep what is hashed: the next pass resumes from it
             volume = index.db_path.drive or str(index.db_path.parent)
+            free_text, needed_text = f"{free / 1024**2:.0f} MB", f"{needed / 1024**2:.0f} MB"
+            if free_text == needed_text:  # within rounding of the floor: never print a tie
+                free_text, needed_text = f"{free:,} bytes", f"{needed:,} bytes"
             raise DedupAborted(
-                f"not enough free disk space on {volume}: {free / 1024**3:.1f} GB free, need at "
-                f"least {needed / 1024**3:.1f} GB. Free up space and run again; the files "
-                "already hashed are kept."
+                f"not enough free disk space on {volume}: {free_text} free, need at least "
+                f"{needed_text}. Free up space and run again; the files already hashed are kept."
             )
 
     def heartbeat() -> None:
@@ -808,7 +827,6 @@ def find_duplicate_clusters(
 
     def run_window(window: list[tuple[int, list[FileRecord]]]) -> None:
         check_cancel()
-        check_disk()
         try:
             with ThreadPoolExecutor(
                 max_workers=_HASH_TIMEOUT_WORKERS, initializer=worker_initializer
@@ -822,9 +840,12 @@ def find_duplicate_clusters(
         executor: ThreadPoolExecutor, window: list[tuple[int, list[FileRecord]]]
     ) -> None:
         # Stage 1: 64KB head+tail partial hash of every file in the window, concurrently.
+        window_records = [record for _, members in window for record in members]
+        if _any_uncached(window_records, hash_cache, _cached_partial_lookup):
+            check_disk()  # only when real hashing is about to happen: a warm pass never aborts
         partial_digests = _hash_stage(
             executor,
-            [record for _, members in window for record in members],
+            window_records,
             stage="partial",
             hash_cache=hash_cache,
             cached_lookup=_cached_partial_lookup,
@@ -872,6 +893,8 @@ def find_duplicate_clusters(
                     else:
                         full_needed.append(record)
         # Stage 2: full BLAKE3 of the remaining candidates (the final arbiter), concurrently.
+        if _any_uncached(full_needed, hash_cache, _cached_full_lookup):
+            check_disk()
         full_digests.update(
             _hash_stage(
                 executor,
@@ -912,7 +935,6 @@ def find_duplicate_clusters(
 
     window: list[tuple[int, list[FileRecord]]] = []
     window_files = 0
-    check_disk()
     # The qualifying-size subquery is expensive (15-60 s on a real index): run it once, not per
     # fetch. Each fetch below is a short SELECT consumed in full before anything is written, so
     # no cursor is ever open across a flush (and none can be left open by a cancel unwinding).

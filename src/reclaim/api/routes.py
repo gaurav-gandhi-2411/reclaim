@@ -58,6 +58,7 @@ from reclaim.api.state import (
     ScanStatus,
 )
 from reclaim.autoclean_schedule import AutoCleanScheduleError
+from reclaim.dedup import DedupAborted
 from reclaim.drives import NoFixedDrivesFoundError
 from reclaim.executor import (
     BatchNotFoundError,
@@ -462,6 +463,14 @@ def _not_warm_response(
     )
 
 
+def _dedup_aborted_response(exc: DedupAborted) -> JSONResponse:
+    """Typed 503 when a duplicate pass has to hash files but the index volume is nearly full.
+    The reader endpoints must never answer 500 for this: the message says what to do next."""
+    return JSONResponse(
+        status_code=503, content={"detail": str(exc), "code": "dedup_insufficient_disk"}
+    )
+
+
 @router.get("/summary", response_model=SummaryResponse)
 def summary(request: Request, background_tasks: BackgroundTasks) -> SummaryResponse | JSONResponse:
     state = get_state(request)
@@ -496,6 +505,8 @@ def candidates(
         return service.list_candidates(state, tier=tier, category_group=category)
     except service.CandidatesNotWarmError as exc:
         return _not_warm_response(state, background_tasks, exc)
+    except DedupAborted as exc:
+        return _dedup_aborted_response(exc)
 
 
 @router.post(
@@ -542,10 +553,15 @@ def clean_one_click_summary(
 
 
 @router.get("/duplicate-clusters/review", response_model=DuplicateClusterReviewResponse)
-def duplicate_cluster_review(request: Request, limit: int = 15) -> DuplicateClusterReviewResponse:
+def duplicate_cluster_review(
+    request: Request, limit: int = 15
+) -> DuplicateClusterReviewResponse | JSONResponse:
     if limit < 1:
         raise HTTPException(status_code=400, detail=f"limit must be >= 1 (got {limit!r})")
-    return service.list_duplicate_cluster_review(get_state(request), limit=limit)
+    try:
+        return service.list_duplicate_cluster_review(get_state(request), limit=limit)
+    except DedupAborted as exc:
+        return _dedup_aborted_response(exc)
 
 
 @router.post("/apply", response_model=ApplyStatusOut, status_code=202)

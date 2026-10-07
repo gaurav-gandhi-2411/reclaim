@@ -294,7 +294,7 @@ def test_disk_guard_stops_cleanly_with_a_readable_error_and_keeps_what_is_hashed
         hashed = index._conn.execute(
             "SELECT COUNT(*) FROM files WHERE partial_hash IS NOT NULL"
         ).fetchone()[0]
-    assert "GB free" in str(err.value) and "Free up space" in str(err.value)
+    assert "MB free" in str(err.value) and "Free up space" in str(err.value)
     assert hashed > 0  # flushed before stopping: a resume keeps it
     assert hashed < _BUCKETS * _PER_BUCKET
 
