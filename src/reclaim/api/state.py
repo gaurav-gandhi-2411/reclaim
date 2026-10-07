@@ -296,6 +296,15 @@ class AppState:
     # `_all_candidates` applies to candidates; always None while `candidates_cache` is None.
     candidates_clusters_cache: list[DuplicateCluster] | None = None
     candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
+    # perf/summary-physical-size: `index.physical_size_bytes_total()` is a whole-table aggregate
+    # (seconds on a multi-million-row index), so `service.cached_physical_size_bytes` memoizes it
+    # per scope (`str(under)` or None) under the key it was computed for (scan generation + the
+    # index files' stat signature). `physical_size_cache_lock` is dedicated and held across the
+    # compute so concurrent requests single-flight instead of running the aggregate twice.
+    physical_size_cache: dict[str | None, tuple[tuple[object, ...], int]] = field(
+        default_factory=dict
+    )
+    physical_size_cache_lock: threading.Lock = field(default_factory=threading.Lock)
     # AE1: single-flight background-warm status for the cache above -- see
     # `CandidatesWarmStatus`'s own docstring for the real cold-start cost this exists to make
     # non-blocking/visible instead of silent.

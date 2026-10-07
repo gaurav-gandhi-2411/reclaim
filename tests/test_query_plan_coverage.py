@@ -274,6 +274,12 @@ _CASES: dict[str, Case] = {
         reason="under=None means 'read the whole table' by design (dashboard total-usage view) "
         "— no index narrows a query that intentionally wants every row",
     ),
+    "physical_size_bytes_total": Case(
+        lambda idx: idx.physical_size_bytes_total(),
+        expect_index=False,
+        reason="under=None is a whole-table aggregate (every row read once) pinned to a table "
+        "scan with NOT INDEXED -- plan stability: tests/test_physical_size_sql.py",
+    ),
     "candidate_inventory": Case(
         lambda idx: idx.candidate_inventory(),
         expect_index=True,

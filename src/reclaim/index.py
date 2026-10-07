@@ -378,6 +378,10 @@ _DISTINCT_INODES_PER_SIZE_SQL = """
     GROUP BY size, (ino = 0), CASE WHEN ino = 0 THEN 0 ELSE dev END,
              CASE WHEN ino = 0 THEN rowid ELSE ino END
 """
+# Grouping for `ScanIndex.physical_size_bytes_total`: one group per (dev, ino); the CASE gives every
+# dev == ino == 0 row its own group (identity unknown -- never deduplicated, as in the Python
+# `physical_size_bytes`). The bare `size` next to MIN(...) is the size of that first row.
+_PHYSICAL_GROUP_BY = "GROUP BY dev, ino, CASE WHEN dev = 0 AND ino = 0 THEN rowid ELSE 0 END"
 # Sizes whose bucket clears the materiality floor at distinct-inode level (param: the floor).
 # S608: only module-level constants are interpolated, never a caller-supplied value.
 _QUALIFYING_SIZES_SQL = f"""
@@ -1159,6 +1163,44 @@ class ScanIndex:
         """Everything the scanner has seen, including cloud placeholders — for the treemap
         and total-usage display, which must reflect real disk (and cloud-footprint) usage."""
         return self._query_inventory(under, candidates_only=False)
+
+    def physical_size_bytes_total(self, under: Path | None = None) -> int:
+        """SQL-side twin of `physical_size_bytes(self.full_inventory(under))`: the same number,
+        computed as one aggregate query without materializing a single `FileRecord` (on a
+        6.9M-row index the Python form took minutes per `/api/summary` request).
+
+        Mirrors the Python rule exactly: directories are skipped; cloud placeholders are NOT
+        filtered (`full_inventory` includes them); a (dev, ino) pair counts once, first-seen row
+        winning (`rowid` order unscoped, `path` order scoped -- the order `full_inventory`
+        iterates in for each form); only dev == 0 AND ino == 0 rows each count separately
+        (note: ino == 0 with a non-zero dev IS deduplicated by the Python function, unlike
+        `_DISTINCT_INODES_PER_SIZE_SQL`, which keys on ino alone).
+        """
+        if under is None:
+            # NOT INDEXED: same whole-table-aggregate plan pin as `_DISTINCT_INODES_PER_SIZE_SQL`
+            # (see its comment) -- a sequential scan whether or not `sqlite_stat1` exists.
+            sql = f"""
+                SELECT COALESCE(SUM(size), 0) AS total FROM (
+                    SELECT size, MIN(rowid) FROM files NOT INDEXED WHERE is_dir = 0
+                    {_PHYSICAL_GROUP_BY}
+                )
+            """  # noqa: S608 -- only module-level constants are interpolated
+            params: tuple[object, ...] = ()
+        else:
+            prefix = under.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            # Unary `+` keeps the primary-key path range as the access path (see
+            # `subtree_entry_count`); MIN(path) = first row in that range's iteration order.
+            sql = f"""
+                SELECT COALESCE(SUM(size), 0) AS total FROM (
+                    SELECT size, MIN(path) FROM files
+                    WHERE (path = ? OR (path >= ? AND path < ?)) AND +is_dir = 0
+                    {_PHYSICAL_GROUP_BY}
+                )
+            """  # noqa: S608 -- only module-level constants are interpolated
+            params = (prefix, lower, upper)
+        row = self._conn.execute(sql, params).fetchone()
+        return int(row["total"])
 
     def candidate_inventory(self, under: Path | None = None) -> list[FileRecord]:
         """Everything except cloud placeholders, fully materialized into a `list[FileRecord]`.
