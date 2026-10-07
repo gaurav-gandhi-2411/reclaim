@@ -245,3 +245,18 @@ categories: read-only subprocesses (`git rev-parse`, `git status`) and SQL on a 
 only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open. Limits:
 the scanner is lexical (a guard in the function, not proof it covers the right path), and a
 `Path.open(mode_variable)` is not detected.
+
+
+## Addendum: Upgrade path
+
+*Added 2026-10-05. Closes the last Consequences bullet of the addendum above (an existing install kept a single-trigger task until the user toggled Settings off/on).*
+
+**Decision.** `reclaim auto-clean --reconcile-task` (mutually exclusive with `--apply`/`--dry-run`; cleans nothing) reads `[autoclean] enabled` from the user's `config.toml`. Enabled: `register_task()` (schtasks `/f`, so an old single-trigger task is replaced by the current weekly + logon definition). Disabled or no config: no schtasks call at all and no task is created. Source/dev run: message, exit 0. Real failure (schtasks error, invalid config, elevated): actionable message on stderr, exit 1, details in `task_registration_diagnostic.log`. Safe to repeat. `packaging/reclaim.iss` runs it from `[Run]` on every install and upgrade, in `{app}`, with `runhidden nowait skipifdoesntexist runasoriginaluser`. Inno does not fail an install on a `[Run]` exit code (BELIEVED from Inno's documented behaviour, not exercised here), so a failure never blocks the install; the Settings toggle remains the manual path.
+
+**Account.** Setup is `PrivilegesRequired=lowest`, so the disk-space task step (`RegisterDiskSpaceTask`, `[Code]`) already runs as the installing user. `runasoriginaluser` keeps the new step on that same user even if Setup were launched elevated, because the task is a per-user `InteractiveToken` task and `auto-clean` refuses to run elevated.
+
+**Uninstall.** The uninstaller (`UnregisterAutoCleanTask`) also deletes `Reclaim Weekly Auto-Clean (<user>)`, with the same BM3 guard as the disk-space task (only if absent or pointing at this install's exe), failure ignored; without it the task outlived the exe and every upgrade re-registered it.
+
+**`--json`.** `--reconcile-task --json` writes exactly one document on every path, via the same helper and vocabulary as the `--json` contract of `auto-clean` (human text to stderr, exception class name only in JSON). Two additions for its success path: status `ok` and reason `task_registered`; a source run maps to `skipped`/`nothing_to_do`, a schtasks failure to `error`/`run_failed`.
+
+**Not verified.** A real installer upgrade over a real old task, and a real uninstall, have not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.
