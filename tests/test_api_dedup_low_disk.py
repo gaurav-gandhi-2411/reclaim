@@ -102,10 +102,19 @@ def test_review_endpoint_returns_a_typed_non_500_when_the_guard_fires(
 
     response = client.get("/api/duplicate-clusters/review")
 
-    assert response.status_code == 503, response.text
+    # With the warm-cache reads (review-clusters PR) a cold cache answers the typed 409 and starts
+    # the courtesy warm-up, which is what meets the guard; the 503 handler in the route is the
+    # backstop for a guard that fires on the read path itself. Never a 500 either way.
+    assert response.status_code in (409, 503), response.text
     body = response.json()
-    assert body["code"] == "dedup_insufficient_disk"
-    assert "not enough free disk space" in body["detail"]
+    if response.status_code == 409:
+        assert body["code"] == "candidates_not_warm"
+        status = client.get("/api/candidates/warm-status").json()
+        assert status["status"] == "failed", status
+        assert "not enough free disk space" in status["error"]
+    else:
+        assert body["code"] == "dedup_insufficient_disk"
+        assert "not enough free disk space" in body["detail"]
 
 
 def test_message_does_not_round_to_a_self_contradiction(

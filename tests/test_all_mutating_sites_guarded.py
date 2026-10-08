@@ -258,8 +258,6 @@ ALLOWLIST: dict[str, str] = {
             "record_seen",
             "protect_under",
             "end_scan_tracking",
-            "store_partial_hashes",
-            "store_full_hashes",
         )
     },
 }
