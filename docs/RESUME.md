@@ -3,7 +3,105 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-08 ~02:40 IST (full delegation; app BUILT, INSTALLED, scanned, one-click run) -- READ THIS FIRST
+## CHECKPOINT 2026-10-08 ~06:00 IST (batch prepared for one GG action; BUILD BLOCKED ON DISK) -- READ THIS FIRST
+
+VERIFIED = I ran it this session and quote the output; BELIEVED = inferred, stated as such.
+
+### State in five lines
+- main = `703be93` (#152 merged). main CI on that commit: `ci`, `eval`, `scale-nightly`, `pages-build-deployment` all `success` (VERIFIED, `gh run list --branch main`).
+- `integration/next` (pushed) = main + #140, #143, #145, #144, #142, #138, #151, #150 + one test-reconciliation commit; head `ee078d6`.
+  Full verify run 1 on `f3d547f`: **4 failed, 1932 passed** (`verify_intnext1.txt`, scratchpad). Three were real cross-PR test issues, now fixed (below); the fourth is the cold-start budget eval measured on a loaded, disk-starved machine (median 6217.6 ms vs 2000 ms budget): NOT counted as fixed, re-run on a quiet machine. Run 2 on `ee078d6` was started; its result goes in the next checkpoint (until then: **integration/next is NOT yet verify-green**).
+- **The build/install is blocked: C: free is 3.3-11.6 GB, the steering requires 25 GB.** Disk step 0 below.
+- The installed app on gaura is still the 2026-10-08 build of `integration/2026-10-07` (pre-#150/#151/#152 fixes): see "Known issues" in docs/HOWTO.md section 6b (avoid the Review Queue right after a big scan).
+- Soak verdict: no leak (below).
+
+### MERGE LOG (merged by me under the existing gate)
+| PR | what | merge commit | gate result at merge | verifier | CI |
+|---|---|---|---|---|---|
+| #141 | docs checkpoint | `d2948c2` | docs-only | n/a | green |
+| #146-#149 | docs checkpoints / GAPS / HOWTO | on main | docs-only | n/a | green |
+| #152 | `/api/summary` SQL physical-size aggregate + per-generation cache | `703be93` | gates 1-5 pass (324 reviewable lines) | second-pass verifier: 1,818 SQL-vs-Python diffs, 0 mismatches; JSON byte-identical; mutations caught (46-47/56 tests fail) | main CI green on `703be93` |
+
+Verifier follow-ups on #152 NOT yet fixed (none blocking): scoped whole-drive aggregate ~6.5x slower than unscoped on a 500k synthetic index (reuse the unscoped total when scope covers every row); stat-signature cache can serve stale if a writer restores mtime with identical db/WAL size; `SUM(size)` raises past 2^63 bytes. Real-index speedup NOT measured.
+
+### Disk, step 0 (steering item 1)
+- Free before/after (VERIFIED, `Get-PSDrive`): 13.9 GB -> 18.3 GB after deleting my own old things; pagefile.sys 17 GB throughout.
+- Deleted (each check run and read first, deletion in a separate command): `%TEMP%\claude\{lo, oss2-docker, rwt, resume-venv}` (other, NON-excluded projects, newest content 24-09, no live process matched, none was a git repo with state; `oss2-docker` was a dangling worktree stub) ~3.2 GB; worktrees of merged PRs `reclaim-wt-{docs2,docs3,docs4,resume,resume2,fix-summary}` (all clean) ~1.3 GB. Untouched: fr-en-transformer, shipdoc-extract, intent-router and everything else under %TEMP%\claude, `%TEMP%\pytest-of-gaura`, `hub_roundtrip_*`.
+- `uv cache prune` (UV_LOCK_TIMEOUT=120, no --force): "No unused entries found". The uv preview number is the known overstatement.
+- `reclaim.exe auto-clean --apply`: freed ~1.2 MB (npm already cleaned earlier; pip cleaned); audit in `data\regenerable_audit.jsonl`.
+- Then C: fell to 3.3 GB within ~40 min and recovered to ~11 GB. NOT caused by Reclaim or my agents (my only runaway was a backgrounded `Get-Content -Tail` I stopped by task id and whose 144 MB output I deleted). Large writers seen: `%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx` 51.8 -> 50.6 GB (modified during the drop), a triage-iq session's task log (426 -> 705 MB, ~16 MB/min), gold-rate-tracker session scratch 17.6 GB. **I did not identify the source of the 10 GB swing.** I did not touch any of them.
+- 25 GB cannot be reached with what I am allowed to delete (nothing else is >7 days old and non-excluded). The big levers are GG's: Docker data/VHDX, other sessions' scratch.
+
+### integration/next: conflict resolutions (so each PR's eventual merge is mechanical)
+Merge order used: #140, #143, #145, #144, #142, #138, #151, #150.
+1. `docs/architecture/adr/0034-regenerable-tier-auto-clean.md`: #142 vs #145 addendum, then #138 vs the same section: all additive; keep both paragraphs (the "Upgrade path" addendum goes after the "Hermetic tests" addendum + #142's CI paragraph).
+2. `src/reclaim/index.py` `ScanIndex.__init__`: #145 adds the `assert_not_real_profile_under_pytest(...)` call, #151 changes `self._db_path = Path(db_path)`, #150 adds `*, busy_timeout_ms: int | None = None` and the timeout branch. Resolved signature: `def __init__(self, db_path: Path, *, busy_timeout_ms: int | None = None)`, guard call first, then `self._db_path = Path(db_path)`, then the `busy_timeout_ms` connect branch.
+3. `src/reclaim/api/routes.py` `/duplicate-clusters/review`: #151 catches `DedupAborted` -> typed 503; #150 takes `BackgroundTasks` and catches `service.CandidatesNotWarmError` -> `_not_warm_response`. Resolved: both `except` arms, the `BackgroundTasks` parameter kept.
+4. Test-level interactions found by the full verify (not textual conflicts):
+   - `tests/test_all_mutating_sites_guarded.py` (#145): the allowlist entries `index.py:ScanIndex.store_partial_hashes` / `store_full_hashes` are STALE once #150 lands (its `_flush_hash_rows` now holds the SQL). Remove those two names from the allowlist when #145 is rebased after #150, or #150 after #145.
+   - `tests/test_api_dedup_low_disk.py::test_review_endpoint_returns_a_typed_non_500_when_the_guard_fires` (#151): with #150 a cold review answers 409 `candidates_not_warm` and the courtesy warm-up hits the disk guard (warm-status `failed`, readable error). Test relaxed to accept 409+failed-warm or 503.
+   - `tests/test_review_clusters_warm.py::test_category_toggle_...` (#150): wrote `config.toml` into the cwd; CI hid it, #140's guard refuses it in a checkout under the real home. Fixed ON #150's own branch (`b0f6bad`, `monkeypatch.chdir(tmp_path)`); it was a latent hygiene bug in #150, not only an integration issue.
+
+### GG MERGE BATCH (one action; in dependency order)
+Gate results are from `merge_gate.py` run read-only on 2026-10-08 (VERIFIED, quoted per PR). Heads are short SHAs.
+
+| order | PR | head | base | gate 1/2/3/4 | needs from GG |
+|---|---|---|---|---|---|
+| 1 | #140 hermetic tests | `d1437fa` | main | pass/pass/pass(309+353 test)/**FAIL: `src/reclaim/safety_env.py`** | gate-4 waiver OR merge in the GitHub UI |
+| 2 | #143 safety_env normalisation | `8626c3a` | #140's branch | pass/pass/pass(120)/**FAIL: `safety_env.py`** | same |
+| 3 | #145 guard every mutating site | `81dd3e6` | #140's branch | all pass (80 reviewable) | merge (after retarget, below) |
+| 4 | #144 refusal leaves no dangling intent | `c2cc084` | #140's branch | all pass (88) | merge (after retarget) |
+| 5 | #142 real Task Scheduler CI | `ca04d1d` | #140's branch | **gate 1 FAIL: branch `ci/...` not recognised** (no waiver exists for gate 1; renaming the branch would be gate-gaming) | merge by hand in the GitHub UI |
+| 6 | #138 installer re-registers weekly task | `4635286` | main | all pass (145) | merge (needs main merged in: BEHIND) |
+| 7 | #151 bounded WAL + disk guard | `e355ab2` | main | all pass (321) | merge |
+| 8 | #150 review clusters via warm cache | `b0f6bad` | main | all pass (340 at `a23eaff`; re-run on `b0f6bad`) | merge |
+
+Honest note on "eligible": #138, #150, #151 (base main) pass the existing gate, so I COULD self-merge them under the turn-6 delegation; I held them in the batch because the 2026-10-08 steering lists them there and because #150/#151/#145 conflict pairwise. Say "self-merge #138/#150/#151" and I will. #143/#144/#145/#142 are stacked on #140's branch: merging them first lands them in that branch, NOT main.
+
+**Steps for GG, in order (everything else is mine):**
+1. Merge #140 into main. Simplest: GitHub UI (the guard hook only constrains my own `gh pr merge`; no waiver needed). If you prefer the waiver route, paste into `~/.claude/scripts/merge_gate.py` `GATE4_WAIVER_ALLOWLIST` (I am forbidden to edit that file):
+```python
+    "gaurav-gandhi-2411/reclaim#140": {
+        "rationale": (
+            "src/reclaim/safety_env.py is a real gate-4 hit by name (it guards 'env'/profile "
+            "roots) but is a pytest-only hermetic guard: it is a no-op outside pytest "
+            "(PYTEST_CURRENT_TEST / 'pytest' in sys.modules). Head d1437fa; verifier probe that "
+            "motivated it deleted real browser caches; second-pass verifier findings fixed in #143."
+        ),
+        "gg_approval": "GG: approve reclaim#140 head d1437fa gate-4 waiver (safety_env.py, pytest-only guard)",
+    },
+    "gaurav-gandhi-2411/reclaim#143": {
+        "rationale": (
+            "Same path (safety_env.py): UNC/device/loopback normalisation and sandbox-env "
+            "hardening of the same pytest-only guard; verifier findings 1 and 2 on #140."
+        ),
+        "gg_approval": "GG: approve reclaim#143 head 8626c3a gate-4 waiver (safety_env.py, pytest-only guard)",
+    },
+```
+   (The `gg_approval` strings are drafts: GG must say the approval himself; I did not and cannot grant it.)
+2. Retarget the stacked PRs to main right after #140 lands (do NOT delete #140's branch first): `gh pr edit 143 --base main`, same for 144, 145, 142. Then I merge main into each (plain merge commits) and re-verify.
+3. Merge #143, #145, #144 (any order after retarget, #145 last of the three because of the allowlist note above), then #142 by hand.
+4. #138: I merge main into it (expected conflict: ADR-0034 addenda, keep both). Then merge.
+5. #151, then #150. Expected conflicts when the second of {#145, #151, #150} lands: items 2-4 of "conflict resolutions" above. `integration/next` is the worked solution: `git diff origin/main origin/integration/next` shows the end state.
+6. After the batch is in: I rebuild from main (ccache is warm now), smoke, reinstall, repeat the browser check.
+
+Verifier evidence per PR: #150 / #151 / #152 second-pass verifier reports are summarised in the PR bodies and in `docs/verifier-reports/2026-10-08-pr-150-151-152.md` (this PR). #140/#143/#144/#145/#138 verifier results are in earlier RESUME sections and PR bodies (their raw agent transcripts were not saved as files in the repo: BELIEVED sufficient, not re-verified this session).
+
+### Soak verdict (calibration, 2 h, frozen exe, VERIFIED from `%TEMP%\reclaim_soak\2026-10-08-calibration\soak_samples.csv`, 132 samples, 12 cycles, t=0..7142.8 s)
+- Handles: 268 baseline, 280 flat from t=420 s to the end; threads settle at 3 (baseline 10); peak during scan/API phases 560 handles / 35 threads, returning to baseline afterwards.
+- Private bytes: 66.98 MB at start, 85.0-86.9 MB for every cycle from cycle 2 onward; fitted idle slope 1.66 MB/h, not monotone (cycle 11 is lower than cycle 10). RSS 133-139.5 MB.
+- Verdict: **no leak signature.** Limits: synthetic fixture, one process, 2 h; not a long-run guarantee.
+
+### WHEN GG HAS TIME (nothing here blocks me)
+1. **Free disk (blocks the build, needs you):** C: needs >=25 GB free before I build. Candidates, biggest first: Docker Desktop data (`docker system prune` after looking at `docker system df`, then compact `docker_data.vhdx` in an elevated PowerShell with `Optimize-VHD`); other sessions' scratch under `%TEMP%\claude` (gold-rate-tracker 17.6 GB, review-iq 8.8 GB, gg-portfolio 6.1 GB) once those sessions end; the triage-iq session's runaway task log (`...\triage-iq\979152a2-...\tasks\bby5b7ohr.output`, 705 MB and growing ~16 MB/min) belongs to that session.
+2. Do the merge steps above (GG MERGE BATCH).
+3. Look at the screen once after the next install: the "Disk space is running low" toast (80% alert) and the "Before you start" first-run modal ("I understand, continue").
+4. Optional: reboot (pagefile reset) and a UAC-elevated compaction; both skipped by instruction.
+
+### Not done yet (honest list)
+integration/next verify run 2 result; rebuild + smoke + DLL closure; reinstall; fresh scan; real-browser Overview screenshot in warm state (summary was slow before #152); cold-start budget re-measure on a quiet machine; 80%/weekly re-confirmation after reinstall; final report.
+
+## CHECKPOINT 2026-10-08 ~02:40 IST (full delegation; app BUILT, INSTALLED, scanned, one-click run) -- superseded where it differs from the section above
 
 **Where things stand (VERIFIED unless marked):** the integration build `integration/2026-10-07` (head `250f40d` = main `d2948c2` + #140
 + #143 + #144 + #145 + #138) is **built and installed on the owner's account**. Main is `d663439`. Open PRs: #138, #140, #142, #143, #144, #145
