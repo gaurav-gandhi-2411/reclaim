@@ -3,6 +3,38 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## CHECKPOINT 2026-10-08 ~11:00 IST (build running on D:; supersedes the disk/build parts of the 06:00 section)
+
+VERIFIED = command run this session; BELIEVED = inferred.
+
+### WHEN GG HAS TIME (top of list, per 2026-10-08 steering)
+1. **Excluded projects' transient scratch is the main disk consumer -- decide whether CC may clear finished sessions' scratch for those projects.**
+   Sizes (VERIFIED, first sampler pass 10:50-10:59 IST, `%TEMP%eclaim_soak6-10-08-attrib\sizes.csv`): `%TEMP%\claude\` fr-en-transformer 10.21 GB,
+   shipdoc-extract 6.52 GB, intent-router 6.18 GB = **22.9 GB**. For comparison NON-excluded: gold-rate-tracker 17.39 GB, review-iq 8.47 GB, gg-portfolio 6.12 GB,
+   triage-iq 5.92 GB. I touched none of them (observation only; hard exclusion stands until you decide).
+2. **GG MERGE BATCH** (block below, unchanged: #140, #143, #145, #144, #142, #138, #151, #150, in that order, with retargeting steps).
+3. Other disk levers: Docker `docker_data.vhdx` 50.7 GB + wsl 26.5 GB (prune/compact); uv cache 31.4 GB (prune freed only 229 MiB, rest is in use).
+4. Look once at the 80% toast and the "Before you start" modal after the next install; optional reboot / elevated compaction.
+
+### Merge log addition
+| #153 | docs checkpoint (06:00) | `8b9f8bb` | gates 1-4 pass (144 reviewable), 5/5 checks fresh, CLEAN | n/a docs-only | green |
+
+### integration/next verify run 2 (VERIFIED, `ee078d6`)
+1 failed, 1935 passed; ruff + mypy clean. The failure is `evals/test_cli_cold_start_budget.py` (median 2915.3 ms vs 2000 ms budget). Back-to-back repeats at ~100% CPU
+alternated pass/fail on identical code (main pass/fail, integration fail/pass) -> load noise, BELIEVED; NOT yet seen passing on a quiet machine.
+
+### Disk plan (replaces "25 GB or no build")
+- Volume D: has 1,767 GB free (VERIFIED `Get-PSDrive`). The Nuitka build dir is now on D: (`reclaim-wt-intnext\packaginguild` is a junction to `D:eclaim-builduild`,
+  holding the build venv, `.build`, `.dist`), and `NUITKA_CACHE_DIR=D:eclaim-build
+uitka-cache` (copy of the 1.4 GB C: cache; the C: copy is left in place). Only the installer
+  output and the install land on C:. Note: ccache keys may miss because the build path changed (BELIEVED) -> possibly a cold build (the last cold one took 292 min).
+- Start rule (steering): free C: >= 2x measured peak (~12 GB) with a watchdog, abort < 4 GB. Free was 10.0 GB at start; with the build on D: the C: footprint is the
+  installer + temp, so I started at 10.0 GB and let the watchdog (`D:eclaim-build\watchdog.csv`, 30 s samples, aborts and removes its own partial output below 4 GB)
+  protect C:. Actual peak footprint is recorded there and will be reported at the end.
+- `uv cache prune` poller (15 min, 24 h): it got the lock on the first try: removed 5,335 files, 229.3 MiB (free 9.93 -> 9.98 GB). Poller finished.
+- Attribution sampler (5 min target, 24 h): first pass took 572 s (the profile walk is slow), so the real period is ~10 min. Top consumers so far (VERIFIED): .cache 186.6 GB,
+  AppData 219.6 GB (Docker 50.7, uv 31.4, wsl 26.5, Programs 15.7), ml-projects >= 283 GB (walk timed out, lower bound). The swing attribution needs the time series; reported at the end.
+
 ## CHECKPOINT 2026-10-08 ~06:00 IST (batch prepared for one GG action; BUILD BLOCKED ON DISK) -- READ THIS FIRST
 
 VERIFIED = I ran it this session and quote the output; BELIEVED = inferred, stated as such.
@@ -10,7 +42,7 @@ VERIFIED = I ran it this session and quote the output; BELIEVED = inferred, stat
 ### State in five lines
 - main = `703be93` (#152 merged). main CI on that commit: `ci`, `eval`, `scale-nightly`, `pages-build-deployment` all `success` (VERIFIED, `gh run list --branch main`).
 - `integration/next` (pushed) = main + #140, #143, #145, #144, #142, #138, #151, #150 + one test-reconciliation commit; head `ee078d6`.
-  Full verify run 1 on `f3d547f`: **4 failed, 1932 passed** (`verify_intnext1.txt`, scratchpad). Three were real cross-PR test issues, now fixed (below); the fourth is the cold-start budget eval measured on a loaded, disk-starved machine (median 6217.6 ms vs 2000 ms budget): NOT counted as fixed, re-run on a quiet machine. Run 2 on `ee078d6` was started; its result goes in the next checkpoint (until then: **integration/next is NOT yet verify-green**).
+  Full verify run 1 on `f3d547f`: **4 failed, 1932 passed** (`verify_intnext1.txt`, scratchpad). Three were real cross-PR test issues, now fixed (below); the fourth is the cold-start budget eval measured on a loaded, disk-starved machine (median 6217.6 ms vs 2000 ms budget): NOT counted as fixed, re-run on a quiet machine. Run 2 on `ee078d6` was started; its result goes in the next checkpoint (result in the 11:00 section: 1 failed = cold-start timing noise, 1935 passed).
 - **The build/install is blocked: C: free is 3.3-11.6 GB, the steering requires 25 GB.** Disk step 0 below.
 - The installed app on gaura is still the 2026-10-08 build of `integration/2026-10-07` (pre-#150/#151/#152 fixes): see "Known issues" in docs/HOWTO.md section 6b (avoid the Review Queue right after a big scan).
 - Soak verdict: no leak (below).
