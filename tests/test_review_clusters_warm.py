@@ -267,7 +267,12 @@ def test_a_failed_warm_leaves_no_clusters_cache(
     assert state.candidates_clusters_cache is None
 
 
-def test_category_toggle_clears_the_clusters_cache_with_the_candidates(tmp_path: Path) -> None:
+def test_category_toggle_clears_the_clusters_cache_with_the_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # update_category_setting persists to a cwd-relative config.toml; without this the test wrote
+    # into the checkout (and the hermetic guard refuses that when the checkout is under the home).
+    monkeypatch.chdir(tmp_path)
     root = tmp_path / "tree"
     _build_tree(root)
     client, state = _cold_client(tmp_path, root)
