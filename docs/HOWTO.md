@@ -47,7 +47,7 @@ Turn it off: Settings -> *Weekly cache clean* -> off (this removes the scheduled
 Auto-Clean (gaura)* -> Disable. Updating Reclaim re-creates the task only if the setting is on.
 
 **80% disk alert** (Settings -> *Low disk space alert*): a background task checks C: a few times a day and shows a Windows
-notification "Disk space is running low" when C: is **80% used or more** (it is at about 98% today, so it will fire), with a
+notification "Disk space is running low" when C: is **80% used or more** (C: is at 78% today after the Hugging Face cache moved to D:, so it will not fire until you pass 80%), with a
 **Snooze for a week** button. Turn it off: Settings -> *Low disk space alert* -> off. **Not seen:** I could not confirm on
 screen that the toast actually appears (the Windows counter I used as a proxy does not track this notification identity), so
 please tell me if you never see one.
@@ -64,15 +64,24 @@ names. Limit: a folder that does not contain the name (for example a generic `py
 as theirs; for those use `[safety] deny = ["*\\some\\path\\*"]`. The optional "pytest temp" cleaning is **off** and stays off
 unless you set `[regenerable] pytest_temp = true`.
 
-## 6b. Known issues in the build installed on 2026-10-08 (fixes are in the merge batch)
-- **Do not open the Review Queue right after a big scan** (and avoid "Scan my files" for now). The Review Queue starts its own
-  duplicate-detection pass, which on your profile (1.6 million candidate files) takes about 30 minutes, fights the background
-  preparation for the database, and while it runs the disk can fill with a very large temporary file (it reached 13 GB). The one click
-  ("Clean My Computer") and the weekly clean are NOT affected: they do not use the index.
-- The first scan of your profile took about 44 minutes and grew the index from 4.9 to 7.2 GB.
-- Preview numbers for **uv** and **npm** caches overstate what is freed (the real command frees far less).
+## 6b. What to expect from the build installed on 2026-10-09 (checked on your real profile)
+- **Scanning is much faster and safe now.** "Scan my files" on your profile took **12.6 minutes** (6.7 million entries), and the
+  background preparation that follows took **31.9 minutes** (checked 20:21-20:53). During it the database's temporary file
+  stayed under **10 MB** (it reached 13 GB in the 10-08 build), C: free did not move, and no "database is locked" error appeared.
+- **While the preparation runs** Overview shows "Indexing your files... The page is not stuck" (screenshots
+  `docs/assets/409-install-20261009-0*.png`); there is no red error. Behind the scenes the server answers "not warm yet" (HTTP 409), which
+  the page turns into that message.
+- **The first time you open Overview after that it can take about 25 seconds** (measured 24.1 s, then 0.25 s); later opens are instant.
+- The Review Queue loaded without starting a second duplicate pass (one `dedup.start` in the log). Its screenshot was taken while the list was
+  still loading; I did not watch it finish.
+- The one click ("Clean My Computer") took **2 minutes** and freed **639 MB** (pip 69 MB, npm 146 MB, Chrome cache 423 MB), C: free 224.04 -> 224.65 GB.
+  Edge was running so its cache was skipped; the uv cache had nothing left to prune. Your three excluded projects were not touched (0 excluded paths applied).
+  Note: your pip cache now lives on D: (a link at the old place), so its 69 MB is not C: space.
+- Preview numbers for **uv** and **npm** caches may still overstate what is freed.
 - On first launch you see a one-time "Before you start" screen; click **I understand, continue**.
 - An empty peach bar with a "Dismiss" button may appear under the header; it is cosmetic.
+- **I could not see the 80% alert on screen.** I fired it with a test threshold (it reported "would notify") and Windows' counter did not move, as before.
+  Tell me if you never see a notification.
 
 ## 7. If something looks wrong
 - Settings and the top bar's **Copy diagnostics** button collect what support needs; nothing leaves your machine.
