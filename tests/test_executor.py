@@ -1111,6 +1111,71 @@ def test_direct_delete_apply_permanently_removes_file(tmp_path: Path) -> None:
     assert entries[0].retention_until is None
 
 
+def test_reversible_only_vaults_a_candidate_that_would_otherwise_delete_permanently(
+    tmp_path: Path,
+) -> None:
+    """Assistant-mcp invariant: with `reversible_only` a `retention_days=None` candidate is
+    vaulted with the full window (restorable), never direct-deleted and never retention 0."""
+    target = tmp_path / "cache" / "file.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"redownloadable-cache-content")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=29, retention_days=None, rebuildable=True)],
+        safety=_safety(),
+        apply=True,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        now=_NOW,
+        reversible_only=True,
+    )
+
+    assert report.files_succeeded == 1
+    assert not target.exists()
+    assert report.items[0].method == "vault"
+    assert report.items[0].vault_path is not None and report.items[0].vault_path.exists()
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert [e.method for e in entries] == ["vault"]
+    assert entries[0].retention_days and entries[0].retention_days > 0
+    restore_batch(
+        report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW + 1,
+    )
+    assert target.read_bytes() == b"redownloadable-cache-content"  # actually restorable
+
+
+def test_reversible_only_refuses_if_the_resolver_ever_returns_direct_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Teeth: the in-loop check is independent of the resolver, so a future edit that lets
+    `direct_delete` through for a reversible-only batch fails closed with the file untouched."""
+    target = tmp_path / "cache" / "file.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"keep")
+    monkeypatch.setattr(
+        executor_module,
+        "_effective_method_and_retention_days",
+        lambda *_a, **_k: ("direct_delete", None),
+    )
+
+    with pytest.raises(SafetyInvariantError, match="reversible_only"):
+        apply_batch(
+            [_candidate(target, retention_days=None)],
+            safety=_safety(),
+            apply=True,
+            manifest_path=tmp_path / "manifest.jsonl",
+            vault_dir=tmp_path / "vault",
+            now=_NOW,
+            reversible_only=True,
+        )
+
+    assert target.read_bytes() == b"keep"
+
+
 def test_direct_delete_removes_readonly_file(tmp_path: Path) -> None:
     """ADR-0004 addendum (2026-07-17): the direct_delete path's single-file branch must clear
     the read-only attribute before unlink, same as the directory/rmtree branch — a lone

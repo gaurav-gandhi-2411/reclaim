@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -266,6 +267,43 @@ async def test_full_workflow_scan_list_preview_delete_actually_quarantines(
     assert not paths["node_modules_dir"].exists()
     assert paths["kept_file"].exists()  # negative control: untouched
     assert any((tmp_path / "vault").rglob("index.js"))  # landed in the real vault
+
+
+async def test_delete_tool_never_deletes_permanently_even_for_a_permanent_category(
+    tmp_path: Path,
+) -> None:
+    """Invariant (docs/specs/assistant-mcp.md): assistant-initiated deletes are always
+    reversible. dev_artifacts defaults to `retention_days=None` (direct, permanent delete for
+    every other caller); through the MCP `delete` tool it must land in the vault, with a
+    manifest entry that is NOT `direct_delete`, and be restorable."""
+    root = tmp_path / "tree"
+    paths = _build_tree(root)
+    config = Config(categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=True)))
+    assert config.categories.dev_artifacts.retention_days is None  # the permanent default
+    state = _build_power_mode_state(tmp_path, config=config)
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+        args = {"scan_id": scan_id, "rule_id_or_category": "dev_artifact_node_modules"}
+        preview = (
+            await session.call_tool("preview_apply", {**args, "tier": "A"})
+        ).structuredContent
+        result = await session.call_tool(
+            "delete", {**args, "tier": "A", "selection_hash": preview["selection_hash"]}
+        )
+        assert result.isError is False, result.content
+        batch_id = result.structuredContent["batch_id"]
+
+    assert not paths["node_modules_dir"].exists()
+    assert any((tmp_path / "vault").rglob("index.js")), "must be in the vault, not gone"
+    methods = {
+        json.loads(line)["method"]
+        for line in (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("batch_id") == batch_id
+    }
+    assert methods and "direct_delete" not in methods
 
 
 async def test_scan_tool_refuses_a_path_outside_home(

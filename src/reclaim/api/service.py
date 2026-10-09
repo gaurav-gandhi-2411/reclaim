@@ -2035,6 +2035,9 @@ def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyRespo
             ),
             scan_index=mcp_apply_scan_index,
             allowed_roots=resolve_allowed_apply_roots(state),
+            # Invariant (docs/specs/assistant-mcp.md): assistant-initiated deletes are always
+            # reversible -- vault or Recycle Bin, never a permanent delete.
+            reversible_only=True,
         )
     return _apply_response(report)
 

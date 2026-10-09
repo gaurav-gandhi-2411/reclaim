@@ -1045,6 +1045,7 @@ def _effective_method_and_retention_days(
     size_guard_retention_days: int,
     entry_count_guard: int,
     subtree_entry_count: int | None,
+    reversible_only: bool = False,
 ) -> tuple[QuarantineMethod, int | None]:
     """Stage 2 safety boundary, checked FIRST, before any other branch in this function: when
     `mode` is `Mode.SAFE`, the result is unconditionally `("recycle_bin", candidate.
@@ -1106,6 +1107,11 @@ def _effective_method_and_retention_days(
     """
     if mode == Mode.SAFE:
         return "recycle_bin", candidate.retention_days
+
+    if candidate.retention_days is None and reversible_only:
+        # Assistant-initiated deletes are always reversible: never the permanent branch below, and
+        # never retention 0 (immediately purge-eligible) either -- the full window applies.
+        return "vault", size_guard_retention_days
 
     if candidate.retention_days is None:
         size_guard_hit = (
@@ -1537,9 +1543,17 @@ def apply_batch(
     on_progress: ProgressCallback | None = None,
     scan_index: ScanIndex | None = None,
     allowed_roots: Sequence[Path] | None = None,
+    reversible_only: bool = False,
 ) -> BatchApplyReport:
     """Quarantines (or, for `retention_days=None` candidates, permanently deletes) every
     candidate in one batch.
+
+    `reversible_only` (assistant-mcp invariant, docs/specs/assistant-mcp.md): when True, NO item
+    may resolve to `direct_delete`. A candidate that would permanently delete (`retention_days is
+    None`) is vaulted instead, with `direct_delete_size_guard_retention_days` as its window, so
+    every item is restorable (vault) or in the Recycle Bin. Enforced here, at the one choke point
+    every real deletion passes through, not in a caller; the resolver converts and a second check
+    in the loop raises if a `direct_delete` ever still comes out (a future edit to the resolver).
 
     `allowed_roots` (AE1): when provided, every candidate whose path falls outside all of
     `allowed_roots` is skipped (`skip_reason="outside_user_scope"`) before any other pre-flight
@@ -1759,7 +1773,13 @@ def apply_batch(
                 size_guard_retention_days=direct_delete_size_guard_retention_days,
                 entry_count_guard=direct_delete_entry_count_guard,
                 subtree_entry_count=subtree_entry_count,
+                reversible_only=reversible_only,
             )
+            if reversible_only and item_method == "direct_delete":
+                raise SafetyInvariantError(
+                    "reversible_only batch resolved a permanent delete for "
+                    f"{candidate.path} -- refusing; nothing further is touched."
+                )
             item_retention_until = (
                 now_ts + item_retention_days * _SECONDS_PER_DAY
                 if item_retention_days is not None
