@@ -565,6 +565,55 @@ def test_send_autoclean_toast_returns_false_when_windows_refuses_it(
     assert recorder.aumids == [TOAST_AUMID]
 
 
+def test_ensure_toast_aumid_writes_display_name_under_hkcu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real registration path, against a fake `winreg` (never the real profile)."""
+    writes: list[tuple[str, str, str]] = []
+
+    class _Key:
+        def __enter__(self) -> _Key:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+    fake = ModuleType("winreg")
+    fake.HKEY_CURRENT_USER = "HKCU"  # type: ignore[attr-defined]
+    fake.REG_SZ = 1  # type: ignore[attr-defined]
+
+    def create_key(hive: str, sub: str) -> _Key:
+        writes.append((hive, sub, ""))
+        return _Key()
+
+    def set_value(_k: object, name: str, _r: int, _t: int, value: str) -> None:
+        writes.append(("set", name, value))
+
+    fake.CreateKey = create_key  # type: ignore[attr-defined]
+    fake.SetValueEx = set_value  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+
+    assert ensure_toast_aumid() is True
+    assert writes[0][:2] == ("HKCU", rf"Software\Classes\AppUserModelId\{TOAST_AUMID}")
+    assert ("set", "DisplayName", "Reclaim") in writes
+
+
+def test_ensure_toast_aumid_returns_false_when_registry_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def deny(*_a: object) -> None:
+        raise PermissionError("denied")
+
+    fake = ModuleType("winreg")
+    fake.HKEY_CURRENT_USER = "HKCU"  # type: ignore[attr-defined]
+    fake.CreateKey = deny  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+
+    assert ensure_toast_aumid() is False
+
+
 def test_ensure_toast_aumid_is_a_noop_under_pytest() -> None:
     """The real HKCU registration must never run from a test (it would write the real profile)."""
     assert ensure_toast_aumid() is False
