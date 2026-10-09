@@ -96,6 +96,17 @@ def _show_toast_checked(toaster: object, toast: object) -> bool:
         codes.append(getattr(event, "error_code", None))
         failed.set()
 
+    # NotificationSetting: 0 = enabled; 1-4 = disabled for the app / user / group policy /
+    # manifest. This is the signal that diagnosed the original drop; best effort (the read raises
+    # for an AUMID Windows has not seen yet), and only a definite "disabled" short-circuits.
+    try:
+        setting = int(toaster.toastNotifier.setting)  # type: ignore[attr-defined]
+    except Exception:
+        setting = 0
+    if setting != 0:
+        logger.info("notifications.toast_disabled", notification_setting=setting)
+        return False
+
     toast.on_failed = _on_failed  # type: ignore[attr-defined]
     toaster.show_toast(toast)  # type: ignore[attr-defined]
     if failed.wait(_TOAST_FAILURE_WAIT_SECONDS):

@@ -555,6 +555,17 @@ def test_send_disk_space_toast_returns_false_when_windows_refuses_it(
     assert send_disk_space_toast(_crossed_result()) is False
 
 
+def test_send_disk_space_toast_returns_false_when_notifications_are_disabled_for_the_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _install_fake_windows_toasts(monkeypatch)
+    fake_toaster = sys.modules["windows_toasts"].InteractableWindowsToaster  # type: ignore[attr-defined]
+    fake_toaster.toastNotifier = SimpleNamespace(setting=1)  # DISABLED_FOR_APPLICATION
+
+    assert send_disk_space_toast(_crossed_result()) is False
+    assert recorder.shown_toasts == []  # not even attempted
+
+
 def test_send_autoclean_toast_returns_false_when_windows_refuses_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
