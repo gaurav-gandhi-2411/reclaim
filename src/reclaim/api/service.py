@@ -483,12 +483,15 @@ def _precompute_summary_caches(
     the scanned volume) at the end of a warm-up, so the first summary after "ready" is a cache hit.
     Measured on the owner's 7.7 GB index: the first summary after a finished warm-up took 24.1 s
     and outlasted the page's 30 s wait. Best effort: a failure only means the first summary
-    computes them itself, as before; a cancel is still honoured."""
-    checkpoint()
+    computes them itself, as before. A cancel seen here only skips the precompute: the candidates
+    cache is already warm, so the warm-up still ends "ready" rather than "cancelled"."""
     try:
+        checkpoint()
         if index.has_any_records():
             cached_physical_size_bytes(index, state)
             _reconciliation_fields(index, state)
+    except DedupCancelled:
+        logger.info("api.summary_precompute_skipped_cancelled")
     except Exception as exc:  # broad on purpose: never turn a finished warm-up into a failed one
         logger.warning("api.summary_precompute_failed", error=str(exc))
 

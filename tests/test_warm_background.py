@@ -555,6 +555,22 @@ def test_first_summary_after_a_warmup_is_a_cache_hit(
     assert len(calls) == during_warm  # the summary found it cached
 
 
+def test_a_cancel_seen_by_the_precompute_only_skips_it(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The candidates cache is already warm by then, so the warm-up must not end "cancelled"."""
+    calls = _count_physical_size_queries(monkeypatch)
+    env.scan()
+
+    def cancelled() -> None:
+        raise dedup.DedupCancelled
+
+    with ScanIndex(env.state.db_path) as index:
+        service._precompute_summary_caches(index, env.state, cancelled)  # must not raise
+
+    assert calls == []
+
+
 def test_a_failing_summary_precompute_never_fails_the_warmup(
     env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
