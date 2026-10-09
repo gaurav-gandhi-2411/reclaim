@@ -9,6 +9,7 @@ from typing import Literal
 from reclaim.ai.category_explainer import DEFAULT_CACHE_DIR as DEFAULT_AI_EXPLANATION_CACHE_DIR
 from reclaim.ai.models import AICluster
 from reclaim.anthropic_key_store import DEFAULT_KEY_PATH as DEFAULT_ANTHROPIC_KEY_PATH
+from reclaim.approvals import ApprovalBroker
 from reclaim.config import Config, apply_safe_mode_category_overrides
 from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
@@ -335,6 +336,12 @@ class AppState:
     # for a caller/agent to miss). Guarding here refuses the second call immediately, before it
     # ever re-derives candidates or computes a hash, with an unambiguous typed error instead.
     mcp_delete_in_progress: bool = False
+    # Assistant-initiated deletes need a click in this process's window (docs/specs/assistant-
+    # mcp.md section 5). The broker lives only in the dashboard process's memory; the MCP server
+    # reaches it over the `/api/mcp-channel/` routes with `mcp_channel_token`, which can create
+    # and read requests but cannot decide them (decisions need the CSRF-protected browser routes).
+    approval_broker: ApprovalBroker = field(default_factory=ApprovalBroker)
+    mcp_channel_token: str = ""
 
     @property
     def live_mode(self) -> Mode:

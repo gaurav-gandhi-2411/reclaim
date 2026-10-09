@@ -38,18 +38,23 @@ Planning:
   - Returns a ranked list of selections, each with `rule_id_or_category`, `tier`, `selection_hash`, `item_count`, `bytes`, `reversible`, `risk_note`, plus `reaches_target`, `planned_bytes` and `shortfall_bytes`. When the target cannot be reached under the constraints it says so with the shortfall instead of relaxing a constraint.
   - Pure function of the index, config and arguments: deterministic and testable without an LLM.
 
-Mutation:
-- `request_delete(plan or selection list)`: creates ONE pending approval covering exactly those selections (with their hashes), returns `approval_id` and `status: "awaiting_user"`. Deletes nothing.
-- `delete_status(approval_id)`: `awaiting_user | approved | declined | expired | executed | refused` plus the result summary.
-- `restore(batch_id)`: undo of a vaulted batch. Allowed without a click (it returns the user's own files), audit-logged.
-- The current one-step `delete(...)` is removed from the MCP surface in the same release that adds `request_delete`; keeping both would leave the unconfirmed route open.
+Mutation (BUILT, 2026-10-10; there is no separate `request_delete`, the confirmation is part of `delete`):
+- `delete(scan_id, rule_id_or_category, tier, selection_hash, wait_seconds=90)`: validates the selection (stale scan or wrong hash is refused before the user is ever asked), creates ONE pending approval in Reclaim's window, then waits up to `wait_seconds` (cap 600) for the answer. Deletes nothing until the user clicks Approve. Returns `status: "executed"` with the result, or `status: "awaiting_user"` with an `approval_id` when the user has not answered in time. Declined, expired and changed-after-approval are typed errors.
+- `delete_status(approval_id, wait_seconds=90)`: keeps waiting for (or collects) that approval. Takes only the id; the selection is whatever the user was shown. It can execute an approved request but cannot approve anything.
+- `restore(batch_id)`: not built yet (undo of a vaulted batch; allowed without a click, audit-logged).
+- Every assistant delete is reversible (invariant I7).
 
-## 5. Confirmation in Reclaim's own window
-- `request_delete` writes a pending record (selections, hashes, byte/item totals, per-item `permanent` flag, client id, expiry 10 minutes, single use) to the data directory. The MCP server runs as a separate stdio process from the dashboard, so the pending record is the handoff.
-- The dashboard (and the tray/toast when it is closed) shows the pending request: client name, the exact categories, counts and bytes, a sample of paths, and a red "permanent, not recoverable" line for any category with no retention. Buttons: Approve, Decline. Approve is a CSRF-protected POST that only the dashboard page can issue.
-- Execution happens only when the approval exists, is unexpired and unused, and a fresh re-derivation of every selection still hashes to the approved hash. Any drift (new scan, changed candidate set) voids the approval; the assistant must plan again.
-- The assistant cannot approve: no MCP tool returns or accepts the approval token.
-- Known limit, stated plainly: an agent that also has shell access can fetch the dashboard page and its CSRF token the way the user's browser does. The confirmation therefore protects against MCP-only clients (Claude Desktop) and against prompt-injected tool calls; it does not make a shell-capable agent safe. Mitigation under consideration: a per-approval code shown only in the Reclaim window that the user must type into it (open item).
+## 5. Confirmation in Reclaim's own window (BUILT 2026-10-10)
+Design, as implemented (`src/reclaim/approvals.py`, `api/approval_routes.py`, `mcp/approval_gate.py`):
+- **Where the request lives.** In the memory of the running dashboard process (`ApprovalBroker`), not in a file. A file the MCP process can read and an agent can edit would make the decision forgeable with one write. The dashboard publishes its port and a per-process random MCP channel token in `dashboard_channel.json` next to the index; the MCP server reads that to reach it. If the file is missing or the window does not answer, `delete` fails closed with "Reclaim's window is not open" and nothing happens. (Opening the window on request is an open item; today the user must have Reclaim open.)
+- **Two routes, two credentials, not interchangeable.**
+  - `/api/mcp-channel/approvals...` (create, read, claim, finish): accepts only the MCP channel token. It cannot decide a request.
+  - `/api/mcp/approvals...` (list, approve, decline): the window's own routes. They need the browser CSRF token that only the served page carries (middleware) and a `Sec-Fetch-Site: same-origin` request header (a real browser always sends it from the page; its absence is refused and logged). The MCP token is rejected here, and the CSRF token is rejected on the channel.
+  - The MCP package never imports or calls `approve`/`decline` and never names the decide routes; an AST test enforces it, and a tool-list test asserts no tool named like approve/decline/confirm exists.
+- **What the window shows.** Client name, category, item count, bytes, method (vault with the restore window in days, or the Recycle Bin), the protected-project list that is honoured, up to five sample paths, the expiry, and Approve / Decline. Cards are built with `textContent` only (file names are untrusted). Screenshots: `reports/screenshots/mcp-approval/`.
+- **Life cycle.** pending (10 min) -> approved -> executing -> executed / failed / stale; pending -> declined / expired; an approval not claimed within 2 min expires. A decision is single use (a second click or a flip is refused 409), claim is exactly-once, at most 5 requests wait at once (HTTP 429 beyond that).
+- **Execution.** Only after the claim. The selection is re-derived and re-hashed at that moment; if it no longer matches what the user approved (a newer scan, drift) nothing runs and the approval ends `stale`. The executor's own exclusion / safety re-checks still apply, so even an approved request cannot touch a protected project (tested: an approved leak of an excluded path ends `failed` with the file untouched).
+- **Residual risk, stated plainly.** The click protects against an MCP-only client (Claude Desktop) and against prompt-injected tool calls: neither can reach the decide routes. It does NOT make an agent with local code execution under the same user safe: such an agent can read the page, take its CSRF token and forge `Sec-Fetch-Site`, drive the browser, or read process memory. What bounds that case: (1) invariant I7, every assistant delete is restorable (vault window >= 1 day, or Recycle Bin) and never permanent; (2) the executor's exclusion and safety checks apply to every delete regardless of approval; (3) each decision is logged with its channel (`Sec-Fetch-Site`, user agent), so a non-browser approval is visible in the audit log; (4) at most 5 pending requests. Not done: a per-approval code the user must type into the window (would also stop a scripted click; costs friction).
 
 ## 6. Hard invariants (each has a test, section 9)
 - I1: no deletion without an approved, unexpired, matching approval.
@@ -79,14 +84,14 @@ Fixtures follow the repo convention: one JSON per case under `evals/fixtures/ass
 - **Size:** start at 60 cases (40 feasible across five machine profiles, 10 infeasible, 10 adversarial); with n=60 the interval on a 90% rate is about +/-8 points, so small differences between versions are not claimed as improvements.
 
 ## 9. Acceptance tests
-- A1 (I1): `request_delete` alone changes nothing on disk; `delete_status` stays `awaiting_user`.
-- A2 (I1): an approval for selection X cannot execute selection Y; a replayed or expired approval is refused.
+- A1 (I1): `delete` with no click changes nothing on disk (`awaiting_user`); a timeout is not consent. (tests/test_mcp_approval.py)
+- A2 (I1): an approval for selection X cannot execute selection Y; a replayed, flipped or expired approval is refused. BUILT: tests/test_mcp_approval.py (broker unit tests, expiry, 409 on replay).
 - A3 (I2): with `[exclusions] project_names = ["fr-en-transformer"]`, no tool output and no executed delete includes a path containing the name, including through `plan_free_space` with `largest_first`.
 - A4 (I3): there is no tool parameter that accepts an arbitrary path to delete; `exclude_path_globs` can only remove items from a plan.
 - A5 (I4/I5): a Tier B request without `max_tier="both"` yields Tier A only.
 - A6 (I6): an infeasible target returns `reaches_target=false` and a positive `shortfall_bytes`, with every constraint unchanged.
-- A7: drift between approval and execution (a new scan) voids the approval and executes nothing.
-- A8: the old one-step `delete` tool is absent from the tool list.
+- A7: drift between approval and execution (a new scan, or the candidate set changing) voids the approval and executes nothing; the approval ends `stale`. BUILT.
+- A8: no MCP tool can approve or decline (tool list has none; the MCP package never references the deciding API, AST test; the MCP token is rejected by the decide routes and the CSRF token by the channel). BUILT.
 - A9: the approval screen shows counts and bytes equal to the plan, and a permanent-delete line when a selection has no retention (screenshot evidence per the repo UI rule).
 
 ## 10. Open items
@@ -94,4 +99,5 @@ Fixtures follow the repo convention: one JSON per case under `evals/fixtures/ass
 - Whether `list_relocation_options` should later allow an approved, single-directory relocation through the same approval screen; the relocate spec's safety rules would apply unchanged.
 - Client setup docs: the `mcpServers` entry for each client pointing at `reclaim.exe mcp-serve`; none exist in `docs/` today.
 - Reclaim-side pricing, if any, for this surface.
-- Rate limits on `request_delete` (a looping agent should not spam the approval queue).
+- Opening the Reclaim window on demand when it is closed (today `delete` fails closed with "window is not open").
+- `restore(batch_id)` as an MCP tool, and `plan_free_space` / `get_summary` / the other read tools (not built).

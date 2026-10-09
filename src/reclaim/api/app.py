@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,15 +15,19 @@ from starlette.responses import Response
 from reclaim.ai.category_explainer import DEFAULT_CACHE_DIR as DEFAULT_AI_EXPLANATION_CACHE_DIR
 from reclaim.anthropic_key_store import DEFAULT_KEY_PATH as DEFAULT_ANTHROPIC_KEY_PATH
 from reclaim.api import service
+from reclaim.api.approval_routes import router as approval_router
 from reclaim.api.routes import router
 from reclaim.api.security import LocalOriginPolicy, generate_csrf_token, local_origin_violation
 from reclaim.api.state import AppState
 from reclaim.app_paths import data_root
+from reclaim.approvals import channel_file_path, remove_channel_file, write_channel_file
 from reclaim.config import Config
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
 from reclaim.safety import SafetyValidator
+
+logger = structlog.get_logger(__name__)
 
 _PACKAGE_DIR = Path(__file__).parent
 _STATIC_DIR = _PACKAGE_DIR / "static"
@@ -100,9 +105,18 @@ def create_app(
         # slowed), and on shutdown cancel a running warm-up so the process exits promptly.
         reclaim_state: AppState = app.state.reclaim
         service.schedule_startup_warm(reclaim_state)
+        # Publish how the MCP server can reach this window (assistant deletes need a click here).
+        channel_path = channel_file_path(reclaim_state.db_path)
+        try:
+            write_channel_file(
+                channel_path, port=reclaim_state.port, token=reclaim_state.mcp_channel_token
+            )
+        except OSError:
+            logger.warning("api.mcp_channel_file_failed", path=str(channel_path), exc_info=True)
         try:
             yield
         finally:
+            remove_channel_file(channel_path, token=reclaim_state.mcp_channel_token)
             service.shutdown_candidates_warm(reclaim_state)
 
     app = FastAPI(title="Reclaim", version=service.installed_version(), lifespan=_lifespan)
@@ -118,6 +132,7 @@ def create_app(
         manifest_path=manifest_path if manifest_path is not None else _DEFAULT_MANIFEST_PATH,
         safety=SafetyValidator(config),
         csrf_token=generate_csrf_token(),
+        mcp_channel_token=generate_csrf_token(),  # same generator: 256-bit urlsafe, per process
         host=host,
         port=port,
         mode_log_path=mode_log_path if mode_log_path is not None else DEFAULT_MODE_LOG_PATH,
@@ -138,6 +153,7 @@ def create_app(
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     app.include_router(router)
+    app.include_router(approval_router)
 
     policy = LocalOriginPolicy(host=host, port=port)
 
