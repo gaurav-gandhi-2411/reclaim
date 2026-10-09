@@ -23,6 +23,7 @@ import pytest
 from reclaim.config import NotificationsConfig
 from reclaim.notifications import (
     SNOOZE_LAUNCH_URI,
+    TOAST_AUMID,
     DiskSpaceCheckResult,
     NotificationState,
     apply_snooze,
@@ -30,8 +31,10 @@ from reclaim.notifications import (
     evaluate_threshold,
     is_snoozed,
     load_state,
+    ensure_toast_aumid,
     record_notified,
     save_state,
+    send_autoclean_toast,
     send_disk_space_toast,
 )
 
@@ -442,7 +445,9 @@ def _install_fake_windows_toasts(monkeypatch: pytest.MonkeyPatch) -> SimpleNames
     windows_toasts import ...` resolves to fakes instead of the real WinRT-backed library --
     matches `test_update_check.py`'s `httpx.MockTransport` discipline of never making the real
     external call from a test. Returns a recorder the test can assert against."""
-    recorder = SimpleNamespace(shown_toasts=[], added_actions=[], toaster_app_names=[])
+    recorder = SimpleNamespace(
+        shown_toasts=[], added_actions=[], toaster_app_names=[], aumids=[], refuse=False
+    )
 
     class FakeToastButton:
         def __init__(self, content: str, launch: str | None = None) -> None:
@@ -459,11 +464,14 @@ def _install_fake_windows_toasts(monkeypatch: pytest.MonkeyPatch) -> SimpleNames
             recorder.added_actions.append(action)
 
     class FakeInteractableWindowsToaster:
-        def __init__(self, application_text: str) -> None:
+        def __init__(self, application_text: str, notifier_aumid: str | None = None) -> None:
             recorder.toaster_app_names.append(application_text)
+            recorder.aumids.append(notifier_aumid)
 
         def show_toast(self, toast: FakeToast) -> None:
             recorder.shown_toasts.append(toast)
+            if recorder.refuse:  # Windows reports a refusal through the async failure callback
+                toast.on_failed(SimpleNamespace(error_code=-2143420143))
 
     fake_module = ModuleType("windows_toasts")
     fake_module.InteractableWindowsToaster = FakeInteractableWindowsToaster  # type: ignore[attr-defined]
@@ -505,7 +513,7 @@ def test_send_disk_space_toast_never_raises_when_show_toast_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ExplodingToaster:
-        def __init__(self, _application_text: str) -> None:
+        def __init__(self, _application_text: str, _aumid: str | None = None) -> None:
             pass
 
         def show_toast(self, _toast: object) -> None:
@@ -524,3 +532,39 @@ def test_send_disk_space_toast_never_raises_when_show_toast_raises(
     result = send_disk_space_toast(_crossed_result())
 
     assert result is False
+
+
+def test_send_disk_space_toast_uses_dedicated_aumid_not_command_prompts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _install_fake_windows_toasts(monkeypatch)
+
+    assert send_disk_space_toast(_crossed_result()) is True
+
+    assert recorder.aumids == [TOAST_AUMID]
+
+
+def test_send_disk_space_toast_returns_false_when_windows_refuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: `show_toast` returned normally while Windows rejected the toast with
+    DISABLED_FOR_APPLICATION (HRESULT 0x803E0111), so the alert looked sent and was debounced."""
+    recorder = _install_fake_windows_toasts(monkeypatch)
+    recorder.refuse = True
+
+    assert send_disk_space_toast(_crossed_result()) is False
+
+
+def test_send_autoclean_toast_returns_false_when_windows_refuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _install_fake_windows_toasts(monkeypatch)
+    recorder.refuse = True
+
+    assert send_autoclean_toast(1024, 50.0, 0) is False
+    assert recorder.aumids == [TOAST_AUMID]
+
+
+def test_ensure_toast_aumid_is_a_noop_under_pytest() -> None:
+    """The real HKCU registration must never run from a test (it would write the real profile)."""
+    assert ensure_toast_aumid() is False
