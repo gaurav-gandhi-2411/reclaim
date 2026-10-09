@@ -3,6 +3,80 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## CHECKPOINT 2026-10-09 ~16:00 IST (reboot happened; pagefile now on D:; build restarted on D:; relocation plan) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred.
+
+### State (VERIFIED 2026-10-09 15:20-15:40)
+- `origin/main` = `9589152` (#154, my merge); CI on it: `ci`, `eval`, `scale-nightly` x2, `pages-build-deployment` all success. Local main was behind and was fast-forwarded. All 8 batch PR heads unchanged, so `integration/next` `ee078d6` is still current.
+- Boot 2026-10-09 13:02. **Pagefile is `D:\pagefile.sys` (16 GB, system-managed); there is no pagefile on C:** (`Win32_PageFileUsage`). C: free went 3.9 GB -> 24.8 GB (the 17 GB pagefile left C:). D: free 1,748 GB.
+- C: and D: are two separate physical NVMe SSDs (`Get-PhysicalDisk`: Disk 1 Samsung MZVL2 954 GB = C:, Disk 0 Samsung 990 EVO Plus 1.8 TB = D:). Moving data to D: costs no speed class.
+- My background tasks from the previous session (watchdog, launcher, samplers) died with the reboot. Restarted: build + watchdog (below) and the attribution sampler (`%TEMP%\reclaim_soak\2026-10-09-attrib\sizes.csv`).
+- Merge log addition: #154 (docs checkpoint 11:00) -> `9589152`, gates 1-4 pass (34 reviewable), CLEAN, 6/6 checks fresh.
+
+### Build (restarted 15:22 IST from `integration/next` `ee078d6`)
+- `packaging/build` is a junction to `D:\reclaim-build\build`; `NUITKA_CACHE_DIR`, `TEMP`/`TMP`, `UV_CACHE_DIR` are all on D: (`D:\reclaim-build\{nuitka-cache,tmp,uvcache}`).
+- Watchdog fixed per steering: it now aborts only if **D:** free < 50 GB (it lists, then deletes, its own partial output) and only LOGS C:. The earlier watchdog killed the 10-08 build because other sessions filled C:; that was the wrong guard. Log: `D:\reclaim-build\watchdog2.csv`; peak C:/D: drop is written at the end.
+- Observation: C: free still fell 25.7 -> 17.1 GB between 15:22 and 15:36 while the build wrote to D:. No file >100 MB was written under LocalAppData/.cache/ml-projects/tmp/AppData in that window (many small files, or Windows-side writes): cause NOT identified; it flattened at 17.1 GB.
+- The ccache may miss because the build path changed: expect a long build (cold: 292 min last time).
+
+### Decision: where Reclaim's data dir lives
+Not moved. `app_paths.data_root()` is the executable's directory and every default (`data/reclaim_index.sqlite3`, `data/quarantine`, logs, state) hangs off it; there is **no config key for the index path**. A junction on the whole `data` folder would also move the vault to D:, and the vault must stay on the volume of the files it vaults (ADR-0001/0005: same-volume rename; a cross-volume vault turns every quarantine into a copy and breaks the rollback guarantee). So the 7.7 GB index stays on C: next to the exe. Cheaper lever: `reclaim index-prune --apply --vacuum` after install (the file has free pages). Prerequisite for ever moving it: a `[storage] index_path` setting (GAPS item 0).
+
+### Relocation plan: C: consumers > 1 GB (VERIFIED, `D:\reclaim-build\c_census.csv`, read-only walk 2026-10-09 15:27-15:39; profile = 866 GB)
+Hardlink bytes are NOT measured (Windows `scandir` gives no link count); "hardlink-dependent" below comes from the tools' documented behaviour.
+
+| size | path | users | class | notes |
+|---|---|---|---|---|
+| 185 GB | `~\.cache\huggingface` (hub 153, datasets 32) | many projects incl. EXCLUDED fr-en-transformer (nllb-200, m2m100, comet models: BELIEVED from names, not checked in code), AetherArt (SDXL, wikiart), mindmeld | MOVABLE (junction, same path) | needs GG approval: relocates excluded projects' files. `token`/`stored_tokens` sit in the same folder: move only `hub`, `datasets`, `xet`, keep tokens on C: |
+| 66 GB | `%TEMP%\claude` (per-project scratch) | Claude sessions, incl. EXCLUDED fr-en 10.2, shipdoc 6.5, intent-router 6.2 | MOVABLE, but live sessions hold handles | needs GG approval (excluded data); not while sessions run |
+| 50.7 GB | `AppData\Local\Docker\wsl\disk\docker_data.vhdx` | Docker Desktop (stopped) | MOVABLE via Docker Desktop setting (no junction) | GG item 2 |
+| 31.4 GB | `AppData\Local\uv` (cache) | every uv venv | **MUST STAY** | uv docs: the cache must share a filesystem with the environment, else "will instead need to fallback to slow copy operations" (docs.astral.sh/uv/concepts/cache, fetched 2026-10-09). Moving it makes every C: venv a full copy = more C: use |
+| 27.0 GB | `AppData\Local\wsl\{...}\ext4.vhdx` (Ubuntu, stopped) | WSL | MOVABLE via `wsl --export/--import` | GG item 3 |
+| 32 GB | `hm-data` (images 28.5) | a data project | movable data | the project's owner decides |
+| 32 GB (envs 21) | `anaconda3` | conda envs (hardlinks from `pkgs` 1.2 GB) | MUST STAY (conda hardlinks; BELIEVED, not fetched) | |
+| 70, 70, 58, 22 GB | `multimodal-fashion-recommender` (data 64), `AetherArt` (data 41, models 23), `mindmeld\generator` (56.7), `SargamSa` (.neural_eval_envs 18.8) | other projects' working data | movable with junctions while those projects' sessions are idle | not touched; needs the owner |
+| 16.4, 8.9, 6.5 GB | EXCLUDED intent-router, fr-en-transformer, shipdoc-extract working dirs | excluded | **NOT TOUCHED** | measured only |
+| 15.7 GB | `AppData\Local\Programs` (installed apps incl. Reclaim) | | stay | |
+| 10.9 GB | `sdks` (android 7.2, flutter 3.0) | | movable, tool paths must be updated | |
+| 1.5 GB | `AppData\Local\npm-cache` | **3 live chrome-devtools-mcp (npx) processes run from `npm-cache\_npx`** (other sessions) | movable, but live holders | skipped; retry when those sessions end |
+| 1.42 GB | `AppData\Local\Nuitka\Nuitka\Cache` | duplicate of `D:\reclaim-build\nuitka-cache` | delete | the classifier blocked my delete: GG item 5 |
+| 0.07 GB | `AppData\Local\pip\cache` | pip | **MOVED** (below) | |
+
+**Executed now (only moves with no excluded data, no live holders, no admin): the pip cache.** Copy -> verify (690 files, 72,245,327 B on both sides; SHA-256 of a 25-file sample, 0 mismatches) -> rename old to `cache.moved` -> junction `C:\Users\gaura\AppData\Local\pip\cache` -> `D:\relocated\pip-cache` (resolves; 690 files through the junction) -> old copy checked (690 files, same bytes, not a link) and deleted in a separate command. Gain: 69 MB (it was small); the value is that the procedure is proven. Rollback: `cmd /c rmdir <junction>` then `robocopy D:\relocated\pip-cache <path> /E`.
+
+The reusable script is `scripts/relocate_dir.ps1` (dry run by default; refuses uv/conda/venv paths; handle probe by rename round-trip; verify; swap with automatic rollback; deleting `.moved` only in a separate `-DeleteMoved` run that re-checks). Independent verifier pass (agent, 38 tool calls, scratch only) FOUND 7 defects in the first version: (1) `-DeleteMoved` compared only count+bytes, so a same-size corrupted target let it delete the only good copy; (2) an edit made between copy and swap was silently lost; (3) verification hashed only a sample (54 of 200 files); (4) a PARENT of uv/conda/.venv passed the denylist; (5) paths >260 chars make it throw (fail-closed); (6) `[ ]` in the target broke the junction step; (7) a stale `.moved` was not refused up front. Fixed in the rewrite: SHA-256 of EVERY file at verify and again in `-DeleteMoved`; source is frozen by renaming to `.moved` and a `/MIR` delta re-sync + re-hash of files written since the copy started runs before the junction; `mklink /J`; descendant/venv denylist; stale `.moved` refused; (5) documented as a known limit. Re-run of the attacks on the fixed script: same-size edit and an added file during the window both reached the target; `-DeleteMoved` refused a same-size corrupted target ("content differs"); parent-of-.venv refused; `t[1] x` target swapped; stale `.moved` refused before any copy. Still untested: pwsh-7-only behaviour, a volume filling mid-copy, ACL/owner preservation (`/COPY:DAT` drops them), a real large directory. Dry-run first on anything real.
+
+### Swing attribution, 10-08 10:50 -> 13:10 (VERIFIED, `2026-10-08-attrib\sizes.csv`, 28 passes; each pass took ~570 s, not 5 min)
+C: free ranged 2.44-9.93 GB. Path growth over the window: ml-projects +1.49 GB, AppData +1.16 (wsl +0.56, pip +0.36), `.cache` +1.06 (a 1.04 GB Hugging Face model written 11:13 by another session), review-iq scratch +0.65, gold-rate-tracker scratch +0.23; shipdoc scratch -0.74. That is ~5 GB of a 7.5 GB swing; **no single path explains it** and ~2.5 GB is unattributed (VSS / system / short-lived files, BELIEVED). The pagefile (17 GB, constant size) was not the swing; its move to D: is what bought the headroom.
+
+### WHEN GG HAS TIME (top items; nothing blocks me)
+1. **Approve moving the Hugging Face cache to D: -- one word ("approve HF").** Size 185 GB (hub 153, datasets 32). It moves files but keeps every path (a junction at the old location), so no project config changes. It relocates files used by the EXCLUDED fr-en-transformer, hence your approval. Before: close all Claude sessions and Python that load models. After approval I run:
+   ```powershell
+   cd C:\Users\gaura\ml-projects\reclaim\scripts
+   foreach ($d in 'hub','datasets','xet') {
+     .\relocate_dir.ps1 -Source C:\Users\gaura\.cache\huggingface\$d -Target D:\relocated\huggingface\$d    # dry run: size, free space, handle probe
+   }
+   # if every dry run says OK: add -Execute (copy, verify, swap); read the CHECK line; then, in a separate run, add -DeleteMoved
+   ```
+   Handle check = the script's rename probe (fails with "Access denied" if anything under the folder is open). Verification = file count + bytes + SHA-256 of EVERY file (185 GB read on both sides: allow ~20-40 min), then a delta re-sync after the source is frozen. Rollback before `-DeleteMoved`: `cmd /c rmdir <path>` then `Rename-Item <path>.moved <name>`; after it: `robocopy D:\relocated\huggingface\<d> <path> /E`, then remove the junction. Frees ~185 GB on C:.
+2. **Docker disk image to D:** Docker Desktop -> Settings -> Resources -> Advanced -> "Disk image location" -> `D:\DockerDesktop` -> Apply & restart (Docker moves the 50.6 GB `docker_data.vhdx` itself). Docker is currently stopped. Optionally `docker system df` / prune first; compaction (`Optimize-VHD`, elevated) is separate.
+3. **WSL Ubuntu to D: (27 GB).** Nothing is running (`wsl -l -v`: Ubuntu Stopped, docker-desktop Stopped).
+   ```powershell
+   wsl --shutdown
+   mkdir D:\wsl
+   wsl --export Ubuntu D:\wsl\ubuntu-backup.tar
+   wsl --unregister Ubuntu          # only after the tar exists and is about the size of the distro
+   wsl --import Ubuntu D:\wsl\Ubuntu D:\wsl\ubuntu-backup.tar --version 2
+   # the default user resets to root: create /etc/wsl.conf with [user] default=<yourname> in the distro, then wsl --shutdown
+   ```
+   Keep the tar until you have booted the distro and checked your files.
+4. Pagefile: already on D: (16 GB, system-managed), none on C:. Optional (admin): a small fixed pagefile on C: so a crash dump can be written; not needed otherwise.
+5. **Delete the 1.4 GB duplicate Nuitka cache on C:** `Remove-Item "$env:LOCALAPPDATA\Nuitka\Nuitka\Cache" -Recurse -Force` (the copy on `D:\reclaim-build\nuitka-cache` is complete: 24,565 files vs 23,679). The permission classifier blocked me from doing it.
+6. **Excluded projects' transient scratch is the main disk consumer** (fr-en 10.2 + shipdoc 6.5 + intent-router 6.2 = 22.9 GB under `%TEMP%\claude`): decide whether CC may clear finished sessions' scratch for those projects, or move it (same approval as item 1).
+7. **GG MERGE BATCH** (block in the 06:00 section: #140, #143, #145, #144, #142, #138, #151, #150, in that order, retarget steps included).
+8. After the next install: look at the 80% toast and the "Before you start" modal once. Optional elevated compaction of the Docker VHDX.
+
 ## CHECKPOINT 2026-10-08 ~11:00 IST (build running on D:; supersedes the disk/build parts of the 06:00 section)
 
 VERIFIED = command run this session; BELIEVED = inferred.
