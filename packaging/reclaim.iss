@@ -59,7 +59,7 @@ Source: "..\NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 ; deliberately isn't "config.toml" (that name is gitignored -- see .gitignore's "User's real
 ; config" entry -- so the repo-tracked source file needs a different name). onlyifdoesntexist:
 ; an upgrade over an existing install must never clobber a user's already-customized config.toml.
-Source: "config.default.toml"; DestDir: "{app}"; DestName: "config.toml"; Flags: onlyifdoesntexist
+Source: "config.default.toml"; DestDir: "{app}"; DestName: "config.toml"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
 ; "Start in" is deliberately {app} (not {userdocs} or anything else) — reclaim's CLI defaults
@@ -538,7 +538,8 @@ begin
   begin
     try
       repeat
-        if (FindRec.Name <> '.') and (FindRec.Name <> '..') and (FindRec.Name <> 'data') then
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') and (FindRec.Name <> 'data')
+           and (FindRec.Name <> 'config.toml') then
           Result := True;
       until (not FindNext(FindRec)) or Result;
     finally
@@ -604,7 +605,8 @@ begin
     if DirExists(DataDir) then
     begin
       Response := MsgBox(
-        'Reclaim leaves its data folder behind by default (scan history, the quarantine vault, ' +
+        'Reclaim leaves its data folder and your settings file (config.toml, including the ' +
+        'folders you protected) behind by default (scan history, the quarantine vault, ' +
         'and logs) so you can reinstall without losing anything -- including any files still ' +
         'held in Reclaim''s vault that you have not restored yet.' + #13#10 + #13#10 +
         'Also delete this data folder now?' + #13#10 + #13#10 +
@@ -613,7 +615,16 @@ begin
         mbConfirmation, MB_YESNO or MB_DEFBUTTON2
       );
       if Response = IDYES then
+      begin
         DelTree(DataDir, True, True, True);
+        // config.toml is kept on every other path (uninsneveruninstall above): it holds the
+        // user's safety exclusions. Deleting data is the explicit "remove everything" answer.
+        DeleteFile(AppDir + '\config.toml');
+        // Inno's own empty-directory removal ran before this step, while data\ still existed,
+        // so without this an empty {app} folder is left behind (seen after a real uninstall,
+        // 2026-10-10). RemoveDir fails on a non-empty directory, so it cannot delete anything.
+        RemoveDir(AppDir);
+      end;
     end;
   end;
 end;
