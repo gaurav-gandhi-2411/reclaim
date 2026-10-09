@@ -3,7 +3,41 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-09 ~16:00 IST (reboot happened; pagefile now on D:; build restarted on D:; relocation plan) -- READ THIS FIRST
+## CHECKPOINT 2026-10-09 ~19:00 IST (disk emergency closed: C: 208 GB free; critical path = build -> smoke/DLL -> install -> verification -> HOWTO) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. This section supersedes the 16:00 section below where they differ.
+
+### MERGE LOG additions (merged by me under the existing gate)
+- #153 -> `8b9f8bb` (docs checkpoint 06:00). #154 -> `9589152` (docs checkpoint 11:00; 34 reviewable lines; 6/6 checks). #155 -> `27b4d38` (relocation docs + `scripts/relocate_dir.ps1`; 247 reviewable lines; gates 1-4 pass; 6/6 checks green on `a24c200`; verifier pass found 7 defects, fixed before merge).
+- CI on main `27b4d38` (VERIFIED): `ci`, `eval`, `scale-nightly`, `pages-build-deployment` all success.
+
+### HF cache moved to D: (GG approval "approve HF" with conditions; VERIFIED, `D:\relocated\hf_move.log`)
+- Rehearsal first: `C:\Users\gaura\sdks\android-sdk` (44,859 files, 7,767,032,058 B) -> `D:\relocated\sdks\android-sdk`; SHA-256 of every file, 0 differences; delta 0 changed; 10.1 min; `adb version` works through the junction; old copy re-hashed (0 differences) and deleted. Left moved.
+- hub (1,099 files, 164,714,311,916 B), datasets (67 files, 34,168,774,203 B) and xet (55 files, 24,078,406 B) -> `D:\relocated\huggingface\{hub,datasets,xet}`. Reparse points: 0 in source and 0 in destination for all three; 0 multi-linked files; counts and bytes equal; per-file SHA-256 differences 0 (copy verify, delta, and again in `-DeleteMoved`). Handle check: the rename probe and the freeze rename both succeeded for all three, so no holder existed and none had to be named (the probe runs before the copy; the freeze rename is the check at swap time). Wall-clock: hub 16.1 min, datasets 3.3 min, xet <1 s; deleting hub.moved took 13.8 min.
+- Load test through the junction path, read-only/offline, every tensor of the smallest weight file read: fr-en-transformer's `Unbabel/wmt22-comet-da` (424 tensors), AetherArt's `stabilityai/sdxl-turbo` (248), triage-iq's `BAAI/bge-reranker-v2-m3` (393, config loaded). Real paths resolve to D:. Only after that were `xet.moved`, `datasets.moved`, `hub.moved` deleted, each in its own command after the check.
+- **C: free 15.45 -> 208.05 GiB.** Accounting (sampler `2026-10-09-attrib\sizes.csv`): 22.86 (before the deletions) + 185.24 deleted = 208.10 expected, 208.05 observed. Steps: +31.81 for xet+datasets (31.84), +153.38 for hub (153.40). The earlier "27 GB unaccounted" came from reading 22.86 as a post-delete figure; it was measured before any HF deletion. The 22.75 -> 15.45 "fall" was ordering: 15.45 was logged before the android-sdk delete finished (+7.30 vs 7.23 GiB).
+- Shadow copies: free space rose by the full deleted amount each time, so there is no sign that shadow storage retained it. `vssadmin` and `Win32_ShadowCopy` need admin, so shadow storage is unread (WHEN GG HAS TIME).
+- The 15:22-15:36 C: drop (25.7 -> 17.1 GB) remains UNDETERMINED: the 10-09 sampler started 15:47 and the USN journal needs admin.
+- Spec for the feature: `docs/specs/relocate.md`. `scripts/relocate_dir.ps1` gained `-ResumeTarget` (re-sync a non-empty target left by a rolled-back run, `/MIR`, full hash still runs).
+
+### Critical path (in this order)
+1. Nuitka build (PID 7620, watchdog PID 6168, output on D:, ETA ~18:15-19:30 by my estimate, BELIEVED) -> `check_dist_dll_closure.py` + `test_packaged_safe_mode.ps1` + `test_packaged_serve.ps1` -> install via `/VERYSILENT` with exclusions in `config.toml` -> triggers, 80% + weekly, fresh scan, 409 browser check, one-click run with audit-log evidence, PeriodicNotificationCount -> `docs/HOWTO.md`.
+2. 24 h attribution sampler keeps running to its end; steady-state C: drift rate to be reported then (so far 17:40-18:35: 23.04 -> 22.86 GiB, about -0.2 GiB/h, BELIEVED to be build/temp noise).
+
+### WHEN GG HAS TIME (re-prioritised 2026-10-09 ~19:00; nothing blocks me)
+1. **Excluded projects' transient scratch is the main remaining C: consumer** (`%TEMP%\claude`: fr-en 10.2 + shipdoc 6.5 + intent-router 6.2 = 22.9 GB). Decide whether CC may clear finished sessions' scratch for those projects, or move it (same approval class as HF).
+2. **GG MERGE BATCH** (06:00 section of 2026-10-08: #140, #143, #145, #144, #142, #138, #151, #150, in that order, retarget steps included).
+3. After the install: look at the 80% toast and the "Before you start" modal once.
+4. Elevated, read-only: `vssadmin list shadowstorage` and `vssadmin list shadows`. Look for used vs max shadow storage on C: (earlier 10.4 of 19 GB) and the shadows' creation dates; if used space drops after large deletes it was retaining them. Optionally an elevated USN-journal read for the 15:22-15:36 drop.
+
+### Optional, low priority (C: is no longer tight)
+- Docker disk image to D: (Docker Desktop -> Settings -> Resources -> Advanced -> Disk image location -> `D:\DockerDesktop`); the 16:00 section lists the steps. ~50.7 GB.
+- WSL Ubuntu to D: via `wsl --export` / `--import` (27 GB); steps in the 16:00 section.
+- Delete the 1.4 GB duplicate Nuitka cache `%LOCALAPPDATA%\Nuitka\Nuitka\Cache` (the classifier blocked my delete; the D: copy is complete).
+- Optional small fixed pagefile on C: for crash dumps (admin).
+- Optional elevated Docker VHDX compaction.
+
+## CHECKPOINT 2026-10-09 ~16:00 IST (reboot happened; pagefile now on D:; build restarted on D:; relocation plan) -- superseded where it differs from the section above
 
 VERIFIED = command run this session; BELIEVED = inferred.
 

@@ -41,7 +41,8 @@ param(
     [Parameter(Mandatory)] [string]$Source,
     [Parameter(Mandatory)] [string]$Target,
     [switch]$Execute,
-    [switch]$DeleteMoved
+    [switch]$DeleteMoved,
+    [switch]$ResumeTarget # allow a non-empty target left by an earlier rolled-back run: robocopy re-syncs it, the full-hash verify still runs
 )
 $ErrorActionPreference = 'Stop'
 $Source = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\')
@@ -95,7 +96,7 @@ if ($inner) { throw "REFUSED: $Source contains a virtualenv/site-packages ($($in
 $links = Get-ChildItem -LiteralPath $Source -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue | Select-Object -First 3
 if ($links) { throw "REFUSED: $Source contains reparse points (junction/symlink), e.g. $($links[0].FullName); robocopy would mis-copy them" }
 if (Test-Path -LiteralPath $Target) {
-    if ((Get-ChildItem -LiteralPath $Target -Force | Measure-Object).Count -gt 0) { throw "target $Target not empty" }
+    if (-not $ResumeTarget -and (Get-ChildItem -LiteralPath $Target -Force | Measure-Object).Count -gt 0) { throw "target $Target not empty (use -ResumeTarget to re-sync a copy left by a rolled-back run)" }
 }
 $files = @(Get-TreeFiles $Source)
 $bytes = ($files | Measure-Object Length -Sum).Sum
@@ -121,7 +122,8 @@ if (-not $Execute) { "DRY RUN OK: re-run with -Execute to copy, verify and swap.
 
 # ---- 3 copy, 4 verify everything
 $copyStart = Get-Date
-robocopy $Source $Target /E /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NP /NS /NC | Out-Null
+$copyMode = if ($ResumeTarget) { '/MIR' } else { '/E' }  # /MIR also purges files in a resumed target that no longer exist in the source
+robocopy $Source $Target $copyMode /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NP /NS /NC | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE); source untouched (partial copy left in $Target)" }
 $tf = @(Get-TreeFiles $Target)
 $tb = ($tf | Measure-Object Length -Sum).Sum
