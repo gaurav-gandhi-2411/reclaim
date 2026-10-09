@@ -1148,6 +1148,52 @@ def test_reversible_only_vaults_a_candidate_that_would_otherwise_delete_permanen
     assert target.read_bytes() == b"redownloadable-cache-content"  # actually restorable
 
 
+@pytest.mark.parametrize(
+    ("candidate_retention", "guard_retention"),
+    [(None, 0), (None, -3), (0, 30), (0, 0)],
+    ids=["guard-0", "guard-negative", "category-0", "both-0"],
+)
+def test_reversible_only_never_gets_a_zero_day_window_or_a_synchronous_purge(
+    tmp_path: Path, candidate_retention: int | None, guard_retention: int
+) -> None:
+    """Regression (verifier pass on PR #163): a configured size-guard retention of 0 made the
+    vaulted copy synchronously purgeable, so the 'reversible' delete removed the vault copy at
+    once. The vault copy must still exist and the entry must be restorable."""
+    target = tmp_path / "cache" / "file.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"precious-if-you-ask")
+    manifest_path = tmp_path / "manifest.jsonl"
+
+    report = apply_batch(
+        [_candidate(target, size_bytes=19, retention_days=candidate_retention, rebuildable=True)],
+        safety=_safety(),
+        apply=True,
+        method="vault",
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        now=_NOW,
+        direct_delete_size_guard_retention_days=guard_retention,
+        reversible_only=True,
+    )
+
+    assert report.files_succeeded == 1
+    assert report.items[0].method == "vault"
+    vault_path = report.items[0].vault_path
+    assert vault_path is not None and vault_path.exists(), "vault copy must survive the batch"
+    assert report.synchronously_purged_count == 0
+    entries = _latest_entries_for_batch(manifest_path, report.batch_id)
+    assert [e.method for e in entries] == ["vault"]
+    assert entries[0].retention_days is not None and entries[0].retention_days >= 1
+    restore_batch(
+        report.batch_id,
+        manifest_path=manifest_path,
+        vault_dir=tmp_path / "vault",
+        safety=_safety(),
+        now=_NOW + 1,
+    )
+    assert target.read_bytes() == b"precious-if-you-ask"
+
+
 def test_reversible_only_refuses_if_the_resolver_ever_returns_direct_delete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

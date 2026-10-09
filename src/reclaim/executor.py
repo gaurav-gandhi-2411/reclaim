@@ -69,6 +69,9 @@ QuarantineMethod = Literal["vault", "recycle_bin", "direct_delete"]
 DEFAULT_VAULT_DIR = data_root() / "data" / "quarantine"
 DEFAULT_MANIFEST_PATH = DEFAULT_VAULT_DIR / "manifest.jsonl"
 _SECONDS_PER_DAY = 86400.0
+# Shortest vault window a `reversible_only` (assistant-initiated) batch may be given: 0 would make
+# the copy purge-eligible at once, so the delete would not be reversible.
+_MIN_REVERSIBLE_RETENTION_DAYS = 1
 
 # --- Progress feedback (fix/apply-progress-feedback) ------------------------------------------
 #
@@ -1108,10 +1111,15 @@ def _effective_method_and_retention_days(
     if mode == Mode.SAFE:
         return "recycle_bin", candidate.retention_days
 
-    if candidate.retention_days is None and reversible_only:
-        # Assistant-initiated deletes are always reversible: never the permanent branch below, and
-        # never retention 0 (immediately purge-eligible) either -- the full window applies.
-        return "vault", size_guard_retention_days
+    if reversible_only:
+        # Assistant-initiated deletes are always reversible: never the permanent branch below,
+        # and never a zero-day window either (a window of 0 is purge-eligible immediately, and
+        # the ADR-0032 synchronous purge would remove the vault copy at once). The floor covers
+        # a configured `direct_delete_size_guard_retention_days = 0` and a category configured
+        # with `retention_days = 0`; found by the second verifier pass on PR #163.
+        if candidate.retention_days is None:
+            return "vault", max(_MIN_REVERSIBLE_RETENTION_DAYS, size_guard_retention_days)
+        return method, max(_MIN_REVERSIBLE_RETENTION_DAYS, candidate.retention_days)
 
     if candidate.retention_days is None:
         size_guard_hit = (
@@ -1762,7 +1770,10 @@ def apply_batch(
             # `None` and the guard axis simply never fires for it, same as `scan_index is None`.
             subtree_entry_count = (
                 scan_index.subtree_entry_count(candidate.path)
-                if scan_index is not None and candidate.is_dir and candidate.retention_days is None
+                if scan_index is not None
+                and candidate.is_dir
+                and candidate.retention_days is None
+                and not reversible_only  # the entry-count guard cannot apply to a vaulted batch
                 else None
             )
             item_method, item_retention_days = _effective_method_and_retention_days(
@@ -1778,7 +1789,8 @@ def apply_batch(
             if reversible_only and item_method == "direct_delete":
                 raise SafetyInvariantError(
                     "reversible_only batch resolved a permanent delete for "
-                    f"{candidate.path} -- refusing; nothing further is touched."
+                    f"{candidate.path} -- refusing at this item; items of this batch processed "
+                    "before it are already applied (and reversible)."
                 )
             item_retention_until = (
                 now_ts + item_retention_days * _SECONDS_PER_DAY
@@ -1972,6 +1984,7 @@ def apply_batch(
                 item_method == "vault"
                 and item_retention_days == 0
                 and candidate.retention_days is None
+                and not reversible_only  # a reversible batch is never purged on the spot
             ):
                 pending_synchronous_purges.append((len(items) - 1, done_entry))
 
