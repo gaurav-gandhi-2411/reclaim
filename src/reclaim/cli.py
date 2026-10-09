@@ -1109,12 +1109,17 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
         return 0
 
     result = check_disk_space(config.notifications, state_path=state_path)
+    toast_note = ""
     if result.should_notify:
-        send_disk_space_toast(result)
-        record_notified(state_path)
+        # Debounce only once Windows accepted the toast: a refused one retries on the next run.
+        if send_disk_space_toast(result):
+            record_notified(state_path)
+            toast_note = " toast=sent"
+        else:
+            toast_note = " toast=not_delivered"
     print(  # noqa: T201
         f"reclaim check-disk-space: status={result.status} reason={result.reason} "
-        f"percent_used={result.percent_used} threshold={result.threshold_percent}"
+        f"percent_used={result.percent_used} threshold={result.threshold_percent}{toast_note}"
     )
     return 0
 

@@ -3,7 +3,275 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-08 ~02:40 IST (full delegation; app BUILT, INSTALLED, scanned, one-click run) -- READ THIS FIRST
+## CHECKPOINT 2026-10-10 ~01:15 IST (toast root-caused and fixed, summary precompute, index pruned, MCP spec) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. The 21:15 section below still holds for the install.
+
+- **MERGE LOG:** #157 -> `d5cf090` (main CI on it: ci, eval, scale-nightly, pages all success, VERIFIED `gh run list`). #159 -> `3c050ba` (docs/specs/assistant-mcp.md, spec only; gates 1-4 pass, 96 lines, 5/5 fresh, rebased, CLEAN). #158 -> `0747a3d` (toast fix; gates 1-4 pass, 94 reviewable + 131 test lines, 5/5 checks fresh on `d7428e8`, rebased on `3c050ba`, CLEAN; `verify.py` steps 1823 passed on the first head, later commits added tests and were covered by CI; TWO verifier passes: the first found no defect but flagged that the registration code never ran in tests (fixed with a fake-winreg test), the second flagged the missing `setting` pre-check (added)). Main CI on `3c050ba`: ci, eval, scale-nightly, pages all success (VERIFIED); on `0747a3d` eval success, ci/scale-nightly still running when written (check `gh run list --branch main`).
+- **GG MERGE BATCH addition:** #160 (`perf/summary-precompute`, head `0e236c3`) is a DRAFT: all checks green, 24 reviewable + 62 test lines, but **gate 1 fails on the branch prefix `perf/`** (not in the gate's list). I did not rename the branch to fit (that is rule-gaming); needs GG to merge or to add `perf/*` to the gate. Verifier pass found a status wart (a cancel in the precompute ended the warm-up "cancelled" with a warm cache): fixed in the PR. Known residual: warm-status stays "computing" for the extra 25-100 s while the aggregates run.
+- **80 % toast ROOT CAUSE (VERIFIED, not a packaging bug):** frozen and source behave identically. `windows_toasts` `InteractableWindowsToaster` defaults to Command Prompt's AUMID (`{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\cmd.exe`). On this machine `toastNotifier.setting` = 1 (DISABLED_FOR_APPLICATION) for it and every toast fails with HRESULT 0x803E0111 via the async `on_failed` callback while `show_toast` returns normally. The cmd.exe key (a NESTED registry key, which my earlier flat enumeration missed) has `LastNotificationAddedTime` 2026-08-26 and count 18 (the BI3 17->18). The CLI ignored the return value and debounced the failure. Fix #158: own registered AUMID `Reclaim.DiskCleanup` (installer `[Registry]` + runtime `ensure_toast_aumid`), failure callback wait 0.75 s, `setting` pre-check, `record_notified` only after an accepted toast, `check-disk-space` prints `toast=sent|not_delivered`. Live: new id `setting` = 0 and its `LastNotificationAddedTime` moved to the run time; old id still 1. **Still UNDETERMINED: that a toast was seen on screen** (Focus Assist; the id has no icon/shortcut), and the installed build (`ee078d6`) does NOT have the fix until the next build. `winreg` is a builtin module of the 3.12 interpreter (VERIFIED `sys.builtin_module_names`), so the frozen build should have it (BELIEVED until a build runs). Left behind by my probing: HKCU `AppUserModelId\Reclaim.DiskCleanup` and its Notifications\Settings entry (intended); my test-id keys were deleted. I fired about 5 real test toasts on the desktop. Weakness accepted: a failure callback later than 0.75 s counts as sent; a persistent refusal retries every scheduled run silently (no escalation).
+- **First `/api/summary` after warm-up (24.1 s) cause, measured on a scratch copy of the real index** (`scripts/scratch_index.py`, copy removed, VERIFIED no leftover dir): whole-index physical-size aggregate 53.4 s cold / 25.6 s warm cache; volume-scoped one 100.7 s; `has_any_records` and `inaccessible_summary` ~0 s. #160 pays them at the end of the warm-up. After-timing on the real index NOT measured (needs a ~30 min warm-up); the regression test fails on main and passes with the change.
+- **Index prune (Reclaim's own data, dashboard closed, no Reclaim process running):** dry run found 43,355 dead rows (425 s); `index-prune --apply --vacuum` removed 44,249 of 6,745,575 rows (1,027,478,317 bytes of file sizes they described; 685,073 directories checked, 4,819 missing; 0 unverifiable), 261.5 s, then VACUUM. **Index file 7,711,076,352 -> 4,956,119,040 bytes** (-2.75 GB). C: free 211.03 -> 211.69 GiB across the run (confounded by other activity; the sampler shows 228.17e9 B at 01:06). The first-summary timing above was measured BEFORE the prune.
+- **docs/specs/assistant-mcp.md** written (96 lines): tools, approval in Reclaim's own window, invariants I1-I6, eval design with a hard-zero unsafe-selection gate, acceptance tests A1-A9, open items (typed approval code for shell-capable agents is the main one). ChatGPT web out of scope.
+- **Sampler** (PID 24340, started 10-09 15:47) is still running; ends about 15:47 on 10-10; steady-state drift to be reported then. Not yet computable (activity windows overlap).
+
+## CHECKPOINT 2026-10-09 ~21:15 IST (NEW BUILD INSTALLED AND VERIFIED; HOWTO updated)
+
+VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 19:00 section's "critical path" list (done below); its MERGE LOG and WHEN GG HAS TIME stay valid.
+
+- **MERGE LOG:** #156 -> `48b1723` (spec docs/specs/relocate.md + 19:00 checkpoint + `relocate_dir.ps1 -ResumeTarget`): gates 1-4 pass (104 reviewable), 5/5 checks fresh on `133f5a4`, CLEAN, rebased on `27b4d38`; my own scratch test of `-ResumeTarget` (refuses a non-empty target without the switch; with it, a stale file purged, full-hash 0 differences, swapped) stood in for a verifier pass. Main CI on `48b1723`: ci, eval, scale-nightly, pages all success.
+- **Build** from `integration/next` `ee078d6`: installer `reclaim-setup.exe` 292.3 MB, SHA-256 `4841de92718bb4ac86d8c5cec1dd621486b64581ddb7aa56941af292604c6ecc` (dist 793.1 MB). Wall clock ~15:22 -> ~20:00 IST, compile resumed after the reboot. Watchdog `END start_free=24.55GB min_free=15.45GB peak_C_drop=9.10GB peak_D_drop=194.54GB`; the D: peak is dominated by my concurrent 185 GiB HF copy, so the build's own peak is NOT isolated; its resting footprint on D: is build 2.93 + nuitka-cache 1.55 + uvcache 0.66 GB (VERIFIED sizes). Peak C: drop 9.1 GB came from other activity (HF rehearsal/other sessions), not the build (its output is on D:).
+- **Checks on the dist:** `check_dist_dll_closure.py` OK; `test_packaged_safe_mode.ps1` 14/14 PASS; `test_packaged_serve.ps1` all PASS (serve, CSRF, scan 6 files, AI tracks semantic_image / near_identical_image / near_dup_document_and_version_chain ran).
+- **Install:** `/VERYSILENT` exit 0 (log `D:\reclaim-build\install.log`); `reclaim.exe --version` 1.3.0; installed `config.toml` hash identical to the pre-install backup (`D:\reclaim-build\config.toml.pre-install-20261009`): `[exclusions] project_names = ["fr-en-transformer","shipdoc-extract","intent-router"]`, `[autoclean] enabled = true`, `[notifications] enabled = true`, `disk_threshold_percent = 80.0`. Index 7,711,076,352 B preserved. Tasks: `Reclaim Weekly Auto-Clean (gaura)` = weekly trigger Sunday 10:00 + logon trigger delay PT3M, next run 2026-10-11 10:00; `Reclaim Disk Space Check (gaura)` Ready (next 21:00).
+- **Fresh scan** (`/api/scan/my-files`, 20:08): complete in **755.4 s**; entries 6,745,575; written 484,361; unchanged 6,261,214; pruned 640,301; no error. Warm-up started at the scan-end second (`source=auto`), **finished `ready` after 1,914 s**; WAL peaked at 10 MB (10-08 build: 13.15 GB), C: free stayed 223-226 GB, no `database is locked`/`table is locked` in the server log, exactly one `dedup.start`. The 10-08 failures (#150/#151 content) look fixed in this build.
+- **Real-browser 409 check** (Playwright + installed Chrome, headless, first-run response stubbed in the browser only): while warming, Overview shows "Indexing your files... 33s so far. The page is not stuck", empty alert region, 0 console errors; server returned typed 409 `candidates_not_warm` on `/api/summary` and `/api/clean/one-click-summary`. Screenshots: `docs/assets/409-install-20261009-0{1-simple,2-advanced-overview,3-review-queue}.png`. After warm: `ready-install-20261009-*.png` (Review Queue was still "Loading" at capture, 2.5 s; I did not watch it finish). **New finding:** the first `/api/summary` after warm-up took **24.1 s** (then 0.25 s); a Playwright `networkidle` goto timed out at 30 s on it. BELIEVED to be the first computation over a 6.7 M-row index; candidate for a follow-up.
+- **One-click run** through the installed app (`POST /api/clean/regenerable apply=true`, run `257e104241d1`): **119.6 s**; `bytes_removed` 669,750,108 (638.7 MB: pip 72,220,883 [via the junction, so this was D: space], npm 153,141,601, aged temp 708,732, Chrome 443,678,892; Edge skipped (running); conda/yarn/brave/firefox absent; `C:\WINDOWS\Temp` needs admin; uv nothing to prune). Report's own free-space delta 607,174,656 B; C: free 224.04 -> 224.65 GB; percent used 78.01 %. **`excluded_applied` 0**, six excluded paths listed (all `*fr-en-transformer*` / `*intent-router*`); excluded scratch entry counts before = after (fr-en 152,614; shipdoc 442; intent-router 18,049). Audit lines 85 -> 102 in `data\regenerable_audit.jsonl`. Pagefile unchanged: `D:\pagefile.sys` 16,384 MB. Driver bug (mine): `drive_oneclick.py` waited for status `completed|failed|idle`, the server says `done`, so it never exited; I stopped it and read the final status by hand.
+- **80 % toast / PeriodicNotificationCount:** `check-disk-space` with a scratch config at threshold 50 returned `status=ok reason=would_notify percent_used=78.01`, no exception, state file written. `PeriodicNotificationCount` (HKCU Notifications\Settings, 8 AUMID keys; no Reclaim key) is **unchanged** (`pnc_before.txt` vs `pnc_after2.txt`, empty diff): same as 10-08, the counter does not track this identity. VERDICT: delivery still UNDETERMINED (nobody confirmed it visually). Real C: use is now 78 %, below the real threshold.
+- **Docs:** `docs/HOWTO.md` section 6b rewritten from these measurements; 98 % statement fixed.
+- Server I started (PID 15400) was stopped by PID; no instance of mine is left running.
+
+### Still open
+24 h attribution sampler (running; steady-state C: drift to be reported at its end; 17:40-18:35 was about -0.2 GiB/h); GG MERGE BATCH; WHEN GG HAS TIME list from the 19:00 section (excluded scratch decision, merge batch, 80% toast look, elevated `vssadmin`); optional: `reclaim index-prune --apply --vacuum` on the 7.7 GB index; delete old integration worktree artifacts only if safe.
+
+## CHECKPOINT 2026-10-09 ~19:00 IST (disk emergency closed: C: 208 GB free; critical path = build -> smoke/DLL -> install -> verification -> HOWTO) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. This section supersedes the 16:00 section below where they differ.
+
+### MERGE LOG additions (merged by me under the existing gate)
+- #153 -> `8b9f8bb` (docs checkpoint 06:00). #154 -> `9589152` (docs checkpoint 11:00; 34 reviewable lines; 6/6 checks). #155 -> `27b4d38` (relocation docs + `scripts/relocate_dir.ps1`; 247 reviewable lines; gates 1-4 pass; 6/6 checks green on `a24c200`; verifier pass found 7 defects, fixed before merge).
+- CI on main `27b4d38` (VERIFIED): `ci`, `eval`, `scale-nightly`, `pages-build-deployment` all success.
+
+### HF cache moved to D: (GG approval "approve HF" with conditions; VERIFIED, `D:\relocated\hf_move.log`)
+- Rehearsal first: `C:\Users\gaura\sdks\android-sdk` (44,859 files, 7,767,032,058 B) -> `D:\relocated\sdks\android-sdk`; SHA-256 of every file, 0 differences; delta 0 changed; 10.1 min; `adb version` works through the junction; old copy re-hashed (0 differences) and deleted. Left moved.
+- hub (1,099 files, 164,714,311,916 B), datasets (67 files, 34,168,774,203 B) and xet (55 files, 24,078,406 B) -> `D:\relocated\huggingface\{hub,datasets,xet}`. Reparse points: 0 in source and 0 in destination for all three; 0 multi-linked files; counts and bytes equal; per-file SHA-256 differences 0 (copy verify, delta, and again in `-DeleteMoved`). Handle check: the rename probe and the freeze rename both succeeded for all three, so no holder existed and none had to be named (the probe runs before the copy; the freeze rename is the check at swap time). Wall-clock: hub 16.1 min, datasets 3.3 min, xet <1 s; deleting hub.moved took 13.8 min.
+- Load test through the junction path, read-only/offline, every tensor of the smallest weight file read: fr-en-transformer's `Unbabel/wmt22-comet-da` (424 tensors), AetherArt's `stabilityai/sdxl-turbo` (248), triage-iq's `BAAI/bge-reranker-v2-m3` (393, config loaded). Real paths resolve to D:. Only after that were `xet.moved`, `datasets.moved`, `hub.moved` deleted, each in its own command after the check.
+- **C: free 15.45 -> 208.05 GiB.** Accounting (sampler `2026-10-09-attrib\sizes.csv`): 22.86 (before the deletions) + 185.24 deleted = 208.10 expected, 208.05 observed. Steps: +31.81 for xet+datasets (31.84), +153.38 for hub (153.40). The earlier "27 GB unaccounted" came from reading 22.86 as a post-delete figure; it was measured before any HF deletion. The 22.75 -> 15.45 "fall" was ordering: 15.45 was logged before the android-sdk delete finished (+7.30 vs 7.23 GiB).
+- Shadow copies: free space rose by the full deleted amount each time, so there is no sign that shadow storage retained it. `vssadmin` and `Win32_ShadowCopy` need admin, so shadow storage is unread (WHEN GG HAS TIME).
+- The 15:22-15:36 C: drop (25.7 -> 17.1 GB) remains UNDETERMINED: the 10-09 sampler started 15:47 and the USN journal needs admin.
+- Spec for the feature: `docs/specs/relocate.md`. `scripts/relocate_dir.ps1` gained `-ResumeTarget` (re-sync a non-empty target left by a rolled-back run, `/MIR`, full hash still runs).
+
+### Critical path (in this order)
+1. Nuitka build (PID 7620, watchdog PID 6168, output on D:, ETA ~18:15-19:30 by my estimate, BELIEVED) -> `check_dist_dll_closure.py` + `test_packaged_safe_mode.ps1` + `test_packaged_serve.ps1` -> install via `/VERYSILENT` with exclusions in `config.toml` -> triggers, 80% + weekly, fresh scan, 409 browser check, one-click run with audit-log evidence, PeriodicNotificationCount -> `docs/HOWTO.md`.
+2. 24 h attribution sampler keeps running to its end; steady-state C: drift rate to be reported then (so far 17:40-18:35: 23.04 -> 22.86 GiB, about -0.2 GiB/h, BELIEVED to be build/temp noise).
+
+### WHEN GG HAS TIME (re-prioritised 2026-10-09 ~19:00; nothing blocks me)
+1. **Excluded projects' transient scratch is the main remaining C: consumer** (`%TEMP%\claude`: fr-en 10.2 + shipdoc 6.5 + intent-router 6.2 = 22.9 GB). Decide whether CC may clear finished sessions' scratch for those projects, or move it (same approval class as HF).
+2. **GG MERGE BATCH** (06:00 section of 2026-10-08: #140, #143, #145, #144, #142, #138, #151, #150, in that order, retarget steps included).
+3. After the install: look at the 80% toast and the "Before you start" modal once.
+4. Elevated, read-only: `vssadmin list shadowstorage` and `vssadmin list shadows`. Look for used vs max shadow storage on C: (earlier 10.4 of 19 GB) and the shadows' creation dates; if used space drops after large deletes it was retaining them. Optionally an elevated USN-journal read for the 15:22-15:36 drop.
+
+### Optional, low priority (C: is no longer tight)
+- Docker disk image to D: (Docker Desktop -> Settings -> Resources -> Advanced -> Disk image location -> `D:\DockerDesktop`); the 16:00 section lists the steps. ~50.7 GB.
+- WSL Ubuntu to D: via `wsl --export` / `--import` (27 GB); steps in the 16:00 section.
+- Delete the 1.4 GB duplicate Nuitka cache `%LOCALAPPDATA%\Nuitka\Nuitka\Cache` (the classifier blocked my delete; the D: copy is complete).
+- Optional small fixed pagefile on C: for crash dumps (admin).
+- Optional elevated Docker VHDX compaction.
+
+## CHECKPOINT 2026-10-09 ~16:00 IST (reboot happened; pagefile now on D:; build restarted on D:; relocation plan) -- superseded where it differs from the section above
+
+VERIFIED = command run this session; BELIEVED = inferred.
+
+### State (VERIFIED 2026-10-09 15:20-15:40)
+- `origin/main` = `9589152` (#154, my merge); CI on it: `ci`, `eval`, `scale-nightly` x2, `pages-build-deployment` all success. Local main was behind and was fast-forwarded. All 8 batch PR heads unchanged, so `integration/next` `ee078d6` is still current.
+- Boot 2026-10-09 13:02. **Pagefile is `D:\pagefile.sys` (16 GB, system-managed); there is no pagefile on C:** (`Win32_PageFileUsage`). C: free went 3.9 GB -> 24.8 GB (the 17 GB pagefile left C:). D: free 1,748 GB.
+- C: and D: are two separate physical NVMe SSDs (`Get-PhysicalDisk`: Disk 1 Samsung MZVL2 954 GB = C:, Disk 0 Samsung 990 EVO Plus 1.8 TB = D:). Moving data to D: costs no speed class.
+- My background tasks from the previous session (watchdog, launcher, samplers) died with the reboot. Restarted: build + watchdog (below) and the attribution sampler (`%TEMP%\reclaim_soak\2026-10-09-attrib\sizes.csv`).
+- Merge log addition: #154 (docs checkpoint 11:00) -> `9589152`, gates 1-4 pass (34 reviewable), CLEAN, 6/6 checks fresh.
+
+### Build (restarted 15:22 IST from `integration/next` `ee078d6`)
+- `packaging/build` is a junction to `D:\reclaim-build\build`; `NUITKA_CACHE_DIR`, `TEMP`/`TMP`, `UV_CACHE_DIR` are all on D: (`D:\reclaim-build\{nuitka-cache,tmp,uvcache}`).
+- Watchdog fixed per steering: it now aborts only if **D:** free < 50 GB (it lists, then deletes, its own partial output) and only LOGS C:. The earlier watchdog killed the 10-08 build because other sessions filled C:; that was the wrong guard. Log: `D:\reclaim-build\watchdog2.csv`; peak C:/D: drop is written at the end.
+- Observation: C: free still fell 25.7 -> 17.1 GB between 15:22 and 15:36 while the build wrote to D:. No file >100 MB was written under LocalAppData/.cache/ml-projects/tmp/AppData in that window (many small files, or Windows-side writes): cause NOT identified; it flattened at 17.1 GB.
+- The ccache may miss because the build path changed: expect a long build (cold: 292 min last time).
+
+### Decision: where Reclaim's data dir lives
+Not moved. `app_paths.data_root()` is the executable's directory and every default (`data/reclaim_index.sqlite3`, `data/quarantine`, logs, state) hangs off it; there is **no config key for the index path**. A junction on the whole `data` folder would also move the vault to D:, and the vault must stay on the volume of the files it vaults (ADR-0001/0005: same-volume rename; a cross-volume vault turns every quarantine into a copy and breaks the rollback guarantee). So the 7.7 GB index stays on C: next to the exe. Cheaper lever: `reclaim index-prune --apply --vacuum` after install (the file has free pages). Prerequisite for ever moving it: a `[storage] index_path` setting (GAPS item 0).
+
+### Relocation plan: C: consumers > 1 GB (VERIFIED, `D:\reclaim-build\c_census.csv`, read-only walk 2026-10-09 15:27-15:39; profile = 866 GB)
+Hardlink bytes are NOT measured (Windows `scandir` gives no link count); "hardlink-dependent" below comes from the tools' documented behaviour.
+
+| size | path | users | class | notes |
+|---|---|---|---|---|
+| 185 GB | `~\.cache\huggingface` (hub 153, datasets 32) | many projects incl. EXCLUDED fr-en-transformer (nllb-200, m2m100, comet models: BELIEVED from names, not checked in code), AetherArt (SDXL, wikiart), mindmeld | MOVABLE (junction, same path) | needs GG approval: relocates excluded projects' files. `token`/`stored_tokens` sit in the same folder: move only `hub`, `datasets`, `xet`, keep tokens on C: |
+| 66 GB | `%TEMP%\claude` (per-project scratch) | Claude sessions, incl. EXCLUDED fr-en 10.2, shipdoc 6.5, intent-router 6.2 | MOVABLE, but live sessions hold handles | needs GG approval (excluded data); not while sessions run |
+| 50.7 GB | `AppData\Local\Docker\wsl\disk\docker_data.vhdx` | Docker Desktop (stopped) | MOVABLE via Docker Desktop setting (no junction) | GG item 2 |
+| 31.4 GB | `AppData\Local\uv` (cache) | every uv venv | **MUST STAY** | uv docs: the cache must share a filesystem with the environment, else "will instead need to fallback to slow copy operations" (docs.astral.sh/uv/concepts/cache, fetched 2026-10-09). Moving it makes every C: venv a full copy = more C: use |
+| 27.0 GB | `AppData\Local\wsl\{...}\ext4.vhdx` (Ubuntu, stopped) | WSL | MOVABLE via `wsl --export/--import` | GG item 3 |
+| 32 GB | `hm-data` (images 28.5) | a data project | movable data | the project's owner decides |
+| 32 GB (envs 21) | `anaconda3` | conda envs (hardlinks from `pkgs` 1.2 GB) | MUST STAY (conda hardlinks; BELIEVED, not fetched) | |
+| 70, 70, 58, 22 GB | `multimodal-fashion-recommender` (data 64), `AetherArt` (data 41, models 23), `mindmeld\generator` (56.7), `SargamSa` (.neural_eval_envs 18.8) | other projects' working data | movable with junctions while those projects' sessions are idle | not touched; needs the owner |
+| 16.4, 8.9, 6.5 GB | EXCLUDED intent-router, fr-en-transformer, shipdoc-extract working dirs | excluded | **NOT TOUCHED** | measured only |
+| 15.7 GB | `AppData\Local\Programs` (installed apps incl. Reclaim) | | stay | |
+| 10.9 GB | `sdks` (android 7.2, flutter 3.0) | | movable, tool paths must be updated | |
+| 1.5 GB | `AppData\Local\npm-cache` | **3 live chrome-devtools-mcp (npx) processes run from `npm-cache\_npx`** (other sessions) | movable, but live holders | skipped; retry when those sessions end |
+| 1.42 GB | `AppData\Local\Nuitka\Nuitka\Cache` | duplicate of `D:\reclaim-build\nuitka-cache` | delete | the classifier blocked my delete: GG item 5 |
+| 0.07 GB | `AppData\Local\pip\cache` | pip | **MOVED** (below) | |
+
+**Executed now (only moves with no excluded data, no live holders, no admin): the pip cache.** Copy -> verify (690 files, 72,245,327 B on both sides; SHA-256 of a 25-file sample, 0 mismatches) -> rename old to `cache.moved` -> junction `C:\Users\gaura\AppData\Local\pip\cache` -> `D:\relocated\pip-cache` (resolves; 690 files through the junction) -> old copy checked (690 files, same bytes, not a link) and deleted in a separate command. Gain: 69 MB (it was small); the value is that the procedure is proven. Rollback: `cmd /c rmdir <junction>` then `robocopy D:\relocated\pip-cache <path> /E`.
+
+The reusable script is `scripts/relocate_dir.ps1` (dry run by default; refuses uv/conda/venv paths; handle probe by rename round-trip; verify; swap with automatic rollback; deleting `.moved` only in a separate `-DeleteMoved` run that re-checks). Independent verifier pass (agent, 38 tool calls, scratch only) FOUND 7 defects in the first version: (1) `-DeleteMoved` compared only count+bytes, so a same-size corrupted target let it delete the only good copy; (2) an edit made between copy and swap was silently lost; (3) verification hashed only a sample (54 of 200 files); (4) a PARENT of uv/conda/.venv passed the denylist; (5) paths >260 chars make it throw (fail-closed); (6) `[ ]` in the target broke the junction step; (7) a stale `.moved` was not refused up front. Fixed in the rewrite: SHA-256 of EVERY file at verify and again in `-DeleteMoved`; source is frozen by renaming to `.moved` and a `/MIR` delta re-sync + re-hash of files written since the copy started runs before the junction; `mklink /J`; descendant/venv denylist; stale `.moved` refused; (5) documented as a known limit. Re-run of the attacks on the fixed script: same-size edit and an added file during the window both reached the target; `-DeleteMoved` refused a same-size corrupted target ("content differs"); parent-of-.venv refused; `t[1] x` target swapped; stale `.moved` refused before any copy. Still untested: pwsh-7-only behaviour, a volume filling mid-copy, ACL/owner preservation (`/COPY:DAT` drops them), a real large directory. Dry-run first on anything real.
+
+### Swing attribution, 10-08 10:50 -> 13:10 (VERIFIED, `2026-10-08-attrib\sizes.csv`, 28 passes; each pass took ~570 s, not 5 min)
+C: free ranged 2.44-9.93 GB. Path growth over the window: ml-projects +1.49 GB, AppData +1.16 (wsl +0.56, pip +0.36), `.cache` +1.06 (a 1.04 GB Hugging Face model written 11:13 by another session), review-iq scratch +0.65, gold-rate-tracker scratch +0.23; shipdoc scratch -0.74. That is ~5 GB of a 7.5 GB swing; **no single path explains it** and ~2.5 GB is unattributed (VSS / system / short-lived files, BELIEVED). The pagefile (17 GB, constant size) was not the swing; its move to D: is what bought the headroom.
+
+### WHEN GG HAS TIME (top items; nothing blocks me)
+1. **Approve moving the Hugging Face cache to D: -- one word ("approve HF").** Size 185 GB (hub 153, datasets 32). It moves files but keeps every path (a junction at the old location), so no project config changes. It relocates files used by the EXCLUDED fr-en-transformer, hence your approval. Before: close all Claude sessions and Python that load models. After approval I run:
+   ```powershell
+   cd C:\Users\gaura\ml-projects\reclaim\scripts
+   foreach ($d in 'hub','datasets','xet') {
+     .\relocate_dir.ps1 -Source C:\Users\gaura\.cache\huggingface\$d -Target D:\relocated\huggingface\$d    # dry run: size, free space, handle probe
+   }
+   # if every dry run says OK: add -Execute (copy, verify, swap); read the CHECK line; then, in a separate run, add -DeleteMoved
+   ```
+   Handle check = the script's rename probe (fails with "Access denied" if anything under the folder is open). Verification = file count + bytes + SHA-256 of EVERY file (185 GB read on both sides: allow ~20-40 min), then a delta re-sync after the source is frozen. Rollback before `-DeleteMoved`: `cmd /c rmdir <path>` then `Rename-Item <path>.moved <name>`; after it: `robocopy D:\relocated\huggingface\<d> <path> /E`, then remove the junction. Frees ~185 GB on C:.
+2. **Docker disk image to D:** Docker Desktop -> Settings -> Resources -> Advanced -> "Disk image location" -> `D:\DockerDesktop` -> Apply & restart (Docker moves the 50.6 GB `docker_data.vhdx` itself). Docker is currently stopped. Optionally `docker system df` / prune first; compaction (`Optimize-VHD`, elevated) is separate.
+3. **WSL Ubuntu to D: (27 GB).** Nothing is running (`wsl -l -v`: Ubuntu Stopped, docker-desktop Stopped).
+   ```powershell
+   wsl --shutdown
+   mkdir D:\wsl
+   wsl --export Ubuntu D:\wsl\ubuntu-backup.tar
+   wsl --unregister Ubuntu          # only after the tar exists and is about the size of the distro
+   wsl --import Ubuntu D:\wsl\Ubuntu D:\wsl\ubuntu-backup.tar --version 2
+   # the default user resets to root: create /etc/wsl.conf with [user] default=<yourname> in the distro, then wsl --shutdown
+   ```
+   Keep the tar until you have booted the distro and checked your files.
+4. Pagefile: already on D: (16 GB, system-managed), none on C:. Optional (admin): a small fixed pagefile on C: so a crash dump can be written; not needed otherwise.
+5. **Delete the 1.4 GB duplicate Nuitka cache on C:** `Remove-Item "$env:LOCALAPPDATA\Nuitka\Nuitka\Cache" -Recurse -Force` (the copy on `D:\reclaim-build\nuitka-cache` is complete: 24,565 files vs 23,679). The permission classifier blocked me from doing it.
+6. **Excluded projects' transient scratch is the main disk consumer** (fr-en 10.2 + shipdoc 6.5 + intent-router 6.2 = 22.9 GB under `%TEMP%\claude`): decide whether CC may clear finished sessions' scratch for those projects, or move it (same approval as item 1).
+7. **GG MERGE BATCH** (block in the 06:00 section: #140, #143, #145, #144, #142, #138, #151, #150, in that order, retarget steps included).
+8. After the next install: look at the 80% toast and the "Before you start" modal once. Optional elevated compaction of the Docker VHDX.
+
+## CHECKPOINT 2026-10-08 ~11:00 IST (build running on D:; supersedes the disk/build parts of the 06:00 section)
+
+VERIFIED = command run this session; BELIEVED = inferred.
+
+### WHEN GG HAS TIME (top of list, per 2026-10-08 steering)
+1. **Excluded projects' transient scratch is the main disk consumer -- decide whether CC may clear finished sessions' scratch for those projects.**
+   Sizes (VERIFIED, first sampler pass 10:50-10:59 IST, `%TEMP%eclaim_soak6-10-08-attrib\sizes.csv`): `%TEMP%\claude\` fr-en-transformer 10.21 GB,
+   shipdoc-extract 6.52 GB, intent-router 6.18 GB = **22.9 GB**. For comparison NON-excluded: gold-rate-tracker 17.39 GB, review-iq 8.47 GB, gg-portfolio 6.12 GB,
+   triage-iq 5.92 GB. I touched none of them (observation only; hard exclusion stands until you decide).
+2. **GG MERGE BATCH** (block below, unchanged: #140, #143, #145, #144, #142, #138, #151, #150, in that order, with retargeting steps).
+3. Other disk levers: Docker `docker_data.vhdx` 50.7 GB + wsl 26.5 GB (prune/compact); uv cache 31.4 GB (prune freed only 229 MiB, rest is in use).
+4. Look once at the 80% toast and the "Before you start" modal after the next install; optional reboot / elevated compaction.
+
+### Merge log addition
+| #153 | docs checkpoint (06:00) | `8b9f8bb` | gates 1-4 pass (144 reviewable), 5/5 checks fresh, CLEAN | n/a docs-only | green |
+
+### integration/next verify run 2 (VERIFIED, `ee078d6`)
+1 failed, 1935 passed; ruff + mypy clean. The failure is `evals/test_cli_cold_start_budget.py` (median 2915.3 ms vs 2000 ms budget). Back-to-back repeats at ~100% CPU
+alternated pass/fail on identical code (main pass/fail, integration fail/pass) -> load noise, BELIEVED; NOT yet seen passing on a quiet machine.
+
+### Disk plan (replaces "25 GB or no build")
+- Volume D: has 1,767 GB free (VERIFIED `Get-PSDrive`). The Nuitka build dir is now on D: (`reclaim-wt-intnext\packaginguild` is a junction to `D:eclaim-builduild`,
+  holding the build venv, `.build`, `.dist`), and `NUITKA_CACHE_DIR=D:eclaim-build
+uitka-cache` (copy of the 1.4 GB C: cache; the C: copy is left in place). Only the installer
+  output and the install land on C:. Note: ccache keys may miss because the build path changed (BELIEVED) -> possibly a cold build (the last cold one took 292 min).
+- Start rule (steering): free C: >= 2x measured peak (~12 GB) with a watchdog, abort < 4 GB. Free was 10.0 GB at start; with the build on D: the C: footprint is the
+  installer + temp, so I started at 10.0 GB and let the watchdog (`D:eclaim-build\watchdog.csv`, 30 s samples, aborts and removes its own partial output below 4 GB)
+  protect C:. Actual peak footprint is recorded there and will be reported at the end.
+- `uv cache prune` poller (15 min, 24 h): it got the lock on the first try: removed 5,335 files, 229.3 MiB (free 9.93 -> 9.98 GB). Poller finished.
+- Attribution sampler (5 min target, 24 h): first pass took 572 s (the profile walk is slow), so the real period is ~10 min. Top consumers so far (VERIFIED): .cache 186.6 GB,
+  AppData 219.6 GB (Docker 50.7, uv 31.4, wsl 26.5, Programs 15.7), ml-projects >= 283 GB (walk timed out, lower bound). The swing attribution needs the time series; reported at the end.
+
+## CHECKPOINT 2026-10-08 ~06:00 IST (batch prepared for one GG action; BUILD BLOCKED ON DISK) -- READ THIS FIRST
+
+VERIFIED = I ran it this session and quote the output; BELIEVED = inferred, stated as such.
+
+### State in five lines
+- main = `703be93` (#152 merged). main CI on that commit: `ci`, `eval`, `scale-nightly`, `pages-build-deployment` all `success` (VERIFIED, `gh run list --branch main`).
+- `integration/next` (pushed) = main + #140, #143, #145, #144, #142, #138, #151, #150 + one test-reconciliation commit; head `ee078d6`.
+  Full verify run 1 on `f3d547f`: **4 failed, 1932 passed** (`verify_intnext1.txt`, scratchpad). Three were real cross-PR test issues, now fixed (below); the fourth is the cold-start budget eval measured on a loaded, disk-starved machine (median 6217.6 ms vs 2000 ms budget): NOT counted as fixed, re-run on a quiet machine. Run 2 on `ee078d6` was started; its result goes in the next checkpoint (result in the 11:00 section: 1 failed = cold-start timing noise, 1935 passed).
+- **The build/install is blocked: C: free is 3.3-11.6 GB, the steering requires 25 GB.** Disk step 0 below.
+- The installed app on gaura is still the 2026-10-08 build of `integration/2026-10-07` (pre-#150/#151/#152 fixes): see "Known issues" in docs/HOWTO.md section 6b (avoid the Review Queue right after a big scan).
+- Soak verdict: no leak (below).
+
+### MERGE LOG (merged by me under the existing gate)
+| PR | what | merge commit | gate result at merge | verifier | CI |
+|---|---|---|---|---|---|
+| #141 | docs checkpoint | `d2948c2` | docs-only | n/a | green |
+| #146-#149 | docs checkpoints / GAPS / HOWTO | on main | docs-only | n/a | green |
+| #152 | `/api/summary` SQL physical-size aggregate + per-generation cache | `703be93` | gates 1-5 pass (324 reviewable lines) | second-pass verifier: 1,818 SQL-vs-Python diffs, 0 mismatches; JSON byte-identical; mutations caught (46-47/56 tests fail) | main CI green on `703be93` |
+
+Verifier follow-ups on #152 NOT yet fixed (none blocking): scoped whole-drive aggregate ~6.5x slower than unscoped on a 500k synthetic index (reuse the unscoped total when scope covers every row); stat-signature cache can serve stale if a writer restores mtime with identical db/WAL size; `SUM(size)` raises past 2^63 bytes. Real-index speedup NOT measured.
+
+### Disk, step 0 (steering item 1)
+- Free before/after (VERIFIED, `Get-PSDrive`): 13.9 GB -> 18.3 GB after deleting my own old things; pagefile.sys 17 GB throughout.
+- Deleted (each check run and read first, deletion in a separate command): `%TEMP%\claude\{lo, oss2-docker, rwt, resume-venv}` (other, NON-excluded projects, newest content 24-09, no live process matched, none was a git repo with state; `oss2-docker` was a dangling worktree stub) ~3.2 GB; worktrees of merged PRs `reclaim-wt-{docs2,docs3,docs4,resume,resume2,fix-summary}` (all clean) ~1.3 GB. Untouched: fr-en-transformer, shipdoc-extract, intent-router and everything else under %TEMP%\claude, `%TEMP%\pytest-of-gaura`, `hub_roundtrip_*`.
+- `uv cache prune` (UV_LOCK_TIMEOUT=120, no --force): "No unused entries found". The uv preview number is the known overstatement.
+- `reclaim.exe auto-clean --apply`: freed ~1.2 MB (npm already cleaned earlier; pip cleaned); audit in `data\regenerable_audit.jsonl`.
+- Then C: fell to 3.3 GB within ~40 min and recovered to ~11 GB. NOT caused by Reclaim or my agents (my only runaway was a backgrounded `Get-Content -Tail` I stopped by task id and whose 144 MB output I deleted). Large writers seen: `%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx` 51.8 -> 50.6 GB (modified during the drop), a triage-iq session's task log (426 -> 705 MB, ~16 MB/min), gold-rate-tracker session scratch 17.6 GB. **I did not identify the source of the 10 GB swing.** I did not touch any of them.
+- 25 GB cannot be reached with what I am allowed to delete (nothing else is >7 days old and non-excluded). The big levers are GG's: Docker data/VHDX, other sessions' scratch.
+
+### integration/next: conflict resolutions (so each PR's eventual merge is mechanical)
+Merge order used: #140, #143, #145, #144, #142, #138, #151, #150.
+1. `docs/architecture/adr/0034-regenerable-tier-auto-clean.md`: #142 vs #145 addendum, then #138 vs the same section: all additive; keep both paragraphs (the "Upgrade path" addendum goes after the "Hermetic tests" addendum + #142's CI paragraph).
+2. `src/reclaim/index.py` `ScanIndex.__init__`: #145 adds the `assert_not_real_profile_under_pytest(...)` call, #151 changes `self._db_path = Path(db_path)`, #150 adds `*, busy_timeout_ms: int | None = None` and the timeout branch. Resolved signature: `def __init__(self, db_path: Path, *, busy_timeout_ms: int | None = None)`, guard call first, then `self._db_path = Path(db_path)`, then the `busy_timeout_ms` connect branch.
+3. `src/reclaim/api/routes.py` `/duplicate-clusters/review`: #151 catches `DedupAborted` -> typed 503; #150 takes `BackgroundTasks` and catches `service.CandidatesNotWarmError` -> `_not_warm_response`. Resolved: both `except` arms, the `BackgroundTasks` parameter kept.
+4. Test-level interactions found by the full verify (not textual conflicts):
+   - `tests/test_all_mutating_sites_guarded.py` (#145): the allowlist entries `index.py:ScanIndex.store_partial_hashes` / `store_full_hashes` are STALE once #150 lands (its `_flush_hash_rows` now holds the SQL). Remove those two names from the allowlist when #145 is rebased after #150, or #150 after #145.
+   - `tests/test_api_dedup_low_disk.py::test_review_endpoint_returns_a_typed_non_500_when_the_guard_fires` (#151): with #150 a cold review answers 409 `candidates_not_warm` and the courtesy warm-up hits the disk guard (warm-status `failed`, readable error). Test relaxed to accept 409+failed-warm or 503.
+   - `tests/test_review_clusters_warm.py::test_category_toggle_...` (#150): wrote `config.toml` into the cwd; CI hid it, #140's guard refuses it in a checkout under the real home. Fixed ON #150's own branch (`b0f6bad`, `monkeypatch.chdir(tmp_path)`); it was a latent hygiene bug in #150, not only an integration issue.
+
+### GG MERGE BATCH (one action; in dependency order)
+Gate results are from `merge_gate.py` run read-only on 2026-10-08 (VERIFIED, quoted per PR). Heads are short SHAs.
+
+| order | PR | head | base | gate 1/2/3/4 | needs from GG |
+|---|---|---|---|---|---|
+| 1 | #140 hermetic tests | `d1437fa` | main | pass/pass/pass(309+353 test)/**FAIL: `src/reclaim/safety_env.py`** | gate-4 waiver OR merge in the GitHub UI |
+| 2 | #143 safety_env normalisation | `8626c3a` | #140's branch | pass/pass/pass(120)/**FAIL: `safety_env.py`** | same |
+| 3 | #145 guard every mutating site | `81dd3e6` | #140's branch | all pass (80 reviewable) | merge (after retarget, below) |
+| 4 | #144 refusal leaves no dangling intent | `c2cc084` | #140's branch | all pass (88) | merge (after retarget) |
+| 5 | #142 real Task Scheduler CI | `ca04d1d` | #140's branch | **gate 1 FAIL: branch `ci/...` not recognised** (no waiver exists for gate 1; renaming the branch would be gate-gaming) | merge by hand in the GitHub UI |
+| 6 | #138 installer re-registers weekly task | `4635286` | main | all pass (145) | merge (needs main merged in: BEHIND) |
+| 7 | #151 bounded WAL + disk guard | `e355ab2` | main | all pass (321) | merge |
+| 8 | #150 review clusters via warm cache | `b0f6bad` | main | all pass (340 at `a23eaff`; re-run on `b0f6bad`) | merge |
+
+Honest note on "eligible": #138, #150, #151 (base main) pass the existing gate, so I COULD self-merge them under the turn-6 delegation; I held them in the batch because the 2026-10-08 steering lists them there and because #150/#151/#145 conflict pairwise. Say "self-merge #138/#150/#151" and I will. #143/#144/#145/#142 are stacked on #140's branch: merging them first lands them in that branch, NOT main.
+
+**Steps for GG, in order (everything else is mine):**
+1. Merge #140 into main. Simplest: GitHub UI (the guard hook only constrains my own `gh pr merge`; no waiver needed). If you prefer the waiver route, paste into `~/.claude/scripts/merge_gate.py` `GATE4_WAIVER_ALLOWLIST` (I am forbidden to edit that file):
+```python
+    "gaurav-gandhi-2411/reclaim#140": {
+        "rationale": (
+            "src/reclaim/safety_env.py is a real gate-4 hit by name (it guards 'env'/profile "
+            "roots) but is a pytest-only hermetic guard: it is a no-op outside pytest "
+            "(PYTEST_CURRENT_TEST / 'pytest' in sys.modules). Head d1437fa; verifier probe that "
+            "motivated it deleted real browser caches; second-pass verifier findings fixed in #143."
+        ),
+        "gg_approval": "GG: approve reclaim#140 head d1437fa gate-4 waiver (safety_env.py, pytest-only guard)",
+    },
+    "gaurav-gandhi-2411/reclaim#143": {
+        "rationale": (
+            "Same path (safety_env.py): UNC/device/loopback normalisation and sandbox-env "
+            "hardening of the same pytest-only guard; verifier findings 1 and 2 on #140."
+        ),
+        "gg_approval": "GG: approve reclaim#143 head 8626c3a gate-4 waiver (safety_env.py, pytest-only guard)",
+    },
+```
+   (The `gg_approval` strings are drafts: GG must say the approval himself; I did not and cannot grant it.)
+2. Retarget the stacked PRs to main right after #140 lands (do NOT delete #140's branch first): `gh pr edit 143 --base main`, same for 144, 145, 142. Then I merge main into each (plain merge commits) and re-verify.
+3. Merge #143, #145, #144 (any order after retarget, #145 last of the three because of the allowlist note above), then #142 by hand.
+4. #138: I merge main into it (expected conflict: ADR-0034 addenda, keep both). Then merge.
+5. #151, then #150. Expected conflicts when the second of {#145, #151, #150} lands: items 2-4 of "conflict resolutions" above. `integration/next` is the worked solution: `git diff origin/main origin/integration/next` shows the end state.
+6. After the batch is in: I rebuild from main (ccache is warm now), smoke, reinstall, repeat the browser check.
+
+Verifier evidence per PR: #150 / #151 / #152 second-pass verifier reports are summarised in the PR bodies and in `docs/verifier-reports/2026-10-08-pr-150-151-152.md` (this PR). #140/#143/#144/#145/#138 verifier results are in earlier RESUME sections and PR bodies (their raw agent transcripts were not saved as files in the repo: BELIEVED sufficient, not re-verified this session).
+
+### Soak verdict (calibration, 2 h, frozen exe, VERIFIED from `%TEMP%\reclaim_soak\2026-10-08-calibration\soak_samples.csv`, 132 samples, 12 cycles, t=0..7142.8 s)
+- Handles: 268 baseline, 280 flat from t=420 s to the end; threads settle at 3 (baseline 10); peak during scan/API phases 560 handles / 35 threads, returning to baseline afterwards.
+- Private bytes: 66.98 MB at start, 85.0-86.9 MB for every cycle from cycle 2 onward; fitted idle slope 1.66 MB/h, not monotone (cycle 11 is lower than cycle 10). RSS 133-139.5 MB.
+- Verdict: **no leak signature.** Limits: synthetic fixture, one process, 2 h; not a long-run guarantee.
+
+### WHEN GG HAS TIME (nothing here blocks me)
+1. **Free disk (blocks the build, needs you):** C: needs >=25 GB free before I build. Candidates, biggest first: Docker Desktop data (`docker system prune` after looking at `docker system df`, then compact `docker_data.vhdx` in an elevated PowerShell with `Optimize-VHD`); other sessions' scratch under `%TEMP%\claude` (gold-rate-tracker 17.6 GB, review-iq 8.8 GB, gg-portfolio 6.1 GB) once those sessions end; the triage-iq session's runaway task log (`...\triage-iq\979152a2-...\tasks\bby5b7ohr.output`, 705 MB and growing ~16 MB/min) belongs to that session.
+2. Do the merge steps above (GG MERGE BATCH).
+3. Look at the screen once after the next install: the "Disk space is running low" toast (80% alert) and the "Before you start" first-run modal ("I understand, continue").
+4. Optional: reboot (pagefile reset) and a UAC-elevated compaction; both skipped by instruction.
+
+### Not done yet (honest list)
+integration/next verify run 2 result; rebuild + smoke + DLL closure; reinstall; fresh scan; real-browser Overview screenshot in warm state (summary was slow before #152); cold-start budget re-measure on a quiet machine; 80%/weekly re-confirmation after reinstall; final report.
+
+## CHECKPOINT 2026-10-08 ~02:40 IST (full delegation; app BUILT, INSTALLED, scanned, one-click run) -- superseded where it differs from the section above
 
 **Where things stand (VERIFIED unless marked):** the integration build `integration/2026-10-07` (head `250f40d` = main `d2948c2` + #140
 + #143 + #144 + #145 + #138) is **built and installed on the owner's account**. Main is `d663439`. Open PRs: #138, #140, #142, #143, #144, #145
