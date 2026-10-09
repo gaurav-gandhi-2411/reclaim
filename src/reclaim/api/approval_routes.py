@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+import json
+from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from reclaim.api.state import AppState
 from reclaim.approvals import Approval, BrokerFullError
@@ -25,24 +26,44 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/api")
 
 
+# Everything the window shows comes from the creator, so every field is length-capped (the window
+# renders them as inert text; the caps stop a client burying the real figures in noise).
+_SHORT = 200
+_PATH = 1024
+
+
 class ApprovalCreate(BaseModel):
-    client_id: str | None = None
-    scan_id: str
-    tier: str
-    rule_id_or_category: str
-    selection_hash: str
+    client_id: str | None = Field(default=None, max_length=_SHORT)
+    scan_id: str = Field(max_length=_SHORT)
+    tier: str = Field(max_length=_SHORT)
+    rule_id_or_category: str = Field(max_length=_SHORT)
+    selection_hash: str = Field(max_length=_SHORT)
     item_count: int = Field(ge=0)
     bytes_total: int = Field(ge=0)
-    sample_paths: list[str] = Field(default_factory=list, max_length=20)
-    protected_names: list[str] = Field(default_factory=list, max_length=50)
+    sample_paths: list[Annotated[str, Field(max_length=_PATH)]] = Field(
+        default_factory=list, max_length=20
+    )
+    protected_names: list[Annotated[str, Field(max_length=_SHORT)]] = Field(
+        default_factory=list, max_length=50
+    )
     reversible_until_days: int | None = None
     method: Literal["vault", "recycle_bin"] = "vault"
+
+
+_MAX_RESULT_BYTES = 20_000
 
 
 class ApprovalFinish(BaseModel):
     status: Literal["executed", "failed", "stale"]
     result: dict[str, Any] | None = None
-    error: str | None = None
+    error: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("result")
+    @classmethod
+    def _bounded(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None and len(json.dumps(value)) > _MAX_RESULT_BYTES:
+            raise ValueError("result too large")
+        return value
 
 
 def _state(request: Request) -> AppState:
@@ -53,7 +74,10 @@ def _state(request: Request) -> AppState:
 def _get_or_404(state: AppState, approval_id: str) -> Approval:
     approval = state.approval_broker.get(approval_id)
     if approval is None:
-        raise HTTPException(status_code=404, detail="unknown approval id")
+        raise HTTPException(
+            status_code=404,
+            detail="unknown approval id (Reclaim may have been restarted since it was created)",
+        )
     return approval
 
 
@@ -76,6 +100,12 @@ def channel_create(body: ApprovalCreate, request: Request) -> dict[str, Any]:
         rule_id_or_category=approval.rule_id_or_category,
     )
     return approval.public()
+
+
+@router.get("/mcp-channel/approvals")
+def channel_list(request: Request) -> dict[str, Any]:
+    """So a model whose `delete` call was cut off (client timeout) can find its request again."""
+    return {"approvals": [a.public() for a in _state(request).approval_broker.listing()]}
 
 
 @router.get("/mcp-channel/approvals/{approval_id}")

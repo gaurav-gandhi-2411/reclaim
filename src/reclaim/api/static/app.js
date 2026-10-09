@@ -2952,6 +2952,9 @@ async function initRecoveryBanner() {
 // textContent only (file names are untrusted text). docs/specs/assistant-mcp.md section 5.
 
 const MCP_APPROVAL_POLL_MS = 2000;
+// A hidden tab is exactly where the user is NOT looking (Claude Desktop in front, Reclaim in
+// the background), so it keeps polling, slowly, to put the request count in the tab title.
+const MCP_APPROVAL_POLL_HIDDEN_MS = 10000;
 const MCP_APPROVAL_SAMPLE_LIMIT = 5;
 const MCP_BASE_TITLE = document.title;
 
@@ -2960,6 +2963,11 @@ function mcpApprovalLine(text, className = "rc-approval-line") {
   p.className = className;
   p.textContent = text;
   return p;
+}
+
+function mcpExpiryText(approval) {
+  const minutes = Math.max(0, Math.round((approval.expires_at - Date.now() / 1000) / 60));
+  return `Expires in about ${minutes} min if you do nothing.`;
 }
 
 function renderMcpApprovalCard(approval, decide) {
@@ -3014,8 +3022,7 @@ function renderMcpApprovalCard(approval, decide) {
     card.append(list);
   }
 
-  const minutes = Math.max(0, Math.round((approval.expires_at - Date.now() / 1000) / 60));
-  card.append(mcpApprovalLine(`Expires in about ${minutes} min if you do nothing.`, "rc-approval-expiry"));
+  card.append(mcpApprovalLine(mcpExpiryText(approval), "rc-approval-expiry"));
 
   const error = mcpApprovalLine("", "rc-form-error");
   error.hidden = true;
@@ -3066,17 +3073,22 @@ function initMcpApprovals() {
     await api(`/api/mcp/approvals/${encodeURIComponent(id)}/${action}`, { method: "POST" });
     status.textContent =
       action === "approve"
-        ? "Approved. The assistant can now clean those items."
+        ? "Approved. If the assistant is still waiting it will clean those items now; an approval nobody picks up expires after 2 minutes."
         : "Declined. Nothing was changed.";
     await poll();
   };
 
   async function poll() {
-    if (polling || document.hidden) return;
+    if (polling) return;
     polling = true;
     try {
       const body = await api("/api/mcp/approvals");
       const pending = body.approvals.filter((a) => a.status === "pending");
+      // Keep the countdown honest without rebuilding the cards (which would drop focus).
+      for (const a of pending) {
+        const el = list.querySelector(`[data-approval-id="${CSS.escape(a.id)}"] .rc-approval-expiry`);
+        if (el) el.textContent = mcpExpiryText(a);
+      }
       const ids = pending.map((a) => a.id).join(",");
       if (ids !== lastPendingIds) {
         lastPendingIds = ids;
@@ -3093,8 +3105,14 @@ function initMcpApprovals() {
     }
   }
 
-  poll();
-  setInterval(poll, MCP_APPROVAL_POLL_MS);
+  const loop = async () => {
+    await poll();
+    setTimeout(loop, document.hidden ? MCP_APPROVAL_POLL_HIDDEN_MS : MCP_APPROVAL_POLL_MS);
+  };
+  loop();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) poll();
+  });
 }
 
 // --- Update check (opt-in; see PRIVACY.md's "Updates" section) --------------------------------

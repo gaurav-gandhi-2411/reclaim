@@ -24,6 +24,7 @@ from reclaim.api.app import create_app
 from reclaim.api.security import CSRF_HEADER_NAME, MCP_CHANNEL_AUTH_HEADER
 from reclaim.approvals import (
     APPROVED_CLAIM_TTL_SECONDS,
+    EXECUTING_LEASE_SECONDS,
     MAX_PENDING,
     PENDING_TTL_SECONDS,
     ApprovalBroker,
@@ -159,8 +160,8 @@ def test_broker_pending_expires_and_an_unclaimed_approval_expires() -> None:
 
 def test_broker_caps_pending_requests() -> None:
     broker = ApprovalBroker()
-    for _ in range(MAX_PENDING):
-        _create(broker)
+    for n in range(MAX_PENDING):
+        _create(broker, selection_hash=f"h{n}")
     with pytest.raises(BrokerFullError):
         _create(broker)
 
@@ -598,6 +599,176 @@ async def test_full_round_trip_over_http_with_a_click_in_the_window(  # type: ig
         headers=_mcp(dash_state),
     ).json()
     assert final["status"] == "executed"
+
+
+# --- verifier findings (PR #164) -----------------------------------------------------------------
+
+
+def test_an_identical_open_request_is_returned_not_duplicated() -> None:
+    broker = ApprovalBroker()
+    first = _create(broker)
+    again = _create(broker)
+    assert again.id == first.id and len(broker.listing()) == 1
+    broker.approve(first.id, channel={})
+    assert _create(broker).id == first.id  # a retry picks up the user's click
+    other = _create(broker, selection_hash="different")
+    assert other.id != first.id
+
+
+def test_an_executing_approval_that_nobody_finishes_fails_after_its_lease() -> None:
+    clock = _FakeClock()
+    broker = ApprovalBroker(clock=clock)
+    a = _create(broker)
+    broker.approve(a.id, channel={})
+    assert broker.claim(a.id) is True
+    clock.now += EXECUTING_LEASE_SECONDS - 1
+    assert broker.get(a.id).status == "executing"  # type: ignore[union-attr]
+    clock.now += 2
+    stuck = broker.get(a.id)
+    assert (
+        stuck is not None and stuck.status == "failed" and "never reported back" in str(stuck.error)
+    )
+    assert broker.claim(a.id) is False
+
+
+async def test_a_stuck_executing_request_is_reported_not_polled_forever(tmp_path: Path) -> None:
+    state, paths, scan_id = _prepare(tmp_path)
+    digest, _ = _selection(state, scan_id)
+    clock = _FakeClock()
+    gate = BrokerGate(ApprovalBroker(clock=clock))
+    server = build_mcp_server(state, approval_gate=gate)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        first = await session.call_tool("delete", _delete_args(scan_id, digest, wait_seconds=0))
+        approval_id = first.structuredContent["approval_id"]
+        gate.broker.approve(approval_id, channel={})
+        assert gate.broker.claim(approval_id)  # a call that claimed then died
+        waiting = await session.call_tool(
+            "delete_status", {"approval_id": approval_id, "wait_seconds": 0}
+        )
+        assert waiting.structuredContent["status"] == "awaiting_user"
+        assert "is running" in waiting.structuredContent["message"]
+        clock.now += EXECUTING_LEASE_SECONDS + 1
+        dead = await session.call_tool(
+            "delete_status", {"approval_id": approval_id, "wait_seconds": 0}
+        )
+
+    assert dead.isError is True and "did not complete" in str(dead.content)
+    assert paths["node_modules_dir"].exists()
+
+
+async def test_retrying_delete_for_the_same_selection_reuses_the_card_and_delete_requests_finds_it(
+    tmp_path: Path,
+) -> None:
+    state, _paths, scan_id = _prepare(tmp_path)
+    digest, _ = _selection(state, scan_id)
+    gate = BrokerGate()
+    server = build_mcp_server(state, approval_gate=gate)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        one = await session.call_tool("delete", _delete_args(scan_id, digest, wait_seconds=0))
+        two = await session.call_tool("delete", _delete_args(scan_id, digest, wait_seconds=0))
+        listed = await session.call_tool("delete_requests", {})
+
+    assert one.structuredContent["approval_id"] == two.structuredContent["approval_id"]
+    rows = listed.structuredContent["requests"]
+    assert [r["approval_id"] for r in rows] == [one.structuredContent["approval_id"]]
+    assert rows[0]["status"] == "pending" and rows[0]["item_count"] == 1
+    assert len([a for a in gate.broker.listing() if a.status == "pending"]) == 1
+
+
+async def test_figures_shown_to_the_user_must_match_the_selection_at_execution(
+    tmp_path: Path,
+) -> None:
+    """A creator talking to the channel directly could show '1 item, 4 KB' for a bigger selection
+    whose (valid) hash it supplies. The numbers are re-checked when it runs."""
+    state, paths, scan_id = _prepare(tmp_path)
+    digest, _ = _selection(state, scan_id)
+    gate = BrokerGate()
+    approval = gate.request(
+        {
+            "client_id": "Claude",
+            "scan_id": scan_id,
+            "tier": "A",
+            "rule_id_or_category": _RULE,
+            "selection_hash": digest,
+            "item_count": 1,
+            "bytes_total": 4096,  # the lie: the real selection is larger
+            "sample_paths": ["C:/harmless"],
+            "protected_names": [],
+            "reversible_until_days": 30,
+            "method": "vault",
+        }
+    )
+    gate.broker.approve(approval["id"], channel={"sec_fetch_site": "test"})
+    server = build_mcp_server(state, approval_gate=gate)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        result = await session.call_tool(
+            "delete_status", {"approval_id": approval["id"], "wait_seconds": 5}
+        )
+
+    assert result.isError is True and "shown" in str(result.content)
+    assert paths["node_modules_dir"].exists()
+    assert gate.broker.get(approval["id"]).status == "stale"  # type: ignore[union-attr]
+
+
+async def test_an_unreadable_executed_result_is_a_clear_error(tmp_path: Path) -> None:
+    state, _paths, scan_id = _prepare(tmp_path)
+    digest, _ = _selection(state, scan_id)
+    gate = BrokerGate()
+    server = build_mcp_server(state, approval_gate=gate)
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        first = await session.call_tool("delete", _delete_args(scan_id, digest, wait_seconds=0))
+        approval_id = first.structuredContent["approval_id"]
+        gate.broker.approve(approval_id, channel={})
+        gate.broker.claim(approval_id)
+        gate.broker.finish(approval_id, status="executed", result={"bogus": 1})
+        bad = await session.call_tool(
+            "delete_status", {"approval_id": approval_id, "wait_seconds": 0}
+        )
+    assert bad.isError is True and "unreadable" in str(bad.content)
+
+
+def test_a_stale_channel_file_is_ignored(tmp_path: Path) -> None:
+    from reclaim.approvals import read_channel_file, write_channel_file
+
+    path = tmp_path / "dashboard_channel.json"
+    write_channel_file(path, port=1234, token="not-a-secret")  # noqa: S106 -- test value
+    assert read_channel_file(path) is not None  # our own pid is alive
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace(f'"pid": {os.getpid()}', '"pid": 2147483000'), encoding="utf-8")
+    assert read_channel_file(path) is None  # a crash left it behind: do not trust its port
+
+
+def test_channel_inputs_are_length_capped_and_the_list_route_needs_the_token(dashboard) -> None:  # type: ignore[no-untyped-def]
+    state, client = dashboard
+    too_long = {**_PAYLOAD, "sample_paths": ["C:/" + "x" * 5000]}
+    assert (
+        client.post("/api/mcp-channel/approvals", json=too_long, headers=_mcp(state)).status_code
+        == 422
+    )
+    huge_client = {**_PAYLOAD, "client_id": "c" * 5000}
+    assert (
+        client.post("/api/mcp-channel/approvals", json=huge_client, headers=_mcp(state)).status_code
+        == 422
+    )
+
+    created = client.post("/api/mcp-channel/approvals", json=_PAYLOAD, headers=_mcp(state)).json()
+    assert client.get("/api/mcp-channel/approvals").status_code == 403
+    assert client.get("/api/mcp-channel/approvals", headers=_browser(state)).status_code == 403
+    listed = client.get("/api/mcp-channel/approvals", headers=_mcp(state)).json()
+    assert [a["id"] for a in listed["approvals"]] == [created["id"]]
+
+    state.approval_broker.approve(created["id"], channel={})
+    state.approval_broker.claim(created["id"])
+    big = {"status": "executed", "result": {"x": "y" * 30_000}}
+    posted = client.post(
+        f"/api/mcp-channel/approvals/{created['id']}/finish", json=big, headers=_mcp(state)
+    )
+    assert posted.status_code == 422
+    missing = client.get("/api/mcp-channel/approvals/nope", headers=_mcp(state))
+    assert missing.status_code == 404 and "restarted" in missing.json()["detail"]
 
 
 # keep the typed errors imported for readers: these are what the tool surfaces as isError text

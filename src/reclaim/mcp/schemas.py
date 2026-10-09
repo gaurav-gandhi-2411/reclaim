@@ -83,6 +83,25 @@ class PreviewApplyResult(BaseModel):
     sample_paths: list[str]
 
 
+class DeleteRequestSummary(BaseModel):
+    """One row of `delete_requests()`: enough to find a cut-off request, nothing to approve with."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str
+    status: str
+    rule_id_or_category: str
+    tier: str
+    item_count: int
+    bytes_total: int
+
+
+class DeleteRequestsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requests: list[DeleteRequestSummary]
+
+
 class DeleteResult(BaseModel):
     """`delete(scan_id, rule_id_or_category, tier, selection_hash)`'s response once the
     selection_hash check passed and `reclaim.api.service.mcp_execute_delete` actually ran --

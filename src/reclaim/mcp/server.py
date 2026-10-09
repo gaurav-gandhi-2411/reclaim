@@ -22,6 +22,8 @@ from reclaim.mcp.approval_gate import ApprovalGate, DashboardApprovalGate
 from reclaim.mcp.audit import log_mcp_action
 from reclaim.mcp.schemas import (
     CandidateSummary,
+    DeleteRequestsResult,
+    DeleteRequestSummary,
     DeleteResult,
     ListCandidatesResult,
     PreviewApplyResult,
@@ -69,9 +71,11 @@ logger = structlog.get_logger(__name__)
 _TIER_CHOICES = ("A", "B", "both")
 
 # How long `delete`/`delete_status` wait for the user's click before answering "awaiting_user".
-# MCP clients commonly time a tool call out after 60-120 s, so the default stays below that;
+# MCP clients commonly time a tool call out after 60 s, so the default stays well below that
+# (a call that dies loses its approval_id; `delete_requests` and a repeated `delete` for the same
+# selection both recover it);
 # the model can call `delete_status` again to keep waiting.
-_DEFAULT_WAIT_SECONDS = 90
+_DEFAULT_WAIT_SECONDS = 45
 _MAX_WAIT_SECONDS = 600
 _APPROVAL_POLL_SECONDS = 0.5
 
@@ -396,6 +400,19 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                 "call preview_apply() and delete() again for a new approval."
             )
 
+    def _require_same_figures(selected: list[Any], record: dict[str, Any]) -> None:
+        # The window showed the user these counts; a creator talking to the channel directly could
+        # have shown different ones than the selection the hash commits to.
+        if (
+            len(selected) != record["item_count"]
+            or sum(c.size_bytes for c in selected) != record["bytes_total"]
+        ):
+            raise SelectionMismatchError(
+                "the item count / size the user was shown does not match this selection "
+                "(after the user approved it). Refusing to delete anything; call preview_apply() "
+                "and delete() again for a new approval."
+            )
+
     def _execute_claimed(
         record: dict[str, Any], *, client_id: str | None, request_id: str
     ) -> DeleteResult:
@@ -406,6 +423,7 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
         try:
             selected, recomputed = _selection_for(scan_id, rule, tier)
             _require_unchanged_since_approval(recomputed, record["selection_hash"])
+            _require_same_figures(selected, record)
             log_mcp_action(
                 "mcp.delete_executing",
                 client_id=client_id,
@@ -457,6 +475,16 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
         _finish_quietly(approval_id, status="executed", result=result.model_dump())
         return result
 
+    def _claim_and_execute(
+        record: dict[str, Any], *, client_id: str | None, request_id: str
+    ) -> DeleteResult | None:
+        """Claim (approved -> executing) and run, in ONE uncancellable worker call: if the tool call
+        is cancelled by the client, the claim and the execution still happen together or not at all.
+        None when another call won the claim."""
+        if not gate.claim(str(record["id"])):
+            return None
+        return _execute_claimed(record, client_id=client_id, request_id=request_id)
+
     def _finish_quietly(
         approval_id: str,
         *,
@@ -479,15 +507,22 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
             record = await anyio.to_thread.run_sync(gate.get, approval_id)
             status = record["status"]
             if status == "approved":
-                if await anyio.to_thread.run_sync(gate.claim, approval_id):
-                    return await anyio.to_thread.run_sync(
-                        functools.partial(
-                            _execute_claimed, record, client_id=client_id, request_id=request_id
-                        )
+                outcome = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        _claim_and_execute, record, client_id=client_id, request_id=request_id
                     )
+                )
+                if outcome is not None:
+                    return outcome
                 # Lost the claim to another call: fall through and watch it finish.
             elif status == "executed":
-                return DeleteResult(**record["result"])
+                try:
+                    return DeleteResult(**(record["result"] or {}))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Reclaim reported this delete as executed but its result was unreadable "
+                        f"({type(exc).__name__}); check the vault / manifest before retrying."
+                    ) from exc
             elif status == "declined":
                 log_mcp_action(
                     "mcp.delete_refused",
@@ -510,13 +545,18 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                     f"This delete did not complete ({status}): {record.get('error') or 'no detail'}"
                 )
             if time.monotonic() >= deadline:
+                running = status == "executing"
                 return DeleteResult(
                     status="awaiting_user",
                     approval_id=approval_id,
                     message=(
-                        "Waiting for the user to answer in Reclaim's window. Nothing has been "
-                        "deleted. Tell the user to look at Reclaim, then call "
-                        f"delete_status(approval_id={approval_id!r}) to keep waiting."
+                        "The user approved and the delete is running; call "
+                        f"delete_status(approval_id={approval_id!r}) to collect the result."
+                        if running
+                        else "Waiting for the user to answer in Reclaim's window. Nothing has "
+                        "been deleted. Tell the user to look at Reclaim, then call "
+                        f"delete_status(approval_id={approval_id!r}) to keep waiting. If you "
+                        "lose the id, delete_requests() lists it."
                     ),
                 )
             await anyio.sleep(_APPROVAL_POLL_SECONDS)
@@ -646,6 +686,32 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
             )
         finally:
             _release_single_flight()
+
+    @mcp.tool()
+    async def delete_requests(ctx: Context[Any, Any, Any]) -> DeleteRequestsResult:
+        """List the delete requests the user was (or is being) asked about in Reclaim's window,
+        so a `delete` call that was cut off can be picked up with `delete_status(approval_id)`.
+        Read-only; cannot approve anything."""
+        records = await anyio.to_thread.run_sync(gate.list_requests)
+        log_mcp_action(
+            "mcp.delete_requests_listed",
+            client_id=_client_id(ctx),
+            request_id=_request_id(ctx),
+            count=len(records),
+        )
+        return DeleteRequestsResult(
+            requests=[
+                DeleteRequestSummary(
+                    approval_id=r["id"],
+                    status=r["status"],
+                    rule_id_or_category=r["rule_id_or_category"],
+                    tier=r["tier"],
+                    item_count=r["item_count"],
+                    bytes_total=r["bytes_total"],
+                )
+                for r in records
+            ]
+        )
 
     return mcp
 

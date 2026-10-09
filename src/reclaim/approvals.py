@@ -32,6 +32,10 @@ ApprovalStatus = Literal[
 PENDING_TTL_SECONDS = 600.0
 # An approved request must be claimed by the waiting MCP call promptly; otherwise the click is void.
 APPROVED_CLAIM_TTL_SECONDS = 120.0
+# A claimed request that nobody finishes (the MCP call was cancelled or died after the claim) must
+# not stay `executing` forever, burning the user's click: after this lease it ends `failed`. Long
+# enough for a large vault batch (ADR-0026: ~8 ms/item), short enough to recover from a crash.
+EXECUTING_LEASE_SECONDS = 900.0
 # A runaway agent must not be able to bury the user's window in requests.
 MAX_PENDING = 5
 _KEEP_FINISHED = 20  # decided/finished records kept for the window's "recent" list
@@ -55,8 +59,32 @@ def write_channel_file(path: Path, *, port: int, token: str) -> None:
     tmp.replace(path)
 
 
+def pid_is_alive(pid: int) -> bool:
+    """Windows: is a process with this pid still running? Never signals the process (on Windows
+    `os.kill(pid, 0)` would TERMINATE it). Elsewhere, and on any error, assume alive."""
+    if os.name != "nt":
+        return True
+    import ctypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def read_channel_file(path: Path) -> dict[str, Any] | None:
-    """None for a missing, unreadable or malformed file (never raises)."""
+    """None for a missing, unreadable or malformed file, or one whose dashboard process is no
+    longer running (a crash leaves the file behind; trusting its port could hand the channel
+    token to whatever process binds that port next). Never raises."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -64,6 +92,8 @@ def read_channel_file(path: Path) -> dict[str, Any] | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("port"), int):
         return None
     if not isinstance(raw.get("token"), str) or not raw["token"]:
+        return None
+    if isinstance(raw.get("pid"), int) and not pid_is_alive(raw["pid"]):
         return None
     return raw
 
@@ -137,6 +167,16 @@ class ApprovalBroker:
         now = self._clock()
         with self._lock:
             self._expire_locked(now)
+            # A model retrying after a client-side timeout must not stack a second card for the
+            # same selection (and an already-approved one is handed back so the click is used).
+            for existing in self._items.values():
+                if existing.status in ("pending", "approved") and (
+                    existing.scan_id,
+                    existing.tier,
+                    existing.rule_id_or_category,
+                    existing.selection_hash,
+                ) == (scan_id, tier, rule_id_or_category, selection_hash):
+                    return existing
             pending = [a for a in self._items.values() if a.status == "pending"]
             if len(pending) >= MAX_PENDING:
                 raise BrokerFullError(
@@ -176,6 +216,7 @@ class ApprovalBroker:
             if approval is None or approval.status != "approved":
                 return False
             approval.status = "executing"
+            approval.claim_deadline = self._clock() + EXECUTING_LEASE_SECONDS
             return True
 
     def finish(
@@ -247,6 +288,16 @@ class ApprovalBroker:
                 and now >= approval.claim_deadline
             ):
                 approval.status = "expired"
+            elif (
+                approval.status == "executing"
+                and approval.claim_deadline is not None
+                and now >= approval.claim_deadline
+            ):
+                approval.status = "failed"
+                approval.error = (
+                    "the executing call never reported back (it was cancelled or the MCP "
+                    "process stopped); nothing further will run for this approval"
+                )
         if len(self._items) > 4 * _KEEP_FINISHED:
             finished = sorted(
                 (a for a in self._items.values() if a.status not in ("pending", "executing")),

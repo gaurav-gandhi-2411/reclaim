@@ -26,6 +26,9 @@ class ApprovalGate(Protocol):
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a pending approval; returns its public record (`id`, `status`, ...)."""
 
+    def list_requests(self) -> list[dict[str, Any]]:
+        """Open and recent requests, so a cut-off `delete` call can be picked up again."""
+
     def get(self, approval_id: str) -> dict[str, Any]:
         """Current record. Raises `ApprovalUnavailableError` if the window cannot be reached."""
 
@@ -87,8 +90,13 @@ class DashboardApprovalGate:
         if response.status_code == 429:
             raise ApprovalUnavailableError(str(response.json().get("detail", "too many requests")))
         if response.status_code >= 400:
+            try:
+                detail = str(response.json().get("detail", ""))
+            except ValueError:
+                detail = ""
+            suffix = f": {detail}" if detail else ""
             raise ApprovalUnavailableError(
-                f"Reclaim's window refused the request (HTTP {response.status_code}). "
+                f"Reclaim's window refused the request (HTTP {response.status_code}{suffix}). "
                 "Nothing was deleted."
             )
         return response
@@ -98,6 +106,11 @@ class DashboardApprovalGate:
             "POST", "/api/mcp-channel/approvals", json=payload
         ).json()
         return record
+
+    def list_requests(self) -> list[dict[str, Any]]:
+        body = self._call("GET", "/api/mcp-channel/approvals").json()
+        approvals: list[dict[str, Any]] = body["approvals"]
+        return approvals
 
     def get(self, approval_id: str) -> dict[str, Any]:
         record: dict[str, Any] = self._call(

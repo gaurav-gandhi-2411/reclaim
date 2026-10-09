@@ -31,6 +31,9 @@ class BrokerGate:
             self.broker.decline(approval.id, channel=channel)
         return approval.public()
 
+    def list_requests(self) -> list[dict[str, Any]]:
+        return [a.public() for a in self.broker.listing()]
+
     def get(self, approval_id: str) -> dict[str, Any]:
         approval = self.broker.get(approval_id)
         assert approval is not None, approval_id
