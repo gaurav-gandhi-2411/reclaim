@@ -64,6 +64,8 @@ if (-not $item.PSIsContainer) { throw "$Source is not a directory" }
 if (Test-Path -LiteralPath $Target) {
     if ((Get-ChildItem -LiteralPath $Target -Force | Measure-Object).Count -gt 0) { throw "target $Target not empty" }
 }
+$links = Get-ChildItem -LiteralPath $Source -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue | Select-Object -First 3
+if ($links) { throw "REFUSED: $Source contains reparse points (junction/symlink), e.g. $($links[0].FullName); robocopy would mis-copy them" }
 $files = Get-ChildItem -LiteralPath $Source -Recurse -File -Force
 $bytes = ($files | Measure-Object Length -Sum).Sum
 $tgtRoot = [System.IO.Path]::GetPathRoot((New-Item -ItemType Directory -Force -Path (Split-Path $Target -Parent)).FullName)
@@ -78,7 +80,7 @@ catch { if ((Test-Path "$Source.probe") -and -not (Test-Path $Source)) { Rename-
 
 if (-not $Execute) { "DRY RUN OK: re-run with -Execute to copy, verify and swap."; return }
 
-robocopy $Source $Target /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NP /NS /NC | Out-Null
+robocopy $Source $Target /E /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NP /NS /NC | Out-Null
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE); source untouched" }
 $tf = Get-ChildItem -LiteralPath $Target -Recurse -File -Force
 $tb = ($tf | Measure-Object Length -Sum).Sum
