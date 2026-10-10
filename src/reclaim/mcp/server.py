@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import functools
 import threading
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import anyio
+import anyio.to_thread
+import structlog
 from mcp.server.fastmcp import Context, FastMCP
 
 from reclaim.api import service
@@ -14,9 +18,12 @@ from reclaim.app_paths import data_root
 from reclaim.config import Config
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH
+from reclaim.mcp.approval_gate import ApprovalGate, DashboardApprovalGate
 from reclaim.mcp.audit import log_mcp_action
 from reclaim.mcp.schemas import (
     CandidateSummary,
+    DeleteRequestsResult,
+    DeleteRequestSummary,
     DeleteResult,
     ListCandidatesResult,
     PreviewApplyResult,
@@ -24,12 +31,16 @@ from reclaim.mcp.schemas import (
     ScanTriggerResult,
 )
 from reclaim.mcp.selection import (
+    ApprovalDeclinedError,
+    ApprovalExpiredError,
+    ApprovalUnavailableError,
     ConcurrentDeleteError,
     SelectionMismatchError,
     StaleScanError,
     compute_selection_hash,
 )
 from reclaim.mode import DEFAULT_MODE_LOG_PATH
+from reclaim.models import Mode
 from reclaim.preflight import check_within_allowed_scope
 from reclaim.safety import SafetyValidator
 
@@ -55,7 +66,18 @@ _DEFAULT_MANIFEST_PATH = _DEFAULT_VAULT_DIR / "manifest.jsonl"
 # inventing a second one.
 _SAMPLE_PATHS_LIMIT = 10
 
+logger = structlog.get_logger(__name__)
+
 _TIER_CHOICES = ("A", "B", "both")
+
+# How long `delete`/`delete_status` wait for the user's click before answering "awaiting_user".
+# MCP clients commonly time a tool call out after 60 s, so the default stays well below that
+# (a call that dies loses its approval_id; `delete_requests` and a repeated `delete` for the same
+# selection both recover it);
+# the model can call `delete_status` again to keep waiting.
+_DEFAULT_WAIT_SECONDS = 45
+_MAX_WAIT_SECONDS = 600
+_APPROVAL_POLL_SECONDS = 0.5
 
 
 def build_state(
@@ -108,10 +130,16 @@ def _request_id(ctx: Context[Any, Any, Any]) -> str:
     return str(ctx.request_id)
 
 
-def build_mcp_server(state: AppState) -> FastMCP:
+def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None) -> FastMCP:
     """Builds one Reclaim MCP server instance bound to `state`. A fresh `AppState` per call
     (never a module-level global) -- same isolation reasoning `AppState`'s own docstring gives
     for the HTTP dashboard: each test, and each real server process, gets its own instance."""
+    # Production default: the user's click in Reclaim's own window. A caller passing a gate is
+    # choosing a different approver (tests do); there is deliberately no way to pass None for
+    # "no approval".
+    gate: ApprovalGate = (
+        approval_gate if approval_gate is not None else DashboardApprovalGate(db_path=state.db_path)
+    )
     mcp = FastMCP(
         name="reclaim",
         instructions=(
@@ -119,7 +147,10 @@ def build_mcp_server(state: AppState) -> FastMCP:
             "completed (note the returned scan_id) -> list_candidates(scan_id, tier, category) "
             "to see what's eligible -> preview_apply(scan_id, rule_id_or_category, tier) to get "
             "a selection_hash and a byte/item count -> delete(scan_id, rule_id_or_category, "
-            "tier, selection_hash) to actually quarantine/delete those files. There is no way "
+            "tier, selection_hash) asks the USER to approve it in Reclaim's own window; "
+            "nothing is deleted until they click Approve, and every delete is reversible "
+            "(vault or Recycle Bin). If delete returns status=awaiting_user, tell the user to "
+            "look at Reclaim and call delete_status(approval_id). There is no way "
             "to name an arbitrary file path for deletion through this server -- every selection "
             "is by Reclaim's own detector rule id or category group, never a path. A stale "
             "scan_id or a selection_hash that no longer matches the live candidate set is "
@@ -311,36 +342,34 @@ def build_mcp_server(state: AppState) -> FastMCP:
             sample_paths=sample_paths,
         )
 
-    @mcp.tool()
-    def delete(
-        scan_id: str,
-        rule_id_or_category: str,
-        tier: str,
-        selection_hash: str,
-        ctx: Context[Any, Any, Any],
-    ) -> DeleteResult:
-        """Actually quarantine/delete the files selected by `(scan_id, rule_id_or_category,
-        tier)` -- REQUIRES a `selection_hash` from a prior `preview_apply` call for this exact
-        selection. There is no path parameter: this tool can only ever act on Reclaim's own
-        deterministic detector output, selected by rule id or category group. Refuses (no
-        partial execution) if `scan_id` is stale, if a fresh re-derivation of the selection no
-        longer hashes to `selection_hash`, or if another `delete` call is already in flight on
-        this server -- call preview_apply again for a current hash in the first two cases, or
-        simply retry once the in-flight call finishes for the third."""
-        client_id = _client_id(ctx)
-        request_id = _request_id(ctx)
+    def _selection_for(scan_id: str, rule_id_or_category: str, tier: str) -> tuple[list[Any], str]:
+        """Fresh re-derivation of a selection and its commitment hash (never cached)."""
+        if not service.is_current_scan_id(state, scan_id):
+            raise StaleScanError(
+                f"scan_id {scan_id!r} does not match the current scan "
+                f"({service.scan_id_for_state(state)}) -- the index has changed since this "
+                "selection was previewed. Refusing to delete anything. Call scan_status() "
+                "for the current scan_id, then preview_apply() again for a fresh "
+                "selection_hash."
+            )
+        selected = service.select_candidates_for_selector(
+            state, tier=tier, rule_id_or_category=rule_id_or_category
+        )
+        digest = compute_selection_hash(
+            scan_id=scan_id,
+            tier=tier,
+            rule_id_or_category=rule_id_or_category,
+            paths=[c.path.as_posix() for c in selected],
+        )
+        return selected, digest
 
+    def _claim_single_flight(
+        *, client_id: str | None, request_id: str, scan_id: str, tier: str, rule: str
+    ) -> None:
         # Concurrency fix (docs/AUDIT-2026-08.md, adversarial re-verification of PR #39):
         # check-and-set `mcp_delete_in_progress` atomically under `state.lock`, same idiom
-        # `POST /api/apply` already uses for `apply_status` (routes.py) -- claims the
-        # single-flight slot BEFORE any candidate re-derivation or hash work happens, so a
-        # second concurrent `delete` call for the identical selection is refused immediately
-        # rather than racing the first one to `apply_batch` (see `ConcurrentDeleteError`'s
-        # docstring for the exact race this closes). The lock is held only briefly here, not
-        # across the whole operation below -- `apply_batch` can take minutes on a large batch
-        # (ADR-0026), and holding a process-wide lock for that long would block every other
-        # AppState reader (scan status polls, mode checks) for no reason; the flag alone is
-        # what needs to be atomic, matching `POST /api/apply`'s own lock-scoping precedent.
+        # `POST /api/apply` already uses for `apply_status`. Held across the wait for the user's
+        # answer too, so a second delete() while one is awaiting approval is refused outright.
         with state.lock:
             if state.mcp_delete_in_progress:
                 log_mcp_action(
@@ -350,7 +379,7 @@ def build_mcp_server(state: AppState) -> FastMCP:
                     reason="concurrent_delete_in_progress",
                     scan_id=scan_id,
                     tier=tier,
-                    rule_id_or_category=rule_id_or_category,
+                    rule_id_or_category=rule,
                 )
                 raise ConcurrentDeleteError(
                     "another delete() call is already in progress on this server -- refusing "
@@ -359,8 +388,212 @@ def build_mcp_server(state: AppState) -> FastMCP:
                 )
             state.mcp_delete_in_progress = True
 
+    def _release_single_flight() -> None:
+        with state.lock:
+            state.mcp_delete_in_progress = False
+
+    def _require_unchanged_since_approval(recomputed: str, approved: str) -> None:
+        if recomputed != approved:
+            raise SelectionMismatchError(
+                "the candidate set changed AFTER the user approved it (a manual apply/restore, "
+                "a background purge, or files changing on disk). Refusing to delete anything; "
+                "call preview_apply() and delete() again for a new approval."
+            )
+
+    def _require_same_figures(selected: list[Any], record: dict[str, Any]) -> None:
+        # The window showed the user these counts; a creator talking to the channel directly could
+        # have shown different ones than the selection the hash commits to.
+        if (
+            len(selected) != record["item_count"]
+            or sum(c.size_bytes for c in selected) != record["bytes_total"]
+        ):
+            raise SelectionMismatchError(
+                "the item count / size the user was shown does not match this selection "
+                "(after the user approved it). Refusing to delete anything; call preview_apply() "
+                "and delete() again for a new approval."
+            )
+
+    def _execute_claimed(
+        record: dict[str, Any], *, client_id: str | None, request_id: str
+    ) -> DeleteResult:
+        """Runs in a worker thread. The approval is already CLAIMED (approved -> executing, once).
+        Re-derives the selection and refuses if it no longer hashes to what the user approved."""
+        approval_id = str(record["id"])
+        scan_id, tier, rule = record["scan_id"], record["tier"], record["rule_id_or_category"]
         try:
-            if not service.is_current_scan_id(state, scan_id):
+            selected, recomputed = _selection_for(scan_id, rule, tier)
+            _require_unchanged_since_approval(recomputed, record["selection_hash"])
+            _require_same_figures(selected, record)
+            log_mcp_action(
+                "mcp.delete_executing",
+                client_id=client_id,
+                request_id=request_id,
+                approval_id=approval_id,
+                scan_id=scan_id,
+                tier=tier,
+                rule_id_or_category=rule,
+                item_count=len(selected),
+            )
+            response = service.mcp_execute_delete(state, selected)
+        except (StaleScanError, SelectionMismatchError) as exc:
+            log_mcp_action(
+                "mcp.delete_refused",
+                client_id=client_id,
+                request_id=request_id,
+                reason="changed_after_approval",
+                approval_id=approval_id,
+            )
+            _finish_quietly(approval_id, status="stale", error=str(exc))
+            raise
+        except Exception as exc:
+            _finish_quietly(approval_id, status="failed", error=str(exc))
+            raise
+        log_mcp_action(
+            "mcp.delete_executed",
+            client_id=client_id,
+            request_id=request_id,
+            approval_id=approval_id,
+            batch_id=response.batch_id,
+            files_succeeded=response.files_succeeded,
+            files_failed=response.files_failed,
+            bytes_freed=response.bytes_freed,
+            bytes_moved=response.bytes_moved,
+        )
+        result = DeleteResult(
+            status="executed",
+            approval_id=approval_id,
+            batch_id=response.batch_id,
+            files_processed=response.files_processed,
+            files_succeeded=response.files_succeeded,
+            files_failed=response.files_failed,
+            bytes_freed=response.bytes_freed,
+            bytes_moved=response.bytes_moved,
+            skipped_by_reason=dict(
+                Counter(item.skip_reason for item in response.items if item.skip_reason)
+            ),
+        )
+        _finish_quietly(approval_id, status="executed", result=result.model_dump())
+        return result
+
+    def _claim_and_execute(
+        record: dict[str, Any], *, client_id: str | None, request_id: str
+    ) -> DeleteResult | None:
+        """Claim (approved -> executing) and run, in ONE uncancellable worker call: if the tool call
+        is cancelled by the client, the claim and the execution still happen together or not at all.
+        None when another call won the claim."""
+        if not gate.claim(str(record["id"])):
+            return None
+        return _execute_claimed(record, client_id=client_id, request_id=request_id)
+
+    def _finish_quietly(
+        approval_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        # The delete already happened (or already failed); a closed window must not turn that
+        # into a second error that hides the real outcome.
+        try:
+            gate.finish(approval_id, status=status, result=result, error=error)
+        except ApprovalUnavailableError:
+            logger.info("mcp.approval_finish_unreported", approval_id=approval_id, status=status)
+
+    async def _wait_and_execute(
+        approval_id: str, *, wait_seconds: float, client_id: str | None, request_id: str
+    ) -> DeleteResult:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            record = await anyio.to_thread.run_sync(gate.get, approval_id)
+            status = record["status"]
+            if status == "approved":
+                outcome = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        _claim_and_execute, record, client_id=client_id, request_id=request_id
+                    )
+                )
+                if outcome is not None:
+                    return outcome
+                # Lost the claim to another call: fall through and watch it finish.
+            elif status == "executed":
+                try:
+                    return DeleteResult(**(record["result"] or {}))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Reclaim reported this delete as executed but its result was unreadable "
+                        f"({type(exc).__name__}); check the vault / manifest before retrying."
+                    ) from exc
+            elif status == "declined":
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="declined_by_user",
+                    approval_id=approval_id,
+                )
+                raise ApprovalDeclinedError(
+                    "The user declined this delete in Reclaim's window. Nothing was deleted. "
+                    "Do not retry the same request; ask the user what they want instead."
+                )
+            elif status == "expired":
+                raise ApprovalExpiredError(
+                    "The approval request expired before the user answered (or before it was "
+                    "used). Nothing was deleted. Call preview_apply() and delete() again."
+                )
+            elif status in ("failed", "stale"):
+                raise RuntimeError(
+                    f"This delete did not complete ({status}): {record.get('error') or 'no detail'}"
+                )
+            if time.monotonic() >= deadline:
+                running = status == "executing"
+                return DeleteResult(
+                    status="awaiting_user",
+                    approval_id=approval_id,
+                    message=(
+                        "The user approved and the delete is running; call "
+                        f"delete_status(approval_id={approval_id!r}) to collect the result."
+                        if running
+                        else "Waiting for the user to answer in Reclaim's window. Nothing has "
+                        "been deleted. Tell the user to look at Reclaim, then call "
+                        f"delete_status(approval_id={approval_id!r}) to keep waiting. If you "
+                        "lose the id, delete_requests() lists it."
+                    ),
+                )
+            await anyio.sleep(_APPROVAL_POLL_SECONDS)
+
+    @mcp.tool()
+    async def delete(
+        scan_id: str,
+        rule_id_or_category: str,
+        tier: str,
+        selection_hash: str,
+        ctx: Context[Any, Any, Any],
+        wait_seconds: int = _DEFAULT_WAIT_SECONDS,
+    ) -> DeleteResult:
+        """Ask to quarantine the files selected by `(scan_id, rule_id_or_category, tier)` --
+        REQUIRES a `selection_hash` from a prior `preview_apply` call for this exact selection,
+        AND the user's click on Approve in Reclaim's own window. This call creates the request,
+        then waits up to `wait_seconds` for the answer. Nothing is deleted until the user
+        approves. Deletes are always reversible (vault or Recycle Bin, never permanent). If the
+        user has not answered in time you get `status="awaiting_user"`: tell the user to look at
+        Reclaim and call `delete_status(approval_id)`. Declined, expired, stale or changed-after-
+        approval selections raise a typed error and delete nothing. There is no path parameter:
+        this tool can only act on Reclaim's own deterministic detector output."""
+        client_id = _client_id(ctx)
+        request_id = _request_id(ctx)
+        wait = float(max(0, min(wait_seconds, _MAX_WAIT_SECONDS)))
+
+        _claim_single_flight(
+            client_id=client_id,
+            request_id=request_id,
+            scan_id=scan_id,
+            tier=tier,
+            rule=rule_id_or_category,
+        )
+        try:
+            try:
+                selected, recomputed = _selection_for(scan_id, rule_id_or_category, tier)
+            except StaleScanError:
                 log_mcp_action(
                     "mcp.delete_refused",
                     client_id=client_id,
@@ -370,22 +603,8 @@ def build_mcp_server(state: AppState) -> FastMCP:
                     tier=tier,
                     rule_id_or_category=rule_id_or_category,
                 )
-                raise StaleScanError(
-                    f"scan_id {scan_id!r} does not match the current scan "
-                    f"({service.scan_id_for_state(state)}) -- the index has changed since this "
-                    "selection was previewed. Refusing to delete anything. Call scan_status() "
-                    "for the current scan_id, then preview_apply() again for a fresh "
-                    "selection_hash."
-                )
-
-            selected = service.select_candidates_for_selector(
-                state, tier=tier, rule_id_or_category=rule_id_or_category
-            )
-            paths = [c.path.as_posix() for c in selected]
-            recomputed_hash = compute_selection_hash(
-                scan_id=scan_id, tier=tier, rule_id_or_category=rule_id_or_category, paths=paths
-            )
-            if recomputed_hash != selection_hash:
+                raise
+            if recomputed != selection_hash:
                 log_mcp_action(
                     "mcp.delete_refused",
                     client_id=client_id,
@@ -404,43 +623,95 @@ def build_mcp_server(state: AppState) -> FastMCP:
                     "selection_hash."
                 )
 
+            safe_mode = state.live_mode == Mode.SAFE
+            guard_days = max(1, state.config.safety.direct_delete_size_guard_retention_days)
+            windows = [
+                max(1, c.retention_days) if c.retention_days is not None else guard_days
+                for c in selected
+            ]
+            payload = {
+                "client_id": client_id,
+                "scan_id": scan_id,
+                "tier": tier,
+                "rule_id_or_category": rule_id_or_category,
+                "selection_hash": selection_hash,
+                "item_count": len(selected),
+                "bytes_total": sum(c.size_bytes for c in selected),
+                "sample_paths": sorted(c.path.as_posix() for c in selected)[:_SAMPLE_PATHS_LIMIT],
+                "protected_names": list(state.config.exclusions.project_names),
+                "method": "recycle_bin" if safe_mode else "vault",
+                "reversible_until_days": None if safe_mode or not windows else min(windows),
+            }
+            record = await anyio.to_thread.run_sync(gate.request, payload)
             log_mcp_action(
-                "mcp.delete_executing",
+                "mcp.delete_awaiting_approval",
                 client_id=client_id,
                 request_id=request_id,
+                approval_id=record["id"],
                 scan_id=scan_id,
                 tier=tier,
                 rule_id_or_category=rule_id_or_category,
                 item_count=len(selected),
             )
-            response = service.mcp_execute_delete(state, selected)
-            log_mcp_action(
-                "mcp.delete_executed",
-                client_id=client_id,
-                request_id=request_id,
-                batch_id=response.batch_id,
-                files_succeeded=response.files_succeeded,
-                files_failed=response.files_failed,
-                bytes_freed=response.bytes_freed,
-                bytes_moved=response.bytes_moved,
-            )
-            return DeleteResult(
-                batch_id=response.batch_id,
-                files_processed=response.files_processed,
-                files_succeeded=response.files_succeeded,
-                files_failed=response.files_failed,
-                bytes_freed=response.bytes_freed,
-                bytes_moved=response.bytes_moved,
-                skipped_by_reason=dict(
-                    Counter(item.skip_reason for item in response.items if item.skip_reason)
-                ),
+            return await _wait_and_execute(
+                str(record["id"]), wait_seconds=wait, client_id=client_id, request_id=request_id
             )
         finally:
-            # Released unconditionally -- a refusal (stale scan, hash mismatch) or a real
-            # exception from mcp_execute_delete must never leave this slot permanently claimed,
-            # which would wedge every future delete() call on this process.
-            with state.lock:
-                state.mcp_delete_in_progress = False
+            _release_single_flight()
+
+    @mcp.tool()
+    async def delete_status(
+        approval_id: str,
+        ctx: Context[Any, Any, Any],
+        wait_seconds: int = _DEFAULT_WAIT_SECONDS,
+    ) -> DeleteResult:
+        """Keep waiting for (or collect the outcome of) a delete the user was asked to approve in
+        Reclaim's window. Takes only the `approval_id` that `delete` returned; the selection is
+        whatever the user was shown. Returns the executed result, `status="awaiting_user"` if
+        still unanswered after `wait_seconds`, or raises a typed error (declined / expired /
+        changed after approval). Cannot approve anything."""
+        client_id = _client_id(ctx)
+        request_id = _request_id(ctx)
+        wait = float(max(0, min(wait_seconds, _MAX_WAIT_SECONDS)))
+        _claim_single_flight(
+            client_id=client_id,
+            request_id=request_id,
+            scan_id="(by approval)",
+            tier="",
+            rule=approval_id,
+        )
+        try:
+            return await _wait_and_execute(
+                approval_id, wait_seconds=wait, client_id=client_id, request_id=request_id
+            )
+        finally:
+            _release_single_flight()
+
+    @mcp.tool()
+    async def delete_requests(ctx: Context[Any, Any, Any]) -> DeleteRequestsResult:
+        """List the delete requests the user was (or is being) asked about in Reclaim's window,
+        so a `delete` call that was cut off can be picked up with `delete_status(approval_id)`.
+        Read-only; cannot approve anything."""
+        records = await anyio.to_thread.run_sync(gate.list_requests)
+        log_mcp_action(
+            "mcp.delete_requests_listed",
+            client_id=_client_id(ctx),
+            request_id=_request_id(ctx),
+            count=len(records),
+        )
+        return DeleteRequestsResult(
+            requests=[
+                DeleteRequestSummary(
+                    approval_id=r["id"],
+                    status=r["status"],
+                    rule_id_or_category=r["rule_id_or_category"],
+                    tier=r["tier"],
+                    item_count=r["item_count"],
+                    bytes_total=r["bytes_total"],
+                )
+                for r in records
+            ]
+        )
 
     return mcp
 

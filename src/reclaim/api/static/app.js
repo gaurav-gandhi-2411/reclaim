@@ -1982,6 +1982,7 @@ export {
   switchToSafeMode,
   confirmPowerMode,
   describeAutoCleanTask,
+  renderMcpApprovalCard,
 };
 
 function updateApplyBar() {
@@ -2943,6 +2944,177 @@ async function initRecoveryBanner() {
   }
 }
 
+// --- Assistant (MCP) delete requests ------------------------------------------------------------
+//
+// An AI assistant driving Reclaim over MCP cannot delete anything by itself: its `delete` call
+// creates a request that appears here, and only a click on Approve (this window) lets it run.
+// Every delete it performs is reversible (vault or Recycle Bin). The cards are built with
+// textContent only (file names are untrusted text). docs/specs/assistant-mcp.md section 5.
+
+const MCP_APPROVAL_POLL_MS = 2000;
+// A hidden tab is exactly where the user is NOT looking (Claude Desktop in front, Reclaim in
+// the background), so it keeps polling, slowly, to put the request count in the tab title.
+const MCP_APPROVAL_POLL_HIDDEN_MS = 10000;
+const MCP_APPROVAL_SAMPLE_LIMIT = 5;
+const MCP_BASE_TITLE = document.title;
+
+function mcpApprovalLine(text, className = "rc-approval-line") {
+  const p = document.createElement("p");
+  p.className = className;
+  p.textContent = text;
+  return p;
+}
+
+function mcpExpiryText(approval) {
+  const minutes = Math.max(0, Math.round((approval.expires_at - Date.now() / 1000) / 60));
+  return `Expires in about ${minutes} min if you do nothing.`;
+}
+
+function renderMcpApprovalCard(approval, decide) {
+  const card = document.createElement("article");
+  card.className = "rc-approval-card";
+  card.dataset.approvalId = approval.id;
+
+  const who = approval.client_id ?? "An AI assistant";
+  const heading = document.createElement("h3");
+  heading.className = "rc-approval-heading";
+  heading.textContent =
+    `${who} wants to clean ${approval.item_count} item(s), ${formatFromBytes(approval.bytes_total)}`;
+  card.append(heading);
+
+  const rule = document.createElement("p");
+  rule.className = "rc-approval-line";
+  rule.append("Category: ");
+  const code = document.createElement("code");
+  code.textContent = approval.rule_id_or_category;
+  rule.append(code);
+  card.append(rule);
+
+  card.append(
+    mcpApprovalLine(
+      approval.method === "recycle_bin"
+        ? "Method: moved to the Windows Recycle Bin. Nothing is permanently deleted; restore from the Recycle Bin."
+        : `Method: moved to Reclaim's vault. Nothing is permanently deleted; you can restore it for at least ${approval.reversible_until_days ?? 1} day(s).`
+    )
+  );
+  card.append(
+    mcpApprovalLine(
+      approval.protected_names.length > 0
+        ? `Never touched (your protected list): ${approval.protected_names.join(", ")}`
+        : "Your protected list is empty."
+    )
+  );
+
+  if (approval.sample_paths.length > 0) {
+    const list = document.createElement("ul");
+    list.className = "rc-approval-paths";
+    for (const path of approval.sample_paths.slice(0, MCP_APPROVAL_SAMPLE_LIMIT)) {
+      const li = document.createElement("li");
+      li.textContent = path;
+      list.append(li);
+    }
+    if (approval.item_count > MCP_APPROVAL_SAMPLE_LIMIT) {
+      const li = document.createElement("li");
+      li.className = "rc-approval-more";
+      li.textContent = `and ${approval.item_count - MCP_APPROVAL_SAMPLE_LIMIT} more`;
+      list.append(li);
+    }
+    card.append(list);
+  }
+
+  card.append(mcpApprovalLine(mcpExpiryText(approval), "rc-approval-expiry"));
+
+  const error = mcpApprovalLine("", "rc-form-error");
+  error.hidden = true;
+  error.setAttribute("role", "alert");
+
+  const actions = document.createElement("div");
+  actions.className = "rc-approval-actions";
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.className = "rc-btn rc-btn-primary";
+  approve.textContent = "Approve";
+  const decline = document.createElement("button");
+  decline.type = "button";
+  decline.className = "rc-btn rc-btn-secondary";
+  decline.textContent = "Decline";
+  const answer = async (action, button, busyText) => {
+    const label = button.textContent;
+    approve.disabled = true;
+    decline.disabled = true;
+    button.textContent = busyText;
+    error.hidden = true;
+    try {
+      await decide(approval.id, action);
+    } catch (e) {
+      button.textContent = label;
+      approve.disabled = false;
+      decline.disabled = false;
+      error.textContent = `Could not send your answer: ${e.message}`;
+      error.hidden = false;
+    }
+  };
+  approve.addEventListener("click", () => answer("approve", approve, "Approving..."));
+  decline.addEventListener("click", () => answer("decline", decline, "Declining..."));
+  actions.append(approve, decline);
+  card.append(actions, error);
+  return card;
+}
+
+function initMcpApprovals() {
+  const section = document.getElementById("mcp-approvals");
+  const list = document.getElementById("mcp-approvals-list");
+  const status = document.getElementById("mcp-approvals-status");
+  if (!section || !list) return;
+  let lastPendingIds = "";
+  let polling = false;
+
+  const decide = async (id, action) => {
+    await api(`/api/mcp/approvals/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+    status.textContent =
+      action === "approve"
+        ? "Approved. If the assistant is still waiting it will clean those items now; an approval nobody picks up expires after 2 minutes."
+        : "Declined. Nothing was changed.";
+    await poll();
+  };
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      const body = await api("/api/mcp/approvals");
+      const pending = body.approvals.filter((a) => a.status === "pending");
+      // Keep the countdown honest without rebuilding the cards (which would drop focus).
+      for (const a of pending) {
+        const el = list.querySelector(`[data-approval-id="${CSS.escape(a.id)}"] .rc-approval-expiry`);
+        if (el) el.textContent = mcpExpiryText(a);
+      }
+      const ids = pending.map((a) => a.id).join(",");
+      if (ids !== lastPendingIds) {
+        lastPendingIds = ids;
+        list.replaceChildren(...pending.map((a) => renderMcpApprovalCard(a, decide)));
+        section.hidden = pending.length === 0;
+        document.title = pending.length > 0 ? `(${pending.length}) Assistant request - ${MCP_BASE_TITLE}` : MCP_BASE_TITLE;
+        if (pending.length > 0) status.textContent = "An AI assistant is asking to clean your disk. Review it below.";
+      }
+    } catch {
+      // Fail quiet: an unreachable approvals endpoint must not read as an alarm. The assistant
+      // side fails closed on its own (nothing is deleted without a click).
+    } finally {
+      polling = false;
+    }
+  }
+
+  const loop = async () => {
+    await poll();
+    setTimeout(loop, document.hidden ? MCP_APPROVAL_POLL_HIDDEN_MS : MCP_APPROVAL_POLL_MS);
+  };
+  loop();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) poll();
+  });
+}
+
 // --- Update check (opt-in; see PRIVACY.md's "Updates" section) --------------------------------
 //
 // GET /api/update-check never blocks initial render (called from init(), fire-and-forget, same
@@ -3080,6 +3252,7 @@ function init() {
   initModeControls();
   initFirstRun();
   initRecoveryBanner();
+  initMcpApprovals();
   initUpdateCheck();
   initSettings();
   activateTab("overview");

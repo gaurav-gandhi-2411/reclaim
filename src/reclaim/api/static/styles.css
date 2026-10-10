@@ -219,6 +219,65 @@ a:active {
   margin: 0;
 }
 
+/* Assistant (MCP) delete requests -- see initMcpApprovals in app.js. Tokens only. */
+.rc-approvals {
+  background: color-mix(in srgb, var(--rc-brand) 8%, var(--rc-surface));
+  border: 1px solid var(--rc-brand);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+  margin-bottom: var(--rc-space-5);
+}
+
+.rc-approvals-title {
+  margin: 0 0 var(--rc-space-3);
+  font-size: var(--rc-text-lg);
+}
+
+.rc-approval-card {
+  background: var(--rc-surface);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+}
+
+.rc-approval-card + .rc-approval-card {
+  margin-top: var(--rc-space-3);
+}
+
+.rc-approval-heading {
+  margin: 0 0 var(--rc-space-2);
+  font-size: var(--rc-text-base);
+}
+
+.rc-approval-line,
+.rc-approval-expiry {
+  margin: var(--rc-space-1) 0;
+}
+
+.rc-approval-expiry {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+}
+
+.rc-approval-paths {
+  margin: var(--rc-space-2) 0;
+  padding-left: var(--rc-space-5);
+  font-family: var(--rc-font-mono);
+  font-size: var(--rc-text-sm);
+  overflow-wrap: anywhere;
+}
+
+.rc-approval-more {
+  font-family: var(--rc-font-sans);
+  color: var(--rc-text-muted);
+}
+
+.rc-approval-actions {
+  display: flex;
+  gap: var(--rc-space-2);
+  margin-top: var(--rc-space-3);
+}
+
 .rc-scan-bar {
   display: flex;
   gap: var(--rc-space-2);
