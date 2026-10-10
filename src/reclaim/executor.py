@@ -38,6 +38,7 @@ from reclaim.preflight import (
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
@@ -578,6 +579,7 @@ def unlink_clear_readonly(path: str) -> None:
     a standalone `os.unlink` call, which has no built-in `onexc`/retry hook of its own to hang a
     handler off of the way `shutil.rmtree` does — so this wraps the retry manually instead.
     """
+    assert_not_real_profile_under_pytest(path, operation="delete the file")
     try:
         os.unlink(path)  # noqa: PTH108 -- \\?\ str, not Path; see module note above
     except PermissionError:
@@ -665,6 +667,7 @@ def rmtree_reparse_point_safe(path: str) -> None:
     point -- nested reparse points inside that real tree are unaffected by this fix (already
     handled correctly by `shutil.rmtree` on its own; see this section's module comment).
     """
+    assert_not_real_profile_under_pytest(path, operation="remove the tree")
     if _is_reparse_point(path):
         try:
             os.rmdir(path)  # noqa: PTH106 -- \\?\ str, not Path; see module note above
@@ -697,6 +700,8 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     shouldn't outlive that item's failure as debris, but a parent shared with other already-
     vaulted siblings in the same batch is left alone (only removed if it's actually empty).
     """
+    assert_not_real_profile_under_pytest(src, operation="move away")
+    assert_not_real_profile_under_pytest(dst, operation="move into")
     long_src = long_path(src)
     long_dst = long_path(dst)
     dst_parent = os.path.dirname(long_dst)  # noqa: PTH120 -- str, not Path; see module note above
@@ -1856,6 +1861,9 @@ def apply_batch(
                     resolved_vault_path = _require_vault_path(vault_path)
                     _atomic_move(candidate.path, resolved_vault_path, is_dir=candidate.is_dir)
                 elif item_method == "recycle_bin":
+                    assert_not_real_profile_under_pytest(
+                        candidate.path, operation="send to the Recycle Bin"
+                    )
                     send2trash.send2trash(str(candidate.path))
                 else:  # direct_delete: permanent, no vault, no Recycle Bin (ADR-0001)
                     if candidate.is_dir:

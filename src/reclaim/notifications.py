@@ -13,6 +13,7 @@ import structlog
 
 from reclaim.app_paths import data_root
 from reclaim.config import NotificationsConfig
+from reclaim.safety_env import refuse_real_side_effect_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -357,6 +358,13 @@ def check_disk_space(
     )
 
 
+def _refuse_real_toast_under_pytest() -> None:
+    """Tests inject a fake `windows_toasts` module (no `__file__`); the genuine installed one
+    would pop a real toast on the owner's desktop, so it is refused under pytest."""
+    if getattr(sys.modules.get("windows_toasts"), "__file__", None) is not None:
+        refuse_real_side_effect_under_pytest("show a real Windows toast")
+
+
 def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
     """Fires the native Windows toast for a threshold-crossing disk-space check.
 
@@ -387,6 +395,7 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
     try:
         from windows_toasts import InteractableWindowsToaster, Toast, ToastButton
 
+        _refuse_real_toast_under_pytest()
         ensure_toast_aumid()
         toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
         toast = Toast(
@@ -428,6 +437,7 @@ def send_autoclean_toast(freed_bytes: int, percent_used: float | None, skipped_i
         )
         from windows_toasts import InteractableWindowsToaster, Toast
 
+        _refuse_real_toast_under_pytest()
         ensure_toast_aumid()
         toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
         toast = Toast(

@@ -34,6 +34,10 @@ import structlog
 
 from reclaim.app_paths import data_root
 from reclaim.safety import first_matching_pattern, subtree_exclusion_match
+from reclaim.safety_env import (
+    assert_not_real_profile_under_pytest,
+    refuse_real_side_effect_under_pytest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -310,6 +314,7 @@ def _to_long_path(path: str) -> str:
 
 
 def _run_command(argv: Sequence[str], timeout: float, env: dict[str, str]) -> CommandResult:
+    refuse_real_side_effect_under_pytest(f"run the real native tool {list(argv)!r}")
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed allow-listed argv, shell=False
             list(argv),
@@ -553,6 +558,7 @@ def _delete_tree_contents(
     `enforce_age` (ADR-0036): the caller's selection rule was "newest content older than
     `env.min_age_seconds`" (aged TEMP / crash dumps), so each file is re-checked against that
     rule right before its unlink -- a file touched since the plan is skipped, not deleted."""
+    assert_not_real_profile_under_pytest(top, operation="delete the contents of")
     dirs_to_try: list[str] = []
     stack = [top]
     while stack:
@@ -615,6 +621,7 @@ def _remove_reparse_entry(
     enforce_age: bool = False,
 ) -> None:
     """A junction/symlink inside an allow-listed tree: remove the link itself only."""
+    assert_not_real_profile_under_pytest(path, operation="remove the link", link_itself=True)
     changed = _changed_since_plan(path, st, env=env, enforce_age=enforce_age)
     if changed is None:
         return
@@ -638,6 +645,7 @@ def _delete_one_file(
     result: RegenerableItemResult,
     enforce_age: bool = False,
 ) -> None:
+    assert_not_real_profile_under_pytest(path, operation="delete the file")
     size = planned.st_size
     if env.has_open_handle(path):
         _record_skip(result, path)
@@ -1231,6 +1239,16 @@ def run_regenerable_clean(
     `only_keys` (the scheduled logon retry) restricts the run to the allow-list items with those
     keys; it can only narrow the plan, never add to it."""
     resolved = env if env is not None else RegenerableEnv.from_os_environment()
+    if apply:
+        # Refuse before ANY item runs (the per-item guards below are the backstop).
+        for root in (
+            resolved.home,
+            resolved.local_appdata,
+            *resolved.temp_roots,
+            *resolved.crash_dump_roots,
+            *resolved.pytest_temp_roots,
+        ):
+            assert_not_real_profile_under_pytest(root, operation="apply a clean against")
     run_id = run_id or uuid.uuid4().hex[:12]
     started = resolved.now()
     free_before = _measure_free(resolved.disk_anchor)
