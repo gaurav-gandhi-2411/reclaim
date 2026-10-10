@@ -771,6 +771,58 @@ def test_channel_inputs_are_length_capped_and_the_list_route_needs_the_token(das
     assert missing.status_code == 404 and "restarted" in missing.json()["detail"]
 
 
+def test_an_approval_id_from_the_model_cannot_steer_the_channel_url(tmp_path: Path) -> None:
+    """Third verifier pass: `../../mcp/approvals/X/approve?` as an id would be normalised by the
+    HTTP client into the decide route. Only CSRF stopped it; now the id never leaves the process."""
+    from reclaim.approvals import write_channel_file
+
+    db_path = tmp_path / "idx.sqlite3"
+    write_channel_file(channel_file_path(db_path), port=1, token="t")  # noqa: S106  (test value)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"claimed": True})
+
+    gate = DashboardApprovalGate(
+        db_path=db_path,
+        client_factory=lambda _c: httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://127.0.0.1:1"
+        ),
+    )
+    for bad in (
+        "../../mcp/approvals/x/approve?",
+        "x/../y",
+        "a b",
+        "x?y=1",
+        "x#",
+        "",
+        "é",
+        "x" * 65,
+    ):
+        with pytest.raises(ApprovalUnavailableError):
+            gate.get(bad)
+        with pytest.raises(ApprovalUnavailableError):
+            gate.claim(bad)
+        with pytest.raises(ApprovalUnavailableError):
+            gate.finish(bad, status="failed")
+    assert seen == []
+    assert gate.claim("Ab_-09xyZ") is True
+    assert seen == ["http://127.0.0.1:1/api/mcp-channel/approvals/Ab_-09xyZ/claim"]
+
+
+def test_a_non_ascii_token_header_is_refused_not_a_server_error(dashboard) -> None:  # type: ignore[no-untyped-def]
+    _state, client = dashboard
+    for name, path, method in (
+        (b"x-reclaim-mcp-token", "/api/mcp-channel/approvals", "GET"),
+        (CSRF_HEADER_NAME.encode(), "/api/mcp/approvals/abc/approve", "POST"),
+    ):
+        # same-origin is sent so the request reaches the token comparison, not an earlier refusal
+        headers = [(name, b"\xe9\xe9"), (b"sec-fetch-site", b"same-origin")]
+        response = client.request(method, path, headers=headers)
+        assert response.status_code == 403, (path, response.status_code)
+
+
 # keep the typed errors imported for readers: these are what the tool surfaces as isError text
 _ = (ApprovalDeclinedError, ApprovalExpiredError, ApprovalUnavailableError)
 _ = (SelectionMismatchError, StaleScanError)

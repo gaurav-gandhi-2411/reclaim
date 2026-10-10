@@ -94,14 +94,14 @@ def local_origin_violation(request: Request, policy: LocalOriginPolicy) -> str |
         if (
             not expected_mcp_token
             or mcp_token is None
-            or not secrets.compare_digest(mcp_token, expected_mcp_token)
+            or not _tokens_match(mcp_token, expected_mcp_token)
         ):
             return "Missing or invalid MCP channel token."
         return None
 
     if request.method in _MUTATING_METHODS:
         token = request.headers.get(CSRF_HEADER_NAME)
-        if token is None or not secrets.compare_digest(token, _current_csrf_token(request)):
+        if token is None or not _tokens_match(token, _current_csrf_token(request)):
             return (
                 "Missing or invalid CSRF token on a mutating request. This also fires whenever "
                 "the page you're using was loaded from a server process that is no longer "
@@ -111,6 +111,12 @@ def local_origin_violation(request: Request, policy: LocalOriginPolicy) -> str |
             )
 
     return None
+
+
+def _tokens_match(supplied: str, expected: str) -> bool:
+    # Compare as bytes: `compare_digest` raises TypeError on a non-ASCII str, which a client can
+    # send in a header (it turned a bad token into a 500 instead of the 403).
+    return secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _current_csrf_token(request: Request) -> str:

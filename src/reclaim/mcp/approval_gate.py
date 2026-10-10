@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,6 +18,18 @@ from reclaim.mcp.selection import ApprovalUnavailableError
 # and `tests/test_mcp_approval.py` enforce both properties.
 
 _HTTP_TIMEOUT_SECONDS = 5.0
+
+# The id comes from the model (`delete_status(approval_id)`) and is spliced into a URL path. An
+# id like `../../mcp/approvals/X/approve?` would be normalised by the HTTP client into a request
+# to the decide route; the browser CSRF check would still refuse it, but a single barrier is not
+# enough, so only the characters `secrets.token_urlsafe` produces are accepted.
+_APPROVAL_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _checked_id(approval_id: str) -> str:
+    if not _APPROVAL_ID_RE.fullmatch(approval_id):
+        raise ApprovalUnavailableError("That is not a valid approval id. Nothing was deleted.")
+    return approval_id
 
 
 class ApprovalGate(Protocol):
@@ -114,12 +127,14 @@ class DashboardApprovalGate:
 
     def get(self, approval_id: str) -> dict[str, Any]:
         record: dict[str, Any] = self._call(
-            "GET", f"/api/mcp-channel/approvals/{approval_id}"
+            "GET", f"/api/mcp-channel/approvals/{_checked_id(approval_id)}"
         ).json()
         return record
 
     def claim(self, approval_id: str) -> bool:
-        body = self._call("POST", f"/api/mcp-channel/approvals/{approval_id}/claim").json()
+        body = self._call(
+            "POST", f"/api/mcp-channel/approvals/{_checked_id(approval_id)}/claim"
+        ).json()
         return bool(body["claimed"])
 
     def finish(
@@ -132,6 +147,6 @@ class DashboardApprovalGate:
     ) -> None:
         self._call(
             "POST",
-            f"/api/mcp-channel/approvals/{approval_id}/finish",
+            f"/api/mcp-channel/approvals/{_checked_id(approval_id)}/finish",
             json={"status": status, "result": result, "error": error},
         )
