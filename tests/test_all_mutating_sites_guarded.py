@@ -246,9 +246,9 @@ ALLOWLIST: dict[str, str] = {
     "ai/eval_harness.py:current_commit_sha": "read-only subprocess: `git rev-parse HEAD`",
     "scanner.py:_query_git_clean": "read-only subprocess: `git status --porcelain`",
     "notifications.py:ensure_toast_aumid": (
-        "HKCU registry write (#158). Returns before touching winreg whenever PYTEST_CURRENT_TEST is "
-        "set, so a test can never write the real profile; the registration test removes that "
-        "variable only while injecting a fake winreg module"
+        "HKCU registry write (#158). Returns before touching winreg whenever "
+        "PYTEST_CURRENT_TEST is set, so a test can never write the real profile; the "
+        "registration test removes that variable only while injecting a fake winreg module"
     ),
     "ai/image_embeddings.py:ImageEmbeddingCache.put": (
         "SQL on a connection opened only by ImageEmbeddingCache.__init__, which guards db_path"
