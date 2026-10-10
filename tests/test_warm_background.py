@@ -521,3 +521,65 @@ def test_a_base_exception_in_the_worker_never_leaves_status_computing(
     assert [enable for enable, _ in env.priority] == [True, False]
     monkeypatch.undo()  # a following warm-up runs normally; the mocks above are gone
     assert env.client.post("/api/candidates/warm").status_code == 202
+
+
+# --- summary precompute ----------------------------------------------------------------------
+
+
+def _count_physical_size_queries(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+    real = ScanIndex.physical_size_bytes_total
+
+    def counting(self: ScanIndex, under: Path | None = None) -> int:
+        calls.append(under)
+        return real(self, under)
+
+    monkeypatch.setattr(ScanIndex, "physical_size_bytes_total", counting)
+    return calls
+
+
+def test_first_summary_after_a_warmup_is_a_cache_hit(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the first /api/summary after "ready" ran the whole-index physical-size
+    aggregate itself (24.1 s on a 7.7 GB index) and outlasted the page's 30 s wait."""
+    calls = _count_physical_size_queries(monkeypatch)
+    env.scan()
+    _run_spawned(env)
+    assert env.warm_status()["status"] == "ready"
+    assert calls, "the warm-up must pay the aggregate itself"
+    during_warm = len(calls)
+
+    assert env.client.get("/api/summary").status_code == 200
+
+    assert len(calls) == during_warm  # the summary found it cached
+
+
+def test_a_cancel_seen_by_the_precompute_only_skips_it(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The candidates cache is already warm by then, so the warm-up must not end "cancelled"."""
+    calls = _count_physical_size_queries(monkeypatch)
+    env.scan()
+
+    def cancelled() -> None:
+        raise dedup.DedupCancelled
+
+    with ScanIndex(env.state.db_path) as index:
+        service._precompute_summary_caches(index, env.state, cancelled)  # must not raise
+
+    assert calls == []
+
+
+def test_a_failing_summary_precompute_never_fails_the_warmup(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> int:
+        raise RuntimeError("simulated aggregate failure")
+
+    env.scan()
+    monkeypatch.setattr(service, "cached_physical_size_bytes", boom)
+    _run_spawned(env)
+
+    assert env.warm_status()["status"] == "ready"
+    assert service.is_candidates_cache_warm(env.state)
