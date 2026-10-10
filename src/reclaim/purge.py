@@ -30,6 +30,7 @@ from reclaim.executor import (
 )
 from reclaim.models import REBUILDABLE_CATEGORY_GROUPS, FileRecord, Mode, Verdict
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import RealProfileAccessError
 
 logger = structlog.get_logger(__name__)
 
@@ -382,6 +383,11 @@ def purge_expired(
                     )
                 )
                 continue
+            except RealProfileAccessError:
+                # Hermetic-test refusal (a BaseException, so `except OSError` never sees it). The
+                # guard runs before any deletion: close the intent as aborted, then re-raise.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                raise
 
             # ADR-0026, phase 2: the vault copy is now permanently gone — log it done, fsynced.
             # A kill between the two `_append_and_sync` calls above leaves an intent whose
