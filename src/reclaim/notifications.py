@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,66 @@ _SECONDS_PER_DAY = 86400.0
 # scheduled-task process). packaging/reclaim.iss registers this scheme at install time under
 # HKCU\Software\Classes (no admin needed) to invoke `reclaim check-disk-space --apply-snooze`.
 SNOOZE_LAUNCH_URI = "reclaim-notify:snooze-disk-alert"
+
+
+# Toast sender identity. windows_toasts' InteractableWindowsToaster defaults to Command Prompt's
+# AUMID, and on a machine where that sender is switched off Windows reports
+# NotificationSetting.DISABLED_FOR_APPLICATION and fails every toast (HRESULT 0x803E0111) while
+# `show_toast` itself returns normally -- the 80% alert was silently dropped on the owner's
+# machine in source and frozen builds alike (2026-10-10 diagnosis; the registry counter for the
+# cmd.exe sender stopped at 18 on 2026-08-26). A dedicated, registered AUMID makes Reclaim its own
+# sender (own entry in Settings > Notifications) and independent of Command Prompt's switch.
+TOAST_AUMID = "Reclaim.DiskCleanup"
+_TOAST_FAILURE_WAIT_SECONDS = 0.75  # the failure callback arrived in ~20 ms when measured
+
+
+def ensure_toast_aumid() -> bool:
+    """Registers `TOAST_AUMID` under HKCU (no admin) so Windows accepts toasts from it. The
+    installer does the same in [Registry]; this covers a source run or a portable copy.
+    Idempotent, NEVER raises, and a no-op under pytest (tests must not write the real profile)."""
+    if sys.platform != "win32" or "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    try:
+        import winreg
+
+        with winreg.CreateKey(
+            winreg.HKEY_CURRENT_USER, rf"Software\Classes\AppUserModelId\{TOAST_AUMID}"
+        ) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "Reclaim")
+    except OSError:
+        logger.info("notifications.aumid_register_failed", exc_info=True)
+        return False
+    return True
+
+
+def _show_toast_checked(toaster: object, toast: object) -> bool:
+    """Shows `toast` and waits briefly for Windows' asynchronous failure callback. `show_toast`
+    returns normally even when Windows refuses the toast, so without this a refused toast looks
+    like a delivered one. Returns False (and logs the HRESULT) when Windows reported a failure."""
+    failed = threading.Event()
+    codes: list[object] = []
+
+    def _on_failed(event: object) -> None:
+        codes.append(getattr(event, "error_code", None))
+        failed.set()
+
+    # NotificationSetting: 0 = enabled; 1-4 = disabled for the app / user / group policy /
+    # manifest. This is the signal that diagnosed the original drop; best effort (the read raises
+    # for an AUMID Windows has not seen yet), and only a definite "disabled" short-circuits.
+    try:
+        setting = int(toaster.toastNotifier.setting)  # type: ignore[attr-defined]
+    except Exception:
+        setting = 0
+    if setting != 0:
+        logger.info("notifications.toast_disabled", notification_setting=setting)
+        return False
+
+    toast.on_failed = _on_failed  # type: ignore[attr-defined]
+    toaster.show_toast(toast)  # type: ignore[attr-defined]
+    if failed.wait(_TOAST_FAILURE_WAIT_SECONDS):
+        logger.info("notifications.toast_refused", error_code=str(codes[0] if codes else None))
+        return False
+    return True
 
 
 def _default_drive_anchor() -> Path:
@@ -315,8 +376,8 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
     desktop session, a locked/logged-out session a scheduled task can still be triggered under)
     degrades to a logged no-op, the same posture as every other best-effort background feature in
     this codebase (`update_check.check_for_update`). Returns `True` only when the toast call
-    itself didn't raise -- this is NOT a confirmation the user actually saw or will see it;
-    Windows gives no such guarantee to the sending process.
+    itself didn't raise and Windows did not report a failure within a short wait -- this is NOT
+    a confirmation the user actually saw or will see it (Focus Assist can still hold it).
 
     The `windows_toasts` import is deferred to inside this function (not at module load) so
     `reclaim.notifications`'s pure logic (`check_disk_space`, state persistence, debounce,
@@ -339,7 +400,8 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
         from windows_toasts import InteractableWindowsToaster, Toast, ToastButton
 
         _refuse_real_toast_under_pytest()
-        toaster = InteractableWindowsToaster("Reclaim")
+        ensure_toast_aumid()
+        toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
         toast = Toast(
             [
                 "Disk space is running low",
@@ -348,11 +410,10 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
             ]
         )
         toast.AddAction(ToastButton("Snooze for a week", launch=SNOOZE_LAUNCH_URI))
-        toaster.show_toast(toast)
+        return _show_toast_checked(toaster, toast)
     except Exception:
         logger.info("notifications.toast_failed", exc_info=True)
         return False
-    return True
 
 
 def autoclean_toast_body(freed_bytes: int, percent_used: float | None) -> str:
@@ -381,12 +442,12 @@ def send_autoclean_toast(freed_bytes: int, percent_used: float | None, skipped_i
         from windows_toasts import InteractableWindowsToaster, Toast
 
         _refuse_real_toast_under_pytest()
-        toaster = InteractableWindowsToaster("Reclaim")
+        ensure_toast_aumid()
+        toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
         toast = Toast(
             ["Reclaim cleaned your disk", autoclean_toast_body(freed_bytes, percent_used)]
         )
-        toaster.show_toast(toast)
+        return _show_toast_checked(toaster, toast)
     except Exception:
         logger.info("notifications.autoclean_toast_failed", exc_info=True)
         return False
-    return True

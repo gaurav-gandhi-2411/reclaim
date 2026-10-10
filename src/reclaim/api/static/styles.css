@@ -7,6 +7,15 @@
   box-sizing: border-box;
 }
 
+/* The `hidden` attribute is the dashboard's one show/hide switch (app.js toggles it everywhere), but
+   a class that sets `display` (e.g. .rc-recovery-banner, .rc-badge) beats the browser's own
+   `[hidden] { display: none }`, so those elements showed while "hidden": an empty banner with a
+   Dismiss button and an empty pill in the footer, seen in the installed build's screenshots
+   (2026-10-09). One rule makes `hidden` always win. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
