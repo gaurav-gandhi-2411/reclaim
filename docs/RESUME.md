@@ -3,6 +3,40 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## GG MERGE BATCH CHECKLIST (written 2026-10-10 ~12:00 IST) -- ONE SITTING, THIS IS THE LIST TO USE
+
+VERIFIED = command run this session; BELIEVED = inferred. Repo `gaurav-gandhi-2411/reclaim`; link pattern `https://github.com/gaurav-gandhi-2411/reclaim/pull/N`. Open-PR list, bases and mergeStateStatus read with `gh pr list` at ~11:55 (VERIFIED). Delete-path PRs (#163, #164) are ordered after the hermetic-test PR #140, as asked.
+
+**Allowlist block: none needed.** Merging by hand in the GitHub UI is not gated by `merge_gate.py`. Only #160 fails a gate (branch prefix `perf/`, gate 1); I did not rename it. If you want a CC session to merge it later, `perf` has to be added to gate 1's prefix list in `~/.claude/scripts/merge_gate.py` (I do not edit that file).
+
+| # | PR | base now | what | rebase / retarget before merging |
+|---|---|---|---|---|
+| 1 | #140 | main | hermetic tests, no real-profile destructive ops under pytest | none; merge first (the four PRs below are stacked on its branch) |
+| 2 | #143 | #140's branch | safety_env UNC/device normalisation | after #140 merges: retarget to `main` (`gh pr edit 143 --base main`) |
+| 3 | #145 | #140's branch | guard every mutating site under pytest | retarget to `main` after #143 |
+| 4 | #144 | #140's branch | refusal state hygiene | retarget to `main`; touches executor.py/service.py, same files as #145 (BELIEVED conflict-free; re-check `mergeStateStatus`) |
+| 5 | #142 | #140's branch | real Task Scheduler CI | retarget to `main` |
+| 6 | #138 | main | installer re-registers the weekly task | none. #162 edits the same file (`packaging/reclaim.iss`) |
+| 7 | #151 | main | dedup bounded WAL | none |
+| 8 | #150 | main | review clusters use warm cache | none (touches `index.py`, `api/service.py`, `routes.py` like #151: check CLEAN) |
+| 9 | #160 | main (DRAFT, BEHIND) | summary precompute (`perf/` prefix) | click Update branch (merging main is clean: `git merge-tree` VERIFIED), mark ready, merge |
+| 10 | #162 | main | uninstaller keeps config.toml, removes empty app dir | Update branch after #138 (same file) |
+| 11 | #163 | main | MCP delete is reversible-only (data-deletion path) | **needs a merge of main after #145/#150: against integration/next `git merge-tree` reports a conflict in `tests/test_mcp.py` (VERIFIED)**; against plain main it is clean. Ask me to do it, or Update branch and resolve the one test file |
+| 12 | #164 | `fix/mcp-delete-reversible-only` | MCP delete needs your click in Reclaim's window (data-deletion path, 2,305 added lines) | merge #163 first, then `gh pr edit 164 --base main`, then merge main in: **conflicts in `src/reclaim/mcp/server.py` and `tests/test_mcp.py` against integration/next (VERIFIED)**; I resolve these when asked |
+
+Already merged by me: #165 -> `0e8dff6` (recovery banner / footer pill hidden-attribute fix; see MERGE LOG below).
+
+Why #163/#164 conflict: #145 and #150 also edit `mcp/server.py` and `tests/test_mcp.py`. Safe sequence: merge rows 1-8, then tell me "rebase the MCP PRs" and I will merge main into #163 and #164 (re-run CI and the verifier on the resolved heads) before you merge rows 11-12. Merging 11-12 earlier, in the other order, is also fine; the conflict then lands on #145/#150 instead.
+
+Verification status of the delete-path pair (both in the batch because they touch the data-deletion path): **#163** head `a07973b`: three verifier passes (state machine, retention-0 purge hole found and fixed, then a data-angle pass: a 2,400-combination probe of retention/size/mode/method found 0 permanent or sub-1-day outcomes; no other MCP-reachable deleter). **#164** head `7a39912`: three passes; the third (auth separation + TOCTOU) found no approval bypass but five weaknesses; fixed in the PR: the model-supplied approval id is validated before it enters a channel URL (`../../mcp/approvals/X/approve?` used to be normalised into the decide route and was stopped by CSRF alone), non-ASCII token header -> 403 not 500; both with tests that fail on the previous source (VERIFIED). Documented, not fixed: live disk drift between approval and execution is not detected (hash covers paths; directory re-walk only runs for direct_delete), card sample paths/method are creator-supplied, `GET /` hands the CSRF token to any local process and there is no CSP, channel-file ACL depends on where the index lives, pid reuse, an already-approved card for the same selection can be picked up by a later call within 2 min. Residual on #163 (not MCP-reachable): an item whose original path is re-created becomes purge-eligible before its retention ends (ADR-0005) if the user runs `reclaim purge --apply`; SAFE-mode Recycle Bin behaviour when the bin is disabled/too small is UNVERIFIED.
+
+### MERGE LOG (this round, merged by me under the gate)
+- #165 -> `0e8dff6` (recovery banner / footer pill: `[hidden] { display: none !important; }`): gates 1-4 pass (9 reviewable + 27 test lines), 5/5 checks fresh on `0c57202`, 0 behind main, CLEAN; verifier pass NOT FALSIFIED (static; also checked no JS sets `style.display` and no element needs to be visible while `hidden`); I looked at the committed before/after screenshots myself (empty banner and footer pill gone). Main CI on the merge commit: not yet read when written.
+
+### State at 11:50 IST
+- Ollama: PID 22364 `llama-server` (model `qwen3:30b-a3b`, blob `sha256-58574f2e...`, loaded 00:58 on 10-10 with `-c 4096`); its parent process is gone, `ollama ps` and `/api/ps` list nothing, resident 4 MB with 19 GB private commit; free RAM fluctuates 1-5 GB because of many processes (Defender 640 MB, a dozen `claude` processes ~400 MB each). Untouched. `ollama stop` cannot unload it (Ollama no longer tracks it): if still held at ~07:00 on 10-11 the only release is ending that PID (yours to decide).
+- Build launcher PID 22992 is waiting for >= 9 GB free; last reading 4.0 GB. Not restarted, not lowered.
+
 ## CHECKPOINT 2026-10-10 ~01:15 IST (toast root-caused and fixed, summary precompute, index pruned, MCP spec) -- READ THIS FIRST
 
 VERIFIED = command run this session; BELIEVED = inferred. The 21:15 section below still holds for the install.
