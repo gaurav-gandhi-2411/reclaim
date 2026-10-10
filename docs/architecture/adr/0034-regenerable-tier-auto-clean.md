@@ -231,3 +231,7 @@ it is a no-op. `RECLAIM_TEST_ALLOW_REAL_PROFILE=1` bypasses it for deliberate ma
 that opt-in is set. `SYSTEMROOT` is not redirected (Windows and child interpreters need it), so
 `C:\Windows\Temp` is protected by the guard, not by the redirect. A subprocess a test spawns is
 not covered by the in-process guard. The guard is a backstop, not a licence to skip the redirect.
+
+The two real-scheduler tests are run in CI by `.github/workflows/real-task-scheduler.yml` (manual,
+weekly, and on PRs touching the scheduler code, its tests or `packaging/reclaim.iss`) on a throwaway
+GitHub runner with the opt-in set on that one step only. It is not a required check.

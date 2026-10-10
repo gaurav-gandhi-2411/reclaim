@@ -1,0 +1,67 @@
+name: real-task-scheduler
+
+# The two tests in tests/test_autoclean_schedule.py that drive the REAL Windows Task Scheduler
+# (generated task XML accepted by schtasks.exe, typed query script accepted by PowerShell) skip
+# under the hermetic-test guard unless RECLAIM_TEST_ALLOW_REAL_PROFILE=1 (ADR-0034, "Hermetic
+# tests"). This workflow is their only automated run: on GitHub's throwaway windows runner,
+# never on a developer machine. Not a required check.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * 1" # Mondays 03:30 UTC
+  pull_request:
+    paths:
+      - src/reclaim/autoclean_schedule.py
+      - tests/test_autoclean_schedule.py
+      - packaging/reclaim.iss
+      - .github/workflows/real-task-scheduler.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-task-scheduler:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+
+      # The opt-in env var is set on THIS step only, and the -k expression selects exactly the
+      # two real-scheduler tests.
+      - name: Real Task Scheduler tests
+        env:
+          RECLAIM_TEST_ALLOW_REAL_PROFILE: "1"
+        run: uv run pytest tests/test_autoclean_schedule.py -k "real_task_scheduler_round_trip or real_query_of_hostile" -p no:cacheprovider -o addopts= -q --junitxml=pytest-real-scheduler.xml
+
+      # A skipped test counts as "collected" in the JUnit total, so check_junit_nonzero.py alone
+      # would pass if the opt-in silently stopped working: require exactly 2 run, 0 skipped.
+      - name: Fail unless exactly 2 tests ran and none were skipped
+        run: uv run python -c "import sys, xml.etree.ElementTree as ET; r = ET.parse('pytest-real-scheduler.xml').getroot(); s = r.findall('testsuite') if r.tag == 'testsuites' else [r]; t = sum(int(x.get('tests', 0)) for x in s); k = sum(int(x.get('skipped', 0)) for x in s); print(f'tests={t} skipped={k}'); sys.exit(0 if (t, k) == (2, 0) else 1)"
+
+      # Backstop only (the round-trip test already removes its task in try/finally): delete any
+      # task left under the tests' stable name prefix "Reclaim Weekly Auto-Clean (pytest-".
+      - name: Remove any leftover throwaway task
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object { $_.TaskName -like 'Reclaim Weekly Auto-Clean (pytest-*' } |
+            ForEach-Object {
+              Write-Host "leftover: $($_.TaskName)"
+              schtasks /delete /tn $_.TaskName /f
+            }
