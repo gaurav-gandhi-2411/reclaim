@@ -46,6 +46,7 @@ from reclaim.models import Candidate, HashSkip, MaterialityExclusionStats, Mode,
 from reclaim.purge import purge_eligible_entries, purge_expired
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import ScanDiskFullError, scan_tree
 
 # Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
@@ -664,6 +665,7 @@ def _run_scan(args: argparse.Namespace) -> int:
         print(f"reclaim: scan path does not exist or is not a directory: {root}", file=sys.stderr)  # noqa: T201
         return 1
 
+    assert_not_real_profile_under_pytest(args.db, operation="create the index directory")
     args.db.parent.mkdir(parents=True, exist_ok=True)
     try:
         with ScanIndex(args.db) as index:

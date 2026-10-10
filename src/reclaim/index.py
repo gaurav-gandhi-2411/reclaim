@@ -12,6 +12,7 @@ from reclaim.models import (
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
 )
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Migration/backfill batch size for `_backfill_name_and_path_lower` — streamed via
 # `fetchmany`/`executemany` in chunks rather than loading every legacy row at once, so
@@ -385,6 +386,10 @@ class ScanIndex:
     """
 
     def __init__(self, db_path: Path) -> None:
+        # Hermetic-test guard (ADR-0034 addendum): the ONLY place a connection is opened, so no
+        # ScanIndex can exist for a real-profile database under pytest.
+        assert_not_real_profile_under_pytest(db_path, operation="open the scan index at")
+        self._db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # Wave 1 finding #4 (2026-07-30 real-disk diagnosis): default rollback-journal mode
@@ -541,6 +546,7 @@ class ScanIndex:
         stale = set(indexed_paths) - set(seen_paths)
         if not stale:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in stale])
         self._conn.commit()
         return len(stale)
@@ -587,6 +593,7 @@ class ScanIndex:
         computes, evaluated entirely inside SQLite via an anti-join against the temp table
         instead of two full Python collections. Must be called after every real entry under
         `root` has reached `record_seen` at least once."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
@@ -644,6 +651,7 @@ class ScanIndex:
         """Deletes the rows whose exact `path` is in `paths` (primary-key point deletes)."""
         if not paths:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
         self._conn.commit()
         return len(paths)
@@ -652,6 +660,7 @@ class ScanIndex:
         """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
         free disk roughly equal to the database size and an exclusive lock (fails with
         `sqlite3.OperationalError` if another connection holds the database open)."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="VACUUM")
         self._conn.commit()
         self._conn.execute("VACUUM")
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -679,6 +688,7 @@ class ScanIndex:
         never call this for a CANCELLED scan -- see `scan_tree`'s own docstring for why (same
         reasoning as `prune_unseen_under_root` being skipped there).
         """
+        assert_not_real_profile_under_pytest(self._db_path, operation="replace rows in")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         self._conn.execute(
