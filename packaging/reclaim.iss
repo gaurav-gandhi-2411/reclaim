@@ -71,6 +71,18 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+; ADR-0034 'Upgrade path': an upgraded install keeps the OLD weekly auto-clean task (one trigger)
+; until the user toggles Settings off/on. This re-registers it with the current definition on every
+; install/upgrade, and only when [autoclean] enabled is true in this user's config.toml (disabled
+; => the command does nothing and creates no task). Runs in {app} so the relative config.toml is
+; the installed one. Same account as the disk-space task: Setup is PrivilegesRequired=lowest, so
+; RegisterDiskSpaceTask (in [Code]) already runs as the installing user; `runasoriginaluser` keeps
+; this step on that user too even if Setup were ever launched elevated over-the-shoulder
+; (autoclean_schedule registers a per-user InteractiveToken task). Best-effort like that task:
+; Inno never fails the install on a [Run] exit code, `nowait` + `runhidden` keep it silent and off
+; the critical path, `skipifdoesntexist` skips it if the exe is somehow absent, and the command's
+; own failure detail goes to data\task_registration_diagnostic.log.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "auto-clean --reconcile-task"; WorkingDir: "{app}"; Flags: runhidden nowait skipifdoesntexist runasoriginaluser
 Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent unchecked
 
 [Registry]
@@ -452,6 +464,26 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+// ADR-0034 'Upgrade path': the weekly auto-clean task is registered by reclaim.exe itself (the
+// Settings toggle, or the [Run] --reconcile-task step), not by [Code], so nothing removed it on
+// uninstall -- it was left pointing at a deleted exe and every upgrade re-registered it. Same
+// BM3 guard as UnregisterDiskSpaceTask: only delete it when it is unregistered (harmless no-op) or
+// currently points at THIS install's exe; if another still-installed copy owns it, leave it alone.
+// The name must equal autoclean_schedule.task_name() (tests/test_autoclean_reconcile_task.py).
+procedure UnregisterAutoCleanTask();
+var
+  ResultCode: Integer;
+  TaskName, ThisExePath, CurrentOwnerPath: String;
+begin
+  TaskName := 'Reclaim Weekly Auto-Clean (' + ExpandConstant('{username}') + ')';
+  ThisExePath := XmlEscape(ExpandConstant('{app}\{#MyAppExeName}'));
+  CurrentOwnerPath := GetRegisteredTaskCommandPath(TaskName);
+  if (CurrentOwnerPath = '') or (CurrentOwnerPath = ThisExePath) then
+    // Best-effort: an absent task or a failed delete never fails the uninstall.
+    Exec('schtasks.exe', '/delete /tn "' + TaskName + '" /f',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   // ssPostInstall fires after [Files] has finished copying, so {app}\{#MyAppExeName} already
@@ -529,6 +561,7 @@ var
   Response: Integer;
 begin
   if CurUninstallStep = usUninstall then
+  begin
     // R5: remove the per-user scheduled task registered by RegisterDiskSpaceTask above. Run at
     // usUninstall (before file removal / the data-folder prompt below) rather than
     // usPostUninstall -- no ordering dependency on either, but this keeps "undo everything this
@@ -537,6 +570,8 @@ begin
     // handler needs no equivalent call here -- Flags: uninsdeletekey in [Registry] above already
     // removes it automatically.
     UnregisterDiskSpaceTask();
+    UnregisterAutoCleanTask();
+  end;
 
   if CurUninstallStep = usPostUninstall then
   begin

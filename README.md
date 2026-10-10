@@ -84,6 +84,7 @@ tiny (see ADR-0034):
 - **Per Windows account:** the task is named `Reclaim Weekly Auto-Clean (<your username>)`, runs
   without administrator rights, and only while you are signed in. Turning the toggle off removes
   it, and a leftover task does nothing once the setting is off.
+- **Upgrades keep it current:** installing a new version re-registers the task (only if the toggle is on), so you never have to switch it off and on again.
 - **Needs the installed app** (a source checkout has no `reclaim.exe` to schedule; the toggle
   explains this instead of failing silently).
 
@@ -94,7 +95,10 @@ document on stdout (human text goes to stderr): the run report, or
 `{"status": "skipped" | "error", "reason": ..., "applied": false}` when nothing ran. `reason` is
 one of `autoclean_disabled`, `nothing_to_do`, `busy`, `config_invalid`, `elevated`, `run_failed`;
 errors caused by an exception add `error_type` (the exception class name only -- the full text is
-on stderr). argparse usage errors and `--help` are printed by argparse and are not JSON, and
+on stderr). `auto-clean --reconcile-task --json` (the installer hook) follows the same contract and
+adds one status and one reason for its success path: `{"status": "ok", "reason":
+"task_registered", "applied": false}` (setting off: `skipped`/`autoclean_disabled`; source run:
+`skipped`/`nothing_to_do`; schtasks failure: `error`/`run_failed`). argparse usage errors and `--help` are printed by argparse and are not JSON, and
 Ctrl+C / `SystemExit` are deliberately not caught.
 
 **Pytest temp folders (a separate opt-in, config file only).** Old `pytest-<N>` folders in
