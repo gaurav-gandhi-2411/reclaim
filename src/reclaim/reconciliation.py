@@ -4,7 +4,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from reclaim.index import ScanIndex, physical_size_bytes
+from reclaim.index import ScanIndex
 
 
 class NotAVolumeRootError(ValueError):
@@ -51,18 +51,19 @@ class DiskReconciliationReport:
     delta_pct: float
 
 
-def compute_disk_reconciliation(index: ScanIndex, volume_root: Path) -> DiskReconciliationReport:
+def compute_disk_reconciliation(
+    index: ScanIndex, volume_root: Path, *, indexed_bytes: int | None = None
+) -> DiskReconciliationReport:
     """Builds a `DiskReconciliationReport` for `volume_root`, which must be a bare drive root
     (see `NotAVolumeRootError`) that was scanned IN FULL -- this function has no way to tell a
     genuine inaccessible-directory undercount apart from "the index simply never covered this
     volume", and does not try to; a partial-subtree scan will show a large, honest-looking but
     scope-driven delta, not a meaningful reconciliation.
 
-    `indexed_bytes` reuses the exact same `physical_size_bytes(index.full_inventory(...))` call
-    `api.service.build_summary` already uses for `SummaryResponse.total_indexed_bytes` (a known,
-    separately-tracked whole-index-materialization cost -- see the P1 finding in
-    `docs/AUDIT-2026-08.md` -- not a new regression introduced here) so the two numbers stay
-    directly comparable.
+    `indexed_bytes` is the same number as `physical_size_bytes(index.full_inventory(under=...))`
+    and as `SummaryResponse.total_indexed_bytes`, so the two stay directly comparable; it is
+    computed in SQL (`ScanIndex.physical_size_bytes_total`) rather than by materializing every
+    row. A caller that already holds a (memoized) value may pass it as `indexed_bytes`.
     """
     if not is_volume_root(volume_root):
         raise NotAVolumeRootError(
@@ -70,7 +71,8 @@ def compute_disk_reconciliation(index: ScanIndex, volume_root: Path) -> DiskReco
             "shutil.disk_usage, which reports whole-VOLUME usage; pass a bare drive root "
             "(e.g. C:\\) that was scanned in full."
         )
-    indexed_bytes = physical_size_bytes(index.full_inventory(under=volume_root))
+    if indexed_bytes is None:
+        indexed_bytes = index.physical_size_bytes_total(under=volume_root)
     inaccessible = index.inaccessible_summary(under=volume_root)
     reported_total_bytes = indexed_bytes + inaccessible.known_bytes
     usage = shutil.disk_usage(volume_root)
