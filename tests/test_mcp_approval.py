@@ -316,6 +316,31 @@ async def test_a_candidate_set_drift_after_approval_is_refused(
     assert gate.broker.get(approval_id).status == "stale"  # type: ignore[union-attr]
 
 
+async def test_a_file_that_changed_on_disk_after_approval_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hash is computed from the warm cache and cannot see disk drift, so the re-stat that
+    guards the request (#163) must run again at execution, after the user's click."""
+    state, paths, scan_id = _prepare(tmp_path)
+    digest, _ = _selection(state, scan_id)
+    gate = BrokerGate()
+    server = build_mcp_server(state, approval_gate=gate)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        first = await session.call_tool("delete", _delete_args(scan_id, digest, wait_seconds=0))
+        approval_id = first.structuredContent["approval_id"]
+        gate.broker.approve(approval_id, channel={"sec_fetch_site": "test"})
+        monkeypatch.setattr(service, "stale_selected_candidates", lambda selected: list(selected))
+        late = await session.call_tool(
+            "delete_status", {"approval_id": approval_id, "wait_seconds": 5}
+        )
+
+    assert late.isError is True and "changed on disk" in str(late.content)
+    assert paths["node_modules_dir"].exists()
+    assert not list((tmp_path / "vault").rglob("index.js"))
+    assert gate.broker.get(approval_id).status == "stale"  # type: ignore[union-attr]
+
+
 async def test_excluded_projects_are_never_offered_and_never_deleted_even_if_approved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

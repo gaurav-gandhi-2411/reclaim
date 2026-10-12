@@ -3,6 +3,79 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
+## CHECKPOINT 2026-10-10 ~18:15 IST (GG closed the laptop mid-batch; new installer built, NOT installed) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. Nothing of mine is running (VERIFIED: build launcher exited 0, watchdog wrote its END line, sampler PID 24340 gone, no server of mine; I started none this round). Ollama runner PID 22364 was stopped by GG.
+
+### Merge loop position (live loop with GG; all merges done by GG in the web UI)
+- Merged by GG: **#140** -> `2f526a8`, **#143** -> `4ea9c72`, **#145** -> `939d065` (VERIFIED `gh pr view`; GG wrote "[I merged #145. / I did not merge #145.]" so I read the state from GitHub). Current main `939d065`.
+- Before each, I merged origin/main into the branch (plain merge, no force) and waited for 6/6 green + CLEAN: #140 had one conflict in `notifications.py` (kept both sides: the pytest toast guard first, then `ensure_toast_aumid` + the registered AUMID); #145 needed `tests/test_all_mutating_sites_guarded.py` to allowlist `notifications.py:ensure_toast_aumid` (the enumerating test flagged #158's registry write, correctly; reason in the allowlist: it returns before touching winreg whenever `PYTEST_CURRENT_TEST` is set, and its own tests are the only place that variable is removed) plus a one-line E501 fix of my own (first push failed lint; lesson: run `ruff check .` before pushing).
+- **NEXT: #144** (`fix/refusal-state-hygiene`). Its branch on origin is still the old head `c2cc084`; main merged in cleanly in a local scratch worktree (`reclaim-wt-batch`, detached, ruff clean, 149 targeted tests passed) but I did NOT push it, because #145 landed after and a fresh merge of main is needed: `git merge origin/main`, push, wait for 6/6 + CLEAN, then GG merges. After it: **#142** (CI-only), **#138**, **#151**, **#150**, **#160**, **#162**, then **#163**, then **#164** (retarget to main after #163: `gh pr edit 164 --base main`, then merge main in; against integration/next it conflicts in `mcp/server.py` and `tests/test_mcp.py`, ask me or resolve there).
+- **#160 is now marked ready** (was draft; GG will merge it in the web UI despite the `perf/` prefix; it is BEHIND main: merge main into it first, a clean merge per `git merge-tree`).
+- Not self-merged because GG is driving the batch; self-merged earlier this round: #165 -> `0e8dff6`, #166 -> `a36d6ae`.
+
+### New installer (built, NOT installed)
+- Built from `integration/next` **`420eea4`** (pushed to origin so the SHA is reachable), 502.6 s compile (cache hit), on D:. `reclaim-setup.exe` 292.3 MB, **SHA-256 `01efb179fec4744e8af2cf2532743e642a869e04e9832f5aef63ff5fd2697c4e`**, dist 793.1 MB, files under `packaging\dist\` in `reclaim-wt-intnext`. Watchdog: `END start_free=139.27GB min_free=129.31GB peak_C_drop=9.97GB peak_D_drop=0.80GB`.
+- Checks on this dist: `scripts/check_dist_dll_closure.py D:\reclaim-build\build\entry_point.dist` OK; `test_packaged_safe_mode.ps1` 15 PASS, 0 FAIL; `test_packaged_serve.ps1` all PASS (scan 6 files; AI tracks semantic_image, near_identical_image, near_dup_document_and_version_chain, screenshot_burst ran; the ranker is skipped only for its absent model file).
+- **Includes:** #158 (toast AUMID), #160 (summary precompute), #162 (uninstaller leftovers), plus the earlier batch PRs #138/#140/#142-#145/#150/#151 as merged into integration/next. **Does NOT include #163, #164, #165** (reversible-only MCP delete, the approval flow, the hidden-attribute banner fix): the installed app would still show the empty recovery banner and the MCP delete would not be reversible-only. **Not verified by any run yet:** the toast end to end on an installed build, #162's uninstall behaviour, #160's first-summary timing.
+- Build logs: `D:\reclaim-build\build_stdout5.txt`, `build_stderr5.txt`, `watchdog5.csv`, `pids5.txt`. (First attempt `launch_build5.py` from Git Bash failed, `pwsh` not on that PATH; relaunched from PowerShell.)
+
+### Pending chain (nothing of it has started; do it once GG is back, as GG specified)
+1. Two uninstall items, neither done yet: (a) evidence from GG's own earlier uninstall of Reclaim, not yet collected: were both per-account tasks (weekly auto-clean, disk-space check) removed, is the uninstall registry entry gone, what remains in the install dir and data dir (config.toml, index, vault, first_run_state, logs); anything the uninstaller should have removed and did not is a defect; (b) a real uninstall of the REBUILT installer to verify #162 end to end (config.toml kept on "keep data", everything removed on "delete data"), then reinstall.
+2. Fresh install on gaura; screenshot the first-run screen in a real browser before acknowledging anything; write `[exclusions] project_names = ["fr-en-transformer","shipdoc-extract","intent-router"]` into the installed `config.toml` and confirm the app reads them; confirm both task triggers, `Reclaim.DiskCleanup` identity, 80% alert and weekly auto-clean enabled.
+3. One test toast: last-add time moves, no 0x803E0111, a refused toast is reported and not debounced.
+4. Fresh scan + warm-up; first `/api/summary` after warm-up on the installed build (target < 2 s; was 24.1 s before #160).
+5. `docs/HOWTO.md` updates (toast identity, uninstall behaviour, MCP approval, banner fix); log in this file.
+
+### Disk findings (VERIFIED from the sampler `%TEMP%\reclaim_soak\2026-10-09-attrib\sizes.csv`, 402 C_free samples, 10-09 15:47 -> 10-10 15:59; sampler ended 15:59)
+- **Scratch of the three excluded projects shrank by itself** from 22.9 GB (fr-en 10.2 + shipdoc 6.5 + intent-router 6.2, measured 10-09) to about 2.1 GB by 10-10 16:45 (fr-en 0.86, shipdoc 0.07, intent-router 1.16; sampler: fr-en -7.55 GiB and shipdoc -5.64 GiB between 08:35 and 15:59): finished sessions or their owners cleaned up. GG's permission (clear finished sessions' scratch, 7+ days idle, no live process) therefore had almost nothing to act on: two dirs qualified (shipdoc `123267d9`, 1 MB; intent-router `38e7a9cf`, empty), deleted check-then-delete in separate commands, about 1 MB freed. The rest are all under 7 days idle (the nearest is fr-en `26fc71be`, 6.95 days: eligible tomorrow). The permission covers finished sessions' scratch only.
+- **C: free** (GiB): 17.10 (10-09 15:47) -> 206.5 (18:59, after the HF move) -> 209.2 (22:00-00:00) -> 212.5 (10-10 01:06) -> **150.3 (08:35)** -> 146.7 (11:51) -> 160.5 (12:55) -> 147.7 (15:59). Windows: 10-09 21:30 -> 10-10 00:30 **-2.67 GiB/h**; 10-10 09:00 -> 15:59 **-0.37 GiB/h**.
+- **UNATTRIBUTED: C: fell 58.5 GiB between 01:06 and 08:35 on 10-10.** Largest clean path growth in the sampler over that window: `%TEMP%\claude\...gg-portfolio` +43.0 GiB (another session's scratch; it later shrank 13.5 GiB), uv cache +4.8, a few smaller. The coarse sampler keys `home/ml-projects` (+94 GiB) and `home/AppData` (+48 GiB) exceed the C_free drop and later swing -205 / -174 GiB while C_free moved only -2.6 GiB, so those two per-path sums are not trustworthy (BELIEVED: walks racing with files being created/removed, or hardlink double counting). Conclusion: most of the 58.5 GiB is another project's scratch, BELIEVED, not proven. A +14 GiB jump at 12:55 also has no attribution.
+- **Build peak C: drop 9.97 GB (watchdog5.csv) during a build whose output is all on D: (peak D: drop only 0.80 GB, cache hit): UNATTRIBUTED, attribute next session.** The same window shows other sessions writing (the sampler is over by then). Method for next time: sample `%TEMP%`/`AppData`/`.cache` per-directory sizes before/during/after a build, and record the sampler pass times.
+- `vssadmin list shadowstorage` (GG ran it): used 0 bytes, allocated 0, max 19.0 GB, no shadow copies on C:. The shadow-copy retention hypothesis is CLOSED and removed from the WHEN GG HAS TIME list.
+
+### WHEN GG HAS TIME (updated)
+1. Remaining merge batch from the position above (#144, #142, #138, #151, #150, #160, #162, #163, #164), plus the Update-branch clicks listed in the checklist.
+2. Clean reinstall chain above (needs GG at the machine only for looking at the 80% toast and the first-run modal).
+3. Decide whether the unattributed 58.5 GiB overnight C: loss (gg-portfolio scratch +43 GiB) needs that project's owner to clean its scratch; and the build's 9.97 GB C: drop.
+4. Optional elevated USN-journal read for the 15:22-15:36 C: drop on 10-09 (shadow copies ruled out).
+5. Lower-priority items from the 19:00 section (Docker disk image to D:, WSL export/import, 1.4 GB duplicate Nuitka cache, small pagefile on C:).
+6. Removed: Ollama runner (stopped by GG), `vssadmin` shadow storage (closed), excluded-scratch decision (decided: finished sessions only; nothing left that qualifies today).
+
+## GG MERGE BATCH CHECKLIST (written 2026-10-10 ~12:00 IST) -- ONE SITTING, THIS IS THE LIST TO USE
+
+VERIFIED = command run this session; BELIEVED = inferred. Repo `gaurav-gandhi-2411/reclaim`; link pattern `https://github.com/gaurav-gandhi-2411/reclaim/pull/N`. Open-PR list, bases and mergeStateStatus read with `gh pr list` at ~11:55 (VERIFIED). Delete-path PRs (#163, #164) are ordered after the hermetic-test PR #140, as asked.
+
+**Allowlist block: none needed.** Merging by hand in the GitHub UI is not gated by `merge_gate.py`. Only #160 fails a gate (branch prefix `perf/`, gate 1); I did not rename it. If you want a CC session to merge it later, `perf` has to be added to gate 1's prefix list in `~/.claude/scripts/merge_gate.py` (I do not edit that file).
+
+| # | PR | base now | what | rebase / retarget before merging |
+|---|---|---|---|---|
+| 1 | #140 | main | hermetic tests, no real-profile destructive ops under pytest | none; merge first (the four PRs below are stacked on its branch) |
+| 2 | #143 | #140's branch | safety_env UNC/device normalisation | after #140 merges: retarget to `main` (`gh pr edit 143 --base main`) |
+| 3 | #145 | #140's branch | guard every mutating site under pytest | retarget to `main` after #143 |
+| 4 | #144 | #140's branch | refusal state hygiene | retarget to `main`; touches executor.py/service.py, same files as #145 (BELIEVED conflict-free; re-check `mergeStateStatus`) |
+| 5 | #142 | #140's branch | real Task Scheduler CI | retarget to `main` |
+| 6 | #138 | main | installer re-registers the weekly task | none. #162 edits the same file (`packaging/reclaim.iss`) |
+| 7 | #151 | main | dedup bounded WAL | none |
+| 8 | #150 | main | review clusters use warm cache | none (touches `index.py`, `api/service.py`, `routes.py` like #151: check CLEAN) |
+| 9 | #160 | main (DRAFT, BEHIND) | summary precompute (`perf/` prefix) | click Update branch (merging main is clean: `git merge-tree` VERIFIED), mark ready, merge |
+| 10 | #162 | main | uninstaller keeps config.toml, removes empty app dir | Update branch after #138 (same file) |
+| 11 | #163 | main | MCP delete is reversible-only (data-deletion path) | **needs a merge of main after #145/#150: against integration/next `git merge-tree` reports a conflict in `tests/test_mcp.py` (VERIFIED)**; against plain main it is clean. Ask me to do it, or Update branch and resolve the one test file |
+| 12 | #164 | `fix/mcp-delete-reversible-only` | MCP delete needs your click in Reclaim's window (data-deletion path, 2,305 added lines) | merge #163 first, then `gh pr edit 164 --base main`, then merge main in: **conflicts in `src/reclaim/mcp/server.py` and `tests/test_mcp.py` against integration/next (VERIFIED)**; I resolve these when asked |
+
+Already merged by me: #165 -> `0e8dff6` (recovery banner / footer pill hidden-attribute fix; see MERGE LOG below).
+
+Why #163/#164 conflict: #145 and #150 also edit `mcp/server.py` and `tests/test_mcp.py`. Safe sequence: merge rows 1-8, then tell me "rebase the MCP PRs" and I will merge main into #163 and #164 (re-run CI and the verifier on the resolved heads) before you merge rows 11-12. Merging 11-12 earlier, in the other order, is also fine; the conflict then lands on #145/#150 instead.
+
+Verification status of the delete-path pair (both in the batch because they touch the data-deletion path): **#163** head `a07973b`: three verifier passes (state machine, retention-0 purge hole found and fixed, then a data-angle pass: a 2,400-combination probe of retention/size/mode/method found 0 permanent or sub-1-day outcomes; no other MCP-reachable deleter). **#164** head `7a39912`: three passes; the third (auth separation + TOCTOU) found no approval bypass but five weaknesses; fixed in the PR: the model-supplied approval id is validated before it enters a channel URL (`../../mcp/approvals/X/approve?` used to be normalised into the decide route and was stopped by CSRF alone), non-ASCII token header -> 403 not 500; both with tests that fail on the previous source (VERIFIED). Documented, not fixed: live disk drift between approval and execution is not detected (hash covers paths; directory re-walk only runs for direct_delete), card sample paths/method are creator-supplied, `GET /` hands the CSRF token to any local process and there is no CSP, channel-file ACL depends on where the index lives, pid reuse, an already-approved card for the same selection can be picked up by a later call within 2 min. Residual on #163 (not MCP-reachable): an item whose original path is re-created becomes purge-eligible before its retention ends (ADR-0005) if the user runs `reclaim purge --apply`; SAFE-mode Recycle Bin behaviour when the bin is disabled/too small is UNVERIFIED.
+
+### MERGE LOG (this round, merged by me under the gate)
+- #165 -> `0e8dff6` (recovery banner / footer pill: `[hidden] { display: none !important; }`): gates 1-4 pass (9 reviewable + 27 test lines), 5/5 checks fresh on `0c57202`, 0 behind main, CLEAN; verifier pass NOT FALSIFIED (static; also checked no JS sets `style.display` and no element needs to be visible while `hidden`); I looked at the committed before/after screenshots myself (empty banner and footer pill gone). Main CI on the merge commit: not yet read when written.
+
+### State at 11:50 IST
+- Ollama: PID 22364 `llama-server` (model `qwen3:30b-a3b`, blob `sha256-58574f2e...`, loaded 00:58 on 10-10 with `-c 4096`); its parent process is gone, `ollama ps` and `/api/ps` list nothing, resident 4 MB with 19 GB private commit; free RAM fluctuates 1-5 GB because of many processes (Defender 640 MB, a dozen `claude` processes ~400 MB each). Untouched. `ollama stop` cannot unload it (Ollama no longer tracks it): if still held at ~07:00 on 10-11 the only release is ending that PID (yours to decide).
+- Build launcher PID 22992 is waiting for >= 9 GB free; last reading 4.0 GB. Not restarted, not lowered.
+
 ## CHECKPOINT 2026-10-10 ~01:15 IST (toast root-caused and fixed, summary precompute, index pruned, MCP spec) -- READ THIS FIRST
 
 VERIFIED = command run this session; BELIEVED = inferred. The 21:15 section below still holds for the install.

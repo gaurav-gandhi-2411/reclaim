@@ -703,7 +703,12 @@ async function explainCategory(categoryGroup, buttonEl, resultEl) {
   resultEl.dataset.tone = "muted";
   resultEl.textContent = "Asking Anthropic…";
   try {
-    const data = await api(`/api/ai/category-explanation/${encodeURIComponent(categoryGroup)}`);
+    // Reads the warm candidates cache server-side: a cold/stale cache is a typed 409, so go
+    // through the shared wait-and-retry-once path (a wait, not a red error).
+    const data = await readCandidateCache(
+      resultEl,
+      `/api/ai/category-explanation/${encodeURIComponent(categoryGroup)}`
+    );
     if (data.status === "ok") {
       resultEl.dataset.tone = "";
       resultEl.textContent = data.explanation;
@@ -1729,7 +1734,11 @@ const selectedPaths = new Set();
 let lastCandidates = [];
 
 async function loadReviewQueue() {
-  loadDuplicateClusterReview();
+  // Back to the loading state now (as before this panel waited on the warm-up), so it never
+  // keeps showing the previous clusters while the cache re-warms.
+  const clustersStateEl = document.getElementById("duplicate-review-state");
+  document.getElementById("duplicate-review-content").hidden = true;
+  renderState(clustersStateEl, "loading", { title: "Loading largest duplicate clusters…" });
 
   const stateEl = document.getElementById("review-state");
   const contentEl = document.getElementById("review-content");
@@ -1743,6 +1752,9 @@ async function loadReviewQueue() {
 
   try {
     const data = await readCandidateCache(stateEl, `/api/candidates?${params.toString()}`);
+    // After the warm-up, not concurrently with it: the cluster panel reads the same warm cache,
+    // and two loaders racing `ensureCandidatesWarm` would each start/poll a warm-up.
+    loadDuplicateClusterReview();
     if (!data.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -1763,6 +1775,7 @@ async function loadReviewQueue() {
     renderCandidateList(data.candidates);
     updateApplyBar();
   } catch (err) {
+    loadDuplicateClusterReview(); // its own panel still reports its own state (loading/error)
     renderState(stateEl, "error", {
       title: "Could not load the review queue",
       message: err.message,
@@ -1779,7 +1792,9 @@ async function loadDuplicateClusterReview() {
   renderState(stateEl, "loading", { title: "Loading largest duplicate clusters…" });
 
   try {
-    const data = await api("/api/duplicate-clusters/review");
+    // Draws from the same warm candidate cache as the other views (clusters are computed in the
+    // warm-up pass), so it waits for the warm-up instead of triggering its own dedup pass.
+    const data = await readCandidateCache(stateEl, "/api/duplicate-clusters/review");
     if (!data.has_scan) {
       renderState(stateEl, "empty", {
         title: "No scan yet",
@@ -1977,6 +1992,8 @@ export {
   loadTreemapView,
   loadReviewQueue,
   loadSimpleResults,
+  loadDuplicateClusterReview,
+  explainCategory,
   openQuickCleanDialogIfFresh,
   refreshActiveView,
   switchToSafeMode,

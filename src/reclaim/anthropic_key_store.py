@@ -4,6 +4,7 @@ import ctypes
 from pathlib import Path
 
 from reclaim.app_paths import data_root
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # R2 (per-category LLM explainer): the ONLY place in this codebase that ever persists the
 # user's Anthropic API key. Uses Windows DPAPI (`CryptProtectData`/`CryptUnprotectData`,
@@ -129,6 +130,7 @@ def store_key(api_key: str, path: Path = DEFAULT_KEY_PATH) -> None:
     `logging_config.DEFAULT_LOG_PATH`/`mode.DEFAULT_MODE_LOG_PATH`). Overwrites any existing
     file at `path` -- this is the one write path (re-entering a key replaces the old one)."""
     encrypted = protect(api_key.encode("utf-8"))
+    assert_not_real_profile_under_pytest(path, operation="write the stored key")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(encrypted)
 
@@ -152,6 +154,7 @@ def delete_key(path: Path = DEFAULT_KEY_PATH) -> None:
     """Removes the stored key, if any. A no-op (never raises) when nothing is stored -- mirrors
     this API's other idempotent "nothing to do" actions (see `routes.cancel_scan`'s docstring
     for the same convention elsewhere in this codebase)."""
+    assert_not_real_profile_under_pytest(path, operation="delete the stored key")
     path.unlink(missing_ok=True)
 
 

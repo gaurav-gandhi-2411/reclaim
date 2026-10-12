@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from reclaim.safety_env import assert_not_real_profile_under_pytest
+
 # Approval broker for assistant-initiated (MCP) deletes -- docs/specs/assistant-mcp.md section 5.
 #
 # Lives in the DASHBOARD process's memory (one broker per `AppState`). An approval is created by
@@ -53,6 +55,7 @@ def channel_file_path(db_path: Path) -> Path:
 def write_channel_file(path: Path, *, port: int, token: str) -> None:
     """Atomic. Holds the per-process MCP channel token, which can create/read approval requests
     but not decide them (see `reclaim.api.security`)."""
+    assert_not_real_profile_under_pytest(path, operation="write the dashboard channel file at")
     payload = {"port": port, "pid": os.getpid(), "token": token, "started_at": time.time()}
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -100,6 +103,7 @@ def read_channel_file(path: Path) -> dict[str, Any] | None:
 
 def remove_channel_file(path: Path, *, token: str) -> None:
     """Removes the file only if it is still OURS (a newer dashboard may have replaced it)."""
+    assert_not_real_profile_under_pytest(path, operation="remove the dashboard channel file at")
     current = read_channel_file(path)
     if current is not None and current.get("token") == token:
         with contextlib.suppress(OSError):

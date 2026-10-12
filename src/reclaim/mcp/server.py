@@ -43,6 +43,7 @@ from reclaim.mode import DEFAULT_MODE_LOG_PATH
 from reclaim.models import Mode
 from reclaim.preflight import check_within_allowed_scope
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # reclaim.mcp.server — the ONLY module in this package that talks to the outside world (stdio,
 # the MCP transport). Never imports `reclaim.executor` or `send2trash` (see this package's
@@ -98,6 +99,7 @@ def build_state(
     (exactly `reclaim.config.load_config`'s output, no safe-mode override baked in) for the same
     reason `create_app` requires it raw -- see `AppState.effective_config`'s docstring."""
     resolved_log_path = log_path if log_path is not None else DEFAULT_LOG_PATH
+    assert_not_real_profile_under_pytest(db_path, operation="create the index directory")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return AppState(
         db_path=db_path,
@@ -413,6 +415,17 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                 "and delete() again for a new approval."
             )
 
+    def _require_files_unchanged_on_disk(selected: list[Any]) -> None:
+        # The hash comes from the shared warm cache and cannot see on-disk changes: re-stat the
+        # files now, after the user's click, exactly as the request path does (#163).
+        stale = service.stale_selected_candidates(selected)
+        if stale:
+            raise SelectionMismatchError(
+                f"{len(stale)} approved file(s) changed on disk since the scan "
+                f"(first: {stale[0].path.as_posix()}). Refusing to delete anything; call "
+                "scan(), preview_apply() and delete() again for a new approval."
+            )
+
     def _execute_claimed(
         record: dict[str, Any], *, client_id: str | None, request_id: str
     ) -> DeleteResult:
@@ -424,6 +437,7 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
             selected, recomputed = _selection_for(scan_id, rule, tier)
             _require_unchanged_since_approval(recomputed, record["selection_hash"])
             _require_same_figures(selected, record)
+            _require_files_unchanged_on_disk(selected)
             log_mcp_action(
                 "mcp.delete_executing",
                 client_id=client_id,
@@ -621,6 +635,26 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                     "purge, or files changing on disk), or the hash was tampered with. Refusing "
                     "to delete anything. Call preview_apply() again for a current "
                     "selection_hash."
+                )
+
+            # The selection above comes from the shared warm cache, so the hash cannot see
+            # an on-disk change since the scan: re-stat the selected files and refuse (before
+            # executing anything) if any changed.
+            stale = service.stale_selected_candidates(selected)
+            if stale:
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="selection_changed_on_disk",
+                    scan_id=scan_id,
+                    tier=tier,
+                    rule_id_or_category=rule_id_or_category,
+                )
+                raise SelectionMismatchError(
+                    f"{len(stale)} selected file(s) changed on disk since the scan "
+                    f"(first: {stale[0].path.as_posix()}). Refusing to delete anything. "
+                    "Call scan() for a fresh scan, then preview_apply() again."
                 )
 
             safe_mode = state.live_mode == Mode.SAFE

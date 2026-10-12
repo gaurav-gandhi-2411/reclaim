@@ -207,3 +207,62 @@ in its `detail`), whether or not the new category is on.
 **Consequences / limits.** A basetemp holding a virtualenv is left for review (the common
 "venv built inside tmp_path" test pattern), so it never frees that space. How much it frees depends entirely on
 the machine (see the PR that added this for a metadata-only dry run on one).
+
+## Addendum: Upgrade path
+
+*Added 2026-10-05. Closes the last Consequences bullet of the addendum above (an existing install kept a single-trigger task until the user toggled Settings off/on).*
+
+**Decision.** `reclaim auto-clean --reconcile-task` (mutually exclusive with `--apply`/`--dry-run`; cleans nothing) reads `[autoclean] enabled` from the user's `config.toml`. Enabled: `register_task()` (schtasks `/f`, so an old single-trigger task is replaced by the current weekly + logon definition). Disabled or no config: no schtasks call at all and no task is created. Source/dev run: message, exit 0. Real failure (schtasks error, invalid config, elevated): actionable message on stderr, exit 1, details in `task_registration_diagnostic.log`. Safe to repeat. `packaging/reclaim.iss` runs it from `[Run]` on every install and upgrade, in `{app}`, with `runhidden nowait skipifdoesntexist runasoriginaluser`. Inno does not fail an install on a `[Run]` exit code (BELIEVED from Inno's documented behaviour, not exercised here), so a failure never blocks the install; the Settings toggle remains the manual path.
+
+**Account.** Setup is `PrivilegesRequired=lowest`, so the disk-space task step (`RegisterDiskSpaceTask`, `[Code]`) already runs as the installing user. `runasoriginaluser` keeps the new step on that same user even if Setup were launched elevated, because the task is a per-user `InteractiveToken` task and `auto-clean` refuses to run elevated.
+
+**Uninstall.** The uninstaller (`UnregisterAutoCleanTask`) also deletes `Reclaim Weekly Auto-Clean (<user>)`, with the same BM3 guard as the disk-space task (only if absent or pointing at this install's exe), failure ignored; without it the task outlived the exe and every upgrade re-registered it.
+
+**`--json`.** `--reconcile-task --json` writes exactly one document on every path, via the same helper and vocabulary as the `--json` contract of `auto-clean` (human text to stderr, exception class name only in JSON). Two additions for its success path: status `ok` and reason `task_registered`; a source run maps to `skipped`/`nothing_to_do`, a schtasks failure to `error`/`run_failed`.
+
+**Not verified.** A real installer upgrade over a real old task, and a real uninstall, have not been run; the tests use an injected fake schtasks and a static parse of the `.iss`.
+
+## Addendum: Hermetic tests
+
+**Incident.** An independent verifier's probe ran a `regenerable` apply under pytest with only
+`TEMP` redirected; `local_appdata` and `home` still pointed at the real machine, and the apply
+deleted the owner's real Chrome/Edge/Brave/Firefox `Cache`/`Code Cache`/`GPUCache` directories under
+`%LOCALAPPDATA%`. The tier's own safety (allow-list, age floor, open-handle probe) worked as
+designed; the failure was that nothing stopped a test from handing it the real roots.
+
+**Decision.** Two independent layers. (1) The repo-root `conftest.py` has an autouse fixture that
+points every profile root variable at pytest's basetemp for every test (`tests/` and `evals/`), and
+captures the real values once at import. (2) `reclaim.safety_env` is called from every destructive
+choke point (`regenerable._delete_one_file`/`_delete_tree_contents`/`_remove_reparse_entry`, the
+pre-flight of `run_regenerable_clean(apply=True)`, `executor.unlink_clear_readonly`/
+`rmtree_reparse_point_safe`/`_atomic_move`/the Recycle Bin call, `anthropic_key_store.delete_key`)
+and from the real subprocess runners (`regenerable._run_command`, `run_schtasks`, `run_powershell`,
+a genuine `windows_toasts`). Under pytest (`PYTEST_CURRENT_TEST` set OR `pytest` in `sys.modules`)
+a target resolving under a real root is refused with `RealProfileAccessError`, a `BaseException` so
+that the per-item `except Exception` isolation cannot turn it into a "failed item". Outside pytest
+it is a no-op. `RECLAIM_TEST_ALLOW_REAL_PROFILE=1` bypasses it for deliberate manual use.
+
+**Consequences / limits.** The two tests that drive the real Task Scheduler are skipped unless
+that opt-in is set. `SYSTEMROOT` is not redirected (Windows and child interpreters need it), so
+`C:\Windows\Temp` is protected by the guard, not by the redirect. A subprocess a test spawns is
+not covered by the in-process guard. The guard is a backstop, not a licence to skip the redirect.
+
+**Enforced, not asserted (follow-up).** An independent verifier showed the original "every
+destructive path is guarded" claim was false: config/state/manifest/log writers, `store_key` and
+the `ScanIndex` DELETE/VACUUM paths (reached via `index-prune --apply`, default DB path
+cwd-relative) were unguarded. They now call the guard, and `tests/test_all_mutating_sites_guarded.py`
+makes the claim a failing test: it parses every `src/reclaim/**/*.py`, finds each mutating call
+(`os`/`shutil`/`Path` file operations, write-mode `open`, `tempfile`, `sqlite3.connect`, mutating
+SQL, `subprocess`, `send2trash`, `winreg`, mutating `ctypes.windll` calls, logging file handlers)
+and requires a guard call earlier in the same function or an in-test `ALLOWLIST` entry keyed
+`file:function` with a reason; a stale allowlist entry also fails. The allowlist has two
+categories: read-only subprocesses (`git rev-parse`, `git status`) and SQL on a connection that
+only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open; the
+one exception is `notifications.ensure_toast_aumid` (the toast sender registration, #158), which
+returns before touching `winreg` whenever `PYTEST_CURRENT_TEST` is set. Limits:
+the scanner is lexical (a guard in the function, not proof it covers the right path), and a
+`Path.open(mode_variable)` is not detected.
+
+The two real-scheduler tests are run in CI by `.github/workflows/real-task-scheduler.yml` (manual,
+weekly, and on PRs touching the scheduler code, its tests or `packaging/reclaim.iss`) on a throwaway
+GitHub runner with the opt-in set on that one step only. It is not a required check.
