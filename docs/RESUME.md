@@ -3,7 +3,33 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-13 ~01:00 IST (MERGE BATCH COMPLETE; rebuild + install chain NEXT) -- READ THIS FIRST
+## CHECKPOINT 2026-10-13 ~04:45 IST (GG SHUTTING DOWN; BUILD INTERRUPTED AT NUITKA STEP 5/6) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. Main is `460192c`, no open PRs, main CI on `23c7ee6` all success.
+
+### State at shutdown
+- **Build interrupted, not finished, nothing installed.** Started 03:54 IST from main `460192c` in `reclaim-wt-intnext` (detached at `460192c`; the previous installer, `integration/next` `420eea4`, SHA-256 `01efb179...c4e`, is backed up at `D:\reclaim-build\old-installer-420eea4\`). Reached `[5/6] Running Nuitka standalone build` (`--jobs=1`, pre-flight 10.1 GB free RAM; Defender exclusions skipped, no admin), then stopped on GG's shutdown. No installer was produced from `460192c`; `packaging\dist\` still holds the OLD `420eea4` installer, which lacks #163/#164/#165. Do not install it.
+- I stopped the build tree (`taskkill /PID 39928 /T /F`, which took its python/Nuitka/ccache children), the watchdog (PID 33476), and the C: sampler (stop file; it wrote its END row). VERIFIED afterwards: none of PIDs 39928, 33476, 32700, 34364, 22612 exists and no process command line mentions `reclaim-build`/`build_installer`/`c_attrib_sampler`/`build_watchdog`. Nothing of mine is running. Logs: `D:\reclaim-build\build_stdout6.txt`, `watchdog6.csv`, `c_attrib6.csv`, `pids6.txt`.
+- **`merge_gate.py` `perf` patch: APPLIED by GG** (VERIFIED: `CC_BRANCH_PREFIXES` in `~/.claude/scripts/merge_gate.py` now ends `"test", "perf")`). `perf/` branches can now pass gate 1. "Count only non-test lines" was already in the gate.
+- Partial C: attribution of this build (38 min, 182 samples, `c_attrib6.csv`): C: free 61.5 -> 57.2 GiB; no build-caused C: write was seen (the build's temp, caches and output are on D:). Top process writers over the window were `ollama.exe` (all volumes, a model/installer process, not ours), `chrome-headless-shell`, `OllamaSetup.tmp`, `msedge`, `node`. `AppData\Local\uv` read 0.58 GiB at the first directory sample and 20.8 GiB at the last: BELIEVED another session's uv activity (this build sets `UV_CACHE_DIR` to D:), but the sampler's directory walk had an 8 s budget, so the first value may be a truncated walk: UNPROVEN. The earlier 9.97 GB C: drop is therefore still not pinned to the build; the evidence leans to other sessions' writes.
+
+### NEXT (in order; the chain from the 01:00 checkpoint is unchanged)
+1. Rebuild from main (`python D:\reclaim-build\tools\launch_build6.py` from the PowerShell tool, not Git Bash, where `pwsh` is not on PATH; that dir also holds `build_watchdog.py` and `c_attrib_sampler.py`; it runs `packaging\build_installer.ps1` with `NUITKA_CACHE_DIR`/`TEMP`/`TMP`/`UV_CACHE_DIR` on D:), watchdog + C: sampler, then smoke tests + DLL closure.
+2. Real uninstall of the installed build -> #162 keep-data path (config.toml survives, tasks and registry entry gone) -> reinstall -> uninstall with delete-data (everything gone incl. the empty folder and the `Reclaim.DiskCleanup` identity) -> reinstall.
+3. First-run screenshot in a real browser BEFORE anything acknowledges it.
+4. Write `[exclusions] project_names = ["fr-en-transformer","shipdoc-extract","intent-router"]` into the installed `config.toml` and confirm the app reads them; confirm both task triggers, the notification identity, 80% alert and weekly auto-clean.
+5. Fresh scan + warm-up; first `/api/summary` (< 2 s).
+6. Toast check WITH GG at the screen: one test toast, `Reclaim.DiskCleanup` last-add time before/after next to GG's yes/no.
+7. MCP approval check on the installed build: one delete request -> pending card in Reclaim's window -> proceeds only after a click -> vaulted (reversible), never direct-deleted.
+8. HOWTO.md update (toast identity, uninstall behaviour, MCP approval, banner fix); then the final report with the MERGE LOG and the WHEN GG HAS TIME list.
+
+### Two follow-up PRs (small, separate, after the install chain or in parallel when idle)
+1. **Scanner attribute bit** (GG: this machine IS production): this Windows build reports directory attributes `268435472` (an extra `0x10000000` bit) where `tests/test_scanner_listing.py` expects `16`. Audit every place the scanner, preflight and detectors use raw file attributes (is-directory, reparse point, cloud placeholder, hidden/system); if any compares raw values or decides on them, an unknown high bit could misclassify on real machines. Mask to the documented bits actually used, make the test compare those bits, and add a test with the extra bit set.
+2. **Mutating-sites test SQL gap:** `tests/test_all_mutating_sites_guarded.py` cannot see SQL passed as a variable to `execute`/`executemany` (this is how #150's `_flush_hash_rows` moved two sites out of its view). Make it flag any `execute`/`executemany` whose SQL is not a literal unless allowlisted with a reason, then re-check the allowlist.
+
+(The 01:00 checkpoint below stays valid for the batch result, the merge policy and the test debt.)
+
+## CHECKPOINT 2026-10-13 ~01:00 IST (MERGE BATCH COMPLETE; rebuild + install chain NEXT)
 
 VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-10 18:15 checkpoint below where they differ (its "merge loop position" and "what the installer lacks" are now history).
 
