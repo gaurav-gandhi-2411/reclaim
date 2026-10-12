@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
+from mcp_gates import auto_approve
 
 from reclaim.api import service
 from reclaim.api.state import AppState
@@ -221,7 +222,7 @@ async def test_full_workflow_scan_list_preview_delete_actually_quarantines(
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         scan_result = await session.call_tool("scan", {"path": str(root)})
@@ -282,7 +283,7 @@ async def test_delete_tool_never_deletes_permanently_even_for_a_permanent_catego
     config = Config(categories=CategoriesConfig(dev_artifacts=DevArtifactsConfig(enabled=True)))
     assert config.categories.dev_artifacts.retention_days is None  # the permanent default
     state = _build_power_mode_state(tmp_path, config=config)
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -323,7 +324,7 @@ async def test_scan_tool_refuses_a_path_outside_home(
     monkeypatch.setattr(service.Path, "home", classmethod(lambda cls: own_profile))
 
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         scan_result = await session.call_tool("scan", {"path": str(outside_dir)})
@@ -388,7 +389,7 @@ def test_concurrent_delete_calls_for_the_identical_selection_do_not_both_execute
 
     monkeypatch.setattr(service, "mcp_execute_delete", _slow_mcp_execute_delete)
 
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
     tool = server._tool_manager.get_tool("delete")
     assert tool is not None
     delete_fn = tool.fn
@@ -407,12 +408,16 @@ def test_concurrent_delete_calls_for_the_identical_selection_do_not_both_execute
 
     def _call_delete(slot: int) -> None:
         try:
-            results[slot] = delete_fn(
-                scan_id=scan_id,
-                rule_id_or_category="dev_artifact_node_modules",
-                tier="A",
-                selection_hash=selection_hash,
-                ctx=_FakeContext(),
+            # `delete` is async now (it awaits the user's approval), so each real OS thread runs
+            # its own event loop; the race under test is still two threads on one AppState.
+            results[slot] = asyncio.run(
+                delete_fn(
+                    scan_id=scan_id,
+                    rule_id_or_category="dev_artifact_node_modules",
+                    tier="A",
+                    selection_hash=selection_hash,
+                    ctx=_FakeContext(),
+                )
             )
         except BaseException as exc:
             errors[slot] = exc
@@ -475,7 +480,7 @@ async def test_delete_succeeds_with_an_independently_computed_hash_never_calling
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -520,7 +525,7 @@ async def test_delete_refuses_a_guessed_hash_that_does_not_match_the_real_select
     root = tmp_path / "tree"
     _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -544,7 +549,7 @@ async def test_delete_refuses_a_stale_scan_id(tmp_path: Path) -> None:
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -587,7 +592,7 @@ async def test_delete_refuses_a_tampered_selection_hash(tmp_path: Path) -> None:
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -632,7 +637,7 @@ async def test_delete_refuses_when_the_candidate_set_changed_since_preview(
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -681,7 +686,7 @@ async def test_list_candidates_and_preview_apply_refuse_a_stale_scan_id(tmp_path
     root = tmp_path / "tree"
     _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -731,7 +736,7 @@ async def test_delete_refuses_when_path_swapped_between_preview_and_delete_via_m
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -820,7 +825,7 @@ async def test_delete_refuses_when_junction_repointed_between_preview_and_delete
         pytest.skip(f"could not create NTFS junction: {result.stderr or result.stdout}")
 
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})
@@ -879,7 +884,7 @@ async def test_delete_refuses_a_selection_hash_reused_across_a_fresh_scan_of_ide
     root = tmp_path / "tree"
     paths = _build_tree(root)
     state = _build_power_mode_state(tmp_path, config=_config())
-    server = build_mcp_server(state)
+    server = build_mcp_server(state, approval_gate=auto_approve())
 
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         await session.call_tool("scan", {"path": str(root)})

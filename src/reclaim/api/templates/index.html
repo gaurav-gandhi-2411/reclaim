@@ -42,6 +42,15 @@
     <button id="recovery-banner-dismiss" type="button" class="rc-btn rc-btn-secondary">Dismiss</button>
   </div>
 
+  <!-- Assistant (MCP) delete requests: nothing is deleted until a click here. Hidden while there
+       is nothing to answer (the empty state); cards carry their own sending/error states. See
+       docs/specs/assistant-mcp.md section 5 and initMcpApprovals in app.js. -->
+  <section id="mcp-approvals" class="rc-approvals" aria-labelledby="mcp-approvals-title" hidden>
+    <h2 id="mcp-approvals-title" class="rc-approvals-title">An AI assistant is asking to clean your disk</h2>
+    <div id="mcp-approvals-list"></div>
+  </section>
+  <p id="mcp-approvals-status" class="rc-visually-hidden" role="status" aria-live="polite"></p>
+
   <form id="scan-form" class="rc-scan-bar" aria-label="Scan a directory">
     <div class="rc-quick-roots" id="quick-roots" hidden>
       <span class="rc-quick-roots-label">Quick scan</span>

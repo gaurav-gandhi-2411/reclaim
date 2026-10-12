@@ -11,6 +11,7 @@ import pytest
 from _warming_client import WarmingTestClient
 from fastapi.testclient import TestClient
 from mcp.shared.memory import create_connected_server_and_client_session
+from mcp_gates import auto_approve
 
 import reclaim.executor as executor_module
 import reclaim.scanner as scanner_module
@@ -419,7 +420,7 @@ def _entry_mcp(tmp_path: Path, tree: Path, dump: Path, capsys: pytest.CaptureFix
     )
 
     async def run() -> dict[str, Any]:
-        server = build_mcp_server(state)
+        server = build_mcp_server(state, approval_gate=auto_approve())
         async with create_connected_server_and_client_session(server._mcp_server) as session:
             await session.call_tool("scan", {"path": str(tree)})
             scan_id = ""

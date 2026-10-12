@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
 
 # Tool input/output shapes for `reclaim.mcp.server`, mirroring `reclaim.api.schemas`'s own
@@ -81,6 +83,25 @@ class PreviewApplyResult(BaseModel):
     sample_paths: list[str]
 
 
+class DeleteRequestSummary(BaseModel):
+    """One row of `delete_requests()`: enough to find a cut-off request, nothing to approve with."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str
+    status: str
+    rule_id_or_category: str
+    tier: str
+    item_count: int
+    bytes_total: int
+
+
+class DeleteRequestsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requests: list[DeleteRequestSummary]
+
+
 class DeleteResult(BaseModel):
     """`delete(scan_id, rule_id_or_category, tier, selection_hash)`'s response once the
     selection_hash check passed and `reclaim.api.service.mcp_execute_delete` actually ran --
@@ -90,13 +111,19 @@ class DeleteResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    batch_id: str
-    files_processed: int
-    files_succeeded: int
-    files_failed: int
+    # "executed": the user approved in Reclaim's window and the delete ran (the fields below are
+    # real). "awaiting_user": nothing has been deleted; the user has not answered yet. Call
+    # `delete_status(approval_id)` to keep waiting. Declined / expired / stale are errors.
+    status: Literal["executed", "awaiting_user"] = "executed"
+    approval_id: str | None = None
+    message: str | None = None
+    batch_id: str | None = None
+    files_processed: int = 0
+    files_succeeded: int = 0
+    files_failed: int = 0
     # Genuinely freed bytes only; Recycle Bin / vault moves (recoverable, space still held) are
     # reported in `bytes_moved`.
-    bytes_freed: int
+    bytes_freed: int = 0
     bytes_moved: int = 0
     # ADR-0036: how many items apply_batch's pre-flight skipped without attempting them, per
     # `PreflightSkipReason` (e.g. {"size_or_mtime_changed_since_scan": 2}) -- counts only, never

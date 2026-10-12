@@ -72,3 +72,19 @@ class ConcurrentDeleteError(RuntimeError):
     that deleted nothing. This error refuses the SECOND call immediately, before it ever
     re-derives candidates or computes a hash -- an unambiguous, impossible-to-miss refusal
     instead of a technically-honest-but-easy-to-misread empty success."""
+
+
+class ApprovalUnavailableError(RuntimeError):
+    """The user's confirmation window cannot be reached, so nothing was requested or deleted:
+    Reclaim's dashboard is not open (no `dashboard_channel.json`, or it no longer answers), or too
+    many requests are already waiting. Open Reclaim and call `delete` again."""
+
+
+class ApprovalDeclinedError(RuntimeError):
+    """The user pressed Decline in Reclaim's window. Nothing was deleted. Do not retry the same
+    request; ask the user what they want instead."""
+
+
+class ApprovalExpiredError(RuntimeError):
+    """The approval request timed out unanswered (or an approval was never claimed in time).
+    Nothing was deleted. Call `preview_apply` and `delete` again for a fresh request."""
