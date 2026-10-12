@@ -3,7 +3,41 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-10 ~18:15 IST (GG closed the laptop mid-batch; new installer built, NOT installed) -- READ THIS FIRST
+## CHECKPOINT 2026-10-13 ~01:00 IST (MERGE BATCH COMPLETE; rebuild + install chain NEXT) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-10 18:15 checkpoint below where they differ (its "merge loop position" and "what the installer lacks" are now history).
+
+### Batch result (VERIFIED `gh pr view`, all merged by GG in the web UI; no open PRs on 10-13 01:00)
+#140 `2f526a8`, #143 `4ea9c72`, #145 `939d065`, #144 `5e72704`, #142 `79decab`, #138 `30a8470`, #151 `b71b06b`, #150 `508a0dd`, #160 `f4e1d91`, #162 `1f0bae3`, #163 `7d08a2c`, #164 `23c7ee6` (= main). Self-merged earlier: #165 `0e8dff6`, #166 `a36d6ae`, #167 `ea0f764`. Main CI on `23c7ee6`: eval, scale-nightly, pages success; `ci` was still running when written (check `gh run list --branch main`).
+
+Conflict resolutions that were more than mechanical (each is in the PR's merge commit):
+- **#151 x main:** `ScanIndex.__init__` keeps main's hermetic-test guard plus #151's `Path(db_path)`.
+- **#150 x #151:** semantic clash. The review endpoint no longer hashes (it reads the warm cache), so the old test expecting 503 `dedup_insufficient_disk` from `/duplicate-clusters/review` is obsolete: a cold cache on a nearly full disk now answers the typed 409 `candidates_not_warm` and reads no file (test rewritten; the warm-up's readable failure is covered by its own test). The `DedupAborted` handler on that route is now unreachable and left in as defence. Two allowlist entries (`ScanIndex.store_partial_hashes`/`store_full_hashes`) went stale because #150 moved their SQL into `_flush_hash_rows` and removed.
+- **#164 x #163:** main's on-disk re-stat (`stale_selected_candidates`) now runs before an approval card is created AND again in `_execute_claimed` after the click (new, stricter, with a test); `approvals.write_channel_file`/`remove_channel_file` call the hermetic guard instead of being allowlisted.
+- Lesson recorded: a `-k`-filtered targeted run missed the #150 x #151 clash and CI caught it; run the full suite (`pytest tests -n 4`, ~4 min) before pushing a conflict resolution.
+
+### Known test debt found on this OS build (not yet fixed; follow-up PRs)
+1. `tests/test_scanner_listing.py` (2 tests) fails locally: directories report attributes `268435472` (extra `0x10000000` bit) where the test expects `16`. CI passes (different runner). GG's decision: this machine IS production, so audit every use of raw attributes (scanner, preflight, detectors) and mask to the documented bits actually used, fix the test to compare those bits, add a test with the extra bit set.
+2. `tests/test_all_mutating_sites_guarded.py` cannot see SQL passed as a variable to `execute`/`executemany` (it is how #150 slipped two sites out of view). Make it flag any non-literal SQL unless allowlisted with a reason, then re-check the allowlist.
+3. Three tests fail intermittently under `-n 4` on this machine and pass alone (`test_autoclean_reconcile_task::test_json_registration_failure_has_class_name_only`, `test_apply_size_mtime::test_in_place_append_is_skipped_and_file_intact[power-vault]`, one more): load-sensitive, BELIEVED, unproven.
+
+### MERGE POLICY (set by GG 2026-10-13; effective now that #162 and #164 have landed)
+1. Gate-passing PRs: I self-merge continuously (unchanged).
+2. Gate-failing PRs: each is verified individually as before, but not sent to GG one by one. They are bundled into ONE weekly release PR on `release/YYYY-MM-DD`, merged with merge commits (not squash) so every change stays traceable. The description has one paragraph per included change, and items touching the delete path, exclusions or the uninstaller come first. GG merges it once a week.
+3. `~/.claude/scripts/merge_gate.py` is NOT edited by me. A patch (add `perf` to the allowed prefixes; selftest cases for accepted `perf/...` and rejected `performance/`, `perf`, `perfx/`, `perf-x/`) is prepared at `C:\Users\gaura\merge_gate_perf_prefix.patch`. VERIFIED: it applies (`git apply --check`), the selftest is 233/233 before and after on scratch copies, and a baseline copy rejects `perf/x`. The other half of the request, "count only non-test lines toward 400", is ALREADY in the gate (`TEST_FILE_PATTERNS`, `evaluate_size_gate`, selftest case 2g2d), so the patch does not touch it. Apply: `git -C C:\Users\gaura\.claude apply C:\Users\gaura\merge_gate_perf_prefix.patch`.
+
+### Also done 10-12/13 (VERIFIED)
+- Stray task `ReclaimInstallerBuild` (created 2026-08-04 by `LEGION\gaura`, one-time trigger, script `packaging\build\run_build.cmd` does not exist, referenced by nothing in the repo/installer/app) deleted after a read-only check.
+- Pagefile: `PagingFiles = ?:\pagefile.sys`, `AutomaticManagedPagefile = True`, the file is `C:\pagefile.sys` (18 GB, written at the 17:19 boot). BELIEVED: system-managed placement is re-chosen at boot, so D: was picked when C: was full on 10-09. Admin fix is in WHEN GG HAS TIME.
+- C: attribution 10-09 -> 10-12 (profile 865.9 -> 785.6 GiB): `%TEMP%` +59.6 GiB, almost all other sessions' scratch (`claude\...gg-portfolio` 81.5 GiB, gold-rate-tracker 18.8, review-iq 9.1, triage-iq 5.9, agentgauge 5.5; Reclaim's own 2.7); `ml-projects` +46 (18 gg-portfolio worktrees, verify copies); HF/Android SDK moved to D: (-192). None of the three excluded projects is among the growers. GG forwarded a clean-up order to the gg-portfolio session, not this one.
+
+### NEXT (post-batch chain, in order)
+1. Confirm main CI green, then retire `integration/next` (tip `420eea4` = the SHA of the installer built 10-10; main is a functional superset, VERIFIED by diff: only formatting differences remain on the lines integration/next has and main lacks).
+2. Rebuild from main on D: with the watchdog AND a C: attribution sampler (to name the writer of the 9.97 GB C: drop seen in the last build); smoke tests + DLL closure.
+3. Real uninstall of the installed build: keep data -> config.toml survives, tasks and registry entry removed; reinstall; uninstall with delete data -> everything gone incl. the empty folder and the `Reclaim.DiskCleanup` identity; reinstall for good.
+4. Final install checks (first-run screenshot in a real browser before acknowledging, exclusions in config.toml, both task triggers, notification identity, 80% alert, weekly auto-clean), fresh scan + warm-up and first `/api/summary` (< 2 s), one test toast (report `Reclaim.DiskCleanup` last-add time before/after with GG's yes/no), MCP approval check on the installed build (one delete request -> pending card -> only proceeds after a click -> vault, never direct delete), HOWTO.md.
+
+## CHECKPOINT 2026-10-10 ~18:15 IST (GG closed the laptop mid-batch; new installer built, NOT installed) -- superseded by the 10-13 checkpoint above for the merge loop
 
 VERIFIED = command run this session; BELIEVED = inferred. Nothing of mine is running (VERIFIED: build launcher exited 0, watchdog wrote its END line, sampler PID 24340 gone, no server of mine; I started none this round). Ollama runner PID 22364 was stopped by GG.
 

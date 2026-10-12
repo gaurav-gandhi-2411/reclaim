@@ -26,10 +26,20 @@ bit us. Read `docs/RESUME.md` first (it is the living checkpoint).
    `.venv\Scripts\python.exe` with the worktree's `src` first on `sys.path`; the CLIP `.onnx` files must
    be real (a worktree can hold 134-byte Git LFS pointers: copy the real files from the main checkout,
    never stage them).
-5. **Never self-merge.** Every PR handoff includes the full table: each required check, mergeStateStatus,
-   draft, base, rebased-onto-main yes/no, plus which later PRs need a rebase after their predecessors
-   land (PRs touching the same files or choke point). "Green at handoff" is not enough for a train:
-   re-verify each PR after its predecessors merge.
+5. **Merge policy (owner-set 2026-10-13).** A PR that passes the global merge gate
+   (`~/.claude/scripts/merge_gate.py`, rule 70a) is self-merged by the session after a
+   verifier pass that tried to falsify it, with the entry added to the MERGE LOG in
+   `docs/RESUME.md`. A PR that fails a gate (delete path, size, branch prefix) is verified the
+   same way but NOT handed over one by one: it joins the weekly release PR
+   (`release/YYYY-MM-DD`, merge commit so every change stays traceable; one paragraph per
+   change, items touching the delete path, exclusions or the uninstaller first) which the
+   owner merges once a week. Never rename a branch to pass gate 1; never edit
+   `merge_gate.py` (prepare a patch and give the owner the apply command). Every handoff
+   still includes the full table: each required check, mergeStateStatus, draft, base,
+   rebased-onto-main yes/no, plus which later PRs need a rebase after their predecessors
+   land. "Green at handoff" is not enough for a train: re-verify each PR after its
+   predecessors merge, and run the FULL test suite (not a `-k` subset) on every conflict
+   resolution before pushing (a subset missed a semantic clash between #150 and #151).
 6. **Report VERIFIED vs BELIEVED**, with the command and output for every number.
 7. **Tests are hermetic: never point a test or a probe at the real profile.** An autouse fixture
    in the repo-root `conftest.py` redirects `LOCALAPPDATA`/`APPDATA`/`TEMP`/`TMP`/`USERPROFILE`/
