@@ -116,7 +116,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import acknowledge as acknowledge_first_run
 from reclaim.first_run import is_acknowledged as first_run_is_acknowledged
-from reclaim.index import InaccessibleSummary, ScanIndex, physical_size_bytes
+from reclaim.index import InaccessibleSummary, ScanIndex
 from reclaim.mode import (
     REQUIRED_POWER_MODE_CONFIRMATION,
     switch_to_power_mode,
@@ -135,6 +135,7 @@ from reclaim.preflight import check_within_allowed_scope
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
 from reclaim.thread_priority import BackgroundScope, set_background_mode
 
@@ -905,6 +906,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     cancelled = False
 
     try:
+        assert_not_real_profile_under_pytest(state.db_path, operation="create the index directory")
         state.db_path.parent.mkdir(parents=True, exist_ok=True)
         with ScanIndex(state.db_path) as index:
             for drive_index, root in enumerate(roots):
@@ -1117,6 +1119,48 @@ def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
     return cards
 
 
+def _index_stat_signature(db_path: Path) -> tuple[int, int, int]:
+    """(db mtime_ns, db size, wal size); a missing file reads as zeros. The index runs in WAL
+    mode, so an uncheckpointed commit grows the `-wal` file while the main file's stat stays
+    put (and a checkpoint/close later changes the main file). The WAL's MTIME is deliberately
+    excluded: merely opening and closing a connection rewrites it (measured: it changed on every
+    `ScanIndex` open with no data change), which would defeat the cache on every request."""
+
+    def stat_of(path: Path) -> tuple[int, int]:
+        try:
+            st = path.stat()
+        except OSError:
+            return 0, 0
+        return st.st_mtime_ns, st.st_size
+
+    db_mtime_ns, db_size = stat_of(db_path)
+    return db_mtime_ns, db_size, stat_of(Path(str(db_path) + "-wal"))[1]
+
+
+def cached_physical_size_bytes(
+    index: ScanIndex, state: AppState, *, under: Path | None = None
+) -> int:
+    """`physical_size_bytes(index.full_inventory(under))` computed in SQL and memoized.
+
+    Keyed on `state.scan_generation` (a completed/cancelled scan bumped it) PLUS the index
+    files' stat signature, because the index can also change without this process's generation
+    moving (another process's scan or `reclaim prune-index`); a changed signature just
+    recomputes. Held under `physical_size_cache_lock` so concurrent callers single-flight.
+    """
+    scope = None if under is None else str(under)
+    with state.physical_size_cache_lock:
+        key: tuple[object, ...] = (
+            state.scan_generation,
+            *_index_stat_signature(state.db_path),
+        )
+        cached = state.physical_size_cache.get(scope)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        total = index.physical_size_bytes_total(under)
+        state.physical_size_cache[scope] = (key, total)
+        return total
+
+
 def _reconciliation_fields(
     index: ScanIndex, state: AppState
 ) -> tuple[str | None, int | None, float | None]:
@@ -1135,7 +1179,9 @@ def _reconciliation_fields(
     if status != "completed" or root is None or drives_total != 1 or not is_volume_root(root):
         return None, None, None
     try:
-        report = compute_disk_reconciliation(index, root)
+        report = compute_disk_reconciliation(
+            index, root, indexed_bytes=cached_physical_size_bytes(index, state, under=root)
+        )
     except (NotAVolumeRootError, OSError) as exc:
         logger.warning("api.reconciliation_unavailable", volume=str(root), error=str(exc))
         return None, None, None
@@ -1184,7 +1230,7 @@ def build_summary(state: AppState, *, require_warm: bool = True) -> SummaryRespo
             )
         if require_warm:
             require_warm_candidates(state)
-        total_indexed_bytes = physical_size_bytes(index.full_inventory())
+        total_indexed_bytes = cached_physical_size_bytes(index, state)
         candidates = _cached_all_candidates(index, state)
 
     tier_a = [c for c in candidates if c.tier == Tier.A]

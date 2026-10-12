@@ -871,6 +871,25 @@ disk_threshold_percent = 10.0
     assert "reason=would_notify" in out
     assert len(sent_results) == 1
     assert state_path.exists()  # record_notified must have run
+    assert "toast=sent" in out
+
+
+def test_check_disk_space_does_not_debounce_a_toast_windows_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused toast must be reported and retried next run, not recorded as notified."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[notifications]\nenabled = true\ndisk_threshold_percent = 10.0\n", encoding="utf-8"
+    )
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr("reclaim.notifications.send_disk_space_toast", lambda result: False)
+
+    exit_code = main(["check-disk-space", "--config", str(config_path), "--state", str(state_path)])
+
+    assert exit_code == 0
+    assert "toast=not_delivered" in capsys.readouterr().out
+    assert not state_path.exists()
 
 
 def test_check_disk_space_apply_snooze_writes_state_without_checking(

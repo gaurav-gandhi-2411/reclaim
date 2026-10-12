@@ -568,6 +568,7 @@ def rmtree_clear_readonly(func: Callable[[str], object], path: str, exc: BaseExc
     debris after a real production run — exactly the failure mode ADR-0004 exists to prevent.
     Every `shutil.rmtree` call in this module (and `purge.py`'s) uses this `onexc` handler.
     """
+    assert_not_real_profile_under_pytest(path, operation="clear the read-only flag of")
     os.chmod(path, stat.S_IWRITE)  # noqa: PTH101 -- \\?\ str, not Path; see module note above
     func(path)
 
@@ -809,6 +810,7 @@ def append_manifest_entries(
     non-per-item batch append. Does NOT fsync — callers on the crash-safety-critical path
     (`apply_batch`/`restore_batch`/`purge_expired`'s per-item loops) use `_open_manifest_for_sync`
     and `_append_and_sync` instead; see ADR-0026."""
+    assert_not_real_profile_under_pytest(manifest_path, operation="append to the manifest")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with manifest_path.open("a", encoding="utf-8") as fh:
         for entry in entries:
@@ -903,6 +905,7 @@ def _release_manifest_lock(fh: TextIO) -> None:
 
 
 def _open_manifest_for_sync(manifest_path: Path) -> TextIO:
+    assert_not_real_profile_under_pytest(manifest_path, operation="append to the manifest")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     fh = manifest_path.open("a", encoding="utf-8")
     _acquire_manifest_lock(fh)

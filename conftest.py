@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from reclaim import safety_env
+from reclaim import cli, logging_config, safety_env
+from reclaim.api import app as api_app
+from reclaim.api import state as api_state
 
 # Repo-root conftest on purpose: it applies to `tests/` AND `evals/` (scripts/verify.py runs
 # both; a conftest under tests/ alone would leave every eval able to reach the real profile).
@@ -56,4 +58,10 @@ def _hermetic_profile(
     # `tempfile` caches its choice on first use; pin it to the redirected dir (restored on
     # teardown by monkeypatch) so `gettempdir()` agrees with `TEMP`.
     monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    # `data_root()` is cwd-relative, so an unpatched default log path lands in the real checkout's
+    # `data/logs/` (inside the real profile: the guard in `configure_logging` now refuses it).
+    # `cli`/`api.app` bind the constant by name, so each binding is patched, not just the source.
+    log_path = root / "logs" / "reclaim.log"
+    for module in (logging_config, cli, api_app, api_state):
+        monkeypatch.setattr(module, "DEFAULT_LOG_PATH", log_path)
     return root
