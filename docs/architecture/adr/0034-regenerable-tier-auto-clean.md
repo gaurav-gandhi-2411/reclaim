@@ -242,6 +242,12 @@ SQL, `subprocess`, `send2trash`, `winreg`, mutating `ctypes.windll` calls, loggi
 and requires a guard call earlier in the same function or an in-test `ALLOWLIST` entry keyed
 `file:function` with a reason; a stale allowlist entry also fails. The allowlist has two
 categories: read-only subprocesses (`git rev-parse`, `git status`) and SQL on a connection that
-only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open. Limits:
+only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open; the
+one exception is `notifications.ensure_toast_aumid` (the toast sender registration, #158), which
+returns before touching `winreg` whenever `PYTEST_CURRENT_TEST` is set. Limits:
 the scanner is lexical (a guard in the function, not proof it covers the right path), and a
 `Path.open(mode_variable)` is not detected.
+
+The two real-scheduler tests are run in CI by `.github/workflows/real-task-scheduler.yml` (manual,
+weekly, and on PRs touching the scheduler code, its tests or `packaging/reclaim.iss`) on a throwaway
+GitHub runner with the opt-in set on that one step only. It is not a required check.
