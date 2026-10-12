@@ -27,6 +27,10 @@ from xml.sax.saxutils import escape
 import structlog
 
 from reclaim.app_paths import compiled_exe_dir, data_root
+from reclaim.safety_env import (
+    assert_not_real_profile_under_pytest,
+    refuse_real_side_effect_under_pytest,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -180,6 +184,7 @@ def resolve_exe_path(exe_path: Path | None = None) -> Path:
 
 
 def run_schtasks(argv: Sequence[str]) -> SchtasksOutcome:
+    refuse_real_side_effect_under_pytest(f"run the real schtasks.exe {list(argv)!r}")
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed schtasks argv, shell=False
             ["schtasks.exe", *argv],  # noqa: S607 -- Windows system tool on PATH
@@ -203,6 +208,7 @@ def run_powershell(script: str, name: str) -> SchtasksOutcome:
     """Runs `script` in the stock Windows PowerShell 5.1 (`powershell.exe`, present on every
     Windows 10/11 SKU; `pwsh` 7 is an optional install). The task name is passed in the
     RECLAIM_TASK_NAME environment variable, never in the command line."""
+    refuse_real_side_effect_under_pytest("run the real powershell.exe")
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed argv, shell=False, name via env var
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],  # noqa: S607
@@ -234,6 +240,7 @@ def _run_logged(
 
 def _append_diag(action: str, command: str, outcome: SchtasksOutcome, diag_log_path: Path) -> None:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    assert_not_real_profile_under_pytest(diag_log_path, operation="append to the diagnostic log")
     try:
         diag_log_path.parent.mkdir(parents=True, exist_ok=True)
         with diag_log_path.open("a", encoding="utf-8") as fh:
@@ -261,6 +268,7 @@ def register_task(
     name = task_name(username)
     diag = diag_log_path if diag_log_path is not None else default_diagnostic_log_path()
     xml_bytes = build_task_xml(str(exe), str(exe.parent))
+    assert_not_real_profile_under_pytest(tempfile.gettempdir(), operation="write the task XML")
     fd, tmp = tempfile.mkstemp(suffix=".xml", prefix="reclaim_autoclean_task_")
     try:
         with os.fdopen(fd, "wb") as fh:
