@@ -509,6 +509,26 @@ def cancel_candidates_warm(state: AppState) -> CandidatesWarmStatus:
 _WARM_BUSY_TIMEOUT_MS = 60_000
 
 
+def _precompute_summary_caches(
+    index: ScanIndex, state: AppState, checkpoint: Callable[[], None]
+) -> None:
+    """Pays `/api/summary`'s two whole-index aggregates (the physical-size totals, whole index and
+    the scanned volume) at the end of a warm-up, so the first summary after "ready" is a cache hit.
+    Measured on the owner's 7.7 GB index: the first summary after a finished warm-up took 24.1 s
+    and outlasted the page's 30 s wait. Best effort: a failure only means the first summary
+    computes them itself, as before. A cancel seen here only skips the precompute: the candidates
+    cache is already warm, so the warm-up still ends "ready" rather than "cancelled"."""
+    try:
+        checkpoint()
+        if index.has_any_records():
+            cached_physical_size_bytes(index, state)
+            _reconciliation_fields(index, state)
+    except DedupCancelled:
+        logger.info("api.summary_precompute_skipped_cancelled")
+    except Exception as exc:  # broad on purpose: never turn a finished warm-up into a failed one
+        logger.warning("api.summary_precompute_failed", error=str(exc))
+
+
 def run_candidates_warm(state: AppState) -> None:
     """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
     real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
@@ -576,6 +596,10 @@ def run_candidates_warm(state: AppState) -> None:
                 checkpoint=checkpoint,
                 worker_initializer=worker_initializer if low_priority else None,
             )
+        # A second, read-only connection AFTER the first closed: that close checkpoints the WAL
+        # and moves the index files' stat signature, which keys the physical-size cache.
+        with ScanIndex(state.db_path) as index:
+            _precompute_summary_caches(index, state, checkpoint)
         finish("ready")
     except DedupCancelled:
         logger.info("api.candidates_warm_cancelled")
