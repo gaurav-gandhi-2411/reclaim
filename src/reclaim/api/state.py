@@ -14,7 +14,7 @@ from reclaim.executor import BatchApplyReport, RestoreReport
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.logging_config import DEFAULT_LOG_PATH
 from reclaim.mode import DEFAULT_MODE_LOG_PATH, current_mode
-from reclaim.models import Candidate, Mode
+from reclaim.models import Candidate, DuplicateCluster, Mode
 from reclaim.safety import SafetyValidator
 from reclaim.thread_priority import BackgroundModeSetter
 
@@ -289,6 +289,12 @@ class AppState:
     # `service._candidates_cache_key`) -- `candidates_cache_generation` alone could not tell a
     # post-toggle / post-mode-switch state from the one the cache was built in.
     candidates_cache_key: tuple[int, str, str, tuple[str, ...]] | None = None
+    # The exact-duplicate clusters the cached candidates above were generated from, computed in
+    # the SAME pass and assigned together with them under `candidates_cache_lock` (so it is warm
+    # iff `candidates_cache` is, under the same key). `GET /api/duplicate-clusters/review` reads
+    # it instead of running its own whole-index dedup pass. Unfiltered by the scope filter
+    # `_all_candidates` applies to candidates; always None while `candidates_cache` is None.
+    candidates_clusters_cache: list[DuplicateCluster] | None = None
     candidates_cache_lock: threading.Lock = field(default_factory=threading.Lock)
     # perf/summary-physical-size: `index.physical_size_bytes_total()` is a whole-table aggregate
     # (seconds on a multi-million-row index), so `service.cached_physical_size_bytes` memoizes it

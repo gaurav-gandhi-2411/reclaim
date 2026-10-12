@@ -406,6 +406,26 @@ def build_mcp_server(state: AppState) -> FastMCP:
                     "selection_hash."
                 )
 
+            # The selection above comes from the shared warm cache, so the hash cannot see
+            # an on-disk change since the scan: re-stat the selected files and refuse (before
+            # executing anything) if any changed.
+            stale = service.stale_selected_candidates(selected)
+            if stale:
+                log_mcp_action(
+                    "mcp.delete_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="selection_changed_on_disk",
+                    scan_id=scan_id,
+                    tier=tier,
+                    rule_id_or_category=rule_id_or_category,
+                )
+                raise SelectionMismatchError(
+                    f"{len(stale)} selected file(s) changed on disk since the scan "
+                    f"(first: {stale[0].path.as_posix()}). Refusing to delete anything. "
+                    "Call scan() for a fresh scan, then preview_apply() again."
+                )
+
             log_mcp_action(
                 "mcp.delete_executing",
                 client_id=client_id,
