@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import shutil
 import subprocess
@@ -903,3 +904,85 @@ async def test_delete_refuses_a_selection_hash_reused_across_a_fresh_scan_of_ide
 # `evals/` (no shared `pythonpath`/package root between the two directories, by this project's
 # existing convention -- neither does tests/test_ai_safety_gate-adjacent code), so the schema
 # check is self-contained there instead of split across two directories.
+
+
+# --- delete re-stats the selected files (selection comes from the shared warm cache) -----------
+
+
+def _file_candidate(path: Path, *, size_bytes: int | None = None, mtime: float | None = None):  # type: ignore[no-untyped-def]
+    from reclaim.models import Candidate, Tier, Verdict
+
+    st = path.stat()
+    return Candidate(
+        path=path,
+        is_dir=False,
+        category="exact_duplicate",
+        category_group="duplicates",
+        size_bytes=st.st_size if size_bytes is None else size_bytes,
+        tier=Tier.B,
+        rationale="test",
+        rebuild_instruction=None,
+        safety_verdict=Verdict.ELIGIBLE,
+        safety_reason_code="ok",
+        retention_days=30,
+        dev=st.st_dev,
+        ino=st.st_ino,
+        mtime=st.st_mtime if mtime is None else mtime,
+    )
+
+
+def test_stale_selected_candidates_flags_only_files_changed_since_the_scan(tmp_path: Path) -> None:
+    fresh = tmp_path / "fresh.bin"
+    resized = tmp_path / "resized.bin"
+    touched = tmp_path / "touched.bin"
+    gone = tmp_path / "gone.bin"
+    for p in (fresh, resized, touched, gone):
+        _write(p, b"x" * 100)
+    candidates = [_file_candidate(p) for p in (fresh, resized, touched, gone)]
+    gone.unlink()  # vanished: apply_batch reports it, not this check
+    _write(resized, b"y" * 200)  # same inode, new size
+    os.utime(touched, (_NOW + 5, _NOW + 5))  # same inode, new mtime
+    directory = tmp_path / "d"
+    directory.mkdir()
+    dir_candidate = _file_candidate(fresh)
+    dir_candidate = dataclasses.replace(dir_candidate, path=directory, is_dir=True)
+
+    stale = service.stale_selected_candidates([*candidates, dir_candidate])
+
+    assert {c.path.name for c in stale} == {"resized.bin", "touched.bin"}
+
+
+async def test_delete_refuses_when_a_selected_file_changed_on_disk_since_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tree"
+    _build_tree(root)
+    victim = root / "victim.bin"
+    _write(victim, b"v" * 100)
+    candidate = _file_candidate(victim)
+    monkeypatch.setattr(service, "select_candidates_for_selector", lambda *_a, **_k: [candidate])
+    state = _build_power_mode_state(tmp_path, config=_config())
+    server = build_mcp_server(state)
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        await session.call_tool("scan", {"path": str(root)})
+        scan_id = await _poll_scan_status_until_completed(session)
+        the_hash = compute_selection_hash(
+            scan_id=scan_id, tier="B", rule_id_or_category="duplicates", paths=[victim.as_posix()]
+        )
+        _write(victim, b"changed-after-the-scan")  # in-place edit after the selection was cached
+
+        result = await session.call_tool(
+            "delete",
+            {
+                "scan_id": scan_id,
+                "rule_id_or_category": "duplicates",
+                "tier": "B",
+                "selection_hash": the_hash,
+            },
+        )
+
+    assert result.isError is True
+    assert "changed on disk" in str(result.content)
+    assert victim.exists(), "nothing may be executed when the selection changed on disk"
+    assert not (tmp_path / "vault").exists() or not any((tmp_path / "vault").rglob("victim.bin"))
