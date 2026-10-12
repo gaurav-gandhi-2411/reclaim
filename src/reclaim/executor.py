@@ -38,7 +38,7 @@ from reclaim.preflight import (
     enumerate_directory_identity,
 )
 from reclaim.safety import SafetyValidator
-from reclaim.safety_env import assert_not_real_profile_under_pytest
+from reclaim.safety_env import RealProfileAccessError, assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
@@ -568,6 +568,7 @@ def rmtree_clear_readonly(func: Callable[[str], object], path: str, exc: BaseExc
     debris after a real production run — exactly the failure mode ADR-0004 exists to prevent.
     Every `shutil.rmtree` call in this module (and `purge.py`'s) uses this `onexc` handler.
     """
+    assert_not_real_profile_under_pytest(path, operation="clear the read-only flag of")
     os.chmod(path, stat.S_IWRITE)  # noqa: PTH101 -- \\?\ str, not Path; see module note above
     func(path)
 
@@ -809,6 +810,7 @@ def append_manifest_entries(
     non-per-item batch append. Does NOT fsync — callers on the crash-safety-critical path
     (`apply_batch`/`restore_batch`/`purge_expired`'s per-item loops) use `_open_manifest_for_sync`
     and `_append_and_sync` instead; see ADR-0026."""
+    assert_not_real_profile_under_pytest(manifest_path, operation="append to the manifest")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with manifest_path.open("a", encoding="utf-8") as fh:
         for entry in entries:
@@ -903,6 +905,7 @@ def _release_manifest_lock(fh: TextIO) -> None:
 
 
 def _open_manifest_for_sync(manifest_path: Path) -> TextIO:
+    assert_not_real_profile_under_pytest(manifest_path, operation="append to the manifest")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     fh = manifest_path.open("a", encoding="utf-8")
     _acquire_manifest_lock(fh)
@@ -1898,6 +1901,15 @@ def apply_batch(
                     )
                 )
                 continue
+            except RealProfileAccessError:
+                # Hermetic-test refusal (a BaseException, so the handler above never sees it). The
+                # guard runs BEFORE any mutation, so nothing happened: close the intent as aborted
+                # rather than leave it dangling for `reclaim.recovery`, then let the refusal
+                # propagate and stop the batch. Deliberately NOT a blanket `BaseException`: after
+                # a KeyboardInterrupt the mutation may or may not have run, and only recovery,
+                # which inspects the disk, can classify that.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                raise
 
             # K2a (audit finding): the mutation call above raised no exception -- but on this
             # platform that is NOT sufficient evidence anything actually happened (K2b's
@@ -2007,6 +2019,12 @@ def apply_batch(
                         manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
                     )
                     continue
+                except RealProfileAccessError:
+                    # Same as the apply loop's refusal handler: pre-mutation, close, re-raise.
+                    _append_and_sync(
+                        manifest_fh, purge_intent.model_copy(update={"phase": "aborted"})
+                    )
+                    raise
                 _append_and_sync(
                     manifest_fh,
                     purge_intent.model_copy(
@@ -2352,6 +2370,10 @@ def restore_batch(
                     )
                 )
                 continue
+            except RealProfileAccessError:
+                # Same as the apply loop's refusal handler: pre-mutation, close, re-raise.
+                _append_and_sync(manifest_fh, intent_entry.model_copy(update={"phase": "aborted"}))
+                raise
 
             # ADR-0026, phase 2: the file is now back at original_path — log it done, fsynced.
             # A kill between the two `_append_and_sync` calls above leaves an intent whose

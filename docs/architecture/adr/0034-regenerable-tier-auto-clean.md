@@ -232,6 +232,22 @@ that opt-in is set. `SYSTEMROOT` is not redirected (Windows and child interprete
 `C:\Windows\Temp` is protected by the guard, not by the redirect. A subprocess a test spawns is
 not covered by the in-process guard. The guard is a backstop, not a licence to skip the redirect.
 
+**Enforced, not asserted (follow-up).** An independent verifier showed the original "every
+destructive path is guarded" claim was false: config/state/manifest/log writers, `store_key` and
+the `ScanIndex` DELETE/VACUUM paths (reached via `index-prune --apply`, default DB path
+cwd-relative) were unguarded. They now call the guard, and `tests/test_all_mutating_sites_guarded.py`
+makes the claim a failing test: it parses every `src/reclaim/**/*.py`, finds each mutating call
+(`os`/`shutil`/`Path` file operations, write-mode `open`, `tempfile`, `sqlite3.connect`, mutating
+SQL, `subprocess`, `send2trash`, `winreg`, mutating `ctypes.windll` calls, logging file handlers)
+and requires a guard call earlier in the same function or an in-test `ALLOWLIST` entry keyed
+`file:function` with a reason; a stale allowlist entry also fails. The allowlist has two
+categories: read-only subprocesses (`git rev-parse`, `git status`) and SQL on a connection that
+only a guarded constructor (`ScanIndex.__init__`, `ImageEmbeddingCache.__init__`) can open; the
+one exception is `notifications.ensure_toast_aumid` (the toast sender registration, #158), which
+returns before touching `winreg` whenever `PYTEST_CURRENT_TEST` is set. Limits:
+the scanner is lexical (a guard in the function, not proof it covers the right path), and a
+`Path.open(mode_variable)` is not detected.
+
 The two real-scheduler tests are run in CI by `.github/workflows/real-task-scheduler.yml` (manual,
 weekly, and on PRs touching the scheduler code, its tests or `packaging/reclaim.iss`) on a throwaway
 GitHub runner with the opt-in set on that one step only. It is not a required check.

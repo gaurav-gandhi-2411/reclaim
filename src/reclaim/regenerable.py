@@ -1321,6 +1321,7 @@ def _write_audit(report: RegenerableReport, path: Path | None) -> None:
     if path is None:
         return
     try:
+        assert_not_real_profile_under_pytest(path, operation="append to the audit log")
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             for item in report.items:

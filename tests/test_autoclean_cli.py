@@ -346,7 +346,7 @@ def _install_fake_windows_toasts(monkeypatch: pytest.MonkeyPatch) -> list[list[s
             shown.append(text)
 
     class FakeToaster:
-        def __init__(self, _name: str) -> None:
+        def __init__(self, _name: str, _aumid: str | None = None) -> None:
             pass
 
         def show_toast(self, _toast: object) -> None:

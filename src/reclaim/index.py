@@ -12,6 +12,7 @@ from reclaim.models import (
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
 )
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Migration/backfill batch size for `_backfill_name_and_path_lower` — streamed via
 # `fetchmany`/`executemany` in chunks rather than loading every legacy row at once, so
@@ -363,6 +364,10 @@ _DISTINCT_INODES_PER_SIZE_SQL = """
     GROUP BY size, (ino = 0), CASE WHEN ino = 0 THEN 0 ELSE dev END,
              CASE WHEN ino = 0 THEN rowid ELSE ino END
 """
+# Grouping for `ScanIndex.physical_size_bytes_total`: one group per (dev, ino); the CASE gives every
+# dev == ino == 0 row its own group (identity unknown -- never deduplicated, as in the Python
+# `physical_size_bytes`). The bare `size` next to MIN(...) is the size of that first row.
+_PHYSICAL_GROUP_BY = "GROUP BY dev, ino, CASE WHEN dev = 0 AND ino = 0 THEN rowid ELSE 0 END"
 # Sizes whose bucket clears the materiality floor at distinct-inode level (param: the floor).
 # S608: only module-level constants are interpolated, never a caller-supplied value.
 _QUALIFYING_SIZES_SQL = f"""
@@ -381,6 +386,10 @@ class ScanIndex:
     """
 
     def __init__(self, db_path: Path) -> None:
+        # Hermetic-test guard (ADR-0034 addendum): the ONLY place a connection is opened, so no
+        # ScanIndex can exist for a real-profile database under pytest.
+        assert_not_real_profile_under_pytest(db_path, operation="open the scan index at")
+        self._db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # Wave 1 finding #4 (2026-07-30 real-disk diagnosis): default rollback-journal mode
@@ -537,6 +546,7 @@ class ScanIndex:
         stale = set(indexed_paths) - set(seen_paths)
         if not stale:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in stale])
         self._conn.commit()
         return len(stale)
@@ -583,6 +593,7 @@ class ScanIndex:
         computes, evaluated entirely inside SQLite via an anti-join against the temp table
         instead of two full Python collections. Must be called after every real entry under
         `root` has reached `record_seen` at least once."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
@@ -640,6 +651,7 @@ class ScanIndex:
         """Deletes the rows whose exact `path` is in `paths` (primary-key point deletes)."""
         if not paths:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
         self._conn.commit()
         return len(paths)
@@ -648,6 +660,7 @@ class ScanIndex:
         """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
         free disk roughly equal to the database size and an exclusive lock (fails with
         `sqlite3.OperationalError` if another connection holds the database open)."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="VACUUM")
         self._conn.commit()
         self._conn.execute("VACUUM")
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -675,6 +688,7 @@ class ScanIndex:
         never call this for a CANCELLED scan -- see `scan_tree`'s own docstring for why (same
         reasoning as `prune_unseen_under_root` being skipped there).
         """
+        assert_not_real_profile_under_pytest(self._db_path, operation="replace rows in")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         self._conn.execute(
@@ -1105,6 +1119,44 @@ class ScanIndex:
         """Everything the scanner has seen, including cloud placeholders — for the treemap
         and total-usage display, which must reflect real disk (and cloud-footprint) usage."""
         return self._query_inventory(under, candidates_only=False)
+
+    def physical_size_bytes_total(self, under: Path | None = None) -> int:
+        """SQL-side twin of `physical_size_bytes(self.full_inventory(under))`: the same number,
+        computed as one aggregate query without materializing a single `FileRecord` (on a
+        6.9M-row index the Python form took minutes per `/api/summary` request).
+
+        Mirrors the Python rule exactly: directories are skipped; cloud placeholders are NOT
+        filtered (`full_inventory` includes them); a (dev, ino) pair counts once, first-seen row
+        winning (`rowid` order unscoped, `path` order scoped -- the order `full_inventory`
+        iterates in for each form); only dev == 0 AND ino == 0 rows each count separately
+        (note: ino == 0 with a non-zero dev IS deduplicated by the Python function, unlike
+        `_DISTINCT_INODES_PER_SIZE_SQL`, which keys on ino alone).
+        """
+        if under is None:
+            # NOT INDEXED: same whole-table-aggregate plan pin as `_DISTINCT_INODES_PER_SIZE_SQL`
+            # (see its comment) -- a sequential scan whether or not `sqlite_stat1` exists.
+            sql = f"""
+                SELECT COALESCE(SUM(size), 0) AS total FROM (
+                    SELECT size, MIN(rowid) FROM files NOT INDEXED WHERE is_dir = 0
+                    {_PHYSICAL_GROUP_BY}
+                )
+            """  # noqa: S608 -- only module-level constants are interpolated
+            params: tuple[object, ...] = ()
+        else:
+            prefix = under.as_posix().rstrip("/")
+            lower, upper = _prefix_range(prefix)
+            # Unary `+` keeps the primary-key path range as the access path (see
+            # `subtree_entry_count`); MIN(path) = first row in that range's iteration order.
+            sql = f"""
+                SELECT COALESCE(SUM(size), 0) AS total FROM (
+                    SELECT size, MIN(path) FROM files
+                    WHERE (path = ? OR (path >= ? AND path < ?)) AND +is_dir = 0
+                    {_PHYSICAL_GROUP_BY}
+                )
+            """  # noqa: S608 -- only module-level constants are interpolated
+            params = (prefix, lower, upper)
+        row = self._conn.execute(sql, params).fetchone()
+        return int(row["total"])
 
     def candidate_inventory(self, under: Path | None = None) -> list[FileRecord]:
         """Everything except cloud placeholders, fully materialized into a `list[FileRecord]`.

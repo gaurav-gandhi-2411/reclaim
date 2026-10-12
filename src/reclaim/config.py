@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reclaim.mode import current_mode
 from reclaim.models import SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS, Mode
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -892,6 +893,7 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
         raise ValueError(f"unknown category {category!r}")
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_category_enabled_in_toml_text(text, category, enabled=enabled)
+    assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
 
@@ -951,6 +953,7 @@ def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
     of the Settings-tab notifications toggle (BH5)."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_notifications_enabled_in_toml_text(text, enabled=enabled)
+    assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
 
@@ -962,5 +965,6 @@ def set_autoclean_enabled(config_path: Path, *, enabled: bool) -> None:
     `set_notifications_enabled`."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled)
+    assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
