@@ -91,21 +91,24 @@ def test_cold_cache_on_a_nearly_full_disk_fails_the_warmup_readably(
     assert calls == []  # it refused before reading a single file
 
 
-def test_review_endpoint_returns_a_typed_non_500_when_the_guard_fires(
+def test_review_endpoint_on_a_cold_cache_never_hashes_even_on_a_nearly_full_disk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """#150: the review reads the warm-up's cache and never hashes itself, so on a cold cache and
+    a nearly full disk it answers the typed 409 (the warm-up it starts fails readably, see the
+    test above) instead of running a whole-index dedup pass that the disk guard would abort."""
     root = tmp_path / "tree"
     _build_tree(root)
     client = _make_app(tmp_path, config=_config(root, duplicates_enabled=True))
-    _scan_and_wait(client, root)  # hash cache is cold: the review call must hash, and cannot
+    _scan_and_wait(client, root)  # hash cache is cold
+    calls = _count_hash_calls(monkeypatch)
     _low_disk(monkeypatch)
 
     response = client.get("/api/duplicate-clusters/review")
 
-    assert response.status_code == 503, response.text
-    body = response.json()
-    assert body["code"] == "dedup_insufficient_disk"
-    assert "not enough free disk space" in body["detail"]
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "candidates_not_warm"
+    assert calls == []  # the request itself read no file
 
 
 def test_message_does_not_round_to_a_self_contradiction(
