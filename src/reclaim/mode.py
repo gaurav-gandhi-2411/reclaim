@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.app_paths import data_root
 from reclaim.models import Mode
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -110,6 +111,7 @@ def current_mode(log_path: Path | None = None) -> Mode:
 
 
 def _append_mode_change(log_path: Path, entry: ModeChangeEntry) -> None:
+    assert_not_real_profile_under_pytest(log_path, operation="append to the mode log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(entry.model_dump_json())

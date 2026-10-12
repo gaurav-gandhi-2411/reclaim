@@ -99,6 +99,11 @@ Filename: "{app}\{#MyAppExeName}"; Parameters: "dashboard"; WorkingDir: "{app}";
 Root: HKCU; Subkey: "Software\Classes\reclaim-notify"; ValueType: string; ValueName: ""; ValueData: "URL:Reclaim Notification Action"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\reclaim-notify"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\reclaim-notify\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" check-disk-space --apply-snooze --config ""{app}\config.toml"" --state ""{app}\data\notification_state.json"""
+; Toast sender identity (src/reclaim/notifications.py TOAST_AUMID): without its own registered
+; AUMID the toast library falls back to Command Prompt's, and Windows drops every toast when that
+; sender is switched off (diagnosed 2026-10-10). The app also registers it at runtime; this makes
+; the entry exist, and be removed again, with the install.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Reclaim.DiskCleanup"; ValueType: string; ValueName: "DisplayName"; ValueData: "Reclaim"; Flags: uninsdeletekey
 
 [Code]
 // R5 (80%-threshold disk-space notification): a per-user, non-elevated Task Scheduler entry

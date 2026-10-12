@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from reclaim.ai._optional import require, require_bundled_model
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # Feature 1a Track B (spec §1, ADR-0022): CLIP semantic image embeddings — the
 # whole-scene/subject similarity signal pHash (Track A) can't provide (pHash is a low-
@@ -79,6 +80,7 @@ class ImageEmbeddingCache:
     in use produces a cache miss, never a stale/wrong embedding silently reused."""
 
     def __init__(self, db_path: Path) -> None:
+        assert_not_real_profile_under_pytest(db_path, operation="open the embedding cache")
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute(_CREATE_TABLE_SQL)
