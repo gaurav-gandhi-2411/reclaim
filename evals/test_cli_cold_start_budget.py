@@ -56,7 +56,7 @@ def _reclaim_exe() -> Path:
     return Path(sys.executable).parent / "reclaim.exe"
 
 
-def test_cli_version_cold_start_stays_under_budget_dev_venv_proxy() -> None:
+def test_cli_version_cold_start_stays_under_budget_dev_venv_proxy(tmp_path: Path) -> None:
     """Measures the dev-venv `reclaim --version` invocation as a proxy for the real, un-buildable-
     per-PR Nuitka packaged binary's cold start -- see module comment for why this is a legitimate
     proxy and packaging/RELEASE_RUNBOOK.md for the directly-measured packaged-binary number this
@@ -70,7 +70,13 @@ def test_cli_version_cold_start_stays_under_budget_dev_venv_proxy() -> None:
     for _ in range(_TRIALS):
         start = time.perf_counter()
         result = subprocess.run(  # noqa: S603 -- fixed argv, local venv executable, no shell
-            [str(exe), "--version"], capture_output=True, text=True, timeout=30, check=False
+            [str(exe), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            # cwd-relative `data/logs/` must land in tmp, never in the real checkout
+            cwd=tmp_path,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
         assert result.returncode == 0, f"reclaim --version failed: {result.stderr}"

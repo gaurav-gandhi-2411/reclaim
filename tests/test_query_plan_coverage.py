@@ -121,6 +121,23 @@ _CASES: dict[str, Case] = {
         "deliberate `NOT INDEXED` table scan (an index only adds a random row lookup per entry "
         "and made the query 4-7x slower once ANALYZE existed); the outer is still indexed",
     ),
+    "duplicate_qualifying_sizes": Case(
+        lambda idx: idx.duplicate_qualifying_sizes(min_reclaim_bytes=0),
+        expect_index=False,
+        reason="the qualifying-sizes subquery of duplicate_size_candidates, run once per pass "
+        "(same pinned whole-table distinct-inode aggregate)",
+    ),
+    "duplicate_candidates_for_sizes": Case(
+        lambda idx: idx.duplicate_candidates_for_sizes([1001, 1002, 1003]),
+        expect_index=True,
+        reason="size IN (bound chunk) -- the short per-chunk fetch is served by idx_files_size",
+    ),
+    "checkpoint_wal": Case(
+        action=None,
+        expect_index=False,
+        reason="PRAGMA wal_checkpoint(PASSIVE/TRUNCATE) -- a checkpoint operation, not a data "
+        "query over `files`; no SEARCH/SCAN plan applies (ADR-0040 addendum, bounded WAL)",
+    ),
     "duplicate_size_candidate_count": Case(
         lambda idx: idx.duplicate_size_candidate_count(min_reclaim_bytes=0),
         expect_index=False,

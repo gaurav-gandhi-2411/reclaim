@@ -14,6 +14,7 @@ from reclaim.models import (
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
 )
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 logger = structlog.get_logger(__name__)
 
@@ -400,6 +401,10 @@ class ScanIndex:
     """
 
     def __init__(self, db_path: Path, *, busy_timeout_ms: int | None = None) -> None:
+        # Hermetic-test guard (ADR-0034 addendum): the ONLY place a connection is opened, so no
+        # ScanIndex can exist for a real-profile database under pytest.
+        assert_not_real_profile_under_pytest(db_path, operation="open the scan index at")
+        self._db_path = Path(db_path)
         # `busy_timeout_ms` (None = sqlite3's 5 s default): how long a statement waits on another
         # connection's write lock before `database is locked`. The candidates warm-up passes a
         # long one -- its dedup hash flushes are the writes most likely to meet a concurrent
@@ -531,6 +536,35 @@ class ScanIndex:
         self._conn.commit()
         return time.perf_counter() - start
 
+    @property
+    def db_path(self) -> Path:
+        """Where this index lives (the volume dedup's free-space guard measures)."""
+        return self._db_path
+
+    def wal_size_bytes(self) -> int:
+        """Current size of the `-wal` sidecar file on disk (0 if absent)."""
+        try:
+            return self._db_path.with_name(self._db_path.name + "-wal").stat().st_size
+        except OSError:
+            return 0
+
+    def checkpoint_wal(self, *, truncate_above_bytes: int) -> int:
+        """Bounded-WAL housekeeping for a long write loop (ADR-0040 addendum). Runs a cheap,
+        non-blocking `PASSIVE` checkpoint, then -- only if the WAL file still exceeds
+        `truncate_above_bytes` -- a `TRUNCATE` one, which also shrinks the file. CALLER CONTRACT:
+        no read cursor of this connection may be open (an open cursor pins its snapshot and no
+        checkpoint can pass it, which is exactly the 13 GB WAL incident). Never raises on a busy
+        checkpoint (another connection reading): it just leaves the WAL for the next call.
+        Returns the WAL size afterwards."""
+        for mode in ("PASSIVE", "TRUNCATE"):
+            if mode == "TRUNCATE" and self.wal_size_bytes() <= truncate_above_bytes:
+                break
+            try:
+                self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()
+            except sqlite3.OperationalError:
+                break  # locked by a reader: retry at the next window boundary
+        return self.wal_size_bytes()
+
     def close(self) -> None:
         # TRUNCATE checkpoint reclaims whatever the session's writes left in the WAL (see the
         # `journal_size_limit` comment in __init__) -- without this, closing never shrinks the
@@ -578,6 +612,7 @@ class ScanIndex:
         stale = set(indexed_paths) - set(seen_paths)
         if not stale:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in stale])
         self._conn.commit()
         return len(stale)
@@ -624,6 +659,7 @@ class ScanIndex:
         computes, evaluated entirely inside SQLite via an anti-join against the temp table
         instead of two full Python collections. Must be called after every real entry under
         `root` has reached `record_seen` at least once."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="prune rows from")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
@@ -681,6 +717,7 @@ class ScanIndex:
         """Deletes the rows whose exact `path` is in `paths` (primary-key point deletes)."""
         if not paths:
             return 0
+        assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
         self._conn.commit()
         return len(paths)
@@ -689,6 +726,7 @@ class ScanIndex:
         """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
         free disk roughly equal to the database size and an exclusive lock (fails with
         `sqlite3.OperationalError` if another connection holds the database open)."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="VACUUM")
         self._conn.commit()
         self._conn.execute("VACUUM")
         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -716,6 +754,7 @@ class ScanIndex:
         never call this for a CANCELLED scan -- see `scan_tree`'s own docstring for why (same
         reasoning as `prune_unseen_under_root` being skipped there).
         """
+        assert_not_real_profile_under_pytest(self._db_path, operation="replace rows in")
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         self._conn.execute(
@@ -1020,6 +1059,34 @@ class ScanIndex:
         """  # noqa: S608 -- constants only; floor is a bound parameter
         for row in self._conn.execute(sql, (min_reclaim_bytes,)):
             yield _row_to_record(row)
+
+    def duplicate_qualifying_sizes(self, *, min_reclaim_bytes: int) -> list[int]:
+        """The ascending list of sizes `duplicate_size_candidates()` would stream. Runs the
+        expensive qualifying-sizes subquery ONCE (15-60 s on a real index) and is fully consumed
+        before returning, so no read cursor stays open."""
+        sql = f"""
+            SELECT size FROM ({_QUALIFYING_SIZES_SQL}) ORDER BY size
+        """  # noqa: S608 -- constants only; floor is a bound parameter
+        return [int(row["size"]) for row in self._conn.execute(sql, (min_reclaim_bytes,))]
+
+    def duplicate_candidates_for_sizes(self, sizes: Sequence[int]) -> list[FileRecord]:
+        """The same rows `duplicate_size_candidates()` yields, restricted to `sizes` and ordered
+        `(size, rowid)`. This is NOT claimed to be the streaming query's visit order: on an
+        un-ANALYZEd index the old plan used `idx_files_is_cloud_placeholder` plus a temp b-tree
+        for ORDER BY; the rowid order within a size was identical empirically. Fully
+        consumed (`fetchall`) before returning: dedup writes hashes between calls, and an open
+        cursor would pin a read snapshot so the WAL could not be checkpointed (13 GB incident,
+        2026-10-08). `sizes` must be a bounded chunk (SQLite's bound-variable limit applies)."""
+        if not sizes:
+            return []
+        placeholders = ", ".join("?" for _ in sizes)
+        sql = f"""
+            SELECT * FROM files
+            WHERE is_dir = 0 AND size > 0 AND is_cloud_placeholder = 0
+            AND size IN ({placeholders})
+            ORDER BY size, rowid
+        """  # noqa: S608 -- placeholders are `?` markers only; every value is bound
+        return [_row_to_record(row) for row in self._conn.execute(sql, list(sizes)).fetchall()]
 
     def duplicate_size_candidate_count(self, *, min_reclaim_bytes: int) -> int:
         """A cheap `COUNT(*)` over the same filter `duplicate_size_candidates()` streams —
