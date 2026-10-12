@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from _warming_client import WarmingTestClient
 from fastapi.testclient import TestClient
 
 from reclaim.ai import category_explainer
@@ -46,7 +47,9 @@ def _make_app(tmp_path: Path) -> TestClient:
         port=_TEST_PORT,
     )
     csrf_token: str = app.state.reclaim.csrf_token
-    return TestClient(
+    # Warming client: category-explanation reads the warm candidates cache (typed 409 + a
+    # courtesy warm-up when cold), exactly like the dashboard's retry.
+    return WarmingTestClient(
         app,
         base_url=f"http://{_TEST_HOST}:{_TEST_PORT}",
         headers={security.CSRF_HEADER_NAME: csrf_token},
