@@ -31,3 +31,12 @@ bit us. Read `docs/RESUME.md` first (it is the living checkpoint).
    land (PRs touching the same files or choke point). "Green at handoff" is not enough for a train:
    re-verify each PR after its predecessors merge.
 6. **Report VERIFIED vs BELIEVED**, with the command and output for every number.
+7. **Tests are hermetic: never point a test or a probe at the real profile.** An autouse fixture
+   in the repo-root `conftest.py` redirects `LOCALAPPDATA`/`APPDATA`/`TEMP`/`TMP`/`USERPROFILE`/
+   `HOME`/`HOMEDRIVE`/`HOMEPATH`/`PROGRAMDATA` (and `Path.home()`, `tempfile.gettempdir()`) into
+   pytest's basetemp, and `reclaim.safety_env` makes every destructive choke point (and the real
+   `schtasks`/`powershell`/native-tool runners) REFUSE under pytest when the target is inside the
+   real profile. `RECLAIM_TEST_ALLOW_REAL_PROFILE=1` bypasses it for deliberate manual use only.
+   A verifier/executor writing its own probe must redirect EVERY root, not just `TEMP` (incident:
+   a probe that redirected only `TEMP` deleted the owner's real browser caches), and must pass
+   injected fakes for `run_command`/schtasks instead of the real runners.

@@ -8,6 +8,7 @@ from pathlib import Path
 import structlog
 
 from reclaim.app_paths import data_root
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 
 # data/ is this app's existing convention for all local state (scan index, quarantine vault,
 # mode log, first-run marker -- see executor.DEFAULT_MANIFEST_PATH, mode.DEFAULT_MODE_LOG_PATH,
@@ -123,6 +124,7 @@ def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO
     resolved_path = log_path if log_path is not None else DEFAULT_LOG_PATH
     if _configured_for_path == resolved_path:
         return
+    assert_not_real_profile_under_pytest(resolved_path, operation="open the log file")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     shared_processors: list[structlog.typing.Processor] = [

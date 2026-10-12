@@ -131,10 +131,11 @@ from reclaim.models import (
     Tier,
     Verdict,
 )
-from reclaim.preflight import check_within_allowed_scope
+from reclaim.preflight import check_identity_unchanged_since_scan, check_within_allowed_scope
 from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliation, is_volume_root
 from reclaim.recovery import compute_reconciliation
 from reclaim.safety import SafetyValidator
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import GitRepoCache, build_record_for_path, count_entries_fast, scan_tree
 from reclaim.thread_priority import BackgroundScope, set_background_mode
 
@@ -217,6 +218,7 @@ def _all_candidates(
     *,
     checkpoint: Callable[[], None] | None = None,
     worker_initializer: Callable[[], None] | None = None,
+    clusters_out: list[DuplicateCluster] | None = None,
 ) -> list[Candidate]:
     """Combined detector + exact-duplicate candidate list — the same two-function contract
     `cli.py::_run_apply` already uses, just orchestrated for the API layer instead.
@@ -240,18 +242,31 @@ def _all_candidates(
     the cost (see `resolve_apply_selection`'s `request.paths is not None` branch).
 
     `checkpoint` (ADR-0040) is called before the detector stage, between it and the duplicate
-    stage and, via `generate_duplicate_candidates`, at every dedup batch boundary; it may raise
+    stage and, via `find_duplicate_clusters`, at every dedup batch boundary; it may raise
     `DedupCancelled`, in which case nothing is returned (and `_cached_all_candidates` caches
-    nothing). `worker_initializer` runs in each hashing pool thread."""
+    nothing). `worker_initializer` runs in each hashing pool thread.
+
+    `clusters_out` (out-param, like `find_duplicate_clusters`'s `skips`): when given, the
+    duplicate clusters computed here are `extend`ed into it. Clusters are computed exactly ONCE
+    per call and handed to `generate_duplicate_candidates(clusters=...)`, so a caller that also
+    needs them (the cluster review endpoint, via `_cached_all_candidates`) never needs a second
+    whole-index dedup pass."""
     config = state.effective_config
     if checkpoint is not None:
         checkpoint()
     candidates = generate_candidates(index, config, state.safety)
     if checkpoint is not None:
         checkpoint()
-    candidates += generate_duplicate_candidates(
-        index, config, state.safety, checkpoint=checkpoint, worker_initializer=worker_initializer
+    clusters = find_duplicate_clusters(
+        index,
+        min_reclaim_bytes=config.categories.duplicates.min_reclaim_bytes,
+        exclusion_patterns=state.safety.exclusion_patterns,
+        checkpoint=checkpoint,
+        worker_initializer=worker_initializer,
     )
+    if clusters_out is not None:
+        clusters_out.extend(clusters)
+    candidates += generate_duplicate_candidates(index, config, state.safety, clusters=clusters)
     allowed_roots = resolve_allowed_apply_roots(state)
     return [
         c for c in candidates if check_within_allowed_scope(c.path, allowed_roots=allowed_roots)
@@ -311,17 +326,28 @@ def _cached_all_candidates(
     """
     with state.candidates_cache_lock:
         key = _candidates_cache_key(state)
-        if state.candidates_cache is not None and state.candidates_cache_key == key:
+        if (
+            state.candidates_cache is not None
+            and state.candidates_clusters_cache is not None
+            and state.candidates_cache_key == key
+        ):
             return state.candidates_cache
-        # A cancelled compute raises out of here BEFORE the three assignments below, so a
-        # cancelled warm-up never leaves partial candidates (or a warm key) behind (ADR-0040).
+        # A cancelled compute raises out of here BEFORE the assignments below, so a cancelled or
+        # failed warm-up never leaves partial candidates, clusters (or a warm key) behind
+        # (ADR-0040). Candidates and clusters are assigned together, under the same lock/key.
+        clusters: list[DuplicateCluster] = []
         if checkpoint is None and worker_initializer is None:
-            candidates = _all_candidates(index, state)
+            candidates = _all_candidates(index, state, clusters_out=clusters)
         else:
             candidates = _all_candidates(
-                index, state, checkpoint=checkpoint, worker_initializer=worker_initializer
+                index,
+                state,
+                checkpoint=checkpoint,
+                worker_initializer=worker_initializer,
+                clusters_out=clusters,
             )
         state.candidates_cache = candidates
+        state.candidates_clusters_cache = clusters
         state.candidates_cache_generation = key[0]
         state.candidates_cache_key = key
         return candidates
@@ -367,8 +393,11 @@ def is_candidates_cache_warm(state: AppState) -> bool:
     if not state.candidates_cache_lock.acquire(blocking=False):
         return False
     try:
+        # The clusters are part of "warm": candidates cached without them (only possible by
+        # direct assignment) would otherwise leave the review endpoint at 409 "computing" forever.
         return (
             state.candidates_cache is not None
+            and state.candidates_clusters_cache is not None
             and state.candidates_cache_key == _candidates_cache_key(state)
         )
     finally:
@@ -397,7 +426,8 @@ def candidates_cache_stale_reason(state: AppState) -> str | None:
             return name
     # Same key but an explicit invalidation dropped the list (the category-toggle handler does
     # this, leaving the old key behind) -- the key diff above names the real cause when it can.
-    return "cold" if state.candidates_cache is None else None
+    cold = state.candidates_cache is None or state.candidates_clusters_cache is None
+    return "cold" if cold else None
 
 
 def require_warm_candidates(state: AppState) -> None:
@@ -476,6 +506,29 @@ def cancel_candidates_warm(state: AppState) -> CandidatesWarmStatus:
         return state.candidates_warm_status
 
 
+_WARM_BUSY_TIMEOUT_MS = 60_000
+
+
+def _precompute_summary_caches(
+    index: ScanIndex, state: AppState, checkpoint: Callable[[], None]
+) -> None:
+    """Pays `/api/summary`'s two whole-index aggregates (the physical-size totals, whole index and
+    the scanned volume) at the end of a warm-up, so the first summary after "ready" is a cache hit.
+    Measured on the owner's 7.7 GB index: the first summary after a finished warm-up took 24.1 s
+    and outlasted the page's 30 s wait. Best effort: a failure only means the first summary
+    computes them itself, as before. A cancel seen here only skips the precompute: the candidates
+    cache is already warm, so the warm-up still ends "ready" rather than "cancelled"."""
+    try:
+        checkpoint()
+        if index.has_any_records():
+            cached_physical_size_bytes(index, state)
+            _reconciliation_fields(index, state)
+    except DedupCancelled:
+        logger.info("api.summary_precompute_skipped_cancelled")
+    except Exception as exc:  # broad on purpose: never turn a finished warm-up into a failed one
+        logger.warning("api.summary_precompute_failed", error=str(exc))
+
+
 def run_candidates_warm(state: AppState) -> None:
     """AE3 background-task body for `POST /api/candidates/warm`: computes `_all_candidates` (the
     real, potentially multi-minute cost — see `CandidatesWarmStatus`'s docstring) off the request
@@ -533,13 +586,20 @@ def run_candidates_warm(state: AppState) -> None:
     try:
         if low_priority:
             scope.enter()
-        with ScanIndex(state.db_path) as index:
+        # Long busy timeout: this connection's hash flushes are the writes that can meet another
+        # writer (see `ScanIndex.__init__`); ten times the sqlite3 default, plus a bounded retry
+        # in `ScanIndex._flush_hash_rows`.
+        with ScanIndex(state.db_path, busy_timeout_ms=_WARM_BUSY_TIMEOUT_MS) as index:
             _cached_all_candidates(
                 index,
                 state,
                 checkpoint=checkpoint,
                 worker_initializer=worker_initializer if low_priority else None,
             )
+        # A second, read-only connection AFTER the first closed: that close checkpoints the WAL
+        # and moves the index files' stat signature, which keys the physical-size cache.
+        with ScanIndex(state.db_path) as index:
+            _precompute_summary_caches(index, state, checkpoint)
         finish("ready")
     except DedupCancelled:
         logger.info("api.candidates_warm_cancelled")
@@ -548,7 +608,9 @@ def run_candidates_warm(state: AppState) -> None:
     except Exception as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery —
         # same posture `run_apply`/`run_scan` already use for their own background bodies.
-        logger.warning("api.candidates_warm_failed", error=str(exc))
+        # exc_info: the 2026-10-08 incident left only `database table is locked` in the log, with
+        # no traceback and the real error masked; the full traceback is the diagnosis.
+        logger.warning("api.candidates_warm_failed", error=str(exc), exc_info=True)
         finish("failed", str(exc))
         return
     finally:
@@ -824,6 +886,19 @@ def _compute_eta_seconds(
 _AGGREGATE_SKIPPED_PATHS_SAMPLE_LIMIT = 20
 
 
+def _background_error_text(exc: BaseException) -> str:
+    """The `error` string a background job records for whatever escaped its body.
+
+    An `Exception` keeps its bare message (the established wording the dashboard already shows).
+    A non-`Exception` `BaseException` (the hermetic-test `RealProfileAccessError`, `SystemExit`,
+    ...) is prefixed with its class name and capped: a status of "failed" with `error=None` is
+    what the UI otherwise shows. No secrets: it is the exception's own message, same as every
+    other recorded error."""
+    if isinstance(exc, Exception):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"[:300]
+
+
 def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     """Background-task body for both `POST /api/scan` (`roots=[the one path]`, `drives_total=1`)
     and `POST /api/scan/full-drive` (`roots=list_fixed_drives()`) -- ONE orchestration path
@@ -892,6 +967,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
     cancelled = False
 
     try:
+        assert_not_real_profile_under_pytest(state.db_path, operation="create the index directory")
         state.db_path.parent.mkdir(parents=True, exist_ok=True)
         with ScanIndex(state.db_path) as index:
             for drive_index, root in enumerate(roots):
@@ -975,16 +1051,20 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                 if stats.cancelled:
                     cancelled = True
                     break
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.scan_failed", roots=[str(r) for r in roots], error=str(exc))
+        # BaseException (not Exception): a refusal such as `RealProfileAccessError` must not leave
+        # "running" behind; it is recorded as failed below and then re-raised.
+        logger.warning(
+            "api.scan_failed", roots=[str(r) for r in roots], error=_background_error_text(exc)
+        )
         with state.lock:
             state.scan_status = ScanStatus(
                 status="failed",
                 root=state.scan_status.root,
                 started_at=started_at,
                 finished_at=time.time(),
-                error=str(exc),
+                error=_background_error_text(exc),
                 dirs_visited=dirs_visited_total,
                 entries_total=entries_total_total,
                 files_written=files_written_total,
@@ -998,6 +1078,8 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                 drives_total=drives_total,
                 drives_done=state.scan_status.drives_done,
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     if cancelled:
@@ -1538,6 +1620,32 @@ def build_one_click_summary(
 _DUPLICATE_CLUSTER_REVIEW_LIMIT = 15
 
 
+def _read_warm_candidates_and_clusters(
+    state: AppState,
+) -> tuple[list[Candidate], list[DuplicateCluster]]:
+    """The cached candidates and the clusters they were generated from, read together under
+    `candidates_cache_lock` so they always belong to the same compute. NON-blocking acquire (see
+    `is_candidates_cache_warm`): a warm-up in flight holds that lock for its whole duration, and
+    a request thread must 409 rather than wait. Raises `CandidatesNotWarmError` unless warm."""
+    if state.candidates_cache_lock.acquire(blocking=False):
+        try:
+            if (
+                state.candidates_cache is not None
+                and state.candidates_clusters_cache is not None
+                and state.candidates_cache_key == _candidates_cache_key(state)
+            ):
+                return state.candidates_cache, state.candidates_clusters_cache
+        finally:
+            state.candidates_cache_lock.release()
+    require_warm_candidates(state)
+    # Warm by the check above but the cache moved between it and the read (a new compute or an
+    # invalidation landed): report not-warm rather than block or recompute.
+    raise CandidatesNotWarmError(
+        "the candidates cache changed while it was being read -- retry",
+        stale_reason="computing",
+    )
+
+
 def list_duplicate_cluster_review(
     state: AppState, *, limit: int = _DUPLICATE_CLUSTER_REVIEW_LIMIT
 ) -> DuplicateClusterReviewResponse:
@@ -1549,24 +1657,22 @@ def list_duplicate_cluster_review(
     can never show a cluster the apply pipeline itself would refuse to touch — and the member
     list actually DISPLAYED is restricted to the kept copy plus only the members that survived
     that filtering, never a member ADR-0008 excluded (a raw, unfiltered `cluster` would otherwise
-    show an excluded path as if it were still proposed for deletion, which it isn't)."""
+    show an excluded path as if it were still proposed for deletion, which it isn't).
+
+    Reads the clusters AND candidates the warm-up computed together (`state.candidates_cache`/
+    `candidates_clusters_cache`, one `find_duplicate_clusters` pass) and never hashes anything
+    itself: a cold or stale cache raises `CandidatesNotWarmError` (typed 409 + courtesy warm-up in
+    the route), exactly like every other reader. This endpoint used to run its own uncached
+    whole-index dedup pass per request, which competed with the warm-up for the same index
+    (ADR-0037 addendum). Candidates come from the scope-filtered cache (AE1), so a cluster whose
+    non-kept members all fall outside the allowed apply roots is not shown, consistently with
+    every other view."""
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return DuplicateClusterReviewResponse(has_scan=False, clusters=[])
 
-        config = state.effective_config
-        # Computed once and threaded through to `generate_duplicate_candidates` below — that
-        # function would otherwise recompute clusters itself, hashing every candidate file a
-        # second time (see `generate_duplicate_candidates`'s `clusters` param docstring).
-        clusters = find_duplicate_clusters(
-            index,
-            min_reclaim_bytes=config.categories.duplicates.min_reclaim_bytes,
-            exclusion_patterns=state.safety.exclusion_patterns,
-        )
-        duplicate_candidates = generate_duplicate_candidates(
-            index, config, state.safety, clusters=clusters
-        )
-        candidate_by_path = {c.path: c for c in duplicate_candidates}
+    cached_candidates, clusters = _read_warm_candidates_and_clusters(state)
+    candidate_by_path = {c.path: c for c in cached_candidates if c.category_group == "duplicates"}
 
     rows: list[DuplicateClusterReviewOut] = []
     for cluster in clusters:
@@ -1917,13 +2023,17 @@ def run_apply(
                 on_progress=_on_progress,
                 scan_index=apply_scan_index,
             )
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.apply_failed", error=str(exc))
+        # BaseException, re-raised below when it is not an Exception: see `run_scan`.
+        error_text = _background_error_text(exc)
+        logger.warning("api.apply_failed", error=error_text)
         with state.lock:
             state.apply_status = ApplyStatus(
-                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+                status="failed", started_at=started_at, finished_at=time.time(), error=error_text
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -1986,8 +2096,15 @@ def select_candidates_for_selector(
     tier validation, so this function must be the one to fail clearly)."""
     if tier not in _TIER_SELECTIONS:
         raise ValueError(f"tier must be one of {sorted(_TIER_SELECTIONS)} (got {tier!r})")
+    # Single-flight cache, not a private `_all_candidates` pass: with a warm-up in flight this
+    # blocks on `candidates_cache_lock` and reuses its result instead of starting a second
+    # whole-index dedup pass on the same index (incident 2026-10-08). Deliberately NOT a
+    # not-warm refusal: a scoped MCP scan never auto-warms, so refusing would make preview_apply
+    # unusable until someone warmed by hand. Scope-filtered identically to `_all_candidates`.
+    # Known limit: a user cancel of the warm-up does not stop a selector already blocked
+    # on the lock; once the warm-up ends cancelled, the selector computes the cache itself.
     with ScanIndex(state.db_path) as index:
-        candidates = _all_candidates(index, state)
+        candidates = _cached_all_candidates(index, state)
     tiers = _TIER_SELECTIONS[tier]
     return [
         c
@@ -1995,6 +2112,33 @@ def select_candidates_for_selector(
         if c.tier in tiers
         and (c.category == rule_id_or_category or c.category_group == rule_id_or_category)
     ]
+
+
+def stale_selected_candidates(selected: Sequence[Candidate]) -> list[Candidate]:
+    """MCP `delete` freshness check: the selected FILE candidates whose live `(dev, ino)`, size
+    or mtime no longer match the scan-time baseline the (cached) candidate carries. One `stat`
+    per file candidate, same comparison and exemptions as the executor's pre-flight
+    (`size_or_mtime_changed_since_scan`: directories and baseline-less candidates exempt; a
+    vanished path is not stale here, `apply_batch` reports it itself).
+
+    `select_candidates_for_selector` reads the shared warm cache, so its recomputed
+    `selection_hash` can no longer notice an on-disk change since the scan; this restores a
+    refuse-before-executing check at the MCP layer instead of leaving only the executor's
+    per-item skip as the backstop."""
+    stale: list[Candidate] = []
+    for candidate in selected:
+        if candidate.is_dir or candidate.mtime == 0.0:
+            continue
+        check = check_identity_unchanged_since_scan(
+            candidate.path,
+            recorded_dev=candidate.dev,
+            recorded_ino=candidate.ino,
+            recorded_mtime=candidate.mtime,
+            recorded_size_bytes=candidate.size_bytes,
+        )
+        if check.identity_changed or check.size_or_mtime_changed:
+            stale.append(candidate)
+    return stale
 
 
 def mcp_execute_delete(state: AppState, selected: list[Candidate]) -> ApplyResponse:
@@ -2154,12 +2298,16 @@ def run_ai_analysis(state: AppState, scan_generation: int, started_at: float) ->
         with ScanIndex(state.db_path) as index:
             records = index.full_inventory(under=root)
         analysis = ai_orchestration.run_ai_analysis(records=records, safety=state.safety)
-    except Exception as exc:  # broad on purpose: a background-task exception must surface via
+    except BaseException as exc:  # broad on purpose: a background-task exception must surface via
         # the status endpoint, never crash silently into Starlette's background-task machinery.
-        logger.warning("api.ai_analysis_failed", error=str(exc))
+        # BaseException, re-raised below when it is not an Exception: see `run_scan`.
+        error_text = _background_error_text(exc)
+        logger.warning("api.ai_analysis_failed", error=error_text)
         _fail_ai_analysis(
-            state, scan_generation=scan_generation, started_at=started_at, error=str(exc)
+            state, scan_generation=scan_generation, started_at=started_at, error=error_text
         )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -2432,12 +2580,15 @@ def run_restore(state: AppState, batch_id: str, started_at: float) -> None:
             safety=state.safety,
             on_progress=_on_progress,
         )
-    except Exception as exc:  # broad on purpose: see run_apply's identical reasoning above.
-        logger.warning("api.restore_failed", batch_id=batch_id, error=str(exc))
+    except BaseException as exc:  # broad on purpose: see run_apply's identical reasoning above.
+        error_text = _background_error_text(exc)
+        logger.warning("api.restore_failed", batch_id=batch_id, error=error_text)
         with state.lock:
             state.restore_status = RestoreStatus(
-                status="failed", started_at=started_at, finished_at=time.time(), error=str(exc)
+                status="failed", started_at=started_at, finished_at=time.time(), error=error_text
             )
+        if not isinstance(exc, Exception):
+            raise
         return
 
     with state.lock:
@@ -2539,6 +2690,7 @@ def update_category_setting(state: AppState, category: str, *, enabled: bool) ->
         state.config = state.config.model_copy(update={"categories": new_categories})
     with state.candidates_cache_lock:
         state.candidates_cache = None
+        state.candidates_clusters_cache = None
         state.candidates_cache_generation = None
     return settings_categories(state)
 
@@ -2740,7 +2892,9 @@ def build_category_explanation(state: AppState, category_group: str) -> Category
     """`GET /api/ai/category-explanation/{category_group}`. Degrades gracefully in every
     failure mode (no scan data, no matching category, no API key, a corrupted key file, or a
     real Anthropic API failure) — every branch returns a typed `CategoryExplanationResponse`,
-    never a raised exception reaching the route (see that response's own docstring)."""
+    never a raised exception reaching the route (see that response's own docstring) -- with
+    one deliberate exception: a cold or stale candidates cache raises
+    `CandidatesNotWarmError`, which the route turns into the typed 409 + courtesy warm-up."""
     with ScanIndex(state.db_path) as index:
         if not index.has_any_records():
             return CategoryExplanationResponse(
@@ -2750,7 +2904,9 @@ def build_category_explanation(state: AppState, category_group: str) -> Category
                 explanation=None,
                 cached=False,
             )
-        candidates = _all_candidates(index, state)
+    # Warm cache only (typed 409 via the route): a private `_all_candidates` pass here ran a
+    # second whole-index dedup pass while a warm-up was in flight (incident 2026-10-08).
+    candidates, _clusters = _read_warm_candidates_and_clusters(state)
 
     descriptor = _category_descriptor_for_group(category_group, candidates)
     if descriptor is None:
@@ -2978,6 +3134,13 @@ def start_regenerable_clean(
         except Exception as exc:
             logger.warning("regenerable.job_failed", run_id=job.run_id, exc_info=True)
             error = f"{type(exc).__name__}: {exc}"[:300]
+        except BaseException as exc:
+            # A refusal (`RealProfileAccessError`) or SystemExit: without this `error` stays None
+            # and the UI shows "failed" with no message. Recorded, then re-raised; the `finally`
+            # below still releases the lock and publishes the terminal status.
+            logger.warning("regenerable.job_aborted", run_id=job.run_id, exc_info=True)
+            error = _background_error_text(exc)
+            raise
         finally:
             # Release first, publish the terminal status second: a client that sees "done" can
             # immediately start the next clean without a spurious 409.
