@@ -85,6 +85,36 @@ _MUTATING_METHODS = frozenset(
 )
 _SQL_MUTATING = ("DELETE", "DROP", "VACUUM", "UPDATE", "INSERT", "REPLACE", "ALTER", "CREATE")
 _WRITE_MODE_CHARS = set("wax+")
+# Statements beyond the _SQL_MUTATING verbs that change a database: ATTACH/DETACH open or close
+# another file, REINDEX/ANALYZE rewrite the index/statistics tables.
+_SQL_MUTATING_EXTRA = ("ATTACH", "DETACH", "REINDEX", "ANALYZE")
+_SQL_COMMENT = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
+_CTE_WRITE = re.compile(r"\b(DELETE|UPDATE|INSERT|REPLACE)\b", re.IGNORECASE)
+# PRAGMAs that write even without an `=` (a checkpoint truncates the WAL file on disk).
+_WRITING_PRAGMAS = ("wal_checkpoint", "optimize", "incremental_vacuum", "shrink_memory")
+
+
+def _mutating_sql_verb(sql: str) -> str | None:
+    """The verb that makes `sql` (static text, possibly several `;`-separated statements, possibly
+    with comments) a write, or None when every statement is a read. A `WITH ... DELETE/UPDATE/
+    INSERT` is a write whatever the CTE looks like; a PRAGMA is a write when it assigns a value
+    or is one of the checkpoint-style pragmas."""
+    for statement in _SQL_COMMENT.sub(" ", sql).split(";"):
+        words = statement.replace("(", " ( ").split()
+        while words and words[0] == "(":
+            words.pop(0)
+        if not words:
+            continue
+        first = words[0].upper()
+        if first in _SQL_MUTATING or first in _SQL_MUTATING_EXTRA:
+            return first
+        if first == "WITH" and (cte := _CTE_WRITE.search(statement)):
+            return f"WITH {cte.group(1).upper()}"
+        if first == "PRAGMA":
+            body = statement.lower()
+            if "=" in body or any(name in body for name in _WRITING_PRAGMAS):
+                return "PRAGMA"
+    return None
 
 
 @dataclass(frozen=True)
@@ -181,7 +211,11 @@ def _module_string_constants(tree: ast.Module) -> dict[str, str]:
             continue
         if isinstance(target, ast.Name):
             text = _static_text(value, consts)
-            if text is not None:
+            if text is None:
+                consts.pop(target.id, None)  # rebound to something opaque
+            elif target.id in consts:
+                consts[target.id] += "; " + text  # bound twice: check both
+            else:
                 consts[target.id] = text
     return consts
 
@@ -215,8 +249,21 @@ def classify_call(node: ast.Call, consts: dict[str, str] | None = None) -> str |
                 # result, e.g. ScanIndex._flush_hash_rows(sql, rows)): fail closed, like a
                 # non-literal open() mode. A reader of such a call must allowlist it with a reason.
                 return "sql <non-literal>"
-            if sql.lstrip().upper().startswith(_SQL_MUTATING):
-                return f"sql {sql.lstrip().split(None, 1)[0].upper()}"
+            verb = _mutating_sql_verb(sql)
+            if verb is not None:
+                return f"sql {verb}"
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and func.args[1].value in (*_MUTATING_METHODS, "execute", "executemany", "executescript")
+    ):
+        # `getattr(conn, "execute")(sql)`: the attribute is spelled out, so the call is a
+        # mutation or an opaque execute, never a read. (`getattr(x, name_variable)(...)` stays a
+        # known limit: nothing can be said about it statically.)
+        return f"getattr {func.args[1].value}"
     return None
 
 
@@ -226,15 +273,72 @@ def _is_guard_call(node: ast.Call) -> bool:
     return name in GUARD_NAMES
 
 
+def _target_names(target: ast.AST) -> list[str]:
+    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+
+
+def _function_bindings(func: ast.AST) -> dict[str, list[tuple[str, ast.AST | None]]]:
+    """Every binding of every name inside `func` (nested functions included), by kind:
+    ("assign", value) for `name = value`, ("aug", value) for `name += value`, ("other", None)
+    for anything the resolver does not model (a parameter, a for/with/except/walrus/comprehension
+    target, tuple unpacking, an import, global/nonlocal). A name with an "other" binding is
+    treated as unknown, so shadowing a constant by any binding form fails closed."""
+    out: dict[str, list[tuple[str, ast.AST | None]]] = {}
+
+    def add(name: str, kind: str, value: ast.AST | None = None) -> None:
+        out.setdefault(name, []).append((kind, value))
+
+    for n in ast.walk(func):
+        if isinstance(n, ast.Assign):
+            if len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                add(n.targets[0].id, "assign", n.value)
+            else:
+                for t in n.targets:
+                    for name in _target_names(t):
+                        add(name, "other")
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            if n.value is not None:
+                add(n.target.id, "assign", n.value)
+            else:
+                add(n.target.id, "other")
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+            if isinstance(n.op, ast.Add):
+                add(n.target.id, "aug", n.value)
+            else:
+                add(n.target.id, "other")
+        elif isinstance(n, ast.NamedExpr):
+            add(n.target.id, "other")
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            for name in _target_names(n.target):
+                add(name, "other")
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            for name in _target_names(n.optional_vars):
+                add(name, "other")
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            add(n.name, "other")
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = n.args
+            for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
+                if arg is not None:
+                    add(arg.arg, "other")
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for alias in n.names:
+                add((alias.asname or alias.name).split(".")[0], "other")
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            for name in n.names:
+                add(name, "other")
+    return out
+
+
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, file: str, consts: dict[str, str]) -> None:
+    def __init__(self, file: str, consts: dict[str, str], rebound_globals: set[str]) -> None:
         self.file = file
-        self.consts = consts
+        self.consts = {k: v for k, v in consts.items() if k not in rebound_globals}
         self.stack: list[str] = []
         # per enclosing function: lines of guard calls found so far in its body
         self.guard_lines: list[list[int]] = []
-        # per enclosing function: (line, name, value-node) of its simple `name = <expr>` bindings
-        self.local_binds: list[list[tuple[int, str, ast.AST]]] = []
+        # per enclosing function: every binding of every name inside it (_function_bindings)
+        self.local_binds: list[dict[str, list[tuple[str, ast.AST | None]]]] = []
         self.raw: list[tuple[str, int, str, list[int]]] = []
 
     def _enter(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
@@ -245,18 +349,7 @@ class _Visitor(ast.NodeVisitor):
                 n.lineno for n in ast.walk(node) if isinstance(n, ast.Call) and _is_guard_call(n)
             ]
             self.guard_lines.append(lines)
-            self.local_binds.append(
-                sorted(
-                    (
-                        (n.lineno, n.targets[0].id, n.value)
-                        for n in ast.walk(node)
-                        if isinstance(n, ast.Assign)
-                        and len(n.targets) == 1
-                        and isinstance(n.targets[0], ast.Name)
-                    ),
-                    key=lambda b: b[0],
-                )
-            )
+            self.local_binds.append(_function_bindings(node))
         self.generic_visit(node)
         if is_func:
             self.guard_lines.pop()
@@ -265,26 +358,31 @@ class _Visitor(ast.NodeVisitor):
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _enter
 
-    def visit_Call(self, node: ast.Call) -> None:
+    def _constants_here(self) -> dict[str, str]:
+        """Module constants overlaid with what the enclosing functions bind. A name resolves only
+        when ALL its bindings anywhere in those functions (not just earlier lines: a loop can run
+        a later rebinding before the call) are plain assignments to static text with one common
+        SQL verb; `+=` of static text is appended, `+=` of anything else makes it unknown."""
         consts = dict(self.consts)
-        # A local binding shadows a module constant. Fail closed when a name is bound more than
-        # once before the call (if/else branches): it resolves only if every earlier binding is
-        # static AND they all start with the same SQL verb, otherwise it is treated as unknown.
-        seen: dict[str, list[str | None]] = {}
         for binds in self.local_binds:
-            for line, name, value in binds:
-                if line >= node.lineno:
-                    break
-                seen.setdefault(name, []).append(_static_text(value, consts))
-        for name, texts in seen.items():
-            verbs = {t.split(None, 1)[0].upper() if t and t.split() else None for t in texts}
-            if None in verbs:
+            for name, entries in binds.items():
                 consts.pop(name, None)
-            elif len(verbs) == 1:
-                consts[name] = texts[-1] or ""
-            else:
-                consts.pop(name, None)
-        what = classify_call(node, consts)
+                if any(kind == "other" for kind, _ in entries):
+                    continue
+                assigns = [_static_text(v, consts) for k, v in entries if k == "assign" and v]
+                augs = [_static_text(v, consts) for k, v in entries if k == "aug" and v]
+                if not assigns or None in assigns:
+                    continue
+                verbs = {t.split(None, 1)[0].upper() if t.split() else "" for t in assigns if t}
+                if len(verbs) != 1 or "" in verbs:
+                    continue
+                # an unknown `+=` operand can only extend a statement, never change its verb, but
+                # a known one may carry a second statement ("; DELETE ...") so it is kept
+                consts[name] = "; ".join([t for t in assigns if t] + [t for t in augs if t])
+        return consts
+
+    def visit_Call(self, node: ast.Call) -> None:
+        what = classify_call(node, self._constants_here())
         if what is not None:
             function = ".".join(self.stack) or "<module>"
             all_guards = [ln for lines in self.guard_lines for ln in lines]
@@ -296,7 +394,10 @@ def scan_source(source: str, file: str) -> list[Site]:
     """Every mutating call in `source`; guarded = a guard call precedes it inside an enclosing
     function (lexically, by line)."""
     tree = ast.parse(source)
-    visitor = _Visitor(file, _module_string_constants(tree))
+    rebound_globals = {
+        name for n in ast.walk(tree) if isinstance(n, ast.Global) for name in n.names
+    }
+    visitor = _Visitor(file, _module_string_constants(tree), rebound_globals)
     visitor.visit(tree)
     return [
         Site(file, function, line, what, any(g <= line for g in guards))
@@ -348,6 +449,11 @@ ALLOWLIST: dict[str, str] = {
             "record_seen",
             "protect_under",
             "end_scan_tracking",
+            # ANALYZE / WAL-checkpoint pragmas: they rewrite only the index's own statistics
+            # tables and WAL file (visible once the scanner learned PRAGMA/ANALYZE are writes)
+            "refresh_planner_stats",
+            "checkpoint_wal",
+            "close",
         )
     },
 }
@@ -526,6 +632,119 @@ def reads_are_fine(conn, where):
         "sql <non-literal>" in problem
         for problem in check_sites(scan_source(source, "synthetic.py"), {})
     )
+
+
+def test_scanner_catches_the_sql_evasions_found_by_the_verifier() -> None:
+    source = """
+_S = "SELECT 1"
+_SAFE = "SELECT 2"
+
+def cte_write(conn):
+    conn.execute("WITH x AS (SELECT 1) DELETE FROM files WHERE id IN (SELECT * FROM x)")
+
+def block_comment(conn):
+    conn.execute("/* tidy */ DELETE FROM files")
+
+def line_comment(conn):
+    conn.execute("-- tidy\\nUPDATE files SET size = 0")
+
+def multi_statement(conn):
+    conn.executescript("SELECT 1; DELETE FROM files")
+
+def pragma_assign(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
+
+def pragma_checkpoint(conn):
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+def attach(conn):
+    conn.execute("ATTACH DATABASE 'x.db' AS x")
+
+def analyze(conn):
+    conn.execute("ANALYZE")
+
+def getattr_dispatch(conn, sql):
+    getattr(conn, "execute")(sql)
+
+def loop_rebind_after_the_call(conn, rows):
+    s = "SELECT 1"
+    for row in rows:
+        conn.execute(s)
+        s = "DELETE FROM files"
+
+def plus_equals_second_statement(conn):
+    s = "SELECT 1"
+    s += "; DELETE FROM files"
+    conn.execute(s)
+
+def shadowed_by_annotated_local(conn):
+    _S: str = "DELETE FROM files"
+    conn.execute(_S)
+
+def shadowed_by_walrus(conn):
+    if (_S := conn.fetch_sql()):
+        conn.execute(_S)
+
+def shadowed_by_loop_variable(conn, statements):
+    for _S in statements:
+        conn.execute(_S)
+
+def shadowed_by_parameter(conn, _S):
+    conn.execute(_S)
+
+def shadowed_by_with(conn, factory):
+    with factory() as _S:
+        conn.execute(_S)
+
+def shadowed_by_unpacking(conn, pair):
+    _S, other = pair
+    conn.execute(_S)
+
+def global_rebind_elsewhere(conn):
+    conn.execute(_SAFE)
+
+def rebinds_the_global():
+    global _SAFE
+    _SAFE = "DELETE FROM files"
+
+def nested_reads_outer_local_rebound_later(conn):
+    s = "SELECT 1"
+
+    def inner():
+        conn.execute(s)
+
+    s = "DELETE FROM files"
+    inner()
+
+def readonly_pragma_and_selects(conn):
+    conn.execute("PRAGMA table_info(files)")
+    conn.execute("PRAGMA integrity_check")
+    conn.execute("WITH x AS (SELECT 1) SELECT * FROM x")
+    conn.execute("SELECT REPLACE(name, 'a', 'b') FROM files")
+    conn.execute("-- just a note\\nSELECT 1; SELECT 2")
+"""
+    by_function = {s.function: s.what for s in scan_source(source, "synthetic.py")}
+    assert by_function == {
+        "cte_write": "sql WITH DELETE",
+        "block_comment": "sql DELETE",
+        "line_comment": "sql UPDATE",
+        "multi_statement": "sql DELETE",
+        "pragma_assign": "sql PRAGMA",
+        "pragma_checkpoint": "sql PRAGMA",
+        "attach": "sql ATTACH",
+        "analyze": "sql ANALYZE",
+        "getattr_dispatch": "getattr execute",
+        "loop_rebind_after_the_call": "sql <non-literal>",
+        "plus_equals_second_statement": "sql DELETE",
+        "shadowed_by_annotated_local": "sql DELETE",
+        "shadowed_by_walrus": "sql <non-literal>",
+        "shadowed_by_loop_variable": "sql <non-literal>",
+        "shadowed_by_parameter": "sql <non-literal>",
+        "shadowed_by_with": "sql <non-literal>",
+        "shadowed_by_unpacking": "sql <non-literal>",
+        "global_rebind_elsewhere": "sql <non-literal>",
+        "nested_reads_outer_local_rebound_later.inner": "sql <non-literal>",
+    }
 
 
 def test_scanner_ignores_reads_and_string_replace() -> None:
