@@ -133,21 +133,60 @@ def _method_open_is_write(node: ast.Call) -> bool:
     return any(kw.arg == "mode" for kw in node.keywords) and _mode_is_write(node, 99)
 
 
-def _sql_text(node: ast.Call) -> str | None:
-    """The leading constant text of a SQL-ish first argument (handles f-strings)."""
-    if not node.args:
-        return None
-    arg = node.args[0]
-    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-        return arg.value
-    if isinstance(arg, ast.JoinedStr):
-        return "".join(
-            v.value for v in arg.values if isinstance(v, ast.Constant) and isinstance(v.value, str)
-        )
+def _static_text(node: ast.AST, consts: dict[str, str]) -> str | None:
+    """The statically known text of a SQL expression: a string literal, an f-string, an implicit
+    or explicit `+` concatenation, or a name bound to one at module level. Only the LEADING text
+    decides the verb, so an f-string/concatenation is returned as far as it is known; None when
+    even its start cannot be determined (a parameter, an attribute, a call result)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    if isinstance(node, ast.JoinedStr):
+        out = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                out += part.value
+            elif isinstance(part, ast.FormattedValue):
+                known = _static_text(part.value, consts)
+                if known is None:
+                    return out or None
+                out += known
+        return out or None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_text(node.left, consts)
+        if left is None:
+            return None
+        right = _static_text(node.right, consts)
+        return left + (right or "")
     return None
 
 
-def classify_call(node: ast.Call) -> str | None:
+def _sql_text(node: ast.Call, consts: dict[str, str] | None = None) -> str | None:
+    """The leading constant text of a SQL-ish first argument, None if it is not static."""
+    if not node.args:
+        return None
+    return _static_text(node.args[0], consts or {})
+
+
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level `NAME = <static string>` bindings (resolved in source order)."""
+    consts: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target, value = stmt.targets[0], stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            target, value = stmt.target, stmt.value
+        else:
+            continue
+        if isinstance(target, ast.Name):
+            text = _static_text(value, consts)
+            if text is not None:
+                consts[target.id] = text
+    return consts
+
+
+def classify_call(node: ast.Call, consts: dict[str, str] | None = None) -> str | None:
     """Describes why `node` is a mutating call, or None when it is not."""
     func = node.func
     dotted = _dotted(func)
@@ -170,8 +209,13 @@ def classify_call(node: ast.Call) -> str | None:
         if name.endswith("FileHandler"):
             return f".{name}()"  # logging file handlers create/append their file
         if name in ("execute", "executemany", "executescript"):
-            sql = _sql_text(node)
-            if sql is not None and sql.lstrip().upper().startswith(_SQL_MUTATING):
+            sql = _sql_text(node, consts)
+            if sql is None:
+                # Cannot be proven read-only (the SQL arrives as a parameter/attribute/call
+                # result, e.g. ScanIndex._flush_hash_rows(sql, rows)): fail closed, like a
+                # non-literal open() mode. A reader of such a call must allowlist it with a reason.
+                return "sql <non-literal>"
+            if sql.lstrip().upper().startswith(_SQL_MUTATING):
                 return f"sql {sql.lstrip().split(None, 1)[0].upper()}"
     return None
 
@@ -183,11 +227,14 @@ def _is_guard_call(node: ast.Call) -> bool:
 
 
 class _Visitor(ast.NodeVisitor):
-    def __init__(self, file: str) -> None:
+    def __init__(self, file: str, consts: dict[str, str]) -> None:
         self.file = file
+        self.consts = consts
         self.stack: list[str] = []
         # per enclosing function: lines of guard calls found so far in its body
         self.guard_lines: list[list[int]] = []
+        # per enclosing function: (line, name, value-node) of its simple `name = <expr>` bindings
+        self.local_binds: list[list[tuple[int, str, ast.AST]]] = []
         self.raw: list[tuple[str, int, str, list[int]]] = []
 
     def _enter(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
@@ -198,15 +245,46 @@ class _Visitor(ast.NodeVisitor):
                 n.lineno for n in ast.walk(node) if isinstance(n, ast.Call) and _is_guard_call(n)
             ]
             self.guard_lines.append(lines)
+            self.local_binds.append(
+                sorted(
+                    (
+                        (n.lineno, n.targets[0].id, n.value)
+                        for n in ast.walk(node)
+                        if isinstance(n, ast.Assign)
+                        and len(n.targets) == 1
+                        and isinstance(n.targets[0], ast.Name)
+                    ),
+                    key=lambda b: b[0],
+                )
+            )
         self.generic_visit(node)
         if is_func:
             self.guard_lines.pop()
+            self.local_binds.pop()
         self.stack.pop()
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _enter
 
     def visit_Call(self, node: ast.Call) -> None:
-        what = classify_call(node)
+        consts = dict(self.consts)
+        # A local binding shadows a module constant. Fail closed when a name is bound more than
+        # once before the call (if/else branches): it resolves only if every earlier binding is
+        # static AND they all start with the same SQL verb, otherwise it is treated as unknown.
+        seen: dict[str, list[str | None]] = {}
+        for binds in self.local_binds:
+            for line, name, value in binds:
+                if line >= node.lineno:
+                    break
+                seen.setdefault(name, []).append(_static_text(value, consts))
+        for name, texts in seen.items():
+            verbs = {t.split(None, 1)[0].upper() if t and t.split() else None for t in texts}
+            if None in verbs:
+                consts.pop(name, None)
+            elif len(verbs) == 1:
+                consts[name] = texts[-1] or ""
+            else:
+                consts.pop(name, None)
+        what = classify_call(node, consts)
         if what is not None:
             function = ".".join(self.stack) or "<module>"
             all_guards = [ln for lines in self.guard_lines for ln in lines]
@@ -217,8 +295,9 @@ class _Visitor(ast.NodeVisitor):
 def scan_source(source: str, file: str) -> list[Site]:
     """Every mutating call in `source`; guarded = a guard call precedes it inside an enclosing
     function (lexically, by line)."""
-    visitor = _Visitor(file)
-    visitor.visit(ast.parse(source))
+    tree = ast.parse(source)
+    visitor = _Visitor(file, _module_string_constants(tree))
+    visitor.visit(tree)
     return [
         Site(file, function, line, what, any(g <= line for g in guards))
         for function, line, what, guards in visitor.raw
@@ -249,6 +328,12 @@ ALLOWLIST: dict[str, str] = {
         "HKCU registry write (#158). Returns before touching winreg whenever "
         "PYTEST_CURRENT_TEST is set, so a test can never write the real profile; the "
         "registration test removes that variable only while injecting a fake winreg module"
+    ),
+    "index.py:ScanIndex._flush_hash_rows": (
+        "executemany(sql, rows) where `sql` is a parameter, so the scanner cannot see its text. "
+        "Its only callers are ScanIndex.store_partial_hashes/store_full_hashes, which pass an "
+        "UPDATE of the hash columns of existing rows (both build the literal inline), on the "
+        "connection opened only by ScanIndex.__init__, which guards db_path (#150/#151)"
     ),
     "ai/image_embeddings.py:ImageEmbeddingCache.put": (
         "SQL on a connection opened only by ImageEmbeddingCache.__init__, which guards db_path"
@@ -386,6 +471,61 @@ def f(p, fh, conn):
         ".RotatingFileHandler()",
         "ctypes.windll.kernel32.DeleteFileW",
     } <= kinds
+
+
+def test_scanner_flags_sql_it_cannot_see_and_resolves_what_it_can() -> None:
+    source = """
+_DELETE_ALL = "DELETE FROM files"
+_BASE = "SELECT 1"
+
+def opaque(conn, sql, rows):
+    conn.executemany(sql, rows)
+
+def attribute(self):
+    self._conn.execute(self._sql)
+
+def hidden_verb(conn, table):
+    conn.execute(f"{table} SET x = 1")
+
+def through_a_module_constant(conn):
+    conn.execute(_DELETE_ALL)
+
+def through_a_local(conn, where):
+    sql = "UPDATE files SET size = 0"
+    sql += where
+    conn.execute(sql)
+
+def concatenated(conn):
+    conn.execute("DROP " + "TABLE files")
+
+def branches_with_different_verbs(conn, flag):
+    if flag:
+        sql = "SELECT 1"
+    else:
+        sql = "DELETE FROM files"
+    conn.execute(sql)
+
+def reads_are_fine(conn, where):
+    sql = f"{_BASE} FROM files"
+    conn.execute(sql + where)
+    q = "SELECT 2"
+    conn.execute(q)
+"""
+    by_function = {s.function: s.what for s in scan_source(source, "synthetic.py")}
+    assert by_function == {
+        "opaque": "sql <non-literal>",
+        "attribute": "sql <non-literal>",
+        "hidden_verb": "sql <non-literal>",
+        "through_a_module_constant": "sql DELETE",
+        "through_a_local": "sql UPDATE",
+        "concatenated": "sql DROP",
+        "branches_with_different_verbs": "sql <non-literal>",
+    }
+    # the non-literal ones are failures until allowlisted with a reason
+    assert any(
+        "sql <non-literal>" in problem
+        for problem in check_sites(scan_source(source, "synthetic.py"), {})
+    )
 
 
 def test_scanner_ignores_reads_and_string_replace() -> None:
