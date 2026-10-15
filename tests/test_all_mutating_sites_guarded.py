@@ -951,6 +951,25 @@ def test_scanner_resolves_module_constants_with_the_same_rules_as_locals() -> No
     assert _whats('Q = "SELECT 1"\n\ndef use(conn):\n    conn.execute(Q)\n') == {}
 
 
+def test_scanner_handles_bracket_identifiers_and_except_shadowing() -> None:
+    source = """
+Q = "SELECT 1"
+
+def bracket_identifier_with_comment_marker(conn):
+    conn.executescript("SELECT [a--b]; DELETE FROM t")
+
+def except_as_shadows_a_constant(conn):
+    try:
+        pass
+    except ValueError as Q:
+        conn.execute(Q)
+"""
+    assert _whats(source) == {
+        "bracket_identifier_with_comment_marker": "sql DELETE",
+        "except_as_shadows_a_constant": "sql <non-literal>",
+    }
+
+
 def test_scanner_models_match_captures_and_class_scope() -> None:
     source = """
 Q = "SELECT 1"
