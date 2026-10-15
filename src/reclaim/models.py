@@ -13,6 +13,26 @@ FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 # alongside this bit and some Python/Windows combinations still report them as traversable.
 FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 
+# Windows FILE_ATTRIBUTE_DIRECTORY.
+FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+
+# The only attribute bits any decision in Reclaim reads (is-directory, reparse point,
+# cloud placeholder; every read is a bitwise `&`, none compares a whole value). Windows
+# builds add bits we never asked about: on the owner's machine (Windows 11 build 26300)
+# `os.stat()` reports 0x10000010 for a directory while `FindFirstFile`/the directory
+# listing reports 0x10, so the same directory was stored with two different values
+# depending on which walk saw it. Recorded values are masked to these bits so a record is
+# the same whichever way it was read, and an unknown future bit can never leak into the
+# index.
+RECORDED_ATTRIBUTE_MASK = (
+    FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+
+def recorded_attributes(attributes: int) -> int:
+    """`attributes` reduced to the bits Reclaim reads (see `RECORDED_ATTRIBUTE_MASK`)."""
+    return attributes & RECORDED_ATTRIBUTE_MASK
+
 
 class Verdict(StrEnum):
     """Outcome of a SafetyValidator evaluation. Only ELIGIBLE files may ever reach Tier A."""

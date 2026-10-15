@@ -13,6 +13,7 @@ from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
+    recorded_attributes,
 )
 from reclaim.safety_env import assert_not_real_profile_under_pytest
 
@@ -304,7 +305,7 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
         record.mtime,
         record.ctime,
         record.ext,
-        record.attributes,
+        recorded_attributes(record.attributes),
         _to_db_int64(record.dev),
         _to_db_int64(record.ino),
         int(record.is_dir),
@@ -338,6 +339,7 @@ def file_row(
     scanner's hot path never has to construct a `Path` + `FileRecord` per file just to have them
     taken apart again. Same column order as `_COLUMNS` by construction (one layout, two entry
     points); tests/test_scanner_listing.py asserts row-for-row equality with `_record_to_row`."""
+    attributes = recorded_attributes(attributes)
     return (
         posix_path,
         size,

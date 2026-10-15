@@ -30,6 +30,7 @@ from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
     FileRecord,
+    recorded_attributes,
 )
 
 logger = structlog.get_logger(__name__)
@@ -685,7 +686,7 @@ def build_record(
         )
         return None
 
-    attributes = st.st_file_attributes
+    attributes = recorded_attributes(st.st_file_attributes)
     is_reparse_point = bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
 
     repo_search_start = entry_path if is_dir_entry else current_dir
@@ -800,7 +801,7 @@ def build_record_from_listing(
         # carries FILE_ATTRIBUTE_DIRECTORY, True for a junction -- recursion is still gated on
         # the reparse bit alone below.
         is_dir_entry = stat.S_ISDIR(st.st_mode)
-        attributes = st.st_file_attributes
+        attributes = recorded_attributes(st.st_file_attributes)
         size_bytes, mtime, ctime = st.st_size, st.st_mtime, st.st_ctime
         dev, ino = st.st_dev, st.st_ino
     else:
