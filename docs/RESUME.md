@@ -3,7 +3,7 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-17 ~01:30 IST (BUILD 9 INSTALLED, INDEX ON D:, OPAQUE-TREE WORK IN FLIGHT) -- READ THIS FIRST
+## CHECKPOINT 2026-10-17 ~04:30 IST (BUILD 9 INSTALLED, INDEX ON D:, OPAQUE-TREE RELEASE PR #177 OPEN FOR GG) -- READ THIS FIRST
 
 VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-15 checkpoint below for the install, the index location and the open work; its uninstall/reinstall verification and merge-policy notes stay valid.
 
@@ -13,7 +13,7 @@ VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-15 c
 - gg-portfolio cleanup (worktrees, verify clones, scratch) is **handled by GG in the gg-portfolio session**; this session touches no gg-portfolio path. A live gg-portfolio `claude.exe` (started 22:47 on 10-16, cwd the gg-portfolio repo) was found by a working-directory scan before anything was done, so nothing was deleted.
 
 ### Repo (VERIFIED `gh pr view`)
-- Merged by me under the gate: #168 `460192c`, #169 `d3689ee`, #170 `d0f46a8`, #171 `70eaf6b`, #172 `609aa15`, #173 `42f8704`, **#175 `4ed17df`** (mcp 1.29.0 -> 1.30.0, lockfile only: pip-audit started failing every PR on CVE-2026-59951; reclaim's MCP server is stdio-only so not exploitable, gate 3b needed the reviewable/generated split in the body), **#174 `a446853`** (`[storage] index_dir`, ADR-0041).
+- Merged by me under the gate: #168 `460192c`, #169 `d3689ee`, #170 `d0f46a8`, #171 `70eaf6b`, #172 `609aa15`, #173 `42f8704`, **#175 `4ed17df`** (mcp 1.29.0 -> 1.30.0, lockfile only: pip-audit started failing every PR on CVE-2026-59951; reclaim's MCP server is stdio-only so not exploitable, gate 3b needed the reviewable/generated split in the body), **#174 `a446853`** (`[storage] index_dir`, ADR-0041), #176 `df28486` (interim 10-17 checkpoint).
 - #174 had TWO hostile verifier passes. Pass 1 found a real defect: `--config` defaulted to a cwd-relative `config.toml` while scan/reconcile/index-prune read the exe-dir config, so from another cwd they could use different indexes, and a typo'd `--config` fell back to the legacy index silently; plus tests that did not fail under the mutation "resolver ignores --config". Fixed (default now `data_root()/config.toml`, an explicit missing/non-file `--config` exits 2, `index_dir` naming an index file is rejected). Pass 2: no behavioural defect; one surviving mutation (default reverted) and a stale ADR line, both fixed. Full verify on the branch: 2034 passed, 19 skipped, mypy and ruff clean; CI green after merging main.
 
 ### Installed app: build 9 (VERIFIED)
@@ -37,16 +37,24 @@ VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-15 c
 - The 10-15 warm-up on the real index was still `computing` after 120 min and was lost in the 22:31 reboot. A second try on a D: copy (index with persisted hashes, source of `42f8704`, `warm_measure.py`) was still computing at **4165 s (69 min)** and its server had grown to **6.3 GB RSS**, starving a build for RAM; I stopped it by PID (the scratch copy was removed by `scratch_index.py`). So the "before" warm-up time is **not measured** (> 69 min, > 6.3 GB). The first `/api/summary` timing on a warmed index is therefore still NOT measured.
 - No dashboard server is running now (reboot); start it only after the opaque-tree change, or expect a multi-hour, multi-GB warm-up.
 
-### In flight / next
-1. Opaque dependency trees (ADR-0042 written, branch `feat/opaque-dependency-trees`, worktree `reclaim-wt-opaque`): executor implementing; then hostile verifier passes, PR, rescan of the real profile into a scratch index on D: to measure rows, index size and warm-up; then build 10 and install.
-2. HOWTO update, then the final report.
+### Opaque dependency trees (ADR-0042): release PR #177 (draft, for GG)
+- Fails the self-merge gates by design (about 2,700 added lines; touches the direct-delete re-verification), so it is the weekly release PR `release/2026-10-17` (merge commit of `feat/opaque-dependency-trees` `7a4494e`, rebased on main `df28486`). Not merged by me.
+- Three independent hostile verifier passes; pass 1 and 2 found real defects (all fixed with mutation-checked tests): hardlink guard fail-open past 260 chars (LongPathsEnabled=0), unreadable file skipped by M1, `os.path.lexists` hiding permission errors, identity check reading a >260 path as vanished, dir-rename blind spot (new `agg_newest_dir_mtime`), case-sensitive `drop_opaque_rows`. Pass 3: nothing in the unsafe direction. Final full verify on the tree: 2127 passed, 22 skipped, ruff and mypy clean (the cold-start eval failed once under load and passed on the quiet re-run).
+- **Measured on a D: scratch copy of the real index** (`D:\reclaim-build\after_opaque.log`, `warm_after_opaque.log`; source = the branch, scanner at `707e009`): entries **12,795,878 -> 2,449,175** (10,145 opaque roots), index file **12.89 -> 1.69 GB** after VACUUM (34 s), in-place conversion rescan 2138 s, candidates warm-up **ready in 2978 s**, first `GET /api/summary` after warm-up **0.15 s** (then 0.17 s, 0.24 s). Baseline for comparison: warm-up on the unslimmed index was still computing after 69 min with 6.3 GB RSS (copy with persisted hashes) and after 120 min (cold, 10-15), so "before" is a lower bound, not a finished number. These are scratch-copy runs through `reclaim serve` from source, NOT an installed build; the installed app (build 9) has NOT got this change.
+- Cleanups: scratch copies on D: removed by `scratch_index.py`; `D:\reclaim-build\scratch-idx` holds only a stale 118-byte channel file.
+
+### Next (after GG merges #177)
+1. Build 10 from main (`launch_build9.py` pattern), smoke, install, then one `reclaim scan C:\Users\gaura` converts the real D: index in place (about 36 min measured), `VACUUM` to about 1.7 GB, start `serve` and expect the first Overview in about 50 min of warm-up.
+2. The scheduled/boot-time dashboard is not running (the 22:31 reboot); nothing to stop.
+3. The `%TEMP%\claude` scratch rule from ADR-0042 (decision 6) is not implemented (small gain, about 0.2M rows); `idx_files_path_lower` duplicate index (2.8 GB) is plan-only in the ADR.
 
 ### WHEN GG HAS TIME (this round)
-1. **MCP Approve click** (isolated, safe; no real files involved): from `C:\Users\gaura\ml-projects\reclaim` run `.venv\Scripts\python.exe D:\reclaim-build\tools\mcp_approval_check.py --leave-open`, open the printed `http://127.0.0.1:8431/` within 10 minutes, click Approve on the card, then stop the process by the printed PID (`Stop-Process -Id <pid>`) and delete `%LOCALAPPDATA%\Temp\reclaim_mcp7` after looking at it. Caveat: its MCP process exits, so the click records the decision but nothing executes.
-2. **Ollama `llama-server.exe`** (not mine; 10-11 GB resident, PID changes) repeatedly leaves under 8 GB free RAM and blocked build 9 at pre-flight until it freed memory; consider a smaller model or `OLLAMA_KEEP_ALIVE`.
-3. Index-size decision once the opaque-tree PR is up: the venv kinds are included only if the hardlink teeth test passes; the `idx_files_path_lower` duplicate index (2.8 GB) is plan-only (ADR-0042).
-4. A stray `C:\Users\gaura\AppData\Local\Programs\Reclaim.stale-20260826` folder exists (not mine).
-5. Lower priority: Docker disk image to D:, WSL export, 1.4 GB duplicate Nuitka cache on C:, optional elevated USN read.
+1. **Merge the weekly release PR #177** (draft; read the "delete-path items first" paragraph; CI results are on the PR). Then I build and install build 10.
+2. **MCP Approve click** (isolated, safe; no real files involved): from `C:\Users\gaura\ml-projects\reclaim` run `.venv\Scripts\python.exe D:\reclaim-build\tools\mcp_approval_check.py --leave-open`, open the printed `http://127.0.0.1:8431/` within 10 minutes, click Approve on the card, then stop the process by the printed PID (`Stop-Process -Id <pid>`) and delete `%LOCALAPPDATA%\Temp\reclaim_mcp7` after looking at it. Caveat: its MCP process exits, so the click records the decision but nothing executes.
+3. **Ollama `llama-server.exe`** (not mine; 10-11 GB resident, PID changes) repeatedly leaves under 8 GB free RAM and blocked build 9 at pre-flight until it freed memory; consider a smaller model or `OLLAMA_KEEP_ALIVE`.
+4. Index-size decisions are in #177: the venv kinds are included because the hardlink teeth tests pass (also past 260 characters); the `idx_files_path_lower` duplicate index (2.8 GB) is plan-only (ADR-0042).
+5. A stray `C:\Users\gaura\AppData\Local\Programs\Reclaim.stale-20260826` folder exists (not mine).
+6. Delete the leftover branch `feat/opaque-dependency-trees-wip` (local only, mine) after #177 merges; lower priority: Docker disk image to D:, WSL export, 1.4 GB duplicate Nuitka cache on C:, optional elevated USN read.
 
 ## CHECKPOINT 2026-10-15 ~12:40 IST (NEW BUILD INSTALLED AND VERIFIED; FRESH SCAN RUNNING; GG AWAY) -- superseded by the 10-17 checkpoint above for the install/index; its verification notes stay valid
 
