@@ -1441,9 +1441,14 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
         if live_record.is_dir:
             continue
         try:
-            nlink = live_record.path.stat(follow_symlinks=False).st_nlink
-        except OSError:
-            continue
+            # `\\?\`-prefixed: a bare stat past MAX_PATH raises and used to be skipped here,
+            # i.e. a deep venv file was silently never hardlink-checked (D12).
+            nlink = os.stat(long_path(live_record.path), follow_symlinks=False).st_nlink  # noqa: PTH116 -- \\?\ str, not Path
+        except OSError as exc:
+            if not os.path.lexists(long_path(live_record.path)):
+                continue  # vanished since the walk: nothing left to delete there
+            # Present but unreadable: it cannot be hardlink-checked, so fail CLOSED.
+            return f"{posix_path}: could not be inspected for hardlinks ({exc})"
         if nlink <= 1:
             continue
         if check_hardlink_shared_active_install(live_record.path).is_shared_with_other_environment:

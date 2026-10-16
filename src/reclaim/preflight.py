@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from reclaim.models import FILE_ATTRIBUTE_REPARSE_POINT
+from reclaim.scanner import long_path
 
 # ADR reference: docs/AUDIT-2026-08.md, P0-1. `apply_batch`'s real mutation loop
 # (`executor.py`) had zero pre-flight probe for either of R6's two required checks before this
@@ -228,7 +229,9 @@ def _enumerate_hardlink_siblings(path: Path) -> list[Path]:
     drive = path.drive
     if not drive:
         return []
-    return [Path(f"{drive}{name}") for name in _raw_enumerate_hardlink_names(str(path))]
+    # `\\?\`-prefixed (D12): a bare path past MAX_PATH makes FindFirstFileNameW fail, which
+    # reads as "no siblings" -- a silent fail-open for exactly the deep paths venvs have.
+    return [Path(f"{drive}{name}") for name in _raw_enumerate_hardlink_names(long_path(path))]
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +269,9 @@ def check_hardlink_shared_active_install(path: Path) -> HardlinkShareCheck:
     per-item `try/except`'s problem to report, not this probe's.
     """
     try:
-        nlink = path.stat().st_nlink
+        # `\\?\`-prefixed (D12): `Path.stat()` on a path past MAX_PATH raises, and the
+        # except below would report "not shared" for a deep venv file that IS shared.
+        nlink = os.stat(long_path(path)).st_nlink  # noqa: PTH116 -- \\?\ str, not Path
     except OSError:
         return HardlinkShareCheck(False, None, ())
     if nlink <= 1:

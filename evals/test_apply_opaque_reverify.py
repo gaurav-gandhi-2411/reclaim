@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,9 @@ from reclaim.executor import (
 )
 from reclaim.index import ScanIndex
 from reclaim.models import Candidate, Tier, Verdict
+from reclaim.preflight import check_hardlink_shared_active_install
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import scan_tree
+from reclaim.scanner import long_path, scan_tree
 
 # ADR-0042 teeth: a dependency tree (node_modules, .venv, ...) is ONE index row carrying
 # aggregates, so the per-file recorded-identity comparison M1 used to run over it is replaced by
@@ -247,3 +249,111 @@ def test_entry_count_guard_counts_the_files_inside_an_opaque_tree(tmp_path: Path
             direct_delete_entry_count_guard=5,  # the 12 files are no longer rows, still counted
         )
     assert result.method == "vault"
+
+
+# --- (iii) over-MAX_PATH venv files: the hardlink guard must not fail open --------------------
+
+
+def _deep_dir(base: Path) -> Path:
+    """`base` extended by 8 levels of 45-char names: any file inside has a path > 260 chars."""
+    deep = base
+    for level in range(8):
+        deep = deep / (f"level{level}_" + "d" * 38)
+    return deep
+
+
+def _make_long_module(venv: Path, content: bytes) -> Path:
+    """A venv (short, recognisable root) holding one module whose full path exceeds MAX_PATH."""
+    (venv / "Scripts").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+    (venv / "Scripts" / "python.exe").write_bytes(b"MZ-fake-interpreter")
+    deep = _deep_dir(venv / "Lib" / "site-packages" / "pkg")
+    os.makedirs(long_path(deep), exist_ok=True)  # noqa: PTH103 -- \?\ str, not Path
+    module = deep / "deepmod.py"
+    with open(long_path(module), "wb") as handle:  # noqa: PTH123 -- \?\ str, not Path
+        handle.write(content)
+    assert len(str(module)) > 260
+    return module
+
+
+def test_a_deep_over_max_path_file_hardlinked_into_another_environment_is_refused(
+    tmp_path: Path,
+) -> None:
+    venv_a = tmp_path / "proj_a" / ".venv"
+    venv_b = tmp_path / "proj_b" / ".venv"
+    module_a = _make_long_module(venv_a, b"deep-shared")
+    _make_venv(venv_b, module_name="own_mod.py", content=b"b-own")
+    try:
+        os.link(long_path(module_a), venv_b / "Lib" / "site-packages" / "pkg" / "alias.py")
+        with ScanIndex(tmp_path / "index.sqlite3") as index:
+            scan_tree(tmp_path, index)
+            candidate = _candidate_for(venv_a, index, retention_days=None)
+            detail = _direct_delete_directory_mismatch(candidate, index)
+            assert detail is not None and "hardlink-connected" in detail
+            result = _apply(candidate, index, tmp_path)
+        assert result.succeeded is False
+        assert result.skip_reason == "identity_changed_since_scan"
+        assert os.path.exists(long_path(module_a))  # noqa: PTH110
+    finally:
+        shutil.rmtree(long_path(tmp_path / "proj_a"), ignore_errors=True)
+
+
+def test_the_same_deep_venv_without_the_link_is_accepted_and_deleted(tmp_path: Path) -> None:
+    venv_a = tmp_path / "proj_a" / ".venv"
+    venv_b = tmp_path / "proj_b" / ".venv"
+    module_a = _make_long_module(venv_a, b"deep-shared")
+    _make_venv(venv_b, module_name="own_mod.py", content=b"b-own")
+    try:
+        with ScanIndex(tmp_path / "index.sqlite3") as index:
+            scan_tree(tmp_path, index)
+            candidate = _candidate_for(venv_a, index, retention_days=None)
+            assert _direct_delete_directory_mismatch(candidate, index) is None
+            result = _apply(candidate, index, tmp_path)
+        assert result.succeeded is True and result.method == "direct_delete"
+        assert not os.path.exists(long_path(module_a))  # noqa: PTH110
+    finally:
+        shutil.rmtree(long_path(tmp_path / "proj_a"), ignore_errors=True)
+
+
+def test_check_hardlink_shared_active_install_sees_siblings_of_an_over_max_path_file(
+    tmp_path: Path,
+) -> None:
+    venv_a = tmp_path / "proj_a" / ".venv"
+    venv_b = tmp_path / "proj_b" / ".venv"
+    module_a = _make_long_module(venv_a, b"deep-shared")
+    _make_venv(venv_b, module_name="own_mod.py", content=b"b-own")
+    try:
+        assert (
+            check_hardlink_shared_active_install(module_a).is_shared_with_other_environment is False
+        )
+        os.link(long_path(module_a), venv_b / "Lib" / "site-packages" / "pkg" / "alias.py")
+        result = check_hardlink_shared_active_install(module_a)
+        assert result.is_shared_with_other_environment is True
+        assert result.own_environment_root == venv_a
+        assert set(result.sibling_environment_roots) == {venv_b}
+    finally:
+        shutil.rmtree(long_path(tmp_path / "proj_a"), ignore_errors=True)
+
+
+def test_an_unreadable_live_file_in_an_opaque_tree_makes_m1_refuse_not_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import reclaim.executor as executor_module
+
+    nm = _node_modules(tmp_path)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidate = _candidate_for(nm, index, retention_days=None)
+        assert _direct_delete_directory_mismatch(candidate, index) is None
+        # isolate the per-file hardlink loop from the aggregate recount
+        monkeypatch.setattr(executor_module, "_opaque_aggregate_mismatch", lambda _r: None)
+        real_stat = os.stat
+
+        def flaky_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+            if str(path).endswith("react.js"):
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "stat", flaky_stat)
+        detail = _direct_delete_directory_mismatch(candidate, index)
+    assert detail is not None and "could not be inspected" in detail
