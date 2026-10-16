@@ -381,7 +381,8 @@ def check_identity_unchanged_since_scan(
     its own honest failure path would just make that failure harder to find in the logs, not
     safer. Any OTHER stat error (permission, sharing fault) means the identity could not be
     verified and reports `identity_changed=True` -- an unverifiable candidate is refused, never
-    passed. The stat uses the `\\?\` form, so a path past MAX_PATH is verified, not "vanished".
+    passed. The stat uses the long-path (extended-length prefix) form, so a path past MAX_PATH is
+    verified, not "vanished".
     """
     try:
         # `\\?\` form (D12): a bare stat past MAX_PATH raises, which used to read as "vanished"

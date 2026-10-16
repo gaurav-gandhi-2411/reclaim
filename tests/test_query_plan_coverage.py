@@ -255,7 +255,9 @@ _CASES: dict[str, Case] = {
     "drop_opaque_rows": Case(
         action=None,
         expect_index=False,
-        reason="DELETE ... WHERE path = ? AND opaque = 1 (primary-key point delete) + COMMIT -- "
+        reason="DELETE ... WHERE path_lower = ? COLLATE NOCASE AND opaque = 1 + COMMIT -- the "
+        "plan is asserted in "
+        "test_drop_opaque_rows_delete_is_served_by_the_nocase_path_lower_index; "
         "the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
     ),
     "opaque_roots_under": Case(

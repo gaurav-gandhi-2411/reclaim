@@ -178,3 +178,20 @@ These refine, and do not change, the decisions above.
 * **Candidate pools.** An opaque root is a directory row. Dedup, large-file and extension pools
   filter on `is_dir = 0`, so they never see it however large its size or aggregates
   (`test_directory_rows_are_excluded_from_the_file_candidate_pools`).
+
+## Addendum 4 (third review pass, 2026-10-17)
+
+* **Case folding is Python's, not SQLite's.** `path_lower` is `str.lower()` of the path on write and on
+  query, so `drop_opaque_rows` folds like Python; SQLite's `COLLATE NOCASE` is ASCII-only and does no
+  work for non-ASCII names. A non-ASCII directory differing only in case (`Ébène`/`ébène`) was verified
+  to match. NTFS up-case pairs that Python's `lower()` folds differently were not exhaustively tested.
+* **An actively written opaque tree refuses every direct-delete apply until it is rescanned.** The
+  aggregate comparison is exact (no tolerance), so a tree that changes between scan and apply (for
+  example a running `npm install`) is refused each time and clears after the next scan records the new
+  aggregates. Fail closed, not a permanent deadlock; not measured against a real `npm install`.
+* **A stat fault refuses the whole MCP delete batch.** `check_identity_unchanged_since_scan` now reports
+  a candidate whose stat fails for any reason other than not-found as changed, and
+  `api/service.py:stale_selected_candidates` (used by the MCP `delete` tool) then refuses the batch
+  ("N selected file(s) changed on disk"). Triggers measured on CPython: winerror 5/21 (PermissionError),
+  123/1920/1117 (OSError). A locked-for-write file and an ACL deny-read file do not trigger it (lstat
+  succeeds). The refusal detail now says the item could not be inspected rather than that it was swapped.

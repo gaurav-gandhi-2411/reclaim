@@ -1252,6 +1252,14 @@ def _top_level_identity_mismatch(
         recorded_mtime=candidate.mtime,
         recorded_size_bytes=candidate.size_bytes,
     )
+    if check.identity_changed and check.live_dev is None and check.live_ino is None:
+        # Same closed-set skip code (preflight's reason list), honest detail: the stat itself
+        # failed, nothing was seen to be swapped.
+        return (
+            "identity_changed_since_scan",
+            f"{candidate.path}: could not be inspected (stat failed other than not-found), so its "
+            "identity since the scan cannot be verified; refusing",
+        )
     if check.identity_changed:
         return (
             "identity_changed_since_scan",
