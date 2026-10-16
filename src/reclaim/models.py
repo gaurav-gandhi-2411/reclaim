@@ -29,6 +29,15 @@ RECORDED_ATTRIBUTE_MASK = (
 )
 
 
+# ADR-0042: directories with one of these names (case-insensitive) are recorded as ONE row carrying
+# aggregates of everything below them; their contents are walked only to compute those aggregates.
+# One constant so a kind can be dropped (the venv family is conditional, ADR-0042 decision 5)
+# without touching the machinery.
+OPAQUE_DIR_NAMES = frozenset(
+    {"node_modules", "__pycache__", ".git", ".venv", "venv", "site-packages"}
+)
+
+
 def recorded_attributes(attributes: int) -> int:
     """`attributes` reduced to the bits Reclaim reads (see `RECORDED_ATTRIBUTE_MASK`)."""
     return attributes & RECORDED_ATTRIBUTE_MASK
@@ -65,6 +74,16 @@ class FileRecord:
     ctime: float = 0.0
     dev: int = 0
     ino: int = 0
+    # ADR-0042 opaque dependency tree: a directory row (`is_dir` stays True, `size_bytes` stays
+    # what the directory itself reports) standing for everything below it. `agg_files` counts the
+    # non-directory entries below (reparse entries included), `agg_bytes` their logical sizes,
+    # `agg_newest_mtime` the newest mtime of any entry below, `agg_physical_bytes` the sizes
+    # counting each file id once. All zero/None for every ordinary record.
+    opaque: bool = False
+    agg_files: int = 0
+    agg_bytes: int = 0
+    agg_newest_mtime: float | None = None
+    agg_physical_bytes: int = 0
 
     @property
     def is_cloud_placeholder(self) -> bool:

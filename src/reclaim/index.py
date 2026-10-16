@@ -55,6 +55,12 @@ _COLUMNS = (
     "last_scanned",
     "name",
     "path_lower",
+    # ADR-0042 opaque-tree aggregates (last, in the order the migration ALTERs append them).
+    "opaque",
+    "agg_files",
+    "agg_bytes",
+    "agg_newest_mtime",
+    "agg_physical_bytes",
 )
 
 _SCHEMA = """
@@ -78,9 +84,24 @@ CREATE TABLE IF NOT EXISTS files (
     partial_hash TEXT,
     full_hash TEXT,
     name TEXT,
-    path_lower TEXT
+    path_lower TEXT,
+    opaque INTEGER NOT NULL DEFAULT 0,
+    agg_files INTEGER NOT NULL DEFAULT 0,
+    agg_bytes INTEGER NOT NULL DEFAULT 0,
+    agg_newest_mtime REAL,
+    agg_physical_bytes INTEGER NOT NULL DEFAULT 0
 );
 """
+# ADR-0042: `opaque = 1` marks a dependency-tree root (node_modules, .venv, ...) recorded as ONE
+# directory row; its `agg_*` columns summarise everything below it (see `models.OPAQUE_DIR_NAMES`).
+# Additive and defaulted: every pre-existing row reads as "not opaque" (`_ensure_opaque_columns`).
+_OPAQUE_COLUMN_DDL = (
+    ("opaque", "INTEGER NOT NULL DEFAULT 0"),
+    ("agg_files", "INTEGER NOT NULL DEFAULT 0"),
+    ("agg_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("agg_newest_mtime", "REAL"),
+    ("agg_physical_bytes", "INTEGER NOT NULL DEFAULT 0"),
+)
 # `name` (lowercased basename) and `path_lower` (lowercased posix path) exist purely so Stage
 # 3/4 candidate generation can query for matches via an index instead of materializing every
 # row into a Python `FileRecord` and filtering in-process (see `files_by_name`,
@@ -294,6 +315,11 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         ctime=row["ctime"],
         dev=_from_db_int64(row["dev"]),
         ino=_from_db_int64(row["ino"]),
+        opaque=bool(row["opaque"]),
+        agg_files=row["agg_files"],
+        agg_bytes=row["agg_bytes"],
+        agg_newest_mtime=row["agg_newest_mtime"],
+        agg_physical_bytes=row["agg_physical_bytes"],
     )
 
 
@@ -316,6 +342,11 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
         scanned_at,
         record.path.name.lower(),
         posix_path.lower(),
+        int(record.opaque),
+        record.agg_files,
+        record.agg_bytes,
+        record.agg_newest_mtime,
+        record.agg_physical_bytes,
     )
 
 
@@ -357,6 +388,11 @@ def file_row(
         scanned_at,
         name.lower(),
         posix_path.lower(),
+        0,  # opaque: the listing fast path only builds plain files, never an opaque root
+        0,
+        0,
+        None,
+        0,
     )
 
 
@@ -385,6 +421,11 @@ _DISTINCT_INODES_PER_SIZE_SQL = """
 # dev == ino == 0 row its own group (identity unknown -- never deduplicated, as in the Python
 # `physical_size_bytes`). The bare `size` next to MIN(...) is the size of that first row.
 _PHYSICAL_GROUP_BY = "GROUP BY dev, ino, CASE WHEN dev = 0 AND ino = 0 THEN rowid ELSE 0 END"
+# ADR-0042: an opaque root is a directory row that stands for its tree; it adds its in-tree
+# physical bytes (each file id once) as its own group, in the same single table scan as the file
+# rows. Documented loss: a hardlink between an opaque tree and a file outside it is no longer
+# de-duplicated across that boundary (the old per-file rows shared one (dev, ino) group).
+_PHYSICAL_BYTES_EXPR = "CASE WHEN opaque = 1 THEN agg_physical_bytes ELSE size END"
 # Sizes whose bucket clears the materiality floor at distinct-inode level (param: the floor).
 # S608: only module-level constants are interpolated, never a caller-supplied value.
 _QUALIFYING_SIZES_SQL = f"""
@@ -445,6 +486,7 @@ class ScanIndex:
         self._conn.execute(_SCHEMA)
         self._conn.execute(_INACCESSIBLE_SCHEMA)
         self._ensure_name_and_path_lower_columns()
+        self._ensure_opaque_columns()
         for statement in _INDEXES:
             self._conn.execute(statement)
         self._conn.commit()
@@ -463,6 +505,19 @@ class ScanIndex:
             self._conn.execute("ALTER TABLE files ADD COLUMN path_lower TEXT")
         self._conn.commit()
         self._backfill_name_and_path_lower()
+
+    def _ensure_opaque_columns(self) -> None:
+        """ADR-0042 migration: adds the opaque-tree aggregate columns to a `files` table created
+        before they existed. `ADD COLUMN` with a constant default is a metadata-only change in
+        SQLite (no table rewrite, instant even on a multi-GB index) and every old row reads as
+        `opaque = 0`; a brand-new DB already has the columns from `_SCHEMA`. Idempotent."""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(files)")}
+        missing = [(name, ddl) for name, ddl in _OPAQUE_COLUMN_DDL if name not in columns]
+        for name, ddl in missing:
+            # Both fragments come from the module-level `_OPAQUE_COLUMN_DDL` constant.
+            self._conn.execute(f"ALTER TABLE files ADD COLUMN {name} {ddl}")
+        if missing:
+            self._conn.commit()
 
     def _backfill_name_and_path_lower(self) -> None:
         """Streams every row missing `name`/`path_lower` via `fetchmany` (never `fetchall`) and
@@ -701,14 +756,16 @@ class ScanIndex:
         cursor), optionally limited to `prefix` itself and everything under it."""
         if prefix is None:
             cursor = self._conn.execute(
-                "SELECT path, size, is_dir FROM files WHERE path > ? ORDER BY path LIMIT ?",
+                "SELECT path, CASE WHEN is_dir = 1 THEN agg_bytes ELSE size END AS size, is_dir "
+                "FROM files WHERE path > ? ORDER BY path LIMIT ?",
                 (after, limit),
             )
         else:
             stripped = prefix.rstrip("/")
             lower, upper = _prefix_range(stripped)
             cursor = self._conn.execute(
-                "SELECT path, size, is_dir FROM files "
+                "SELECT path, CASE WHEN is_dir = 1 THEN agg_bytes ELSE size END AS size, is_dir "
+                "FROM files "
                 "WHERE path > ? AND (path = ? OR (path >= ? AND path < ?)) "
                 "ORDER BY path LIMIT ?",
                 (after, stripped, lower, upper, limit),
@@ -723,6 +780,32 @@ class ScanIndex:
         self._conn.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths])
         self._conn.commit()
         return len(paths)
+
+    def delete_descendants(self, roots: Sequence[str]) -> int:
+        """Deletes every row STRICTLY below each of `roots` (POSIX form; the root's own row stays).
+        Used when a directory is written as an opaque root (ADR-0042): any per-file rows an older
+        scan left beneath it would otherwise be counted next to the aggregate until a later full
+        prune, so they go in the same flush. One primary-key range delete per root."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
+        count = 0
+        for root in roots:
+            lower, upper = _prefix_range(root.rstrip("/"))
+            count += self._conn.execute(
+                "DELETE FROM files WHERE path >= ? AND path < ?", (lower, upper)
+            ).rowcount
+        self._conn.commit()
+        return count
+
+    def opaque_roots_under(self, root: Path) -> list[FileRecord]:
+        """Opaque-root rows (ADR-0042) at or under `root`, including `root` itself. Each carries
+        the aggregates a per-file query over the same range cannot see."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT * FROM files WHERE (path = ? OR (path >= ? AND path < ?)) AND opaque = 1",
+            (prefix, lower, upper),
+        )
+        return [_row_to_record(row) for row in cursor]
 
     def vacuum(self) -> None:
         """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
@@ -843,14 +926,21 @@ class ScanIndex:
     def load_stat_cache(self, root: Path | None = None) -> dict[str, StoredStat]:
         """Loads path -> (size, mtime) for every indexed row (optionally scoped under `root`)
         in one query, so the scanner's per-entry incremental compare never round-trips to
-        SQLite per file."""
+        SQLite per file.
+
+        Opaque roots (ADR-0042) are deliberately left out: a directory's own (size, mtime) says
+        nothing about its contents, so an opaque row must never compare as "unchanged" -- absent
+        from this cache it is always rewritten, which also lets a scan that no longer collapses a
+        tree (kind dropped from `OPAQUE_DIR_NAMES`, or an unreadable subtree) overwrite the stale
+        aggregate row instead of leaving it next to freshly written child rows."""
         if root is None:
-            cursor = self._conn.execute("SELECT path, size, mtime FROM files")
+            cursor = self._conn.execute("SELECT path, size, mtime FROM files WHERE opaque = 0")
         else:
             prefix = root.as_posix().rstrip("/")
             lower, upper = _prefix_range(prefix)
             cursor = self._conn.execute(
-                "SELECT path, size, mtime FROM files WHERE path = ? OR (path >= ? AND path < ?)",
+                "SELECT path, size, mtime FROM files "
+                "WHERE (path = ? OR (path >= ? AND path < ?)) AND opaque = 0",
                 (prefix, lower, upper),
             )
         return {row["path"]: StoredStat(size=row["size"], mtime=row["mtime"]) for row in cursor}
@@ -1123,8 +1213,9 @@ class ScanIndex:
         return int(row["bucket_count"]), int(row["theoretical_bytes"])
 
     def subtree_size_bytes(self, root: Path) -> int:
-        """Sum of `size` for every non-directory row at or under `root` — the aggregate size a
-        directory-level candidate (e.g. a `node_modules` dir) represents.
+        """Sum of `size` for every non-directory row at or under `root`, plus the `agg_bytes` of
+        every opaque root (ADR-0042) in range — the aggregate size a directory-level candidate
+        (e.g. a `node_modules` dir) represents.
 
         Logical sum (matches `logical_size_bytes` semantics), not hardlink-deduped: package/
         dependency-cache trees are vanishingly unlikely to contain internal hardlinks, so the
@@ -1132,9 +1223,11 @@ class ScanIndex:
         """
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
+        # ADR-0042: an opaque root is a directory row carrying `agg_bytes`; every other directory
+        # row has agg_bytes = 0, so the CASE adds the aggregate without a second pass.
         cursor = self._conn.execute(
-            "SELECT COALESCE(SUM(size), 0) AS total FROM files "
-            "WHERE (path = ? OR (path >= ? AND path < ?)) AND is_dir = 0",
+            "SELECT COALESCE(SUM(CASE WHEN is_dir = 0 THEN size ELSE agg_bytes END), 0) AS total "
+            "FROM files WHERE (path = ? OR (path >= ? AND path < ?))",
             (prefix, lower, upper),
         )
         row = cursor.fetchone()
@@ -1144,20 +1237,28 @@ class ScanIndex:
         """Newest `mtime` of `root` itself or any row under it, or None if nothing is indexed
         there. A directory's own mtime changes only when its direct entries are added, removed,
         or renamed (NTFS), not when a file deeper down is rewritten -- so "how recently was this
-        tree used" must be answered from the subtree, never from the directory row alone."""
+        tree used" must be answered from the subtree, never from the directory row alone. Opaque
+        roots (ADR-0042) contribute their `agg_newest_mtime`."""
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
-            "SELECT MAX(mtime) AS newest FROM files WHERE path = ? OR (path >= ? AND path < ?)",
+            "SELECT MAX(mtime) AS newest, MAX(agg_newest_mtime) AS agg_newest FROM files "
+            "WHERE path = ? OR (path >= ? AND path < ?)",
             (prefix, lower, upper),
         )
         row = cursor.fetchone()
-        return None if row["newest"] is None else float(row["newest"])
+        # ADR-0042: an opaque root's newest content mtime lives in agg_newest_mtime, not mtime.
+        candidates = [float(v) for v in (row["newest"], row["agg_newest"]) if v is not None]
+        return max(candidates) if candidates else None
 
     def newest_files_under(self, root: Path, *, limit: int) -> list[Path]:
         """Paths of up to `limit` non-directory rows under `root`, newest indexed `mtime`
         first. Bounded by `limit`, so a caller that re-`stat`s the result (the ADR-0035
-        decision-point re-check) pays O(limit) per subtree however large the subtree is."""
+        decision-point re-check) pays O(limit) per subtree however large the subtree is.
+
+        Files below an opaque root (ADR-0042) are not rows and never appear here: a caller that
+        must recheck them asks `opaque_roots_under` and re-walks those trees live
+        (`detectors._restat_newest_mtime`)."""
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
@@ -1177,12 +1278,14 @@ class ScanIndex:
         cost-estimation query over the last scan's own recorded shape of this subtree, which is
         by definition all this decision can see before paying the re-walk's own live-filesystem
         cost. Counts both files and directories (unlike `subtree_size_bytes`, which sums only
-        file rows) because the re-walk itself visits and compares both.
+        file rows) because the re-walk itself visits and compares both. Opaque roots (ADR-0042)
+        add their `agg_files`, so the apply-time entry-count guard still trips on a huge
+        `node_modules` even though its files are no longer rows.
         """
         prefix = under.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
-            "SELECT COUNT(*) AS total FROM files "
+            "SELECT COUNT(*) + COALESCE(SUM(agg_files), 0) AS total FROM files "
             # Unary `+` on `is_cloud_placeholder` is load-bearing, not noise: it makes that term
             # non-indexable so the planner uses the primary-key path range. Without it (no
             # ANALYZE stats on this DB) SQLite picked `idx_files_is_cloud_placeholder` -- ~every
@@ -1243,14 +1346,16 @@ class ScanIndex:
         winning (`rowid` order unscoped, `path` order scoped -- the order `full_inventory`
         iterates in for each form); only dev == 0 AND ino == 0 rows each count separately
         (note: ino == 0 with a non-zero dev IS deduplicated by the Python function, unlike
-        `_DISTINCT_INODES_PER_SIZE_SQL`, which keys on ino alone).
+        `_DISTINCT_INODES_PER_SIZE_SQL`, which keys on ino alone). Opaque roots (ADR-0042)
+        contribute `agg_physical_bytes` as one additional group each.
         """
         if under is None:
             # NOT INDEXED: same whole-table-aggregate plan pin as `_DISTINCT_INODES_PER_SIZE_SQL`
             # (see its comment) -- a sequential scan whether or not `sqlite_stat1` exists.
             sql = f"""
-                SELECT COALESCE(SUM(size), 0) AS total FROM (
-                    SELECT size, MIN(rowid) FROM files NOT INDEXED WHERE is_dir = 0
+                SELECT COALESCE(SUM(bytes), 0) AS total FROM (
+                    SELECT {_PHYSICAL_BYTES_EXPR} AS bytes, MIN(rowid) FROM files NOT INDEXED
+                    WHERE is_dir = 0 OR opaque = 1
                     {_PHYSICAL_GROUP_BY}
                 )
             """  # noqa: S608 -- only module-level constants are interpolated
@@ -1261,9 +1366,9 @@ class ScanIndex:
             # Unary `+` keeps the primary-key path range as the access path (see
             # `subtree_entry_count`); MIN(path) = first row in that range's iteration order.
             sql = f"""
-                SELECT COALESCE(SUM(size), 0) AS total FROM (
-                    SELECT size, MIN(path) FROM files
-                    WHERE (path = ? OR (path >= ? AND path < ?)) AND +is_dir = 0
+                SELECT COALESCE(SUM(bytes), 0) AS total FROM (
+                    SELECT {_PHYSICAL_BYTES_EXPR} AS bytes, MIN(path) FROM files
+                    WHERE (path = ? OR (path >= ? AND path < ?)) AND (+is_dir = 0 OR +opaque = 1)
                     {_PHYSICAL_GROUP_BY}
                 )
             """  # noqa: S608 -- only module-level constants are interpolated
@@ -1313,7 +1418,7 @@ class ScanIndex:
 def logical_size_bytes(records: Iterable[FileRecord]) -> int:
     """Sum of `size_bytes` across every file record — double-counts hardlinks (same on-disk
     allocation, multiple path entries), which is exactly what "logical size" means here."""
-    return sum(record.size_bytes for record in records if not record.is_dir)
+    return sum(record.agg_bytes if record.is_dir else record.size_bytes for record in records)
 
 
 def physical_size_bytes(records: Iterable[FileRecord]) -> int:
@@ -1328,6 +1433,7 @@ def physical_size_bytes(records: Iterable[FileRecord]) -> int:
     total = 0
     for record in records:
         if record.is_dir:
+            total += record.agg_physical_bytes if record.opaque else 0  # ADR-0042
             continue
         key = (record.dev, record.ino)
         if key == (0, 0):

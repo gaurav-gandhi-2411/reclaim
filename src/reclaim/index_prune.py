@@ -194,8 +194,9 @@ def prune_dead_rows(
                 if is_dead:
                     dead.append(path)
                     report.dead_rows += 1
-                    if not is_dir:
-                        report.dead_bytes += size
+                    # `size` is the file size, or for a directory row its ADR-0042 aggregate (0 for
+                    # every ordinary directory), so a dead opaque tree's bytes are counted too.
+                    report.dead_bytes += size
                     report.dead_by_prefix["/".join(path.split("/")[:_REPORT_PREFIX_SEGMENTS])] += 1
             if apply and dead:
                 index.delete_paths(dead)

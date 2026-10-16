@@ -246,6 +246,24 @@ _CASES: dict[str, Case] = {
         reason="DELETE ... WHERE path = ? (primary-key point delete, as prune_missing above) + "
         "COMMIT -- the last captured statement is the COMMIT, which has no plan rows",
     ),
+    "delete_descendants": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE ... WHERE path >= ? AND path < ? (prefix range via _prefix_range) + COMMIT "
+        "-- the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
+    ),
+    "opaque_roots_under": Case(
+        lambda idx: idx.opaque_roots_under(_SCOPE),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range; `opaque = 1` is a residual filter over the "
+        "one subtree (ADR-0042)",
+    ),
+    "_ensure_opaque_columns": Case(
+        action=None,
+        expect_index=False,
+        reason="PRAGMA table_info + ALTER TABLE ADD COLUMN -- schema introspection/DDL, not a "
+        "data query (ADR-0042)",
+    ),
     "vacuum": Case(
         action=None,
         expect_index=False,
