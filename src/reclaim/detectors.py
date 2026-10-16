@@ -22,6 +22,7 @@ from reclaim.models import (
     Verdict,
 )
 from reclaim.safety import SafetyValidator
+from reclaim.scanner import aggregate_tree
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +39,11 @@ _SECONDS_PER_DAY = 86400.0
 # old AND which is not among the newest-N of a subtree larger than the cap is not caught here;
 # bounded cost is the owner's stated trade (apply-time preflight still re-verifies identity).
 _TEMP_CHILD_RESTAT_CAP = 2000
+# ADR-0042: files below an opaque dependency-tree root are not index rows, so the ADR-0035 recheck
+# of a temp child re-walks each such tree live (a real stat per file). Bounded: a tree with more
+# entries than this cannot be verified inside the budget and counts as "changed since scan"
+# (fail closed) -- the child is simply not proposed this time, never proposed on a guess.
+_OPAQUE_RECHECK_MAX_ENTRIES = 200_000
 
 # Config `[categories]` group ids — the coarse identifier every `RawCandidate.category_group`
 # must be one of, matched against `_CATEGORY_GROUP_ENABLED_GETTERS` in `_category_enabled`.
@@ -333,12 +339,19 @@ def detect_model_caches(
 # --- Browser/temp/thumbnail caches ----------------------------------------------------------
 
 
-def _restat_newest_mtime(index: ScanIndex, child: FileRecord, listing_newest: float) -> float:
+def _restat_newest_mtime(
+    index: ScanIndex, child: FileRecord, listing_newest: float, *, now: float
+) -> float:
     """`listing_newest`, raised to the live mtime of whatever could be open for write.
 
     A file child is re-`stat`ed itself; a directory child gets its files re-`stat`ed (all of
     them up to `_TEMP_CHILD_RESTAT_CAP`, else the newest-N by listing mtime). A path that cannot
-    be `stat`ed contributes nothing (see `fresh_stat_signature`). Only ever raises the value."""
+    be `stat`ed contributes nothing (see `fresh_stat_signature`). Only ever raises the value.
+
+    ADR-0042: every opaque dependency-tree root at or under `child` is re-walked live (bounded by
+    `_OPAQUE_RECHECK_MAX_ENTRIES`, real per-file stats) and its newest mtime folded in. A tree that
+    cannot be fully re-measured inside the budget returns `now` -- "modified just now" -- so the
+    caller's age guard rejects the child (fail closed)."""
     if child.is_dir:
         paths = index.newest_files_under(child.path, limit=_TEMP_CHILD_RESTAT_CAP + 1)
         if len(paths) > _TEMP_CHILD_RESTAT_CAP:
@@ -353,6 +366,19 @@ def _restat_newest_mtime(index: ScanIndex, child: FileRecord, listing_newest: fl
         fresh = fresh_stat_signature(path)
         if fresh is not None:
             newest = max(newest, fresh.mtime)
+    if child.is_dir:
+        for opaque_root in index.opaque_roots_under(child.path):
+            live = aggregate_tree(
+                opaque_root.path, use_listing=False, max_entries=_OPAQUE_RECHECK_MAX_ENTRIES
+            )
+            if live is None:
+                logger.info(
+                    "candidates.temp_restat_opaque_unverifiable", path=str(opaque_root.path)
+                )
+                return max(newest, now)
+            for live_mtime in (live.newest_mtime, live.newest_dir_mtime):
+                if live_mtime is not None:
+                    newest = max(newest, live_mtime)
     return newest
 
 
@@ -446,7 +472,7 @@ def detect_temp_and_browser_caches(
                 age_seconds = now - newest
                 if age_seconds >= min_age_seconds:
                     # Listing says "old enough": confirm against live mtimes (ADR-0035).
-                    newest = _restat_newest_mtime(index, child, newest)
+                    newest = _restat_newest_mtime(index, child, newest, now=now)
                     age_seconds = now - newest
                 if age_seconds < min_age_seconds:
                     # Younger than the age floor -- never proposed, not even Tier B (matches
@@ -896,7 +922,9 @@ def _run_all_detectors(index: ScanIndex, config: Config, now: float) -> list[Raw
 _LINK_AWARE_CATEGORY_GROUPS = frozenset({_GROUP_PACKAGE_CACHES, _GROUP_MODEL_CACHES})
 
 
-def _reclaimable_bytes_for_candidate(index: ScanIndex, rc: RawCandidate, size_bytes: int) -> int:
+def _reclaimable_bytes_for_candidate(
+    index: ScanIndex, rc: RawCandidate, size_bytes: int
+) -> int | None:
     """Hardlink-aware reclaimable-bytes estimate for one package/model-cache candidate.
 
     Deliberately scoped to ONLY this candidate's own file(s) -- never batched together with
@@ -917,19 +945,31 @@ def _reclaimable_bytes_for_candidate(index: ScanIndex, rc: RawCandidate, size_by
     indexed `size` is the full remote size, not real local bytes, so counting one toward
     reclaimable would overclaim independent of hardlinks). For a file candidate (an individual
     model-weight file matched by extension), evaluates that single file alone.
+
+    ADR-0042: files below an opaque dependency-tree root (e.g. a conda `pkgs/<x>/site-packages`)
+    are not rows, so they are not evaluated and credit nothing -- the estimate can only
+    UNDER-estimate (the safe direction). It never returns a misleading `0` for a directory that
+    holds opaque bytes: when nothing else could be evaluated it returns `None` ("no hardlink-
+    aware estimate"), which consumers resolve to the logical size exactly as they do for every
+    category without a link-aware estimate.
     """
+    opaque_bytes = 0
     if rc.is_dir:
         members = [
             (record.path, record.size_bytes)
             for record in index.candidate_inventory(under=rc.path)
             if not record.is_dir
         ]
-        if not members:
+        opaque_bytes = sum(record.agg_bytes for record in index.opaque_roots_under(rc.path))
+        if not members and not opaque_bytes:
             return 0
     else:
         members = [(rc.path, size_bytes)]
     estimates = estimate_reclaimable_bytes(members)
-    return sum(estimate.reclaimable_bytes for estimate in estimates.values())
+    reclaimable = sum(estimate.reclaimable_bytes for estimate in estimates.values())
+    if opaque_bytes and reclaimable == 0:
+        return None
+    return reclaimable
 
 
 def generate_candidates(

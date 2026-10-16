@@ -506,7 +506,10 @@ def test_apply_skips_a_stale_cross_tenant_candidate_zero_files_touched(
     _write(own_node_modules / "index.js", b"x" * 4096)
     (own_profile / "projects" / "myapp" / "package.json").write_bytes(b"{}")
 
-    other_node_modules = other_profile / "ml-projects" / "otherapp" / "node_modules" / "lodash"
+    # ADR-0042: a file below `node_modules` is no longer an index row (the tree is one opaque
+    # row), and an explicit-path apply only reaches a file the index knows. The target is a plain
+    # `vendor` file so this test keeps exercising apply_batch's own scope check.
+    other_node_modules = other_profile / "ml-projects" / "otherapp" / "vendor" / "lodash"
     other_target = other_node_modules / "index.js"
     _write(other_target, b"y" * 4096)
     (other_profile / "ml-projects" / "otherapp" / "package.json").write_bytes(b"{}")

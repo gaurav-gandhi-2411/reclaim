@@ -13,7 +13,7 @@ import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import structlog
@@ -29,6 +29,7 @@ from reclaim.index import InaccessibleEntry, ScanIndex, StoredStat, file_row, is
 from reclaim.models import (
     FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_REPARSE_POINT,
+    OPAQUE_DIR_NAMES,
     FileRecord,
     recorded_attributes,
 )
@@ -379,7 +380,7 @@ def is_cloud_sync_root(path: Path) -> bool:
     name_lower = path.name.lower()
     if any(name_lower.startswith(prefix) for prefix in _CLOUD_ROOT_FOLDER_PREFIXES):
         return True
-    return (path / ".dropbox").exists()
+    return os.path.exists(long_path(path / ".dropbox"))  # noqa: PTH110 -- \\?\ str
 
 
 @dataclass(frozen=True, slots=True)
@@ -867,6 +868,201 @@ def build_record_for_path(path: Path, git_cache: GitRepoCache) -> FileRecord | N
     return None
 
 
+# --- Opaque dependency trees (ADR-0042) ----------------------------------------------------------
+#
+# A directory named in `models.OPAQUE_DIR_NAMES` (node_modules, .venv, ...) is recorded as ONE row
+# whose `agg_*` columns summarise everything below it; its contents are walked here only to compute
+# those aggregates and are never recorded. Same walk rules as the scan: never cross a reparse
+# point (counted as an entry, not descended), `\\?\`-prefixed paths, the ID-bearing directory
+# listing where the volume supports it and `os.scandir` + `os.stat` otherwise.
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueAggregate:
+    """What `aggregate_tree` measured below one directory.
+
+    `files` counts non-directory entries plus reparse entries (junctions/symlinks, never
+    descended, contributing no bytes); `bytes` is the logical sum of file sizes; `newest_mtime`
+    the newest mtime of any non-directory entry below (reparse entries included), `None` if there
+    is none; `newest_dir_mtime` the newest mtime of any directory in the tree, the root included
+    (it moves when an entry is added, removed or renamed in that directory); `physical_bytes`
+    the same sum counting each file id once; `entries` every entry
+    visited including directories (progress accounting only, not persisted)."""
+
+    files: int
+    bytes: int
+    newest_mtime: float | None
+    physical_bytes: int
+    entries: int
+    newest_dir_mtime: float | None = None
+
+
+def aggregate_tree(
+    root: Path,
+    *,
+    use_listing: bool = True,
+    cancel_event: threading.Event | None = None,
+    max_entries: int | None = None,
+    on_entries: Callable[[int], None] | None = None,
+    volume_serial: int | None = None,
+) -> OpaqueAggregate | None:
+    """Iterative aggregate walk of `root` (see `OpaqueAggregate`), or `None` when the result
+    would not be a COMPLETE measurement: any directory could not be listed, any entry could not
+    be stat'd, the walk was cancelled, or more than `max_entries` entries were seen.
+
+    `None` is the fail-closed answer, never a partial number: the scanner then walks the
+    directory the ordinary way (every unreadable path is recorded in the existing skipped /
+    inaccessible machinery, and no aggregate row is written that could look complete); the
+    apply-time and recheck callers treat it as "changed since scan". Used by the scan, by
+    `executor._direct_delete_directory_mismatch` (live recount) and by the ADR-0035 recheck
+    (`detectors._restat_newest_mtime`), so scan-time and live values come from one code path.
+
+    `on_entries` receives the number of entries seen in each directory as it is processed
+    (progress / ETA accounting). `volume_serial`: the walk's already-known volume serial, so the
+    listing is not asked to re-read and re-validate it for every opaque root (see
+    `dirlist.list_directory`); `None` learns it from the first directory."""
+    try:
+        # Never measure THROUGH a junction/symlink root: os.stat below would follow it.
+        if os.lstat(long_path(root)).st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+    except OSError:
+        return None
+    files = 0
+    total_bytes = 0
+    physical = 0
+    entries = 0
+    newest: float | None = None
+    newest_dir: float | None = None
+    seen_ids: set[int] = set()
+    stack = [root]
+    while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        current = stack.pop()
+        long_dir = long_path(current)
+        before = entries
+        try:
+            # A directory's own mtime is read from the directory itself (not from the entry its
+            # parent's listing carries, which can lag -- ADR-0035), at scan time and live alike.
+            dir_mtime = os.stat(long_dir).st_mtime  # noqa: PTH116 -- \\?\ str, not Path
+        except OSError:
+            return None
+        if newest_dir is None or dir_mtime > newest_dir:
+            newest_dir = dir_mtime
+        listing = _list_directory_or_none(long_dir, volume_serial) if use_listing else None
+        if listing is not None:
+            volume_serial, listed = listing
+            for name, attributes, size, last_write, _creation, id_low, id_high in listed:
+                entries += 1
+                if (
+                    attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                    or not attributes & _ATTRIBUTE_DIRECTORY
+                ):
+                    mtime = filetime_to_unix_seconds(last_write)
+                    if newest is None or mtime > newest:
+                        newest = mtime
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                    files += 1
+                elif attributes & _ATTRIBUTE_DIRECTORY:
+                    stack.append(current / name)
+                else:
+                    files += 1
+                    total_bytes += size
+                    file_id = id_low | (id_high << 64)
+                    if file_id == 0 or file_id not in seen_ids:
+                        physical += size
+                        seen_ids.add(file_id)
+        else:
+            try:
+                with os.scandir(long_dir) as scan_iterator:
+                    dir_entries = list(scan_iterator)
+            except OSError:
+                return None
+            for entry in dir_entries:
+                entries += 1
+                file_id = 0
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    attributes = st.st_file_attributes
+                    if not attributes & (FILE_ATTRIBUTE_REPARSE_POINT | _ATTRIBUTE_DIRECTORY):
+                        # A plain file gets a real handle-based stat: the identity `DirEntry.stat()`
+                        # lacks, and a size/mtime that reflects a write still in flight rather than
+                        # the (possibly lagging) directory entry -- the ADR-0035 hazard, which is
+                        # why the live recounts (M1, the temp recheck) use this walk.
+                        st = os.stat(entry.path, follow_symlinks=False)  # noqa: PTH116 -- \\?\ str, not Path
+                        file_id = st.st_ino
+                except OSError:
+                    return None
+                is_dir_walked = (
+                    attributes & _ATTRIBUTE_DIRECTORY
+                    and not attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                if not is_dir_walked and (newest is None or st.st_mtime > newest):
+                    newest = st.st_mtime
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                    files += 1
+                elif attributes & _ATTRIBUTE_DIRECTORY:
+                    stack.append(current / entry.name)
+                else:
+                    files += 1
+                    total_bytes += st.st_size
+                    if file_id == 0 or file_id not in seen_ids:
+                        physical += st.st_size
+                        seen_ids.add(file_id)
+        if on_entries is not None and entries > before:
+            on_entries(entries - before)
+        if max_entries is not None and entries > max_entries:
+            return None
+    return OpaqueAggregate(
+        files=files,
+        bytes=total_bytes,
+        newest_mtime=newest,
+        physical_bytes=physical,
+        entries=entries,
+        newest_dir_mtime=newest_dir,
+    )
+
+
+def _collapse_if_opaque(
+    record: FileRecord,
+    should_recurse: bool,
+    *,
+    use_listing: bool,
+    cancel_event: threading.Event | None,
+    tracker: _ProgressTracker | None,
+    volume_serial: int | None = None,
+) -> FileRecord | None:
+    """The opaque form of `record` (`opaque=True`, aggregates filled in) when it is a walkable
+    directory named in `OPAQUE_DIR_NAMES` and its aggregate walk completed; otherwise `None` and
+    the caller treats it as an ordinary directory.
+
+    Incompletely measured trees (unreadable subdirectory, cancellation) are deliberately NOT
+    collapsed: they fall back to the ordinary recursion, which records every unreadable path in
+    the skipped / inaccessible accounting and keeps the per-file rows, so an opaque row can never
+    claim a completeness it did not measure."""
+    if not should_recurse or record.path.name.lower() not in OPAQUE_DIR_NAMES:
+        return None
+    aggregate = aggregate_tree(
+        record.path,
+        use_listing=use_listing,
+        cancel_event=cancel_event,
+        on_entries=tracker.add if tracker is not None else None,
+        volume_serial=volume_serial,
+    )
+    if aggregate is None:
+        logger.info("scan.opaque_walk_incomplete", path=str(record.path))
+        return None
+    return replace(
+        record,
+        opaque=True,
+        agg_files=aggregate.files,
+        agg_bytes=aggregate.bytes,
+        agg_newest_mtime=aggregate.newest_mtime,
+        agg_physical_bytes=aggregate.physical_bytes,
+        agg_newest_dir_mtime=aggregate.newest_dir_mtime,
+    )
+
+
 # Wave 1 finding #1 (2026-07-30 real-disk diagnosis): batched-transaction size — mirrors
 # dedup.py's `_WRITE_BATCH_SIZE` cadence (that one flushes hash writes; this one flushes scan
 # writes) and the spec's own "batched transactions (e.g. 5-10k inserts)" ask.
@@ -932,6 +1128,11 @@ class _BatchIndexWriter:
         with self._lock:
             if upserts:
                 self.written += self._index.upsert_records(upserts, scanned_at=self._scanned_at)
+                # ADR-0042: per-file rows an older scan left below a now-opaque root go in the
+                # same flush, so a cancelled scan cannot leave them counted next to the aggregate.
+                opaque_roots = [record.path.as_posix() for record in upserts if record.opaque]
+                if opaque_roots:
+                    self._index.delete_descendants(opaque_roots)
             if rows:
                 self.written += self._index.upsert_rows(rows)
             self._index.record_seen(seen)
@@ -1047,13 +1248,26 @@ def _walk_subtree(
                     if built is None:
                         continue
                     record, should_recurse = built
-                    _classify_record(
-                        record, stat_cache, incremental, pending_upserts, pending_unchanged
+                    opaque_record = _collapse_if_opaque(
+                        record,
+                        should_recurse,
+                        use_listing=True,
+                        cancel_event=cancel_event,
+                        tracker=tracker,
+                        volume_serial=volume_serial,
                     )
+                    if opaque_record is not None:
+                        # Always rewritten, never compared: a directory's own (size, mtime) does
+                        # not move when a deep file changes (ADR-0042).
+                        pending_upserts.append(opaque_record)
+                    else:
+                        _classify_record(
+                            record, stat_cache, incremental, pending_upserts, pending_unchanged
+                        )
+                        if should_recurse:
+                            stack.append(record.path)
                     if tracker is not None:
                         tracker.add(1)
-                    if should_recurse:
-                        stack.append(record.path)
                 else:
                     # Plain file: no syscall, no Path, no FileRecord -- see the "Listing-sourced
                     # records" section comment for what this is exactly equal to.
@@ -1143,11 +1357,23 @@ def _walk_subtree(
             if built is None:
                 continue
             record, should_recurse = built
-            _classify_record(record, stat_cache, incremental, pending_upserts, pending_unchanged)
+            opaque_record = _collapse_if_opaque(
+                record,
+                should_recurse,
+                use_listing=_USE_DIRECTORY_LISTING and not force_guard,
+                cancel_event=cancel_event,
+                tracker=tracker,
+            )
+            if opaque_record is not None:
+                pending_upserts.append(opaque_record)  # always rewritten (ADR-0042)
+            else:
+                _classify_record(
+                    record, stat_cache, incremental, pending_upserts, pending_unchanged
+                )
+                if should_recurse:
+                    stack.append(record.path)
             if tracker is not None:
                 tracker.add(1)
-            if should_recurse:
-                stack.append(record.path)
             if len(pending_upserts) >= _WRITE_BATCH_SIZE or len(pending_unchanged) >= (
                 _WRITE_BATCH_SIZE
             ):
@@ -1223,6 +1449,16 @@ def scan_tree(
     # `_entry_is_risky`/`is_network_drive`'s docstrings.
     force_guard = is_network_drive(root)
     risk_counter = _RiskCounter()
+    # ADR-0042: a scan rooted at or inside an opaque-named directory indexes that tree's
+    # contents normally; an opaque row for it (or an enclosing one) from an earlier scan
+    # would then be counted next to those rows, so it is dropped up front.
+    enclosing_opaque = [
+        candidate.as_posix()
+        for candidate in (root, *root.parents)
+        if candidate.name.lower() in OPAQUE_DIR_NAMES
+    ]
+    if enclosing_opaque:
+        index.drop_opaque_rows(enclosing_opaque)
 
     all_skipped: list[SkippedPath] = []
     try:
@@ -1262,10 +1498,22 @@ def scan_tree(
             if built is None:
                 continue
             record, should_recurse = built
-            _classify_record(record, stat_cache, incremental, pending_upserts, pending_unchanged)
+            opaque_record = _collapse_if_opaque(
+                record,
+                should_recurse,
+                use_listing=_USE_DIRECTORY_LISTING and not force_guard,
+                cancel_event=cancel_event,
+                tracker=tracker,
+            )
+            if opaque_record is not None:
+                pending_upserts.append(opaque_record)  # always rewritten (ADR-0042)
+            else:
+                _classify_record(
+                    record, stat_cache, incremental, pending_upserts, pending_unchanged
+                )
+                if should_recurse:
+                    recurse_into.append(record.path)
             tracker.add(1)
-            if should_recurse:
-                recurse_into.append(record.path)
 
         index.begin_scan_tracking()
         try:
