@@ -528,3 +528,127 @@ def test_adding_and_removing_an_empty_directory_makes_m1_refuse(
         transient.rmdir()  # the tree looks identical again, except the parent's mtime moved
         detail = _direct_delete_directory_mismatch(candidate, index)
         assert detail is not None and "changed since the scan" in detail
+
+
+# --- the exact fail-open / fail-closed branch table of the M1 vanished-vs-unreadable decision ----
+
+
+def _faulty_stat_calls(monkeypatch: pytest.MonkeyPatch, error: OSError, suffix: str) -> None:
+    """Makes os.stat AND os.lstat raise `error` for paths ending in `suffix`."""
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def wrap(real: Callable[..., os.stat_result]) -> Callable[..., os.stat_result]:
+        def inner(path: object, *args: object, **kwargs: object) -> os.stat_result:
+            if str(path).endswith(suffix):
+                raise error
+            return real(path, *args, **kwargs)
+
+        return inner
+
+    monkeypatch.setattr(os, "stat", wrap(real_stat))
+    monkeypatch.setattr(os, "lstat", wrap(real_lstat))
+
+
+def test_m1_hardlink_loop_branch_table_unreadable_refuses_vanished_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import reclaim.executor as executor_module
+
+    nm = _node_modules(tmp_path)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidate = _candidate_for(nm, index, retention_days=None)
+        monkeypatch.setattr(executor_module, "_opaque_aggregate_mismatch", lambda _r: None)
+
+        _faulty_stat_calls(monkeypatch, PermissionError(13, "denied"), "react.js")
+        denied = _direct_delete_directory_mismatch(candidate, index)
+        assert denied is not None and "could not be inspected" in denied
+        monkeypatch.undo()
+        monkeypatch.setattr(executor_module, "_opaque_aggregate_mismatch", lambda _r: None)
+
+        _faulty_stat_calls(monkeypatch, FileNotFoundError(2, "gone"), "react.js")
+        assert _direct_delete_directory_mismatch(candidate, index) is None  # vanished: skipped
+        monkeypatch.undo()
+
+
+def test_opaque_root_that_cannot_be_inspected_refuses_but_a_vanished_one_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import reclaim.executor as executor_module
+
+    nm = _node_modules(tmp_path)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        record = index.get_record(nm)
+        assert record is not None
+        _faulty_stat_calls(monkeypatch, PermissionError(13, "denied"), "node_modules")
+        assert executor_module._opaque_aggregate_mismatch(record) is not None
+        monkeypatch.undo()
+        _faulty_stat_calls(monkeypatch, FileNotFoundError(2, "gone"), "node_modules")
+        assert executor_module._opaque_aggregate_mismatch(record) is None
+        monkeypatch.undo()
+
+
+# --- identity check past MAX_PATH ---------------------------------------------------------------
+
+
+def test_identity_check_verifies_an_over_max_path_file_instead_of_reading_it_as_vanished(
+    tmp_path: Path,
+) -> None:
+    from reclaim.preflight import check_identity_unchanged_since_scan
+
+    deep = _deep_dir(tmp_path / "ident")
+    os.makedirs(long_path(deep), exist_ok=True)  # noqa: PTH103 -- \\?\ str, not Path
+    target = deep / "f.bin"
+    with open(long_path(target), "wb") as handle:  # noqa: PTH123 -- \\?\ str, not Path
+        handle.write(b"x" * 10)
+    assert len(str(target)) > 260
+    try:
+        live = os.stat(long_path(target))  # noqa: PTH116 -- \? str
+        same = check_identity_unchanged_since_scan(
+            target,
+            recorded_dev=live.st_dev,
+            recorded_ino=live.st_ino,
+            recorded_mtime=live.st_mtime,
+            recorded_size_bytes=10,
+        )
+        assert same.identity_changed is False and same.live_ino == live.st_ino
+        swapped = check_identity_unchanged_since_scan(
+            target,
+            recorded_dev=live.st_dev,
+            recorded_ino=live.st_ino + 1,  # a different file than the scan recorded
+            recorded_mtime=live.st_mtime,
+            recorded_size_bytes=10,
+        )
+        assert swapped.identity_changed is True
+    finally:
+        shutil.rmtree(long_path(tmp_path / "ident"), ignore_errors=True)
+
+
+def test_identity_check_branch_table_vanished_passes_unreadable_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.preflight import check_identity_unchanged_since_scan
+
+    target = tmp_path / "f.bin"
+    target.write_bytes(b"x")
+    args = {"recorded_dev": 1, "recorded_ino": 2, "recorded_mtime": 3.0, "recorded_size_bytes": 1}
+    missing = check_identity_unchanged_since_scan(tmp_path / "missing.bin", **args)  # type: ignore[arg-type]
+    assert missing.identity_changed is False and missing.live_dev is None  # vanished: unchanged
+    _faulty_stat_calls(monkeypatch, PermissionError(13, "denied"), "f.bin")
+    denied = check_identity_unchanged_since_scan(target, **args)  # type: ignore[arg-type]
+    assert denied.identity_changed is True and denied.live_dev is None  # unverifiable: refuse
+    monkeypatch.undo()
+
+
+def test_directory_probe_targets_are_found_past_max_path(tmp_path: Path) -> None:
+    from reclaim.preflight import _top_level_file_probe_targets
+
+    deep = _deep_dir(tmp_path / "probe")
+    os.makedirs(long_path(deep), exist_ok=True)  # noqa: PTH103 -- \\?\ str, not Path
+    with open(long_path(deep / "a.bin"), "wb") as handle:  # noqa: PTH123 -- \\?\ str, not Path
+        handle.write(b"a")
+    try:
+        assert _top_level_file_probe_targets(deep, limit=5) == [deep / "a.bin"]
+    finally:
+        shutil.rmtree(long_path(tmp_path / "probe"), ignore_errors=True)

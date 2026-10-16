@@ -1332,6 +1332,19 @@ def _live_subtree_records(root: Path) -> list[FileRecord]:
     return records
 
 
+def _entry_vanished(path: Path) -> bool:
+    """True ONLY on a definitive not-found for the entry itself (`lstat`, long form). Any other
+    error -- notably PermissionError -- is "cannot tell", i.e. False: `os.path.lexists` reports
+    False on every OSError, which would turn an unreadable entry into a skipped (unverified) one."""
+    try:
+        os.lstat(long_path(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _opaque_aggregate_mismatch(root: FileRecord) -> str | None:
     """ADR-0042: live recount of one opaque dependency-tree root against the aggregates the scan
     recorded for it. The files below it are not index rows, so the per-file recorded-identity
@@ -1345,7 +1358,7 @@ def _opaque_aggregate_mismatch(root: FileRecord) -> str | None:
     mid-walk) is a mismatch, never a pass. A root that no longer exists is not (nothing left to
     delete -- the same stance the per-file loop takes for a vanished entry)."""
     posix_path = root.path.as_posix()
-    if not os.path.lexists(long_path(root.path)):
+    if _entry_vanished(root.path):
         return None
     live = aggregate_tree(root.path, use_listing=False)
     if live is None:
@@ -1459,7 +1472,7 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
             # i.e. a deep venv file was silently never hardlink-checked (D12).
             nlink = os.stat(long_path(live_record.path), follow_symlinks=False).st_nlink  # noqa: PTH116 -- \\?\ str, not Path
         except OSError as exc:
-            if not os.path.lexists(long_path(live_record.path)):
+            if _entry_vanished(live_record.path):
                 continue  # vanished since the walk: nothing left to delete there
             # Present but unreadable: it cannot be hardlink-checked, so fail CLOSED.
             return f"{posix_path}: could not be inspected for hardlinks ({exc})"

@@ -130,10 +130,11 @@ def _top_level_file_probe_targets(path: Path, *, limit: int) -> list[Path]:
     attempt still surfaces that condition on its own; this probe simply has nothing to add.
     """
     try:
-        entries = list(os.scandir(path))
+        # `\\?\` form (D12): a bare scandir past MAX_PATH raises and read as an empty listing.
+        entries = list(os.scandir(long_path(path)))
     except OSError:
         return []
-    files = [Path(entry.path) for entry in entries if entry.is_file(follow_symlinks=False)]
+    files = [path / entry.name for entry in entries if entry.is_file(follow_symlinks=False)]
     return files[:limit]
 
 
@@ -152,9 +153,9 @@ def check_file_in_use(
     nothing here can cause a locked file to be silently reported as successfully removed.
     """
     if not is_dir:
-        return _raw_probe_exclusive_open(str(path), is_dir=False)
+        return _raw_probe_exclusive_open(long_path(path), is_dir=False)
     return any(
-        _raw_probe_exclusive_open(str(candidate_file), is_dir=False)
+        _raw_probe_exclusive_open(long_path(candidate_file), is_dir=False)
         for candidate_file in _top_level_file_probe_targets(path, limit=max_directory_samples)
     )
 
@@ -374,17 +375,25 @@ def check_identity_unchanged_since_scan(
     a caller must supply (this module has no index/DB access of its own; see
     `executor._preflight_skip_reason` for where the baseline comes from).
 
-    Fails safe toward "not a mismatch" (returns `identity_changed=False`) when `path` can no
-    longer be stat'd at all -- a vanished path is `apply_batch`'s existing per-item
-    `try/except`'s problem to report as a failed item, not this probe's; manufacturing a
-    skip_reason for a condition that already has its own honest failure path would just make
-    that failure harder to find in the logs, not safer.
+    Returns `identity_changed=False` when `path` has VANISHED (definitive not-found): a
+    vanished path is `apply_batch`'s existing per-item `try/except`'s problem to report as a
+    failed item, not this probe's; manufacturing a skip_reason for a condition that already has
+    its own honest failure path would just make that failure harder to find in the logs, not
+    safer. Any OTHER stat error (permission, sharing fault) means the identity could not be
+    verified and reports `identity_changed=True` -- an unverifiable candidate is refused, never
+    passed. The stat uses the `\\?\` form, so a path past MAX_PATH is verified, not "vanished".
     """
     try:
-        st = path.stat(follow_symlinks=False)
-    except OSError:
+        # `\\?\` form (D12): a bare stat past MAX_PATH raises, which used to read as "vanished"
+        # and let a swapped file through.
+        st = os.stat(long_path(path), follow_symlinks=False)  # noqa: PTH116 -- \\?\ str
+    except OSError as exc:
+        # Only a definitive not-found is "vanished" (apply_batch's per-item handling reports
+        # it). Anything else -- PermissionError, a sharing fault -- means the identity could not
+        # be verified, which must refuse rather than pass (fail closed, rule 98a).
+        vanished = isinstance(exc, FileNotFoundError | NotADirectoryError)
         return IdentityCheck(
-            identity_changed=False,
+            identity_changed=not vanished,
             recorded_dev=recorded_dev,
             recorded_ino=recorded_ino,
             live_dev=None,
