@@ -38,8 +38,15 @@ was rejected: the uninstaller's `DelTree` would follow it.
   volume survives uninstall and is deleted by hand.
 * A config.toml containing `[storage]` is rejected by older builds (unknown top-level key, the
   ADR-0027 hard reject): downgrading requires removing the section.
-* A relative `--config` default is still CWD-relative for commands that have it (pre-existing);
-  `scan`/`reconcile`/`index-prune` read the config next to the executable.
+* The `--config` default is anchored like the data folder (`data_root()/config.toml`: the executable's
+  directory when frozen, plain `config.toml` in dev/test), so every command reads the same config
+  whatever the launch cwd. Before this change the default was cwd-relative for commands that have
+  `--config`. A task with a different cwd and no `--config` therefore now reads the installed
+  config (exclusions, `[autoclean]`) instead of built-in defaults.
+* An explicit `--config` that is not an existing file exits 2 for commands that resolve the index
+  (a typo must not fall back to the legacy index). `check-disk-space` and `auto-clean` never open
+  the index and keep their pre-existing tolerance of a missing config.
+* `index_dir` must be a directory: a value ending in `.sqlite3`/`.sqlite`/`.db` is rejected.
 
 ## Alternatives
 

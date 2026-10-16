@@ -207,3 +207,25 @@ def test_index_dir_naming_the_index_file_is_rejected(tmp_path: Path) -> None:
     cfg.write_text(_storage_toml(r"D:\x\reclaim_index.sqlite3"), encoding="utf-8")
     with pytest.raises(ValueError, match="directory"):
         resolve_index_db(None, cfg)
+
+
+def test_default_config_path_is_anchored_on_the_exe_dir_when_frozen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Teeth for the verifier's mutation (default reverted to a cwd-relative Path): exercises the
+    real `default_config_path` / `data_root` wiring instead of patching the resulting constant."""
+    from reclaim import app_paths
+    from reclaim.index_location import default_config_path
+
+    assert default_config_path() == Path("config.toml")  # dev/test: unchanged
+    monkeypatch.setattr(app_paths, "compiled_exe_dir", lambda: tmp_path / "install")
+    assert default_config_path() == tmp_path / "install" / "config.toml"
+    assert default_index_path() == tmp_path / "install" / "data" / INDEX_FILE_NAME
+
+
+def test_directory_given_as_config_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "adir").mkdir()
+    monkeypatch.setattr(cli_module, "_run_serve", lambda *_a, **_k: pytest.fail("must not serve"))
+    assert main(["serve", "--config", str(tmp_path / "adir")]) == 2

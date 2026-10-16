@@ -1741,11 +1741,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             own_config is not None
             and own_config != _DEFAULT_CONFIG_PATH
-            and not own_config.exists()
+            and not own_config.is_file()
         ):
             # A typo'd explicit --config would otherwise resolve to the legacy index in silence.
             print(  # noqa: T201
-                f"reclaim {args.command}: --config {own_config} does not exist",
+                f"reclaim {args.command}: --config {own_config} does not exist or is not a file",
                 file=sys.stderr,
             )
             return 2
