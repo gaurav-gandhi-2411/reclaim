@@ -3,7 +3,52 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-15 ~12:40 IST (NEW BUILD INSTALLED AND VERIFIED; FRESH SCAN RUNNING; GG AWAY) -- READ THIS FIRST
+## CHECKPOINT 2026-10-17 ~01:30 IST (BUILD 9 INSTALLED, INDEX ON D:, OPAQUE-TREE WORK IN FLIGHT) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-15 checkpoint below for the install, the index location and the open work; its uninstall/reinstall verification and merge-policy notes stay valid.
+
+### Owner facts recorded (GG, 2026-10-16)
+- The 80% disk alert was **visually confirmed by GG**: it fired when C: was at 97% (owner-reported). The "toast glance" human check is closed.
+- The pagefile is on **D:** again (`D:\pagefile.sys`, VERIFIED `Win32_PageFileUsage` 2026-10-16 22:50).
+- gg-portfolio cleanup (worktrees, verify clones, scratch) is **handled by GG in the gg-portfolio session**; this session touches no gg-portfolio path. A live gg-portfolio `claude.exe` (started 22:47 on 10-16, cwd the gg-portfolio repo) was found by a working-directory scan before anything was done, so nothing was deleted.
+
+### Repo (VERIFIED `gh pr view`)
+- Merged by me under the gate: #168 `460192c`, #169 `d3689ee`, #170 `d0f46a8`, #171 `70eaf6b`, #172 `609aa15`, #173 `42f8704`, **#175 `4ed17df`** (mcp 1.29.0 -> 1.30.0, lockfile only: pip-audit started failing every PR on CVE-2026-59951; reclaim's MCP server is stdio-only so not exploitable, gate 3b needed the reviewable/generated split in the body), **#174 `a446853`** (`[storage] index_dir`, ADR-0041).
+- #174 had TWO hostile verifier passes. Pass 1 found a real defect: `--config` defaulted to a cwd-relative `config.toml` while scan/reconcile/index-prune read the exe-dir config, so from another cwd they could use different indexes, and a typo'd `--config` fell back to the legacy index silently; plus tests that did not fail under the mutation "resolver ignores --config". Fixed (default now `data_root()/config.toml`, an explicit missing/non-file `--config` exits 2, `index_dir` naming an index file is rejected). Pass 2: no behavioural defect; one surviving mutation (default reverted) and a stale ADR line, both fixed. Full verify on the branch: 2034 passed, 19 skipped, mypy and ruff clean; CI green after merging main.
+
+### Installed app: build 9 (VERIFIED)
+- Upgraded in place: build 8 first (`4b2a2e32...e889`, from `42f8704`), then **build 9 = `D:\reclaim-build\installer-a446853.exe`, SHA-256 `65d1501e6ca5e2bd51d52e9bb967b3031cd23b7782c0ef204765ee91978c208a`, 306,642,861 bytes, built from `a446853`** (DLL closure OK, safe-mode smoke all PASS, serve/scan/AI smoke all PASS). Logs `install8.log`, `install9.log`, both exit 0.
+- Survived both upgrades: `config.toml` (sha `c32f52e9...3d44` unchanged by the installer), `[exclusions]`, both tasks (`Reclaim Disk Space Check (gaura)` next run 17-10 05:00, `Reclaim Weekly Auto-Clean (gaura)` next Sun 18-10 10:00), AUMID key, `reclaim-notify` key, uninstall entry.
+- Attribute storage (scanner mask, #170) on the installed exe against a fixture: build 7 stored files as `0x20`, **build 8/9 store files `0x0`, dirs `0x10`, 0 rows with out-of-mask bits** (`attr_probe.py`).
+- The scheduled auto-clean ran by itself at the 10-16 logon (08:44 IST): removed 4.09 GB, freed 2.56 GB (`regenerable_audit.jsonl`); `%TEMP%\claude` is skipped and `--dry-run` from a non-install cwd still reports the exclusions applied (`*fr-en-transformer*` on the `%TEMP%\claude` item); would remove 38.1 GB now.
+
+### Index moved to D: (VERIFIED, `D:\reclaim-build\tools\move_index.py`, log `tmp\move_index.log`)
+- WAL checkpoint(TRUNCATE) on the source, copy to `D:\reclaim-index\reclaim_index.sqlite3`: 13,837,266,944 bytes both, 12,795,878 rows both, `PRAGMA quick_check` ok, SHA-256 `d0ea890d...59a25d` identical.
+- `[storage] index_dir = 'D:\reclaim-index'` appended to the installed `config.toml` (now sha `f28fc41a...c87b`; backup `D:\reclaim-build\config.toml.pre-indexdir`). Proof the installed exe uses it: with the C: copy renamed away, `reclaim.exe reconcile C:\` from `%USERPROFILE%` returned `indexed_bytes=831,763,867,483` and created no index on C:. The C: copy was then deleted (separate command): **C: free 31.8 -> 44.7 GB (+12.9 GB)**.
+- The uninstaller's delete-data does not know `index_dir`; the D: index survives an uninstall and is deleted by hand (ADR-0041).
+
+### Why the scan was 12.8M rows (VERIFIED, read-only on the real index; raw `D:\reclaim-build\index_breakdown.json`, `index_buckets2.json`, `index_kinds.json`)
+- One device only (C:), no rows outside `C:/Users/gaura/`, 1,641 reparse rows, 0 reparse directories with children: **the scanner does not follow junctions** (android-sdk is one row, `is_reparse_point=1`, target `D:\relocated\sdks\android-sdk`). HF cache and pip cache are plain directories on C: now.
+- Top level: `ml-projects` 6.37M (49.8%), `AppData` 5.00M (39.1%; Temp 3.84M, uv 0.65M), `anaconda3` 0.41M. gg-portfolio anywhere 5.72M (44.7%, 179.6 GiB: scratch 3.50M/108 GiB + worktrees/verify copies 2.16M/68 GiB). All `%TEMP%\claude` 3.65M (28.5%). Excluded projects 0.29M (2.3%).
+- Rows below an ancestor named: `node_modules` 6.93M (54.1%), `.venv` 2.13M (16.7%), `site-packages` 1.04M (8.1%), `.git` 0.17M (1.3%), `__pycache__` 0.06M (0.5%), `venv` 0.004M; the `%TEMP%\claude` rule adds only about 0.2M beyond these (3.30M of its 3.65M are already under a `node_modules`).
+- Per row 948 bytes; `idx_files_path_lower` (2.80 GB) duplicates the path PK index (2.79 GB).
+
+### Warm-up evidence (VERIFIED where stated)
+- The 10-15 warm-up on the real index was still `computing` after 120 min and was lost in the 22:31 reboot. A second try on a D: copy (index with persisted hashes, source of `42f8704`, `warm_measure.py`) was still computing at **4165 s (69 min)** and its server had grown to **6.3 GB RSS**, starving a build for RAM; I stopped it by PID (the scratch copy was removed by `scratch_index.py`). So the "before" warm-up time is **not measured** (> 69 min, > 6.3 GB). The first `/api/summary` timing on a warmed index is therefore still NOT measured.
+- No dashboard server is running now (reboot); start it only after the opaque-tree change, or expect a multi-hour, multi-GB warm-up.
+
+### In flight / next
+1. Opaque dependency trees (ADR-0042 written, branch `feat/opaque-dependency-trees`, worktree `reclaim-wt-opaque`): executor implementing; then hostile verifier passes, PR, rescan of the real profile into a scratch index on D: to measure rows, index size and warm-up; then build 10 and install.
+2. HOWTO update, then the final report.
+
+### WHEN GG HAS TIME (this round)
+1. **MCP Approve click** (isolated, safe; no real files involved): from `C:\Users\gaura\ml-projects\reclaim` run `.venv\Scripts\python.exe D:\reclaim-build\tools\mcp_approval_check.py --leave-open`, open the printed `http://127.0.0.1:8431/` within 10 minutes, click Approve on the card, then stop the process by the printed PID (`Stop-Process -Id <pid>`) and delete `%LOCALAPPDATA%\Temp\reclaim_mcp7` after looking at it. Caveat: its MCP process exits, so the click records the decision but nothing executes.
+2. **Ollama `llama-server.exe`** (not mine; 10-11 GB resident, PID changes) repeatedly leaves under 8 GB free RAM and blocked build 9 at pre-flight until it freed memory; consider a smaller model or `OLLAMA_KEEP_ALIVE`.
+3. Index-size decision once the opaque-tree PR is up: the venv kinds are included only if the hardlink teeth test passes; the `idx_files_path_lower` duplicate index (2.8 GB) is plan-only (ADR-0042).
+4. A stray `C:\Users\gaura\AppData\Local\Programs\Reclaim.stale-20260826` folder exists (not mine).
+5. Lower priority: Docker disk image to D:, WSL export, 1.4 GB duplicate Nuitka cache on C:, optional elevated USN read.
+
+## CHECKPOINT 2026-10-15 ~12:40 IST (NEW BUILD INSTALLED AND VERIFIED; FRESH SCAN RUNNING; GG AWAY) -- superseded by the 10-17 checkpoint above for the install/index; its verification notes stay valid
 
 VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-13 04:45 checkpoint below for the build and the install chain (its merge policy, test-debt and gate-patch notes stay valid).
 
