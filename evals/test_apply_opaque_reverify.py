@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from reclaim.index import ScanIndex
 from reclaim.models import Candidate, Tier, Verdict
 from reclaim.preflight import check_hardlink_shared_active_install
 from reclaim.safety import SafetyValidator
-from reclaim.scanner import long_path, scan_tree
+from reclaim.scanner import aggregate_tree, long_path, scan_tree
 
 # ADR-0042 teeth: a dependency tree (node_modules, .venv, ...) is ONE index row carrying
 # aggregates, so the per-file recorded-identity comparison M1 used to run over it is replaced by
@@ -357,3 +358,102 @@ def test_an_unreadable_live_file_in_an_opaque_tree_makes_m1_refuse_not_skip(
         monkeypatch.setattr(os, "stat", flaky_stat)
         detail = _direct_delete_directory_mismatch(candidate, index)
     assert detail is not None and "could not be inspected" in detail
+
+
+# --- each component of the aggregate comparison is independently load-bearing ------------------
+
+
+def _restore_mtime(path: Path, before: os.stat_result) -> None:
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+def test_only_the_byte_total_changing_makes_the_direct_delete_refuse(tmp_path: Path) -> None:
+    """Same file count, same newest mtime (the rewritten file's old mtime is restored, no
+    directory entry changes): the logical byte total alone differs."""
+    nm = _node_modules(tmp_path)
+    deep = nm / "react" / "lib" / "react.js"
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidate = _candidate_for(nm, index, retention_days=None)
+        before = deep.stat()
+        deep.write_bytes(b"s" * 300)  # was 500 bytes
+        _restore_mtime(deep, before)
+        assert deep.stat().st_mtime_ns == before.st_mtime_ns
+        detail = _direct_delete_directory_mismatch(candidate, index)
+        assert detail is not None and "changed since the scan" in detail
+        result = _apply(candidate, index, tmp_path)
+    assert result.succeeded is False and nm.exists()
+
+
+def test_only_the_physical_byte_total_changing_makes_the_direct_delete_refuse(
+    tmp_path: Path,
+) -> None:
+    """A same-size file replaced by a hardlink of another file in the tree, timestamps restored:
+    file count, logical bytes and every mtime are unchanged; only the physical total drops."""
+    nm = tmp_path / "app" / "node_modules"
+    (nm / "a").mkdir(parents=True)
+    (nm / "b").mkdir()
+    file_a = nm / "a" / "x.js"
+    file_b = nm / "b" / "x.js"
+    file_a.write_bytes(b"1" * 100)
+    file_b.write_bytes(b"2" * 100)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidate = _candidate_for(nm, index, retention_days=None)
+        before_b = file_b.stat()
+        before_dir = file_b.parent.stat()
+        file_b.unlink()
+        os.link(file_a, file_b)
+        os.utime(file_b, ns=(before_b.st_atime_ns, before_b.st_mtime_ns))
+        os.utime(file_b.parent, ns=(before_dir.st_atime_ns, before_dir.st_mtime_ns))
+        # the premise: the other four components are untouched
+        live = aggregate_tree(nm, use_listing=False)
+        recorded = index.get_record(nm)
+        assert live is not None and recorded is not None
+        assert (live.files, live.bytes, live.newest_mtime) == (
+            recorded.agg_files,
+            recorded.agg_bytes,
+            recorded.agg_newest_mtime,
+        )
+        assert live.physical_bytes != recorded.agg_physical_bytes
+        assert _direct_delete_directory_mismatch(candidate, index) is not None
+
+
+def test_a_logical_byte_change_that_leaves_the_physical_total_equal_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """Isolates the LOGICAL byte total: two offsetting swaps keep the file count, every mtime and
+    the physical total (+80 and -80) unchanged while the logical total drops by 20."""
+    nm = tmp_path / "app" / "node_modules"
+    for sub in ("p", "q", "r", "t"):
+        (nm / sub).mkdir(parents=True)
+    file_p, file_q = nm / "p" / "f.js", nm / "q" / "f.js"
+    file_r, file_t = nm / "r" / "f.js", nm / "t" / "f.js"
+    file_p.write_bytes(b"p" * 50)
+    os.link(file_p, file_q)  # one inode, two names
+    file_r.write_bytes(b"r" * 80)
+    file_t.write_bytes(b"t" * 30)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        scan_tree(tmp_path, index)
+        candidate = _candidate_for(nm, index, retention_days=None)
+        recorded = index.get_record(nm)
+        assert recorded is not None
+
+        def swap(target: Path, make: Callable[[], None]) -> None:
+            before, before_dir = target.stat(), target.parent.stat()
+            target.unlink()
+            make()
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.utime(target.parent, ns=(before_dir.st_atime_ns, before_dir.st_mtime_ns))
+
+        swap(file_q, lambda: file_q.write_bytes(b"q" * 80))  # linked 50 -> new 80
+        swap(file_r, lambda: os.link(file_t, file_r))  # standalone 80 -> link to the 30-byte inode
+        live = aggregate_tree(nm, use_listing=False)
+        assert live is not None
+        assert (live.files, live.physical_bytes, live.newest_mtime) == (
+            recorded.agg_files,
+            recorded.agg_physical_bytes,
+            recorded.agg_newest_mtime,
+        )
+        assert live.bytes == recorded.agg_bytes - 20
+        assert _direct_delete_directory_mismatch(candidate, index) is not None

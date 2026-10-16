@@ -1335,7 +1335,7 @@ def _live_subtree_records(root: Path) -> list[FileRecord]:
 def _opaque_aggregate_mismatch(root: FileRecord) -> str | None:
     """ADR-0042: live recount of one opaque dependency-tree root against the aggregates the scan
     recorded for it. The files below it are not index rows, so the per-file recorded-identity
-    comparison cannot run; instead the live tree's (files, bytes, newest mtime) must EQUAL the
+    comparison cannot run; instead the live tree's (files, bytes, physical bytes, newest mtime) must EQUAL the
     recorded triple, which still refuses an added, removed, grown or recently-written file.
     The recount uses the scandir walk with a real per-file stat (`aggregate_tree(use_listing=
     False)`), so a write the directory listing has not caught up with is seen too (ADR-0035).
@@ -1349,12 +1349,12 @@ def _opaque_aggregate_mismatch(root: FileRecord) -> str | None:
     live = aggregate_tree(root.path, use_listing=False)
     if live is None:
         return f"{posix_path}: opaque tree could not be fully re-measured (unreadable or changed)"
-    recorded = (root.agg_files, root.agg_bytes, root.agg_newest_mtime)
-    seen_now = (live.files, live.bytes, live.newest_mtime)
+    recorded = (root.agg_files, root.agg_bytes, root.agg_physical_bytes, root.agg_newest_mtime)
+    seen_now = (live.files, live.bytes, live.physical_bytes, live.newest_mtime)
     if recorded != seen_now:
         return (
-            f"{posix_path}: opaque tree changed since the scan -- live (files, bytes, newest "
-            f"mtime)={seen_now} differs from the scan's recorded {recorded}"
+            f"{posix_path}: opaque tree changed since the scan -- live (files, bytes, physical "
+            f"bytes, newest mtime)={seen_now} differs from the scan's recorded {recorded}"
         )
     return None
 
