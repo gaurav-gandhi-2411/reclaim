@@ -160,3 +160,21 @@ These refine, and do not change, the decisions above.
   directory (the entry a parent's listing carries lags), at scan time and live alike.
 * **M1 compares five values:** files, logical bytes, physical bytes, newest file mtime, newest
   directory mtime. Each is pinned by a test that changes only that value.
+* **Case-insensitive invalidation.** `drop_opaque_rows` matches `path_lower COLLATE NOCASE` (the
+  existing `idx_files_path_lower`, plan pinned in `tests/test_query_plan_coverage.py`), because NTFS
+  paths are case-insensitive while index paths keep the case they were walked with. It removes
+  only rows with `opaque = 1`. Each call commits on its own, independently of the scan's batch
+  flushes: a crash after the drop leaves the candidate missing until the next scan, never stale.
+  Other index paths (child rows, prune, stat cache) keep their pre-existing case-sensitive keying;
+  a scan rooted with a different case than a previous one can leave case-variant rows for the same
+  file, which predates this change.
+* **Fail-closed vanished-vs-unreadable table.** Only a definitive not-found (`FileNotFoundError`,
+  `NotADirectoryError` on an `lstat` in the long form) counts as vanished. Anything else on a live
+  file in an opaque tree (M1 hardlink loop), on an opaque root, or on a candidate's identity check
+  (`check_identity_unchanged_since_scan`, now long-path aware) refuses. `os.path.lexists` was
+  replaced because it reports False for every OSError. `aggregate_tree` also refuses a reparse-point
+  root (it would measure the target); the scanner never collapses a junction named like an opaque
+  kind (`should_recurse` is false for reparse points), pinned for both walk paths.
+* **Candidate pools.** An opaque root is a directory row. Dedup, large-file and extension pools
+  filter on `is_dir = 0`, so they never see it however large its size or aggregates
+  (`test_directory_rows_are_excluded_from_the_file_candidate_pools`).
