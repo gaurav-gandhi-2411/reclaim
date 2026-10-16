@@ -391,3 +391,55 @@ def test_row_count_does_not_grow_with_the_size_of_an_opaque_tree(
             counts.append(len(_rows(index, root)))
             assert index.get_record(root / "node_modules").agg_files == n_files  # type: ignore[union-attr]
     assert counts[0] == counts[1] == 3  # src, src/a.py, node_modules
+
+
+# --- a scan rooted INSIDE an opaque tree (known limitation, bounded by a safe invalidation) -------
+
+
+@_BOTH_PATHS
+def test_scanning_a_path_inside_an_opaque_tree_drops_the_enclosing_aggregate_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    """Characterisation: the inner scan indexes the tree's files as ordinary rows, so the earlier
+    whole-project scan's aggregate row for `node_modules` must not survive next to them (it would
+    be counted twice and could be compared as current). It is dropped; the candidate returns when
+    the enclosing root is rescanned."""
+    root = tmp_path / "proj"
+    _build_tree(root)
+    nm = root / "node_modules"
+    with _scan(root, tmp_path / "i.sqlite3", monkeypatch, listing) as index:
+        assert index.get_record(nm).opaque is True  # type: ignore[union-attr]
+        whole = index.subtree_size_bytes(root)
+        scan_tree(nm / "react", index)  # the root of this scan is INSIDE node_modules
+        assert index.get_record(nm) is None  # the stale aggregate is gone, not double counted
+        react_files = sum(p.stat().st_size for p in (nm / "react").rglob("*") if p.is_file())
+        assert index.subtree_size_bytes(nm) == react_files  # only what the inner scan indexed
+        assert index.subtree_size_bytes(root) < whole  # under-counts, never over-counts
+        # rescanning the enclosing root restores the single aggregate row and the full size
+        scan_tree(root, index)
+        assert index.get_record(nm).opaque is True  # type: ignore[union-attr]
+        assert index.subtree_size_bytes(root) == whole
+        assert not [p for p in _rows(index, root) if p.startswith(nm.as_posix() + "/")]
+
+
+@_BOTH_PATHS
+def test_scanning_the_opaque_directory_itself_drops_its_own_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    root = tmp_path / "proj"
+    _build_tree(root)
+    nm = root / "node_modules"
+    with _scan(root, tmp_path / "i.sqlite3", monkeypatch, listing) as index:
+        scan_tree(nm, index)
+        assert index.get_record(nm) is None
+        assert index.record_exists(nm / "react" / "index.js")
+
+
+def test_scanning_elsewhere_leaves_opaque_rows_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "proj"
+    _build_tree(root)
+    with _scan(root, tmp_path / "i.sqlite3", monkeypatch, True) as index:
+        scan_tree(root / "src", index)
+        assert index.get_record(root / "node_modules").opaque is True  # type: ignore[union-attr]

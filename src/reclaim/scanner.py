@@ -1443,6 +1443,16 @@ def scan_tree(
     # `_entry_is_risky`/`is_network_drive`'s docstrings.
     force_guard = is_network_drive(root)
     risk_counter = _RiskCounter()
+    # ADR-0042: a scan rooted at or inside an opaque-named directory indexes that tree's
+    # contents normally; an opaque row for it (or an enclosing one) from an earlier scan
+    # would then be counted next to those rows, so it is dropped up front.
+    enclosing_opaque = [
+        candidate.as_posix()
+        for candidate in (root, *root.parents)
+        if candidate.name.lower() in OPAQUE_DIR_NAMES
+    ]
+    if enclosing_opaque:
+        index.drop_opaque_rows(enclosing_opaque)
 
     all_skipped: list[SkippedPath] = []
     try:

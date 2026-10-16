@@ -252,6 +252,12 @@ _CASES: dict[str, Case] = {
         reason="DELETE ... WHERE path >= ? AND path < ? (prefix range via _prefix_range) + COMMIT "
         "-- the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
     ),
+    "drop_opaque_rows": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE ... WHERE path = ? AND opaque = 1 (primary-key point delete) + COMMIT -- "
+        "the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
+    ),
     "opaque_roots_under": Case(
         lambda idx: idx.opaque_roots_under(_SCOPE),
         expect_index=True,

@@ -802,6 +802,21 @@ class ScanIndex:
         self._conn.commit()
         return count
 
+    def drop_opaque_rows(self, paths: Sequence[str]) -> int:
+        """Deletes the OPAQUE row (ADR-0042) at each of `paths` (POSIX form), if there is one; an
+        ordinary row at the same path is left alone. A scan rooted inside an opaque tree indexes
+        that tree's contents normally, so an enclosing opaque row left in place would be counted
+        next to them; dropping it makes the candidate disappear until the enclosing root is
+        rescanned, which is the safe direction (it can never be compared as current)."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
+        count = 0
+        for path in paths:
+            count += self._conn.execute(
+                "DELETE FROM files WHERE path = ? AND opaque = 1", (path.rstrip("/"),)
+            ).rowcount
+        self._conn.commit()
+        return count
+
     def opaque_roots_under(self, root: Path) -> list[FileRecord]:
         """Opaque-root rows (ADR-0042) at or under `root`, including `root` itself. Each carries
         the aggregates a per-file query over the same range cannot see."""

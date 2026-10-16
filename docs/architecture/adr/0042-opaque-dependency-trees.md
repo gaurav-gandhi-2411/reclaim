@@ -137,6 +137,26 @@ These refine, and do not change, the decisions above.
   not newer than the tree's newest (e.g. a `robocopy /COPY:DAT` over an existing file). The per-file
   identity M1 used to compare is gone for opaque trees; the live hardlink loop is unchanged. A
   content-digest column would close this and is the first thing to add if it matters.
-* **Scan root inside an opaque tree.** Scanning `...\node_modules` itself indexes its children
-  normally while an earlier whole-profile scan may hold an opaque row for it; rescan the enclosing
-  root to reconcile.
+* **Scan root inside an opaque tree.** Scanning `...\node_modules` (or a path below it) indexes
+  its contents as ordinary rows, so an opaque row for that tree left from an earlier scan would be
+  counted next to them. `scan_tree` therefore deletes the opaque row of its root and of every
+  ancestor up front (`ScanIndex.drop_opaque_rows`); the candidate reappears, as one row, when the
+  enclosing root is rescanned. Until then sizes under-count and never over-count. Characterised in
+  `tests/test_scanner_opaque.py`.
+
+## Addendum 2 (2026-10-17, after independent review)
+
+* **Long paths.** `check_hardlink_shared_active_install` and M1's per-file hardlink loop used a bare
+  `Path.stat()` / bare string, which fail past MAX_PATH (`LongPathsEnabled=0`) and read as "not
+  shared": the guard that justifies collapsing `.venv`/`venv`/`site-packages` failed open exactly on
+  deep site-packages paths. Both now use the `\\?\` form (Path values stay unprefixed), and M1 now
+  refuses when a live file is present but cannot be inspected (a vanished file is still skipped).
+* **Sixth column.** Decision 2 listed three columns plus `agg_physical_bytes`; a review showed that
+  renaming a direct child directory of an opaque root, or adding and removing an empty directory,
+  changes no file count, size or file mtime (the child keeps its own mtime). `agg_newest_dir_mtime`
+  (REAL, newest mtime of any directory in the tree, root included) closes that: it is compared by M1
+  and folded into the ADR-0035 recheck. `agg_newest_mtime` stays "newest non-directory entry";
+  `subtree_newest_mtime` takes the max of both. Directory mtimes come from a real `stat` of each
+  directory (the entry a parent's listing carries lags), at scan time and live alike.
+* **M1 compares five values:** files, logical bytes, physical bytes, newest file mtime, newest
+  directory mtime. Each is pinned by a test that changes only that value.
