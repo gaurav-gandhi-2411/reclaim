@@ -804,15 +804,21 @@ class ScanIndex:
 
     def drop_opaque_rows(self, paths: Sequence[str]) -> int:
         """Deletes the OPAQUE row (ADR-0042) at each of `paths` (POSIX form), if there is one; an
-        ordinary row at the same path is left alone. A scan rooted inside an opaque tree indexes
-        that tree's contents normally, so an enclosing opaque row left in place would be counted
-        next to them; dropping it makes the candidate disappear until the enclosing root is
-        rescanned, which is the safe direction (it can never be compared as current)."""
+        ordinary row at the same path is left alone. Matching is case-insensitive. A scan
+        rooted inside an opaque tree indexes that tree's contents normally, so an enclosing
+        opaque row left in place would be counted next to them; dropping it makes the candidate
+        disappear until the enclosing root is rescanned, which is the safe direction (it can never
+        be compared as current). Each call commits on its own, independently of the scan's batch
+        flushes: a crash after the drop leaves the candidate missing, never stale."""
         assert_not_real_profile_under_pytest(self._db_path, operation="delete rows from")
         count = 0
         for path in paths:
+            # `path_lower ... COLLATE NOCASE` (served by idx_files_path_lower): NTFS paths are
+            # case-insensitive while index paths keep the case they were walked with, and a scan
+            # root typed as `Node_Modules` must still find the row stored as `node_modules`.
             count += self._conn.execute(
-                "DELETE FROM files WHERE path = ? AND opaque = 1", (path.rstrip("/"),)
+                "DELETE FROM files WHERE path_lower = ? COLLATE NOCASE AND opaque = 1",
+                (path.rstrip("/").lower(),),
             ).rowcount
         self._conn.commit()
         return count

@@ -380,7 +380,7 @@ def is_cloud_sync_root(path: Path) -> bool:
     name_lower = path.name.lower()
     if any(name_lower.startswith(prefix) for prefix in _CLOUD_ROOT_FOLDER_PREFIXES):
         return True
-    return (path / ".dropbox").exists()
+    return os.path.exists(long_path(path / ".dropbox"))  # noqa: PTH110 -- \\?\ str
 
 
 @dataclass(frozen=True, slots=True)
@@ -921,6 +921,12 @@ def aggregate_tree(
     (progress / ETA accounting). `volume_serial`: the walk's already-known volume serial, so the
     listing is not asked to re-read and re-validate it for every opaque root (see
     `dirlist.list_directory`); `None` learns it from the first directory."""
+    try:
+        # Never measure THROUGH a junction/symlink root: os.stat below would follow it.
+        if os.lstat(long_path(root)).st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            return None
+    except OSError:
+        return None
     files = 0
     total_bytes = 0
     physical = 0

@@ -443,3 +443,85 @@ def test_scanning_elsewhere_leaves_opaque_rows_alone(
     with _scan(root, tmp_path / "i.sqlite3", monkeypatch, True) as index:
         scan_tree(root / "src", index)
         assert index.get_record(root / "node_modules").opaque is True  # type: ignore[union-attr]
+
+
+@_BOTH_PATHS
+def test_a_case_variant_scan_root_inside_an_opaque_tree_drops_the_enclosing_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    """NTFS is case-insensitive, index paths keep the case they were walked with: a scan rooted
+    at `.../Node_Modules/react` must still invalidate the row stored as `.../node_modules`."""
+    root = tmp_path / "proj"
+    _build_tree(root)
+    nm = root / "node_modules"
+    with _scan(root, tmp_path / "i.sqlite3", monkeypatch, listing) as index:
+        whole = index.subtree_size_bytes(root)
+        nm_bytes = sum(p.stat().st_size for p in nm.rglob("*") if p.is_file())
+        react_bytes = sum(p.stat().st_size for p in (nm / "react").rglob("*") if p.is_file())
+        scan_tree(root / "Node_Modules" / "react", index)  # different case than on disk
+        assert index.get_record(nm) is None
+        # the stale aggregate is gone (not counted next to the inner scan's rows): the project
+        # total is what is outside node_modules plus what the inner scan indexed
+        assert index.subtree_size_bytes(root) == whole - nm_bytes + react_bytes
+
+
+@_BOTH_PATHS
+def test_an_unreadable_directory_stat_inside_an_opaque_tree_prevents_collapsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    """Only the directory `os.stat` fails (listing/scandir succeed): the aggregate cannot be
+    complete, so it must report 'incomplete' -- not record a 0.0 directory mtime and collapse."""
+    root = tmp_path / "proj"
+    (root / "node_modules" / "ok").mkdir(parents=True)
+    (root / "node_modules" / "ok" / "i.js").write_bytes(b"12345")
+    (root / "node_modules" / "locked").mkdir()
+    (root / "node_modules" / "locked" / "s.js").write_bytes(b"s")
+
+    real_stat = os.stat
+
+    def flaky_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if str(path).endswith("locked"):
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", flaky_stat)
+    monkeypatch.setattr(scanner_module, "_USE_DIRECTORY_LISTING", listing)
+    assert aggregate_tree(root / "node_modules", use_listing=listing) is None
+    with ScanIndex(tmp_path / "i.sqlite3") as index:
+        stats = scan_tree(root, index, incremental=False)
+        record = index.get_record(root / "node_modules")
+        assert record is not None and record.opaque is False
+        assert record.agg_newest_dir_mtime is None and record.agg_files == 0
+        assert stats.skipped_unreadable_count >= 1  # the ordinary walk accounts for it
+        assert index.record_exists(root / "node_modules" / "ok" / "i.js")
+
+
+@_BOTH_PATHS
+def test_a_junction_named_like_an_opaque_kind_stays_a_plain_reparse_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "huge.bin").write_bytes(b"h" * 5000)
+    root = tmp_path / "proj"
+    (root / "app").mkdir(parents=True)
+    _make_junction(root / "node_modules", outside)  # directly under the scan root
+    _make_junction(root / "app" / ".venv", outside)  # nested
+    with _scan(root, tmp_path / "i.sqlite3", monkeypatch, listing) as index:
+        rows = _rows(index, root)
+        for junction in (root / "node_modules", root / "app" / ".venv"):
+            record = rows[junction.as_posix()]
+            assert record.is_reparse_point is True
+            assert record.opaque is False and record.agg_files == 0 and record.agg_bytes == 0
+        assert not [p for p in rows if "huge.bin" in p]  # target never followed
+        assert index.subtree_size_bytes(root) == 0
+
+
+def test_aggregate_tree_refuses_a_reparse_point_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "f.bin").write_bytes(b"x" * 10)
+    link = tmp_path / "node_modules"
+    _make_junction(link, outside)
+    assert aggregate_tree(link) is None
+    assert aggregate_tree(link, use_listing=False) is None

@@ -321,3 +321,50 @@ def test_newest_dir_mtime_round_trips_and_feeds_subtree_newest_mtime(tmp_path: P
         assert stored is not None and stored.agg_newest_dir_mtime == 777.0
         # a renamed/added directory entry moves a directory mtime, which counts as "recently used"
         assert idx.subtree_newest_mtime(Path("C:/p")) == 777.0
+
+
+def test_drop_opaque_rows_removes_only_opaque_rows_and_matches_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    with ScanIndex(tmp_path / "i.sqlite3") as idx:
+        plain_dir = replace(
+            _opaque("C:/p/plain/node_modules", files=0, nbytes=0, newest=None),
+            opaque=False,
+            agg_bytes=0,
+            agg_physical_bytes=0,
+        )
+        idx.upsert_records(
+            [
+                _opaque("C:/p/Node_Modules", files=2, nbytes=900, newest=1.0),
+                _opaque("C:/q/node_modules", files=2, nbytes=500, newest=1.0),
+                plain_dir,  # an ORDINARY directory row at a matching path
+                _file("C:/p/Node_Modules_extra/x.js", 5),
+            ],
+            scanned_at=1.0,
+        )
+        # lower-case request finds the mixed-case stored row; the ordinary row survives a drop
+        # even though its path is requested too.
+        assert idx.drop_opaque_rows(["C:/p/node_modules", "C:/p/plain/node_modules"]) == 1
+        assert not idx.record_exists(Path("C:/p/Node_Modules"))
+        assert idx.record_exists(Path("C:/p/plain/node_modules"))
+        assert idx.record_exists(Path("C:/q/node_modules"))  # other opaque row untouched
+        assert idx.record_exists(Path("C:/p/Node_Modules_extra/x.js"))  # prefix sibling untouched
+        # upper-case request finds a lower-case stored row
+        assert idx.drop_opaque_rows(["C:/Q/NODE_MODULES"]) == 1
+        assert not idx.record_exists(Path("C:/q/node_modules"))
+
+
+def test_directory_rows_are_excluded_from_the_file_candidate_pools(tmp_path: Path) -> None:
+    """An opaque root is a directory row; dedup / large-file / extension pools filter on
+    `is_dir = 0` and so never see it, however large its recorded size or aggregates."""
+    big_a = replace(
+        _opaque("C:/a/node_modules", files=9, nbytes=10**9, newest=1.0), size_bytes=10**9
+    )
+    big_b = replace(
+        _opaque("C:/b/node_modules", files=9, nbytes=10**9, newest=1.0), size_bytes=10**9
+    )
+    with ScanIndex(tmp_path / "i.sqlite3") as idx:
+        idx.upsert_records([big_a, big_b, _file("C:/c/f.bin", 5)], scanned_at=1.0)
+        assert [r.path for r in idx.files_larger_than(1)] == [Path("C:/c/f.bin")]
+        assert list(idx.duplicate_size_candidates(min_reclaim_bytes=0)) == []
+        assert idx.duplicate_qualifying_sizes(min_reclaim_bytes=0) == []
