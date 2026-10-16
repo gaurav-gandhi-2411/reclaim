@@ -64,7 +64,10 @@ _DB_HELP = (
     "Path to the SQLite index file (default: [storage] index_dir in config.toml, "
     f"else {_DEFAULT_DB_PATH})."
 )
-_DEFAULT_CONFIG_PATH = Path("config.toml")
+# ADR-0041: anchored like the data folder (the executable's directory when frozen, plain
+# "config.toml" in dev/test, byte-identical to before), NOT the launch cwd -- otherwise `serve` run
+# from another directory would read a different [storage] than `scan` and use another index.
+_DEFAULT_CONFIG_PATH = default_config_path()
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
 
@@ -1735,6 +1738,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The config path is the command's own `--config` when it has one, so the command reads
         # [storage] from the same file it reads everything else from.
         own_config = getattr(args, "config", None)
+        if (
+            own_config is not None
+            and own_config != _DEFAULT_CONFIG_PATH
+            and not own_config.exists()
+        ):
+            # A typo'd explicit --config would otherwise resolve to the legacy index in silence.
+            print(  # noqa: T201
+                f"reclaim {args.command}: --config {own_config} does not exist",
+                file=sys.stderr,
+            )
+            return 2
         try:
             args.db = resolve_index_db(None, own_config or default_config_path())
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:

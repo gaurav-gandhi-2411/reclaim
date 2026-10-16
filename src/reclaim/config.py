@@ -667,6 +667,10 @@ class StorageConfig(BaseModel):
         # A relative path would resolve against whichever CWD a scheduled task / protocol handler
         # happens to start in (the P0 class app_paths.data_root exists to prevent), so the same
         # config would point serve and the weekly task at two different indexes. Fail loudly.
+        if Path(value).suffix.lower() in {".sqlite3", ".sqlite", ".db"}:
+            raise ValueError(
+                f"[storage] index_dir {value!r} must be a directory, not an index file path"
+            )
         if not Path(value).is_absolute() or ".." in Path(value).parts:
             raise ValueError(
                 f"[storage] index_dir {value!r} must be an absolute path without '..' segments"

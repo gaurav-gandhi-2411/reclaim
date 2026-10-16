@@ -32,6 +32,11 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
 
 
+def _storage_toml(index_dir: str) -> str:
+    # TOML literal string ('...') so Windows backslashes are not read as escapes.
+    return f"[storage]\nindex_dir = '{index_dir}'\n"
+
+
 def _write_config(path: Path, index_dir: Path) -> Path:
     # TOML literal string ('...') so Windows backslashes are not read as escapes.
     path.write_text(f"[storage]\nindex_dir = '{index_dir}'\n", encoding="utf-8")
@@ -147,3 +152,58 @@ def test_vault_default_is_not_moved_by_index_dir(
     )
     assert main(["serve", "--config", str(cfg)]) == 0
     assert "bigdisk" not in str(captured["vault"])
+
+
+def test_explicit_config_beats_the_default_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Teeth for the verifier's mutation (resolve ignoring --config): the default config.toml in
+    the cwd says one dir, --config says another; config-bearing commands must follow --config."""
+    _write_config(tmp_path / "config.toml", tmp_path / "from_default")
+    other = _write_config(tmp_path / "other.toml", tmp_path / "from_flag")
+    seen: list[Path] = []
+    monkeypatch.setattr(cli_module, "_run_serve", lambda a, **_k: seen.append(a.db) or 0)
+    assert main(["serve", "--config", str(other)]) == 0
+    assert seen == [tmp_path / "from_flag" / INDEX_FILE_NAME]
+
+
+def test_all_commands_agree_when_launched_from_a_different_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifier defect D1: a frozen install anchors its data/config on the exe directory, but
+    `--config` used to default to the launch cwd, so `serve` and `scan` could pick different
+    indexes. Simulate: install dir holds config.toml; cwd is somewhere else entirely."""
+    install = tmp_path / "install"
+    install.mkdir()
+    target = tmp_path / "bigdisk"
+    _write_config(install / "config.toml", target)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setattr("reclaim.index_location.data_root", lambda: install)
+    monkeypatch.setattr(cli_module, "_DEFAULT_CONFIG_PATH", install / "config.toml")
+    got: dict[str, Path] = {}
+    for _argv, runner, _ in _DB_COMMANDS:
+        monkeypatch.setattr(
+            cli_module, runner, lambda a, _n=runner, **_k: got.__setitem__(_n, a.db) or 0
+        )
+    for argv, _runner, _has_cfg in _DB_COMMANDS:
+        # the parser default must be rebuilt after the monkeypatch so --config defaults to install/
+        full = [a if a != "SCANROOT" else str(elsewhere) for a in argv]
+        assert main(full) == 0
+    assert set(got.values()) == {target / INDEX_FILE_NAME}, got
+
+
+def test_nonexistent_explicit_config_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_module, "_run_serve", lambda *_a, **_k: pytest.fail("must not serve"))
+    assert main(["serve", "--config", str(tmp_path / "nope.toml")]) == 2
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_index_dir_naming_the_index_file_is_rejected(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(_storage_toml(r"D:\x\reclaim_index.sqlite3"), encoding="utf-8")
+    with pytest.raises(ValueError, match="directory"):
+        resolve_index_db(None, cfg)
