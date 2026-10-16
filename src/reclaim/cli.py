@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import time
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from reclaim.executor import (
 )
 from reclaim.first_run import DEFAULT_FIRST_RUN_STATE_PATH
 from reclaim.index import ScanIndex
+from reclaim.index_location import default_config_path, resolve_index_db
 from reclaim.index_prune import prune_dead_rows
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging
 from reclaim.mode import (
@@ -58,7 +60,14 @@ from reclaim.scanner import ScanDiskFullError, scan_tree
 # reachable from any working-directory-less invocation today, but "not reachable today" is a
 # property of today's call sites, not of the code.
 _DEFAULT_DB_PATH = data_root() / "data" / "reclaim_index.sqlite3"
-_DEFAULT_CONFIG_PATH = Path("config.toml")
+_DB_HELP = (
+    "Path to the SQLite index file (default: [storage] index_dir in config.toml, "
+    f"else {_DEFAULT_DB_PATH})."
+)
+# ADR-0041: anchored like the data folder (the executable's directory when frozen, plain
+# "config.toml" in dev/test, byte-identical to before), NOT the launch cwd -- otherwise `serve` run
+# from another directory would read a different [storage] than `scan` and use another index.
+_DEFAULT_CONFIG_PATH = default_config_path()
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8420
 
@@ -108,8 +117,8 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
     scan_parser.add_argument(
         "--full",
@@ -131,8 +140,8 @@ def _build_parser() -> argparse.ArgumentParser:
     prune_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
     prune_parser.add_argument(
         "--apply", action="store_true", help="Actually delete the dead rows (default: dry run)."
@@ -169,8 +178,8 @@ def _build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
 
     apply_parser = subparsers.add_parser(
@@ -225,8 +234,8 @@ def _build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
     apply_parser.add_argument(
         "--config",
@@ -277,7 +286,7 @@ def _build_parser() -> argparse.ArgumentParser:
     purge_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
+        default=None,
         help="Accepted for CLI symmetry with 'scan'/'apply'; unused — purge_expired only reads "
         "the quarantine manifest, never the scan index.",
     )
@@ -313,7 +322,7 @@ def _build_parser() -> argparse.ArgumentParser:
     undo_parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
+        default=None,
         help="Accepted for CLI symmetry with 'scan'/'apply'; unused — restore_batch only reads "
         "the quarantine manifest, never the scan index.",
     )
@@ -528,8 +537,8 @@ def _add_serve_like_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
     parser.add_argument(
         "--config",
@@ -580,8 +589,8 @@ def _add_mcp_serve_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db",
         type=Path,
-        default=_DEFAULT_DB_PATH,
-        help=f"Path to the SQLite index file (default: {_DEFAULT_DB_PATH}).",
+        default=None,
+        help=_DB_HELP,
     )
     parser.add_argument(
         "--config",
@@ -1724,6 +1733,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(DEFAULT_LOG_PATH)
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if hasattr(args, "db") and args.db is None:
+        # ADR-0041: the index location is decided in exactly one place for every subcommand.
+        # The config path is the command's own `--config` when it has one, so the command reads
+        # [storage] from the same file it reads everything else from.
+        own_config = getattr(args, "config", None)
+        if (
+            own_config is not None
+            and own_config != _DEFAULT_CONFIG_PATH
+            and not own_config.is_file()
+        ):
+            # A typo'd explicit --config would otherwise resolve to the legacy index in silence.
+            print(  # noqa: T201
+                f"reclaim {args.command}: --config {own_config} does not exist or is not a file",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            args.db = resolve_index_db(None, own_config or default_config_path())
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            if own_config is None:
+                # scan/reconcile/index-prune have no config handling of their own: refuse rather
+                # than quietly use (or create) the legacy index when [storage] cannot be read.
+                print(  # noqa: T201
+                    f"reclaim {args.command}: cannot resolve the index location: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
+            # The command loads the same config next and reports the problem in its own words.
+            args.db = _DEFAULT_DB_PATH
     if args.command == "scan":
         return _run_scan(args)
     if args.command == "reconcile":
