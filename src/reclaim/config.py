@@ -647,9 +647,37 @@ class ExclusionsConfig(BaseModel):
         return cleaned
 
 
+class StorageConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # ADR-0041: directory that holds the scan index (reclaim_index.sqlite3 and its -wal/-shm) and,
+    # because it is defined as "next to the index", the dashboard channel file. The index is the
+    # one large, regenerable file Reclaim writes (11 GB for 12.8M entries); this lets it live on a
+    # roomier volume than the install. NOT the quarantine vault: the vault must stay on the volume
+    # of the files it holds so a quarantine is a same-volume rename, never a cross-volume copy.
+    # Empty = the install's own `data/` folder (the old behaviour).
+    index_dir: str = ""
+
+    @field_validator("index_dir")
+    @classmethod
+    def _index_dir_is_absolute(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        # A relative path would resolve against whichever CWD a scheduled task / protocol handler
+        # happens to start in (the P0 class app_paths.data_root exists to prevent), so the same
+        # config would point serve and the weekly task at two different indexes. Fail loudly.
+        if not Path(value).is_absolute() or ".." in Path(value).parts:
+            raise ValueError(
+                f"[storage] index_dir {value!r} must be an absolute path without '..' segments"
+            )
+        return value
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
     update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
