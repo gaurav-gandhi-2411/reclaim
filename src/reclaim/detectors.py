@@ -376,8 +376,9 @@ def _restat_newest_mtime(
                     "candidates.temp_restat_opaque_unverifiable", path=str(opaque_root.path)
                 )
                 return max(newest, now)
-            if live.newest_mtime is not None:
-                newest = max(newest, live.newest_mtime)
+            for live_mtime in (live.newest_mtime, live.newest_dir_mtime):
+                if live_mtime is not None:
+                    newest = max(newest, live_mtime)
     return newest
 
 

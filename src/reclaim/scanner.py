@@ -883,8 +883,10 @@ class OpaqueAggregate:
 
     `files` counts non-directory entries plus reparse entries (junctions/symlinks, never
     descended, contributing no bytes); `bytes` is the logical sum of file sizes; `newest_mtime`
-    the newest mtime of any entry below (directories and reparse entries included), `None` for an
-    empty tree; `physical_bytes` the same sum counting each file id once; `entries` every entry
+    the newest mtime of any non-directory entry below (reparse entries included), `None` if there
+    is none; `newest_dir_mtime` the newest mtime of any directory in the tree, the root included
+    (it moves when an entry is added, removed or renamed in that directory); `physical_bytes`
+    the same sum counting each file id once; `entries` every entry
     visited including directories (progress accounting only, not persisted)."""
 
     files: int
@@ -892,6 +894,7 @@ class OpaqueAggregate:
     newest_mtime: float | None
     physical_bytes: int
     entries: int
+    newest_dir_mtime: float | None = None
 
 
 def aggregate_tree(
@@ -923,6 +926,7 @@ def aggregate_tree(
     physical = 0
     entries = 0
     newest: float | None = None
+    newest_dir: float | None = None
     seen_ids: set[int] = set()
     stack = [root]
     while stack:
@@ -931,14 +935,26 @@ def aggregate_tree(
         current = stack.pop()
         long_dir = long_path(current)
         before = entries
+        try:
+            # A directory's own mtime is read from the directory itself (not from the entry its
+            # parent's listing carries, which can lag -- ADR-0035), at scan time and live alike.
+            dir_mtime = os.stat(long_dir).st_mtime  # noqa: PTH116 -- \\?\ str, not Path
+        except OSError:
+            return None
+        if newest_dir is None or dir_mtime > newest_dir:
+            newest_dir = dir_mtime
         listing = _list_directory_or_none(long_dir, volume_serial) if use_listing else None
         if listing is not None:
             volume_serial, listed = listing
             for name, attributes, size, last_write, _creation, id_low, id_high in listed:
                 entries += 1
-                mtime = filetime_to_unix_seconds(last_write)
-                if newest is None or mtime > newest:
-                    newest = mtime
+                if (
+                    attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                    or not attributes & _ATTRIBUTE_DIRECTORY
+                ):
+                    mtime = filetime_to_unix_seconds(last_write)
+                    if newest is None or mtime > newest:
+                        newest = mtime
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
                     files += 1
                 elif attributes & _ATTRIBUTE_DIRECTORY:
@@ -971,7 +987,11 @@ def aggregate_tree(
                         file_id = st.st_ino
                 except OSError:
                     return None
-                if newest is None or st.st_mtime > newest:
+                is_dir_walked = (
+                    attributes & _ATTRIBUTE_DIRECTORY
+                    and not attributes & FILE_ATTRIBUTE_REPARSE_POINT
+                )
+                if not is_dir_walked and (newest is None or st.st_mtime > newest):
                     newest = st.st_mtime
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
                     files += 1
@@ -993,6 +1013,7 @@ def aggregate_tree(
         newest_mtime=newest,
         physical_bytes=physical,
         entries=entries,
+        newest_dir_mtime=newest_dir,
     )
 
 
@@ -1032,6 +1053,7 @@ def _collapse_if_opaque(
         agg_bytes=aggregate.bytes,
         agg_newest_mtime=aggregate.newest_mtime,
         agg_physical_bytes=aggregate.physical_bytes,
+        agg_newest_dir_mtime=aggregate.newest_dir_mtime,
     )
 
 

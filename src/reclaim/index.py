@@ -61,6 +61,7 @@ _COLUMNS = (
     "agg_bytes",
     "agg_newest_mtime",
     "agg_physical_bytes",
+    "agg_newest_dir_mtime",
 )
 
 _SCHEMA = """
@@ -89,7 +90,8 @@ CREATE TABLE IF NOT EXISTS files (
     agg_files INTEGER NOT NULL DEFAULT 0,
     agg_bytes INTEGER NOT NULL DEFAULT 0,
     agg_newest_mtime REAL,
-    agg_physical_bytes INTEGER NOT NULL DEFAULT 0
+    agg_physical_bytes INTEGER NOT NULL DEFAULT 0,
+    agg_newest_dir_mtime REAL
 );
 """
 # ADR-0042: `opaque = 1` marks a dependency-tree root (node_modules, .venv, ...) recorded as ONE
@@ -101,6 +103,7 @@ _OPAQUE_COLUMN_DDL = (
     ("agg_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ("agg_newest_mtime", "REAL"),
     ("agg_physical_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("agg_newest_dir_mtime", "REAL"),
 )
 # `name` (lowercased basename) and `path_lower` (lowercased posix path) exist purely so Stage
 # 3/4 candidate generation can query for matches via an index instead of materializing every
@@ -320,6 +323,7 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         agg_bytes=row["agg_bytes"],
         agg_newest_mtime=row["agg_newest_mtime"],
         agg_physical_bytes=row["agg_physical_bytes"],
+        agg_newest_dir_mtime=row["agg_newest_dir_mtime"],
     )
 
 
@@ -347,6 +351,7 @@ def _record_to_row(record: FileRecord, scanned_at: float) -> tuple[object, ...]:
         record.agg_bytes,
         record.agg_newest_mtime,
         record.agg_physical_bytes,
+        record.agg_newest_dir_mtime,
     )
 
 
@@ -393,6 +398,7 @@ def file_row(
         0,
         None,
         0,
+        None,
     )
 
 
@@ -1242,13 +1248,18 @@ class ScanIndex:
         prefix = root.as_posix().rstrip("/")
         lower, upper = _prefix_range(prefix)
         cursor = self._conn.execute(
-            "SELECT MAX(mtime) AS newest, MAX(agg_newest_mtime) AS agg_newest FROM files "
+            "SELECT MAX(mtime) AS newest, MAX(agg_newest_mtime) AS agg_newest, "
+            "MAX(agg_newest_dir_mtime) AS agg_newest_dir FROM files "
             "WHERE path = ? OR (path >= ? AND path < ?)",
             (prefix, lower, upper),
         )
         row = cursor.fetchone()
         # ADR-0042: an opaque root's newest content mtime lives in agg_newest_mtime, not mtime.
-        candidates = [float(v) for v in (row["newest"], row["agg_newest"]) if v is not None]
+        candidates = [
+            float(v)
+            for v in (row["newest"], row["agg_newest"], row["agg_newest_dir"])
+            if v is not None
+        ]
         return max(candidates) if candidates else None
 
     def newest_files_under(self, root: Path, *, limit: int) -> list[Path]:

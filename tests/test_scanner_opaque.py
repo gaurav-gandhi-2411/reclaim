@@ -57,18 +57,19 @@ def _build_tree(root: Path) -> None:
     (sp / "mod.py").write_bytes(b"m" * 21)
 
 
-def _independent_aggregate(root: Path) -> tuple[int, int, float | None, int]:
-    """(files, bytes, newest mtime, physical bytes) via os.walk + lstat -- shares no code with
-    the scanner's walkers."""
+def _independent_aggregate(root: Path) -> tuple[int, int, float | None, int, float]:
+    """(files, bytes, newest file mtime, physical bytes, newest directory mtime incl. the root)
+    via os.walk + lstat -- shares no code with the scanner's walkers."""
     files = 0
     total = 0
     physical = 0
     newest: float | None = None
+    newest_dir = os.lstat(root).st_mtime
     seen: set[tuple[int, int]] = set()
     for dirpath, dirnames, filenames in os.walk(root):
         for name in dirnames:
             mtime = os.lstat(os.path.join(dirpath, name)).st_mtime  # noqa: PTH118
-            newest = mtime if newest is None or mtime > newest else newest
+            newest_dir = max(newest_dir, mtime)
         for name in filenames:
             st = os.lstat(os.path.join(dirpath, name))  # noqa: PTH118
             files += 1
@@ -77,7 +78,7 @@ def _independent_aggregate(root: Path) -> tuple[int, int, float | None, int]:
             if (st.st_dev, st.st_ino) not in seen:
                 seen.add((st.st_dev, st.st_ino))
                 physical += st.st_size
-    return files, total, newest, physical
+    return files, total, newest, physical, newest_dir
 
 
 def _rows(index: ScanIndex, root: Path) -> dict[str, FileRecord]:
@@ -133,9 +134,10 @@ def test_each_opaque_root_is_one_row_with_independently_verified_aggregates(
 
         for opaque_path in opaque_paths:
             record = rows[opaque_path]
-            files, nbytes, newest, physical = _independent_aggregate(Path(opaque_path))
+            files, nbytes, newest, physical, newest_dir = _independent_aggregate(Path(opaque_path))
             assert (record.agg_files, record.agg_bytes) == (files, nbytes), opaque_path
             assert record.agg_newest_mtime == newest, opaque_path
+            assert record.agg_newest_dir_mtime == newest_dir, opaque_path
             assert record.agg_physical_bytes == physical, opaque_path
 
         nm = rows[(root / "node_modules").as_posix()]
@@ -150,9 +152,10 @@ def test_consumers_see_the_aggregates_after_a_real_scan(
     _build_tree(root)
     with _scan(root, tmp_path / "i.sqlite3", monkeypatch, listing) as index:
         nm = root / "node_modules"
-        files, nbytes, newest, _ = _independent_aggregate(nm)
+        files, nbytes, newest, _, newest_dir = _independent_aggregate(nm)
         assert index.subtree_size_bytes(nm) == nbytes
-        assert index.subtree_newest_mtime(nm) == max(newest or 0.0, index.get_record(nm).mtime)  # type: ignore[union-attr]
+        row_mtime = index.get_record(nm).mtime  # type: ignore[union-attr]
+        assert index.subtree_newest_mtime(nm) == max(newest or 0.0, newest_dir, row_mtime)
         assert index.subtree_entry_count(nm) == 1 + files
 
 
@@ -345,7 +348,12 @@ def test_aggregate_tree_empty_tree_has_no_newest_mtime(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     assert aggregate_tree(empty) == OpaqueAggregate(
-        files=0, bytes=0, newest_mtime=None, physical_bytes=0, entries=0
+        files=0,
+        bytes=0,
+        newest_mtime=None,
+        physical_bytes=0,
+        entries=0,
+        newest_dir_mtime=empty.stat().st_mtime,  # the root directory itself is always a directory
     )
 
 

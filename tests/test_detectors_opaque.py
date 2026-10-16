@@ -197,3 +197,15 @@ def test_reclaimable_estimate_is_not_a_misleading_zero_for_an_opaque_only_direct
         # None = "no hardlink-aware estimate" -> consumers fall back to the logical size, the same
         # value every category without a link-aware estimate already reports.
         assert _reclaimable_bytes_for_candidate(index, _raw(cache), 5000) is None
+
+
+def test_renaming_a_directory_inside_an_opaque_tree_blocks_the_proposal(tmp_path: Path) -> None:
+    """No file mtime moves on a rename; the parent directory's mtime does, and the recheck folds
+    in the live newest DIRECTORY mtime too."""
+    temp, deep = _temp_tree(tmp_path)
+    with ScanIndex(tmp_path / "i.sqlite3") as index:
+        scan_tree(temp, index, incremental=False)
+        assert _proposed(index, temp) == ["sess"]
+        pkg = deep.parent
+        pkg.rename(pkg.with_name("pkg_renamed"))
+        assert _proposed(index, temp) == []

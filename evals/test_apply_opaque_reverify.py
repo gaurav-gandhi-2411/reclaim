@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -447,7 +448,9 @@ def test_a_logical_byte_change_that_leaves_the_physical_total_equal_still_refuse
             os.utime(target.parent, ns=(before_dir.st_atime_ns, before_dir.st_mtime_ns))
 
         swap(file_q, lambda: file_q.write_bytes(b"q" * 80))  # linked 50 -> new 80
+        before_t = file_t.stat()
         swap(file_r, lambda: os.link(file_t, file_r))  # standalone 80 -> link to the 30-byte inode
+        os.utime(file_t, ns=(before_t.st_atime_ns, before_t.st_mtime_ns))  # shared inode: undo
         live = aggregate_tree(nm, use_listing=False)
         assert live is not None
         assert (live.files, live.physical_bytes, live.newest_mtime) == (
@@ -457,3 +460,71 @@ def test_a_logical_byte_change_that_leaves_the_physical_total_equal_still_refuse
         )
         assert live.bytes == recorded.agg_bytes - 20
         assert _direct_delete_directory_mismatch(candidate, index) is not None
+
+
+# --- directory mtimes: renames and add/remove of an empty directory are visible ----------------
+
+
+def _age_everything(root: Path, *, days: float = 40) -> None:
+    """Gives every file and directory under (and including) `root` the same old mtime."""
+    old = time.time() - days * 86400
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in (*filenames, *dirnames):
+            os.utime(os.path.join(dirpath, name), (old, old))  # noqa: PTH118
+    os.utime(root, (old, old))
+
+
+_BOTH_SCANS = pytest.mark.parametrize("listing", [True, False], ids=["listing", "scandir"])
+
+
+def _scan_aged_node_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> tuple[Path, ScanIndex]:
+    import reclaim.scanner as scanner_module
+
+    monkeypatch.setattr(scanner_module, "_USE_DIRECTORY_LISTING", listing)
+    nm = _node_modules(tmp_path)
+    _age_everything(nm)
+    index = ScanIndex(tmp_path / "index.sqlite3")
+    scan_tree(tmp_path, index)
+    return nm, index
+
+
+@_BOTH_SCANS
+def test_renaming_a_direct_child_directory_of_an_opaque_root_makes_m1_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    nm, index = _scan_aged_node_modules(tmp_path, monkeypatch, listing)
+    with index:
+        candidate = _candidate_for(nm, index, retention_days=None)
+        recorded = index.get_record(nm)
+        assert recorded is not None
+        assert _direct_delete_directory_mismatch(candidate, index) is None  # control
+        (nm / "left-pad").rename(nm / "left-pad-renamed")  # the child keeps its own mtime
+        live = aggregate_tree(nm, use_listing=False)
+        assert live is not None
+        # count, bytes, physical and the newest FILE mtime are all unchanged: only the root
+        # directory's own mtime moved.
+        assert (live.files, live.bytes, live.physical_bytes, live.newest_mtime) == (
+            recorded.agg_files,
+            recorded.agg_bytes,
+            recorded.agg_physical_bytes,
+            recorded.agg_newest_mtime,
+        )
+        assert live.newest_dir_mtime != recorded.agg_newest_dir_mtime
+        assert _direct_delete_directory_mismatch(candidate, index) is not None
+
+
+@_BOTH_SCANS
+def test_adding_and_removing_an_empty_directory_makes_m1_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listing: bool
+) -> None:
+    nm, index = _scan_aged_node_modules(tmp_path, monkeypatch, listing)
+    with index:
+        candidate = _candidate_for(nm, index, retention_days=None)
+        assert _direct_delete_directory_mismatch(candidate, index) is None  # control
+        transient = nm / "react" / "lib" / "transient"
+        transient.mkdir()
+        transient.rmdir()  # the tree looks identical again, except the parent's mtime moved
+        detail = _direct_delete_directory_mismatch(candidate, index)
+        assert detail is not None and "changed since the scan" in detail

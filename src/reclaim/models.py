@@ -77,13 +77,17 @@ class FileRecord:
     # ADR-0042 opaque dependency tree: a directory row (`is_dir` stays True, `size_bytes` stays
     # what the directory itself reports) standing for everything below it. `agg_files` counts the
     # non-directory entries below (reparse entries included), `agg_bytes` their logical sizes,
-    # `agg_newest_mtime` the newest mtime of any entry below, `agg_physical_bytes` the sizes
-    # counting each file id once. All zero/None for every ordinary record.
+    # `agg_newest_mtime` the newest mtime of any non-directory entry below, `agg_physical_bytes`
+    # the sizes counting each file id once. All zero/None for every ordinary record.
     opaque: bool = False
     agg_files: int = 0
     agg_bytes: int = 0
     agg_newest_mtime: float | None = None
     agg_physical_bytes: int = 0
+    # Newest mtime of any DIRECTORY in the tree, the root included. A directory's mtime moves
+    # when an entry is added, removed or renamed in it, which no file mtime shows (a rename
+    # keeps the file's own mtime). `agg_newest_mtime` stays "newest non-directory entry".
+    agg_newest_dir_mtime: float | None = None
 
     @property
     def is_cloud_placeholder(self) -> bool:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
+import reclaim.index as index_module
 from reclaim.index import ScanIndex, logical_size_bytes, physical_size_bytes
 from reclaim.models import FileRecord
 
@@ -271,3 +273,51 @@ def test_prune_dead_rows_counts_the_aggregate_bytes_of_a_dead_opaque_root(tmp_pa
         )
         assert report.dead_rows == 2
         assert report.dead_bytes == 11 + 900
+
+
+_OPAQUE_TAIL = [
+    "opaque",
+    "agg_files",
+    "agg_bytes",
+    "agg_newest_mtime",
+    "agg_physical_bytes",
+    "agg_newest_dir_mtime",
+]
+
+
+def _column_names(db: Path) -> list[str]:
+    conn = sqlite3.connect(db)
+    try:
+        return [row[1] for row in conn.execute("PRAGMA table_info(files)")]
+    finally:
+        conn.close()
+
+
+def test_opaque_columns_have_the_same_order_in_a_fresh_and_a_migrated_index(
+    tmp_path: Path,
+) -> None:
+    """Schema pin: new databases and in-place migrations end with the same six columns in the
+    same order, matching `_COLUMNS`' tail."""
+    fresh = tmp_path / "fresh.sqlite3"
+    ScanIndex(fresh).close()
+    legacy = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(legacy)
+    conn.execute(_OLD_FILES_DDL)
+    conn.commit()
+    conn.close()
+    ScanIndex(legacy).close()
+    assert _column_names(fresh)[-6:] == _OPAQUE_TAIL
+    assert _column_names(legacy)[-6:] == _OPAQUE_TAIL
+    assert _column_names(fresh)[-6:] == list(index_module._COLUMNS[-6:])
+
+
+def test_newest_dir_mtime_round_trips_and_feeds_subtree_newest_mtime(tmp_path: Path) -> None:
+    root = replace(
+        _opaque("C:/p/node_modules", files=1, nbytes=1, newest=1.0), agg_newest_dir_mtime=777.0
+    )
+    with ScanIndex(tmp_path / "i.sqlite3") as idx:
+        idx.upsert_records([root], scanned_at=1.0)
+        stored = idx.get_record(Path("C:/p/node_modules"))
+        assert stored is not None and stored.agg_newest_dir_mtime == 777.0
+        # a renamed/added directory entry moves a directory mtime, which counts as "recently used"
+        assert idx.subtree_newest_mtime(Path("C:/p")) == 777.0
