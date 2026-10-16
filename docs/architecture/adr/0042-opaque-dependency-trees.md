@@ -103,3 +103,40 @@ warm-up/summary queries over millions of rows.
 (2.79 GB). Replace it with `path COLLATE NOCASE` lookups served by one NOCASE-collated index (or make
 the PK itself NOCASE). It is a migration of every query that uses `path_lower`, so it needs its own ADR
 and a query-plan review (`tests/test_query_plan_coverage.py` pins the plans). Not part of this change.
+
+## Implementation notes (2026-10-17, decisions the contract left open)
+
+These refine, and do not change, the decisions above.
+
+* **Incompletely measured trees are never collapsed.** If the aggregate walk of an opaque-named
+  directory meets an unreadable subdirectory, an entry it cannot stat, a cancellation, or (for the
+  recheck) the entry budget, it returns "no result" and the scanner walks that directory the
+  ordinary way: every unreadable path then lands in the existing skipped / `inaccessible_paths`
+  accounting and the per-file rows keep their lower-bound meaning. An opaque row therefore always
+  means "fully measured at scan time".
+* **Always rewritten.** `load_stat_cache` omits opaque rows, so a stored opaque row can never
+  compare as unchanged (also when a kind is later dropped from `OPAQUE_DIR_NAMES`: the stale
+  aggregate row is overwritten by the ordinary directory row). The writer deletes any per-file rows
+  below a root in the same flush that writes it (`ScanIndex.delete_descendants`), so a cancelled
+  scan cannot leave child rows counted next to the aggregate.
+* **Physical total.** Implemented as one table scan (`WHERE is_dir = 0 OR opaque = 1`, an opaque
+  row contributes `agg_physical_bytes` as its own group) rather than a second `SUM`; the result is
+  the additive term the decision describes and keeps the single-scan plan pin.
+* **Live recounts use the scandir walk with a real per-file stat** (`aggregate_tree(use_listing=
+  False)`), not the directory listing, so a write the directory entry has not caught up with
+  (ADR-0035) is seen. M1 compares (files, bytes, newest mtime) for equality; it also judges an
+  opaque tree nested inside a larger direct-delete candidate, whose files are exempt from the
+  "present now, never recorded" rule.
+* **Recheck budget.** The temp-child recheck re-walks an opaque tree up to 200,000 entries and
+  treats anything larger, or unreadable, as "modified just now" (fail closed: the child is not
+  proposed).
+* **`_reclaimable_bytes_for_candidate`** returns `None` (consumers use the logical size, as for
+  every category without a link-aware estimate) instead of `0` when a directory's only content is
+  opaque; with indexed members present it is the under-estimate over those members.
+* **Known weaker spot.** An aggregate cannot see a file swapped for a same-size one whose mtime is
+  not newer than the tree's newest (e.g. a `robocopy /COPY:DAT` over an existing file). The per-file
+  identity M1 used to compare is gone for opaque trees; the live hardlink loop is unchanged. A
+  content-digest column would close this and is the first thing to add if it matters.
+* **Scan root inside an opaque tree.** Scanning `...\node_modules` itself indexes its children
+  normally while an earlier whole-profile scan may hold an opaque row for it; rescan the enclosing
+  root to reconcile.
