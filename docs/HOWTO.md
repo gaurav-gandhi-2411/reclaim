@@ -1,7 +1,8 @@
 # Reclaim: how to use it (plain version)
 
-Written for the owner. Everything here was checked against the build installed on 2026-10-08
-(`integration/2026-10-07`, installer SHA-256 `55c34c7f3dfc...feb5`). Things I could not see on screen are
+Written for the owner. Sections 1-6b were checked against earlier builds (2026-10-08 and 2026-10-09);
+section 6c is about the build installed on 2026-10-17 (main `a446853`, installer SHA-256
+`65d1501e6ca5e2bd51d52e9bb967b3031cd23b7782c0ef204765ee91978c208a`). Things I could not see on screen are
 marked **not seen**.
 
 ## 1. Start it
@@ -48,9 +49,9 @@ Auto-Clean (gaura)* -> Disable. Updating Reclaim re-creates the task only if the
 
 **80% disk alert** (Settings -> *Low disk space alert*): a background task checks C: a few times a day and shows a Windows
 notification "Disk space is running low" when C: is **80% used or more** (C: is at 78% today after the Hugging Face cache moved to D:, so it will not fire until you pass 80%), with a
-**Snooze for a week** button. Turn it off: Settings -> *Low disk space alert* -> off. **Not seen:** I could not confirm on
-screen that the toast actually appears (the Windows counter I used as a proxy does not track this notification identity), so
-please tell me if you never see one.
+**Snooze for a week** button. Turn it off: Settings -> *Low disk space alert* -> off. **Seen:** you saw the alert on
+screen when C: was at 97% (confirmed by you, 2026-10-16). Since the 10-15 build Windows' own notification counter for
+Reclaim also moves when a toast is sent, so it can be checked without looking at the screen.
 
 ## 6. Protecting your projects
 `C:\Users\gaura\AppData\Local\Programs\Reclaim\config.toml` has
@@ -80,12 +81,38 @@ unless you set `[regenerable] pytest_temp = true`.
 - Preview numbers for **uv** and **npm** caches may still overstate what is freed.
 - On first launch you see a one-time "Before you start" screen; click **I understand, continue**.
 - An empty peach bar with a "Dismiss" button may appear under the header; it is cosmetic.
-- **I could not see the 80% alert on screen.** I fired it with a test threshold (it reported "would notify") and Windows' counter did not move, as before.
-  Tell me if you never see a notification.
+- (Superseded: the 80% alert has since been seen on screen by you, see section 5.)
+
+## 6c. What to expect from the build installed on 2026-10-17 (checked on your real profile)
+- **The scan index can live on another drive.** It was 11 GB (13.8 GB after the duplicate pass) because the 12.8 million
+  entries of your profile are stored. Your install now has, at the end of `config.toml`:
+  `[storage]` / `index_dir = 'D:\reclaim-index'`. The index file is `D:\reclaim-index\reclaim_index.sqlite3` (moved and
+  checked identical, SHA-256 `d0ea890d...59a25d`); C: free went from 31.8 to 44.7 GB. The quarantine vault stays on C:
+  on purpose (moving a file into it must stay an instant rename on the same drive).
+  If you ever remove the `[storage]` lines, Reclaim looks for the index under `data\` again and finds none (a warning
+  says so); do not do that without moving the file back.
+- **Scheduled tasks still work from any folder.** The default `config.toml` is now the one next to `reclaim.exe`, wherever a
+  command is started from, so the weekly clean applies your exclusions even if started elsewhere (checked from a different
+  folder: would remove 38.1 GB, `%TEMP%\claude` skipped, your three excluded projects not touched).
+- **A mistyped `--config` is refused** instead of silently falling back to defaults (for the commands that use the index).
+- **The first Overview after a fresh scan is still slow on this build.** On the full 12.8-million-entry index the duplicate
+  preparation was still running after 2 hours (120 min on 10-15, lost to a reboot) and used about 6 GB of memory; I stopped a
+  second try after 69 minutes. Do not expect Overview to be fast on this build until the next one below is installed.
+- **Next build (not installed, waiting for your merge of the weekly release PR):** the scanner stops listing every file inside
+  `node_modules`, `.venv`, `venv`, `site-packages`, `.git` and `__pycache__`; each becomes one entry with its total size. On a
+  copy of your real index this cut it from **12,795,878 to 2,449,175 entries** and from **12.89 GB to 1.69 GB**, the duplicate
+  preparation finished in **49.6 minutes** (2978 s) with the server at about 0.9 GB when I last sampled it (30 minutes in; later not sampled), and the first Overview opened in **0.15 s**
+  (then 0.17 s and 0.24 s). That is a measurement on a scratch copy with the source from the release branch, not on an installed build.
+  Deleting such a folder is then checked against its total size, file count and newest change instead of file by file; any
+  difference refuses the delete, and a file hard-linked into another Python environment still refuses it.
+- The disk alert, the weekly clean and the one-click flows are unchanged from 6b.
 
 ## 7. If something looks wrong
 - Settings and the top bar's **Copy diagnostics** button collect what support needs; nothing leaves your machine.
 - Every automatic or one-click run is recorded in `...\Reclaim\data\regenerable_audit.jsonl` (what was cleaned, skipped, and why).
 - `reclaim.exe auto-clean` (no flags) is a preview; `reclaim.exe auto-clean --apply` really cleans.
-- Uninstall: Windows Settings -> Installed apps -> Reclaim. This also removes the two scheduled tasks (**not seen**: I did not
-  uninstall; the uninstall script compiled and its ownership guard is unit-tested).
+- Uninstall: Windows Settings -> Installed apps -> Reclaim. It asks whether to remove everything; answer Yes to also be asked about
+  the data folder. Checked on the real installed build (2026-10-15): a silent uninstall keeps your `config.toml` and data and removes
+  both scheduled tasks and the Windows notification identity; the dialog path with Yes/Yes removes the whole folder, data, config,
+  tasks and identity. Reinstalling puts the tasks back. An index you moved with `index_dir` (6c) is on another drive and is
+  **not** removed by either path; delete that folder by hand.
