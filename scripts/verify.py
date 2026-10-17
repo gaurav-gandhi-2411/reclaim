@@ -127,6 +127,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_reclaimable_bytes_link_aware_gate.py",
     "evals/test_cache_reclaimable_bytes_gate.py",
     "evals/test_apply_identity_reverify.py",
+    "evals/test_apply_opaque_reverify.py",
     "evals/test_r2_llm_env_var_gate.py",
     "evals/test_scan_scope_gate.py",
     "evals/test_config_env_var_normalization_gate.py",

@@ -554,6 +554,7 @@ ALLOWLIST: dict[str, str] = {
         f"index.py:ScanIndex.{name}": _SQL_ON_GUARDED_CONNECTION
         for name in (
             "_ensure_name_and_path_lower_columns",
+            "_ensure_opaque_columns",
             "_backfill_name_and_path_lower",
             "upsert_rows",
             "begin_scan_tracking",

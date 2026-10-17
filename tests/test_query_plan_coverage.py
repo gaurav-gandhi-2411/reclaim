@@ -246,6 +246,32 @@ _CASES: dict[str, Case] = {
         reason="DELETE ... WHERE path = ? (primary-key point delete, as prune_missing above) + "
         "COMMIT -- the last captured statement is the COMMIT, which has no plan rows",
     ),
+    "delete_descendants": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE ... WHERE path >= ? AND path < ? (prefix range via _prefix_range) + COMMIT "
+        "-- the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
+    ),
+    "drop_opaque_rows": Case(
+        action=None,
+        expect_index=False,
+        reason="DELETE ... WHERE path_lower = ? COLLATE NOCASE AND opaque = 1 + COMMIT -- the "
+        "plan is asserted in "
+        "test_drop_opaque_rows_delete_is_served_by_the_nocase_path_lower_index; "
+        "the last captured statement is the COMMIT, which has no plan rows (ADR-0042)",
+    ),
+    "opaque_roots_under": Case(
+        lambda idx: idx.opaque_roots_under(_SCOPE),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range; `opaque = 1` is a residual filter over the "
+        "one subtree (ADR-0042)",
+    ),
+    "_ensure_opaque_columns": Case(
+        action=None,
+        expect_index=False,
+        reason="PRAGMA table_info + ALTER TABLE ADD COLUMN -- schema introspection/DDL, not a "
+        "data query (ADR-0042)",
+    ),
     "vacuum": Case(
         action=None,
         expect_index=False,
@@ -492,3 +518,23 @@ def test_no_unmarked_like_escape_in_query_layer() -> None:
         "if this specific instance is a residual filter over an already-narrowed row set:\n"
         + "\n".join(violations)
     )
+
+
+def test_drop_opaque_rows_delete_is_served_by_the_nocase_path_lower_index(
+    indexed_bulk: ScanIndex,
+) -> None:
+    """`drop_opaque_rows` matches case-insensitively; the DELETE must still SEARCH the
+    `path_lower COLLATE NOCASE` index (not scan the table) -- real plan, not a skip."""
+    captured: list[str] = []
+    indexed_bulk._conn.set_trace_callback(captured.append)
+    try:
+        indexed_bulk.drop_opaque_rows(["C:/Data/dir1/Node_Modules"])
+    finally:
+        indexed_bulk._conn.set_trace_callback(None)
+    delete_sql = next(s for s in captured if s.lstrip().upper().startswith("DELETE"))
+    details = [
+        row["detail"]
+        for row in indexed_bulk._conn.execute("EXPLAIN QUERY PLAN " + delete_sql).fetchall()
+    ]
+    assert any("SEARCH" in d and "idx_files_path_lower" in d for d in details), details
+    assert not _has_bare_scan(details), details

@@ -39,7 +39,7 @@ from reclaim.preflight import (
 )
 from reclaim.safety import SafetyValidator
 from reclaim.safety_env import RealProfileAccessError, assert_not_real_profile_under_pytest
-from reclaim.scanner import GitRepoCache, build_record_for_path
+from reclaim.scanner import GitRepoCache, aggregate_tree, build_record_for_path
 from reclaim.scanner import long_path as long_path  # re-exported; see D12 note below
 
 logger = structlog.get_logger(__name__)
@@ -1252,6 +1252,14 @@ def _top_level_identity_mismatch(
         recorded_mtime=candidate.mtime,
         recorded_size_bytes=candidate.size_bytes,
     )
+    if check.identity_changed and check.live_dev is None and check.live_ino is None:
+        # Same closed-set skip code (preflight's reason list), honest detail: the stat itself
+        # failed, nothing was seen to be swapped.
+        return (
+            "identity_changed_since_scan",
+            f"{candidate.path}: could not be inspected (stat failed other than not-found), so its "
+            "identity since the scan cannot be verified; refusing",
+        )
     if check.identity_changed:
         return (
             "identity_changed_since_scan",
@@ -1332,6 +1340,60 @@ def _live_subtree_records(root: Path) -> list[FileRecord]:
     return records
 
 
+def _entry_vanished(path: Path) -> bool:
+    """True ONLY on a definitive not-found for the entry itself (`lstat`, long form). Any other
+    error -- notably PermissionError -- is "cannot tell", i.e. False: `os.path.lexists` reports
+    False on every OSError, which would turn an unreadable entry into a skipped (unverified) one."""
+    try:
+        os.lstat(long_path(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _opaque_aggregate_mismatch(root: FileRecord) -> str | None:
+    """ADR-0042: live recount of one opaque dependency-tree root against the aggregates the scan
+    recorded for it. The files below it are not index rows, so the per-file recorded-identity
+    comparison cannot run; instead the live tree's (files, bytes, physical bytes, newest file
+    mtime, newest directory mtime) must EQUAL the recorded tuple, which refuses an added, removed,
+    renamed, grown or recently-written entry.
+    The recount uses the scandir walk with a real per-file stat (`aggregate_tree(use_listing=
+    False)`), so a write the directory listing has not caught up with is seen too (ADR-0035).
+
+    Fail closed: a tree that cannot be fully re-measured (unreadable subdirectory, vanished
+    mid-walk) is a mismatch, never a pass. A root that no longer exists is not (nothing left to
+    delete -- the same stance the per-file loop takes for a vanished entry)."""
+    posix_path = root.path.as_posix()
+    if _entry_vanished(root.path):
+        return None
+    live = aggregate_tree(root.path, use_listing=False)
+    if live is None:
+        return f"{posix_path}: opaque tree could not be fully re-measured (unreadable or changed)"
+    recorded = (
+        root.agg_files,
+        root.agg_bytes,
+        root.agg_physical_bytes,
+        root.agg_newest_mtime,
+        root.agg_newest_dir_mtime,
+    )
+    seen_now = (
+        live.files,
+        live.bytes,
+        live.physical_bytes,
+        live.newest_mtime,
+        live.newest_dir_mtime,
+    )
+    if recorded != seen_now:
+        return (
+            f"{posix_path}: opaque tree changed since the scan -- live (files, bytes, physical "
+            f"bytes, newest file mtime, newest directory mtime)={seen_now} differs from the "
+            f"scan's recorded {recorded}"
+        )
+    return None
+
+
 def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanIndex) -> str | None:
     """M1: full-subtree re-verification for an irreversible (`item_method="direct_delete"`)
     DIRECTORY candidate, run immediately before the real `shutil.rmtree`. Unlike every other
@@ -1372,6 +1434,13 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
         different-environment hardlink the scan simply never evaluated at that depth -- a
         false-positive in the strict "did anything change" sense, never a false negative in the
         safety sense.
+
+    ADR-0042: the files below an opaque dependency-tree root (node_modules, .venv, ...) are not
+    index rows, so for (a) and (b) such a root is judged by `_opaque_aggregate_mismatch` -- a live
+    recount of (files, bytes, newest mtime) that must equal the recorded aggregates -- instead of
+    by row. Condition (c) is untouched and still runs over EVERY live file of the live tree,
+    opaque or not. The aggregate check is weaker than the per-file identity it replaces in one
+    respect (a file swapped for a same-size one carrying an older-than-newest mtime is not seen).
     """
     recorded_by_path = {
         record.path.as_posix(): record
@@ -1381,9 +1450,15 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
         record.path.as_posix(): record for record in _live_subtree_records(candidate.path)
     }
 
+    opaque_roots = [record for record in recorded_by_path.values() if record.opaque]
+    opaque_prefixes = tuple(f"{record.path.as_posix()}/" for record in opaque_roots)
+
     for posix_path in live_by_path:
-        if posix_path not in recorded_by_path:
-            return f"{posix_path}: present now, was never recorded by the scan"
+        if posix_path in recorded_by_path:
+            continue
+        if opaque_prefixes and posix_path.startswith(opaque_prefixes):
+            continue  # inside an opaque tree: judged by that tree's aggregate below, not by row
+        return f"{posix_path}: present now, was never recorded by the scan"
 
     for posix_path, recorded_record in recorded_by_path.items():
         live_record = live_by_path.get(posix_path)
@@ -1392,13 +1467,23 @@ def _direct_delete_directory_mismatch(candidate: Candidate, scan_index: ScanInde
         if live_record.dev != recorded_record.dev or live_record.ino != recorded_record.ino:
             return f"{posix_path}: live (dev, ino) no longer matches the scan's recorded value"
 
+    for opaque_root in opaque_roots:
+        aggregate_detail = _opaque_aggregate_mismatch(opaque_root)
+        if aggregate_detail is not None:
+            return aggregate_detail
+
     for posix_path, live_record in live_by_path.items():
         if live_record.is_dir:
             continue
         try:
-            nlink = live_record.path.stat(follow_symlinks=False).st_nlink
-        except OSError:
-            continue
+            # `\\?\`-prefixed: a bare stat past MAX_PATH raises and used to be skipped here,
+            # i.e. a deep venv file was silently never hardlink-checked (D12).
+            nlink = os.stat(long_path(live_record.path), follow_symlinks=False).st_nlink  # noqa: PTH116 -- \\?\ str, not Path
+        except OSError as exc:
+            if _entry_vanished(live_record.path):
+                continue  # vanished since the walk: nothing left to delete there
+            # Present but unreadable: it cannot be hardlink-checked, so fail CLOSED.
+            return f"{posix_path}: could not be inspected for hardlinks ({exc})"
         if nlink <= 1:
             continue
         if check_hardlink_shared_active_install(live_record.path).is_shared_with_other_environment:

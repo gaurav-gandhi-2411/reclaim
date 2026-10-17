@@ -113,8 +113,11 @@ def test_incremental_rescan_classifies_changes_like_the_scandir_walk(
             changed = scan_tree(root, index)
             record = index.get_record(root / "a" / "naïve café.tar.gz")
         assert first.files_written == first.entries_total
-        assert unchanged.files_written == 0
-        assert unchanged.files_unchanged == unchanged.entries_total
+        # ADR-0042: the tree's one opaque root (`proj/.git`) is rewritten on EVERY scan -- a
+        # directory's own (size, mtime) cannot show that a deep file changed -- so it is the only
+        # row an unchanged rescan writes; everything else is still skipped as unchanged.
+        assert unchanged.files_written == 1
+        assert unchanged.files_unchanged == unchanged.entries_total - 1
         assert changed.files_written >= 1
         assert record is not None
         assert record.size_bytes == 700
@@ -390,9 +393,9 @@ def test_hardlinked_cache_file_in_a_scanned_tree_still_trips_the_active_install_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression guard for the original incident class: a package-cache file hardlinked into
-    live venvs. After scanning with the listing walk, (a) the index must record the SAME
-    (dev, ino) for the cache name and every venv name -- the identity the dedup/preflight logic
-    keys on -- exactly as the legacy walk does, and (b) `check_hardlink_shared_active_install`
+    live venvs. After scanning with the listing walk, (a) the index must record the cache name's
+    real (dev, ino) exactly as the legacy walk does (the venv-side names are aggregated into
+    their opaque `.venv` rows, ADR-0042), and (b) `check_hardlink_shared_active_install`
     on the cache file must return the same positive verdict under both walks (it is a live
     filesystem check, so this also pins that scanning never perturbs it)."""
     tree = tmp_path / "tree"
@@ -414,11 +417,21 @@ def test_hardlinked_cache_file_in_a_scanned_tree_still_trips_the_active_install_
             tree, tmp_path / f"hl_{listing}.db", listing=listing, monkeypatch=monkeypatch
         )
         by_path = {r.path: r for r in records}
-        linked = [by_path[cache_file]] + [
-            by_path[v / "Lib" / "site-packages" / "mypy_extensions.py"] for v in venv_roots
-        ]
-        identities[listing] = [(r.dev, r.ino) for r in linked]
-        assert len({(r.dev, r.ino) for r in linked}) == 1, "hardlinked names must share an id"
+        # ADR-0042: each `.venv` is ONE opaque row, so the venv-side names have no rows of their
+        # own any more; the cache-side name keeps its recorded identity, the venvs keep the
+        # aggregate of the one linked file, and the live hardlink check below (which never read
+        # the index) still sees every sibling.
+        assert not any(p.is_relative_to(v) and p != v for p in by_path for v in venv_roots)
+        for venv in venv_roots:
+            assert by_path[venv].opaque is True
+            assert (by_path[venv].agg_files, by_path[venv].agg_bytes) == (
+                2,
+                cache_file.stat().st_size + (venv / "pyvenv.cfg").stat().st_size,
+            )
+        cache_record = by_path[cache_file]
+        live = cache_file.stat()
+        assert (cache_record.dev, cache_record.ino) == (live.st_dev, live.st_ino)
+        identities[listing] = [(cache_record.dev, cache_record.ino)]
         result = check_hardlink_shared_active_install(cache_file)
         verdicts[listing] = (
             result.is_shared_with_other_environment,
