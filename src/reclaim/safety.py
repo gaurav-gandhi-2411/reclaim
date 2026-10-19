@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
 import os
 import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 from reclaim.config import Config, exclusion_patterns
 from reclaim.models import FileRecord, SafetyResult, Verdict
@@ -48,15 +50,83 @@ def _strip_local_extended_length_prefix(path: Path) -> Path:
     return path
 
 
-def _pattern_matches(path: Path, pattern: str) -> bool:
-    candidate = _strip_local_extended_length_prefix(path).as_posix()
+class _CompiledPattern(NamedTuple):
+    """One user deny/exclusion pattern prepared once. A subtree walk matches millions of entries
+    against a handful of patterns; re-deriving the pattern per entry was ~80% of the warm-up
+    (measured: 7.3M `_pattern_matches` calls, ~358 s of a 574 s candidates warm-up)."""
+
+    # `re:` pattern: searched case-insensitively in the case-kept path
+    regex: re.Pattern[str] | None
+    # `*lit*` glob whose `lit` has no wildcard: substring test on the folded path
+    literal: str | None
+    # any other glob: fnmatch's own translation, matched against the folded path
+    glob: re.Pattern[str] | None
+
+
+def _fold(text: str) -> str:
+    # Exactly what the old `fnmatch.fnmatch(candidate.lower(), pattern.lower())` compared: fnmatch
+    # applies `os.path.normcase` to both sides (on Windows: lowercase again and `/` -> `\`).
+    return os.path.normcase(text.lower())
+
+
+@functools.lru_cache(maxsize=512)
+def _compile_pattern(pattern: str) -> _CompiledPattern:
     if pattern.startswith("re:"):
-        return re.search(pattern[3:], candidate, flags=re.IGNORECASE) is not None
-    return fnmatch.fnmatch(candidate.lower(), pattern.lower())
+        return _CompiledPattern(re.compile(pattern[3:], flags=re.IGNORECASE), None, None)
+    folded = os.path.normcase(pattern.lower())
+    inner = folded[1:-1]
+    is_substring_glob = folded[:1] == "*" and folded[-1:] == "*" and len(folded) >= 2
+    if is_substring_glob and not any(c in inner for c in "*?["):
+        # `*lit*` == `(?s:.*lit.*)\Z`: it matches exactly when `lit` occurs anywhere in the text.
+        return _CompiledPattern(None, inner, None)
+    # `fnmatch.fnmatch` is `fnmatchcase(normcase(name), normcase(pat))`, i.e.
+    # `re.compile(translate(pat)).match`.
+    return _CompiledPattern(None, None, re.compile(fnmatch.translate(folded)))
+
+
+def _strip_candidate(path: Path) -> str:
+    return _strip_local_extended_length_prefix(path).as_posix()
+
+
+def _first_hit(patterns: Sequence[str], text: str, other: str | None = None) -> str | None:
+    """First of `patterns`, in order, that matches `text` (or, for the same pattern, `other`).
+    Patterns are compiled lazily, one by one, so a malformed later pattern still only raises when
+    it is actually reached -- as before."""
+    if other == text:
+        other = None  # identical text gives an identical (already false) answer
+    folded: str | None = None
+    other_folded: str | None = None
+    for pattern in patterns:
+        compiled = _compile_pattern(pattern)
+        if compiled.regex is not None:
+            if compiled.regex.search(text) is not None:
+                return pattern
+            if other is not None and compiled.regex.search(other) is not None:
+                return pattern
+            continue
+        if folded is None:
+            folded = _fold(text)
+            other_folded = _fold(other) if other is not None else None
+        if compiled.literal is not None:
+            if compiled.literal in folded:
+                return pattern
+            if other_folded is not None and compiled.literal in other_folded:
+                return pattern
+        else:
+            assert compiled.glob is not None  # noqa: S101 -- one of the three fields is always set
+            if compiled.glob.match(folded) is not None:
+                return pattern
+            if other_folded is not None and compiled.glob.match(other_folded) is not None:
+                return pattern
+    return None
+
+
+def _pattern_matches(path: Path, pattern: str) -> bool:
+    return _first_hit((pattern,), _strip_candidate(path)) is not None
 
 
 def _any_pattern_matches(path: Path, patterns: Sequence[str]) -> bool:
-    return any(_pattern_matches(path, pattern) for pattern in patterns)
+    return _first_hit(tuple(patterns), _strip_candidate(path)) is not None
 
 
 def first_matching_pattern(
@@ -68,12 +138,8 @@ def first_matching_pattern(
     Pure string matching, no I/O: shared by the generic pipeline, the executor's last-line check
     and the regenerable tier (ADR-0039)."""
     base = Path(path)
-    for pattern in patterns:
-        if _pattern_matches(base, pattern):
-            return pattern
-        if is_dir and _pattern_matches(Path(str(base) + "/"), pattern):
-            return pattern
-    return None
+    other = _strip_candidate(Path(str(base) + "/")) if is_dir else None
+    return _first_hit(tuple(patterns), _strip_candidate(base), other)
 
 
 def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | None:
@@ -82,15 +148,26 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     before deleting a whole directory: a directory that merely CONTAINS an excluded tree (e.g.
     `%TEMP%/claude` holding `.../C--Users-...-<project>`) must not be deleted wholesale.
     Unreadable directories are skipped, not treated as clean-and-safe-to-delete-silently: the
-    caller still gets every match found in what could be listed. No patterns -> no walk."""
+    caller still gets every match found in what could be listed. No patterns -> no walk.
+
+    The match text of an entry is its parent's text + `/` + its name, built by string
+    concatenation instead of re-parsing every path with `pathlib` (identical text for scandir
+    names; pinned against the previous implementation by `tests/test_safety_exclusion_matching.py`).
+    The traversal order and the per-entry pattern order are unchanged, so the pattern reported
+    for a tree with several matches is the same one as before. There is deliberately NO subtree
+    pruning: an excluded name can sit anywhere below a directory whose own path says nothing
+    (e.g. a package named like an excluded project inside `node_modules`), so skipping a subtree
+    cannot be proven safe for the `*name*` patterns this is used with."""
     if not patterns:
         return None
     hit = first_matching_pattern(root, patterns, is_dir=True)
     if hit is not None:
         return hit
-    stack = [str(root)]
+    ordered = tuple(patterns)
+    stack = [(str(root), _strip_candidate(Path(root)))]
     while stack:
-        current = stack.pop()
+        current, current_text = stack.pop()
+        prefix = current_text if current_text.endswith("/") else current_text + "/"
         try:
             with os.scandir(current) as it:
                 for entry in it:
@@ -98,11 +175,12 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError:
                         is_dir = False
-                    hit = first_matching_pattern(entry.path, patterns, is_dir=is_dir)
+                    text = prefix + entry.name
+                    hit = _first_hit(ordered, text)
                     if hit is not None:
                         return hit
                     if is_dir:
-                        stack.append(entry.path)
+                        stack.append((entry.path, text))
         except OSError:
             continue
     return None
