@@ -371,3 +371,62 @@ def test_a_locked_directory_does_not_hide_a_match_in_its_siblings(
     monkeypatch.setattr(os, "scandir", flaky)
     assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
     assert _ref_subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+# --- relative and drive-relative roots (found by an independent verifier) -----------------------
+# pathlib normalises: the entries of "." read "proj" (not "./proj") and those of a drive-relative
+# "C:" read "C:proj" (not "C:/proj"). Anchored patterns are what notice.
+
+ANCHORED = [
+    "proj*",
+    "re:^proj",
+    "[a-z]*",
+    "re:^PROJ",
+    "*/proj",
+    "re:^./proj",
+    "re:^[a-z]:proj",
+    "c:proj*",
+    "d:proj*",
+    "re:^C:/proj",
+    "c:/proj*",
+    "*proj*",
+    "sub/*",
+    "re:^sub/deep$",
+    "re:^\\.\\./",
+]
+
+
+def _relative_root_cases(cwd_drive: str) -> list[str]:
+    return [".", "./", ".\\", "./.", cwd_drive, ".\\sub", "sub", "./sub", "sub/"]
+
+
+@pytest.mark.parametrize("pattern", ANCHORED)
+def test_relative_roots_relative_roots_match_the_previous_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pattern: str
+) -> None:
+    tree = tmp_path / "wd"
+    (tree / "proj" / "inner").mkdir(parents=True)
+    (tree / "sub" / "deep").mkdir(parents=True)
+    (tree / "Other.txt").write_text("x", encoding="utf-8")
+    monkeypatch.chdir(tree)
+    drive = os.path.splitdrive(str(Path.cwd()))[0]
+    compared = 0
+    for root in _relative_root_cases(drive):
+        for patterns in ([pattern], [pattern, "*zzz*"], ["*zzz*", pattern]):
+            expected = _ref_subtree_exclusion_match(root, patterns)
+            assert subtree_exclusion_match(root, patterns) == expected, (root, patterns)
+            compared += 1
+    assert compared == 27
+
+
+def test_relative_roots_are_pinned_on_a_known_divergence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The exact repro: root "." and an anchored pattern. Concatenating "./" + name loses it.
+    (tmp_path / "proj").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert subtree_exclusion_match(".", ["proj*"]) == "proj*"
+    assert subtree_exclusion_match(".", ["re:^proj"]) == "re:^proj"
+    drive = os.path.splitdrive(str(Path.cwd()))[0]
+    assert subtree_exclusion_match(drive, ["re:^" + re.escape(drive) + "proj"]) is not None
+    assert subtree_exclusion_match(drive, ["re:^" + re.escape(drive) + "/proj"]) is None

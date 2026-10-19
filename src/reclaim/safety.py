@@ -150,9 +150,9 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     Unreadable directories are skipped, not treated as clean-and-safe-to-delete-silently: the
     caller still gets every match found in what could be listed. No patterns -> no walk.
 
-    The match text of an entry is its parent's text + `/` + its name, built by string
-    concatenation instead of re-parsing every path with `pathlib` (identical text for scandir
-    names; pinned against the previous implementation by `tests/test_safety_exclusion_matching.py`).
+    The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
+    per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
+    text; pinned against the previous implementation by `tests/test_safety_exclusion_matching.py`).
     The traversal order and the per-entry pattern order are unchanged, so the pattern reported
     for a tree with several matches is the same one as before. There is deliberately NO subtree
     pruning: an excluded name can sit anywhere below a directory whose own path says nothing
@@ -164,10 +164,10 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     if hit is not None:
         return hit
     ordered = tuple(patterns)
-    stack = [(str(root), _strip_candidate(Path(root)))]
+    stack = [str(root)]
     while stack:
-        current, current_text = stack.pop()
-        prefix = current_text if current_text.endswith("/") else current_text + "/"
+        current = stack.pop()
+        prefix = _child_text_prefix(current)
         try:
             with os.scandir(current) as it:
                 for entry in it:
@@ -180,10 +180,21 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                     if hit is not None:
                         return hit
                     if is_dir:
-                        stack.append((entry.path, text))
+                        stack.append(entry.path)
         except OSError:
             continue
     return None
+
+
+def _child_text_prefix(directory: str) -> str:
+    """The text `pathlib` gives a child of `directory`, minus the child's name. Taken from
+    pathlib itself with a placeholder name (one `Path` per DIRECTORY, not per entry) because its
+    normalisation is not plain concatenation: a root of `.` drops the leading `./` (children read
+    `proj`, not `./proj`), a drive-relative `D:` keeps no slash (`D:proj`), an extended-length
+    prefix is stripped. A verifier found the concatenation version diverging on exactly those
+    roots; this one is the old text by construction."""
+    probe = _strip_candidate(Path(os.path.join(directory, "x")))  # noqa: PTH118 -- same join scandir uses
+    return probe[:-1]
 
 
 def _canonical_path(path: Path) -> Path:
