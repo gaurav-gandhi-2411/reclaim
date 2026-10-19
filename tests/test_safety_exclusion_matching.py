@@ -281,9 +281,9 @@ def test_invalid_regex_raises_only_when_reached_like_before(tmp_path: Path) -> N
     root = tmp_path / "r"
     (root / "intent-router").mkdir(parents=True)
     # a hit on the first pattern returns before the malformed second one is ever compiled
-    hit_first = ["*pytest-of*", "re:["]
-    assert subtree_exclusion_match(root, hit_first) == "*pytest-of*"
-    assert _ref_subtree_exclusion_match(root, hit_first) == "*pytest-of*"
+    hit_first = [f"*{tmp_path.name.lower()}*", "re:["]
+    assert subtree_exclusion_match(root, hit_first) == hit_first[0]
+    assert _ref_subtree_exclusion_match(root, hit_first) == hit_first[0]
     with pytest.raises(re.error):
         subtree_exclusion_match(root, ["*nomatch*", "re:["])
     with pytest.raises(re.error):
@@ -430,3 +430,116 @@ def test_relative_roots_are_pinned_on_a_known_divergence(
     drive = os.path.splitdrive(str(Path.cwd()))[0]
     assert subtree_exclusion_match(drive, ["re:^" + re.escape(drive) + "proj"]) is not None
     assert subtree_exclusion_match(drive, ["re:^" + re.escape(drive) + "/proj"]) is None
+
+
+# --- weak spots found by an independent verifier (pass 2); each test below kills a mutant -------
+
+
+def test_pass2_trailing_slash_form_matters_for_a_drive_relative_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a drive-relative root ("D:") has a trailing-slash text ("D:/") that differs from its
+    plain text ("D:"), so only here is the `other` mechanism exercised at all."""
+    monkeypatch.chdir(tmp_path)
+    drive = os.path.splitdrive(str(Path.cwd()))[0]
+    low = drive.lower()
+    for pattern in (
+        f"{low}/",
+        f"{low}/*",
+        f"re:^{low}/$",
+        "*:/",
+        "*:/*",
+        "*/*",
+        f"re:^{re.escape(low)}/",
+    ):
+        for is_dir in (True, False):
+            assert first_matching_pattern(
+                drive, [pattern], is_dir=is_dir
+            ) == _ref_first_matching_pattern(drive, [pattern], is_dir=is_dir), (pattern, is_dir)
+    # and the concrete outcome, so the equality above cannot hold by both being None
+    assert first_matching_pattern(drive, [f"{low}/"], is_dir=True) == f"{low}/"
+    assert first_matching_pattern(drive, [f"{low}/*"], is_dir=True) == f"{low}/*"
+    assert first_matching_pattern(drive, [f"re:^{low}/$"], is_dir=True) == f"re:^{low}/$"
+    assert first_matching_pattern(drive, [f"{low}/"], is_dir=False) is None
+    # a `*lit*` pattern (the literal fast path) that only the trailing-slash text satisfies
+    assert first_matching_pattern(drive, ["*:/*"], is_dir=True) == "*:/*"
+    assert first_matching_pattern(drive, ["*:/*"], is_dir=False) is None
+
+
+def test_pass2_non_ascii_regex_is_case_insensitive_like_before() -> None:
+    caf = "caf" + chr(0xE9)
+    path = "C:/x/" + caf
+    pattern = "re:CAF" + chr(0xC9)
+    assert first_matching_pattern(path, [pattern]) == pattern
+    assert _ref_first_matching_pattern(path, [pattern]) == pattern
+
+
+class _FakeEntry:
+    """A DirEntry stand-in: `is_dir` can raise, and a directory symlink answers True only when
+    asked to follow links."""
+
+    def __init__(self, parent: str, name: str, *, is_dir_raises: bool = False, link: bool = False):
+        self.name = name
+        self.path = parent + chr(92) + name
+        self._raises = is_dir_raises
+        self._link = link
+        self.calls: list[bool] = []
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        self.calls.append(follow_symlinks)
+        if self._raises:
+            raise OSError("is_dir failed")
+        return self._link and follow_symlinks
+
+
+class _FakeScan:
+    def __init__(self, entries: list[_FakeEntry]) -> None:
+        self._entries = entries
+
+    def __enter__(self) -> _FakeScan:
+        return self
+
+    def __exit__(self, *_a: object) -> None:
+        return None
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self._entries)
+
+
+def test_pass2_entry_whose_is_dir_raises_is_still_matched(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = "C:" + chr(92) + "fake-root"
+
+    def fake_scandir(path: object) -> _FakeScan:
+        assert str(path) == root
+        return _FakeScan([_FakeEntry(root, "intent-router", is_dir_raises=True)])
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    # the root itself does not match; the only match is the entry whose is_dir() failed
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+    assert _ref_subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+def test_pass2_links_are_never_followed(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = "C:" + chr(92) + "fake-root"
+    link = _FakeEntry(root, "linked-dir", link=True)
+    scanned: list[str] = []
+
+    def fake_scandir(path: object) -> _FakeScan:
+        scanned.append(str(path))
+        if str(path) == root:
+            return _FakeScan([link])
+        raise AssertionError("a directory link must not be descended into")
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+    assert scanned == [root]
+    assert link.calls and all(
+        call is False for call in link.calls
+    )  # asked with follow_symlinks=False
+
+
+def test_pass2_the_root_alone_can_match_without_any_children(tmp_path: Path) -> None:
+    protected = tmp_path / "intent-router"
+    protected.mkdir()
+    assert subtree_exclusion_match(protected, ["*intent-router*"]) == "*intent-router*"
+    assert subtree_exclusion_match(protected, ["*zzz*"]) is None
