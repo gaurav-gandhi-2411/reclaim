@@ -50,3 +50,4 @@ bit us. Read `docs/RESUME.md` first (it is the living checkpoint).
    A verifier/executor writing its own probe must redirect EVERY root, not just `TEMP` (incident:
    a probe that redirected only `TEMP` deleted the owner's real browser caches), and must pass
    injected fakes for `run_command`/schtasks instead of the real runners.
+8. **Git identity is settled (owner decision 2026-10-20): the repo-local `user.email` in this repo's `.git/config` is `gaurav.gandhi2411@gmail.com` and STAYS.** It is the owner's own GitHub account email, not a stale address. Do NOT "fix" it, do NOT override it with the global noreply address (`-c user.email=...`), and do NOT rewrite any existing history over it. This repo-specific decision overrides the global CLAUDE.md note that repo-local overrides must not exist. Commit with the repo-local value; before committing, `git config --show-origin user.email` should show `.git/config` and that address.
