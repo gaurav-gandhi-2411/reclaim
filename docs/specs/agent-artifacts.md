@@ -5,7 +5,7 @@
 **Success metric:** on the fixture suite (section 8), ZERO unsafe selections (hard gate: nothing with unpushed commits, uncommitted or hidden-modified files, a live process, an unmerged branch, a junction to outside data or an excluded name is ever offered or removed), and on the owner's machine the dry run's recall is MEASURED and reported (target: most of the bytes a human reviewer agrees are finished; expect a real loss from junction-bearing worktrees and globally ignored files, see section 4, so no percentage is promised before the first measurement).
 **Who pays:** the user; no inference calls, no per-use cost. It is a new Reclaim category, not a new product.
 
-Status: spec only, no build. Written 2026-10-15, revised the same day after two hostile fact-checks: the first reproduced two data-loss cases against the first draft, the second found submodule and nested-repo holes in the revision (sections 3, 4, 5 and 9 record what changed). Related: ADR-0039 (user exclusion list), ADR-0034 (regenerable tier), ADR-0005 (vault retention), `docs/specs/assistant-mcp.md` (same "provable rules, hard-zero unsafe gate" approach).
+Status: BUILT 2026-10-20 (ADR-0043); section 10 lists every place where the build differs from sections 2-9 below, and it wins where they disagree. Written 2026-10-15, revised the same day after two hostile fact-checks: the first reproduced two data-loss cases against the first draft, the second found submodule and nested-repo holes in the revision (sections 3, 4, 5 and 9 record what changed). Related: ADR-0039 (user exclusion list), ADR-0034 (regenerable tier), ADR-0005 (vault retention), `docs/specs/assistant-mcp.md` (same "provable rules, hard-zero unsafe gate" approach).
 
 ## 1. What this machine looks like (VERIFIED, read-only walks on 2026-10-12 unless noted)
 - `%TEMP%` held 129.6 GiB at 21:47 (`%TEMP%\claude` is nearly all of it, one directory per project; the largest eight were): the gg-portfolio project 81.5 GiB (newest write 21:45, i.e. live), gold-rate-tracker 18.8, review-iq 9.1, triage-iq 5.9, agentgauge 5.5, reclaim 2.7. The owner reported one gg-portfolio session holding about 127 GB in total, together with its 18 `gg-portfolio-wt-*` worktrees (about 1.6 GB each, 1.09 GB of that `node_modules`), two `gg-portfolio-verify*` copies and a `_verify305` clone under `C:\Users\gaura\ml-projects\`.
@@ -40,7 +40,7 @@ Unit: one linked worktree registered by `git worktree list --porcelain` in a rep
 | W7 | Not excluded | the worktree path and its repo path do not match `[exclusions] project_names` or `[safety] deny` (the `exclusion_match` check only; the validator's built-in "inside a git repository" deny is a different rule and would reject every worktree if read literally) |
 | W8 | No ignored content except regenerable directories, and no reparse point anywhere | `git status --ignored=matching --porcelain` lists only directories named `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.next`. Everything else ignored (`.env*`, `*.db`, `*.sqlite*`, `*.pem`, `*.key`, `*.pfx`, data and model dirs, and also `build`, `dist`, `.cache`, `target`, which can hold non-regenerable output) makes the worktree a review-only item that lists those paths and is never selected by "clean all". Reclaim walks the whole tree (not following links) and refuses any worktree containing ANY junction or symlink, including inside `node_modules` (the first draft's "lose only the link" cannot be honoured by git). Recall cost, measured by reading npm 10's installer: plain `npm install` on Windows writes `.bin` as cmd-shim FILES, not links, so ordinary trees pass; npm workspaces, `file:` dependencies and `npm link` create junctions and are refused; pnpm is UNVERIFIED. `--ignored=matching` also lists globally ignored files (`.vscode/`, `.idea/`, `.vercel/`, `*.log`, `*.tsbuildinfo`, `.coverage`, `dist`), which makes those worktrees review-only: both losses are expected, unmeasured, and the reason section 1's metric is a measurement rather than a promise |
 
-Removal: Reclaim re-runs W1 to W8 immediately before acting, then deletes the tree with its own non-following removal (the reparse-aware code the executor already uses), then runs `git worktree prune`. It never deletes the repo's branch; the branch ref stays, so the work is one `git worktree add` away. The freed bytes are real: no Recycle Bin and no vault, because a vault copy of a `node_modules` tree would defeat the purpose and everything in the tree is in the remote or regenerable by W2-W4 and W8. Residual risk, stated: files inside `node_modules`/`.venv` that were hand-edited are lost (they are regenerable by definition; an edit inside them is not supported).
+Removal (SUPERSEDED by section 10: items are moved into the vault, not deleted): Reclaim re-runs W1 to W8 immediately before acting, then deletes the tree with its own non-following removal (the reparse-aware code the executor already uses), then runs `git worktree prune`. It never deletes the repo's branch; the branch ref stays, so the work is one `git worktree add` away. The freed bytes are real: no Recycle Bin and no vault, because a vault copy of a `node_modules` tree would defeat the purpose and everything in the tree is in the remote or regenerable by W2-W4 and W8. Residual risk, stated: files inside `node_modules`/`.venv` that were hand-edited are lost (they are regenerable by definition; an edit inside them is not supported).
 
 Tier: B (review queue) in v1. Tier A (automatic, under the weekly auto-clean) is out of scope until the measurement gate in section 8 has run clean for four consecutive weekly dry runs on the owner's machine, and then only for worktrees idle 14+ days.
 
@@ -83,3 +83,58 @@ Fixture suite, each case a synthetic repo built in a tmp dir (hermetic, CLAUDE.m
 7. Take over detector candidates that today appear inside agent worktrees (see the pre-existing gap in section 4), so a `node_modules` in a worktree is never offered on its own.
 8. `git status` can execute programs named in the repo's own config (`core.fsmonitor`, hooks are not run by status); the spec disables fsmonitor, but a hostile repo is out of scope (these are the owner's own repos).
 9. NOT CHECKED: `rebase-apply/` and `MERGE_HEAD` appear in the per-worktree git dir (the other states were reproduced), a `file://`, UNC or relative remote form (the allow-list refuses all non-listed forms by construction), sparse checkouts (inconclusive: files stayed present, `ls-files -v` showed only `H`), `core.worktree` oddities, a worktree on another drive, and a `.git` pointer file whose path contains spaces.
+
+## 10. As built (2026-10-20): where the implementation differs from sections 2-9
+Owner decisions of 2026-10-20 and what building it taught. Where this section and the text above
+disagree, this section is right. Code: `src/reclaim/agent_artifacts.py`, `src/reclaim/procscan.py`;
+hooks in `executor.py` (apply-time re-proof, rename-only move, prune/repair) and `detectors.py`.
+
+1. **Three categories, not two.** Added `agent_clone` (C1-C7): standalone throwaway clones whose
+   directory name matches `[categories.agent_artifacts] clone_name_patterns` (default `*-verify*`,
+   `_verify*`, case-insensitive). Rules: a standalone `.git` directory; clean (W2) and no stash; EVERY
+   local branch, tag and HEAD contained in a remote ref of a real remote (`git rev-list --branches
+   --tags HEAD --not --remotes=<name>` is empty); no linked worktrees depend on it; no live process;
+   not excluded; regenerable ignored content only; no reparse point; same volume as the vault.
+2. **W3/W4 relaxed to "every commit of HEAD is on a real remote ref".** The spec required HEAD to be an
+   ancestor of the remote DEFAULT branch, which refuses every worktree on a pushed feature branch.
+   The build requires `git rev-list HEAD --not --remotes=<allowed remote>` to be empty, where an
+   allowed remote is one whose fetch URL passes the scheme allow-list (W3, unchanged). A squash-merged
+   branch with its remote branch deleted is still not offered.
+3. **Removal is a vault move for all three categories (supersedes the worktree "Removal" paragraph).**
+   A same-volume `os.rename` into the vault with a manifest entry and retention
+   (`retention_days`, default 14, minimum 1; never a permanent delete), restorable with
+   `reclaim undo`. The copy-verify-delete fallback is DISABLED for these categories: a refused rename
+   is reported as a failed item and the directory is left untouched. An item on a different volume
+   than the vault is not offered (rule V). Worktrees: the git admin directory is copied into the
+   vaulted directory (`.reclaim-gitadmin/`) and `git worktree prune` runs; restore puts it back,
+   removes the helper folder, runs `git worktree repair` and checks git lists the worktree.
+4. **Always Tier B, off by default, forced off in SAFE mode** (added to
+   `SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`: SAFE mode never uses the vault). Assistant (MCP) requests go
+   through the same approval card as any delete (`reversible_only` batches vault these items).
+5. **W6 narrowed.** Only a transcript under the WORKTREE'S OWN project slug counts; the repository's
+   slug is ignored (otherwise every worktree of an active repository would be refused for as long as
+   anyone works in it, which is the common case). Slugs are compared after mapping every
+   non-alphanumeric to `-` on both sides.
+6. **S2 counts directories too.** The idle test uses the newest mtime of any FILE OR DIRECTORY in the
+   tree (the spec said files only): a rename or a deletion bumps a directory's mtime and is activity.
+   More conservative than the spec; the scan index (aggregate rows included) gives an early refusal
+   so an active tree is never walked.
+7. **Process inspection decided: ctypes, no `psutil`** (spec open item 1). Same-user processes only
+   (SID compared); a same-user process that cannot be read fails the check, EXCEPT unreadable
+   Windows/vendor service binaries under %SystemRoot%, Program Files or ProgramData whose name is
+   not a shell/interpreter/work host (`procscan.is_vendor_service`). Measured on the owner's machine:
+   all 6 same-user unreadable processes were OEM/Windows helpers (Tobii, NVIDIA, ctfmon, an Fn-key
+   helper, a WMI host, Defender); without that rule nothing would ever be offered.
+8. **Apply-time re-proof is total.** `executor._preflight_skip_reason` re-runs every rule from live
+   state (fresh process scan included) before each move; failure skips the item
+   (`agent_artifact_not_provably_finished`); a non-vault method is refused
+   (`agent_artifact_requires_vault`); a missing validator or vault refuses.
+9. **Nested candidates.** An offered artifact takes over ordinary candidates inside it (open item 7),
+   and a scratch directory holding a worktree or clone is offered once, as the outer item.
+10. **UI.** Rows carry the project, branch, last commit date, remote-ref fetch time, size and the
+    exact rules that held in the rationale text; grouping is by category group in the existing review
+    queue, and `reclaim agent-artifacts` (read-only dry run) prints the list grouped by project with
+    the first failed rule of every kept item (`--all`). No dedicated project-grouped view was built.
+11. **Open items status.** 1 decided (item 7 above). 2, 3, 4 unchanged. 5 unchanged. 6: the weekly
+    `aged_temp` sweep is untouched; both may see the same scratch directory, and whichever acts first
+    wins (the other finds it gone). 7 done (item 9 above). 8, 9 unchanged.
