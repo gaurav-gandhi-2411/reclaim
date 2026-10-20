@@ -1,9 +1,10 @@
 """Hermetic fixtures for the agent-artifacts tests: REAL git repositories in a tmp dir.
 
-The remote is a local bare repository, but the repository's fetch URL is a fake `https://` one and
-only its PUSH url points at the bare repo, so Reclaim's remote allow-list (which looks at the
-fetch URL, like `git remote get-url`) sees a real remote while pushes land in the bare repo and
-update the remote-tracking refs. No network is ever used.
+There is no real remote. A repository gets `origin` with a plausible `https://` URL for both fetch
+and push, and "pushing" a branch is recorded exactly as git records a successful push: the
+remote-tracking ref `refs/remotes/origin/<branch>` is set to the pushed commit (`mark_pushed`). No
+network is used, and no local path ever stands in for the remote (a push URL that points at a local
+bare repository must NOT count as a backup; the tests prove that separately).
 """
 
 from __future__ import annotations
@@ -54,17 +55,20 @@ def commit_file(repo: Path, name: str, text: str, message: str = "change") -> No
     git(repo, "commit", "-q", "-m", message)
 
 
+def mark_pushed(repo: Path, branch: str, remote: str = "origin") -> None:
+    """Record that `branch` (as it is NOW) was pushed to `remote`: what a successful `git push`
+    leaves behind in the local repository."""
+    git(repo, "update-ref", f"refs/remotes/{remote}/{branch}", "HEAD")
+
+
 def make_repo(root: Path, name: str = "proj") -> Path:
-    """A repository whose `main` is pushed to a (local, bare) remote with a fake https URL."""
-    bare = root / f"{name}-remote.git"
-    git(root, "init", "-q", "--bare", "-b", "main", str(bare))
+    """A repository whose `main` is recorded as pushed to `origin` (a plausible https URL)."""
     repo = root / name
     repo.mkdir(parents=True)
     git(repo, "init", "-q", "-b", "main")
     commit_file(repo, "README.md", "hello\n", "initial")
     git(repo, "remote", "add", "origin", f"https://example.invalid/{name}.git")
-    git(repo, "remote", "set-url", "--push", "origin", str(bare))
-    git(repo, "push", "-q", "-u", "origin", "main")
+    mark_pushed(repo, "main")
     return repo
 
 
@@ -79,7 +83,7 @@ def add_worktree(repo: Path, name: str, branch: str | None = None) -> Path:
 
 
 def push_branch(worktree: Path, branch: str) -> None:
-    git(worktree, "push", "-q", "-u", "origin", branch)
+    mark_pushed(worktree, branch)
 
 
 def worktree_listed(repo: Path, path: Path) -> bool:

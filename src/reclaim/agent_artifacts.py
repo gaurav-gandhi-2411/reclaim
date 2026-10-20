@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,11 +115,23 @@ def run_git(args: Sequence[str], cwd: Path) -> GitResult:
     return GitResult(proc.returncode, proc.stdout, proc.stderr)
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # noqa: S104 -- a deny-list entry
+_DRIVE_IN_PATH = re.compile(r"^/?[A-Za-z]:[\\/]")
+
+
 def is_real_remote_url(url: str) -> bool:
-    """Allow-list: https://, ssh://, git:// or scp-style user@host:path. A drive-letter path, a
-    UNC path, file:// or any local path is NOT a backup (spec W3)."""
+    """Allow-list: https://, ssh://, git:// or scp-style user@host:path, with a real host. A
+    drive-letter path, a UNC path, file://, any local path, a loopback host (`ssh://localhost/...`)
+    or a path that names a drive (`ssh://host/D:/backup`) is NOT a backup (spec W3)."""
     text = url.strip()
-    return text.lower().startswith(_REMOTE_SCHEMES) or bool(_SCP_REMOTE.match(text))
+    if text.lower().startswith(_REMOTE_SCHEMES):
+        parts = urllib.parse.urlsplit(text)
+        host = (parts.hostname or "").lower()
+        return bool(host) and host not in _LOOPBACK_HOSTS and not _DRIVE_IN_PATH.match(parts.path)
+    if not _SCP_REMOTE.match(text):
+        return False
+    host = text.split("@", 1)[1].split(":", 1)[0].lower()
+    return host not in _LOOPBACK_HOSTS and not _DRIVE_IN_PATH.match(text.split(":", 1)[1])
 
 
 # --- environment --------------------------------------------------------------------------
@@ -139,6 +152,8 @@ class AgentEnv:
     idle_seconds: float = 7 * 86400.0
     clone_name_patterns: tuple[str, ...] = ("*-verify*", "_verify*")
     run_git: GitRunner = run_git
+    # The raw exclusion patterns, for the slug check (Claude's project slug rewrites `_` and `.`).
+    exclusion_patterns: tuple[str, ...] = ()
     newest_mtime_hint: Callable[[Path], float | None] | None = None
     cache: dict[str, object] = field(default_factory=dict)
 
@@ -166,10 +181,12 @@ class ArtifactVerdict:
 
 
 class _Refusal(Exception):
-    def __init__(self, rule: str, detail: str) -> None:
+    def __init__(self, rule: str, detail: str, *, excluded: bool = False) -> None:
         super().__init__(f"{rule}: {detail}")
         self.rule = rule
         self.detail = detail
+        # An exclusion hit: the verdict is hidden from every report and its detail is generic.
+        self.excluded = excluded
 
 
 # --- small helpers ------------------------------------------------------------------------
@@ -228,6 +245,9 @@ class TreeFacts:
     reparse: str | None
     git_entries: tuple[Path, ...]
     error: str | None
+    # Directories that look like a BARE repository (HEAD + objects + refs) outside any `.git`: a
+    # bare repo can hold the only copy of a commit and has no working tree to inspect.
+    bare_repos: tuple[Path, ...] = ()
 
 
 def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
@@ -239,25 +259,30 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
     newest = 0.0
     reparse: str | None = None
     git_entries: list[Path] = []
+    bare_repos: list[Path] = []
     error: str | None = None
     stack = [root]
     try:
         top = os.lstat(long_path(root))
         if getattr(top, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
-            return TreeFacts(newest, str(root), (), None)
+            return TreeFacts(newest, str(root), (), None, ())
         newest = top.st_mtime
     except OSError as exc:
-        return TreeFacts(0.0, None, (), f"{root}: {exc}")
+        return TreeFacts(0.0, None, (), f"{root}: {exc}", ())
     while stack:
         current = stack.pop()
+        names: set[str] = set()
         try:
             with os.scandir(long_path(current)) as it:
                 for entry in it:
                     path = current / entry.name
+                    names.add(entry.name.lower())
                     if _is_reparse(entry):
                         reparse = reparse or str(path)
                         if stop_at_reparse:
-                            return TreeFacts(newest, reparse, tuple(git_entries), error)
+                            return TreeFacts(
+                                newest, reparse, tuple(git_entries), error, tuple(bare_repos)
+                            )
                         continue
                     try:
                         newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
@@ -269,7 +294,11 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
                         stack.append(path)
         except OSError as exc:
             error = error or f"{current}: {exc}"
-    return TreeFacts(newest, reparse, tuple(git_entries), error)
+        if {"head", "objects", "refs"} <= names and ".git" not in [
+            part.lower() for part in current.relative_to(root).parts
+        ]:
+            bare_repos.append(current)
+    return TreeFacts(newest, reparse, tuple(git_entries), error, tuple(bare_repos))
 
 
 # --- shared repository proofs -------------------------------------------------------------
@@ -280,8 +309,15 @@ def _remotes(env: AgentEnv, repo: Path) -> list[str]:
     names = [n for n in _must(env, repo, "W3", "remote").split() if n]
     allowed = []
     for name in names:
-        result = _git(env, repo, "remote", "get-url", name)
-        if result.rc == 0 and is_real_remote_url(result.out):
+        if any(ch in name for ch in "*?[]\\"):
+            continue  # `--remotes=<name>` is a glob: such a name cannot be matched exactly
+        # BOTH directions must be a real remote. A commit that only ever reached a local path
+        # through `pushurl`/`pushInsteadOf` still updates `refs/remotes/<name>/*`: not a backup.
+        fetch = _git(env, repo, "remote", "get-url", "--all", name)
+        push = _git(env, repo, "remote", "get-url", "--push", "--all", name)
+        urls = [*fetch.out.split("\n"), *push.out.split("\n")]
+        urls = [u.strip() for u in urls if u.strip()]
+        if fetch.rc == 0 and push.rc == 0 and urls and all(is_real_remote_url(u) for u in urls):
             allowed.append(name)
     return allowed
 
@@ -300,6 +336,8 @@ def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bo
         for name in _STATE_DIRS:
             if (gitdir / name).exists():
                 raise _Refusal("W2", f"{name}/ present: an operation is in progress")
+    for lock in gitdir.glob("*.lock"):
+        raise _Refusal("W2", f"{lock.name} present: a git process is working in it")
     if (repo / ".gitmodules").exists() or (gitdir / "modules").exists():
         raise _Refusal("W2", "submodules present (their git dir lives inside the removed area)")
     staged = _must(env, repo, "W2", "ls-files", "-s")
@@ -332,7 +370,9 @@ def _prove_pushed(
         raise _Refusal(rule, "no remote with a real URL (https, ssh, git or scp-style)")
     if _git(env, repo, "rev-parse", "--verify", "-q", "HEAD").rc != 0:
         raise _Refusal(rule, "no commit at HEAD")
-    tips = ["--branches", "--tags", "HEAD"] if everything else ["HEAD"]
+    # `--all` = every ref (branches, tags, notes, stash, refs/original, refs/jj, custom namespaces)
+    # plus HEAD. Commits that exist only in a reflog are NOT counted (accepted residual risk).
+    tips = ["--all"] if everything else ["HEAD"]
     remotes = [f"--remotes={name}" for name in allowed]
     result = _git(env, repo, "rev-list", *tips, "--not", *remotes, "-n", "1")
     if result.rc != 0:
@@ -344,7 +384,7 @@ def _prove_pushed(
             rule, f"commit {result.out.strip()[:12]} is not on any remote ref of {allowed}"
         )
     held.append(
-        f"{rule} every commit of {'all branches, tags and HEAD' if everything else 'HEAD'} is on a "
+        f"{rule} every commit of {'every ref and HEAD' if everything else 'HEAD'} is on a "
         f"remote ref of {', '.join(allowed)}"
     )
     return allowed
@@ -369,6 +409,15 @@ def _ignored_entry_is_regenerable(rel: str) -> bool:
     return any(part in REGENERABLE_IGNORED_DIRS for part in inside)
 
 
+def _regenerable_root(rel: str) -> str:
+    """The shortest leading part of an ignored entry's path that ends at a regenerable name."""
+    parts = [p for p in rel.rstrip("/").split("/") if p]
+    for index, part in enumerate(parts):
+        if part.lower() in REGENERABLE_IGNORED_DIRS:
+            return "/".join(parts[: index + 1])
+    return ""
+
+
 def _prove_ignored(env: AgentEnv, repo: Path, held: list[str]) -> None:
     """W8: the only ignored content is regenerable directories."""
     # `--ignored=matching` cannot be combined with `--untracked-files=no`: untracked entries are
@@ -382,7 +431,44 @@ def _prove_ignored(env: AgentEnv, repo: Path, held: list[str]) -> None:
         rel = item[3:]
         if not _ignored_entry_is_regenerable(rel):
             raise _Refusal("W8", f"ignored content that may not be regenerable: {rel[:120]}")
+        parts = rel.rstrip("/").split("/")
+        if rel.endswith("/") and parts[-1].lower() in REGENERABLE_IGNORED_DIRS:
+            continue  # an entirely ignored directory: git lists it only if nothing in it is tracked
+        # An ignored FILE inside a directory that merely bears a regenerable NAME (`venv/`,
+        # `node_modules/`): regenerable only if that directory holds no tracked source. A tracked
+        # `venv/tool.py` next to an ignored `venv/keys.secretlocal` is a project, not a cache.
+        root = _regenerable_root(rel)
+        tracked = _must(env, repo, "W8", "ls-files", "-z", "--", f":(literal){root}")
+        if tracked.strip("\0"):
+            raise _Refusal(
+                "W8", f"tracked source lives under '{root}', so ignored {rel[:100]} is kept"
+            )
     held.append("W8 the only ignored content is regenerable directories")
+
+
+def _prove_nested(
+    env: AgentEnv, root: Path, facts: TreeFacts, held: list[str], rule: str, *, include_root: bool
+) -> None:
+    """Every repository INSIDE the artifact (a clone in `.venv/src`, one in scratch...) must itself
+    be clean and fully pushed, and a bare repository inside is refused outright (it can hold
+    the only copy of a commit). `include_root`: a `.git` directly in `root` is the artifact's
+    own (worktree, clone) unless the artifact is a scratch directory, where it is a nested repo."""
+    if facts.bare_repos:
+        raise _Refusal(rule, f"bare repository inside: {facts.bare_repos[0]}")
+    repos = sorted({e.parent for e in facts.git_entries if include_root or e.parent != root})
+    for repo in repos:
+        nested: list[str] = []
+        try:
+            _prove_clean(env, repo, nested)
+            _prove_no_stash(env, repo, nested)
+            _prove_pushed(env, repo, nested, everything=True, rule=rule)
+        except _Refusal as inner:
+            raise _Refusal(
+                rule, f"nested repository {repo}: {inner.rule} {inner.detail}"
+            ) from inner
+    held.append(
+        f"{rule} {len(repos)} nested repositories (0 is fine), none bare, each clean and pushed"
+    )
 
 
 def _prove_tree(env: AgentEnv, path: Path, held: list[str]) -> TreeFacts:
@@ -398,7 +484,7 @@ def _prove_tree(env: AgentEnv, path: Path, held: list[str]) -> TreeFacts:
 def _prove_not_excluded(env: AgentEnv, path: Path, held: list[str], rule: str) -> None:
     hit = env.exclusion_match(path, True)
     if hit is not None:
-        raise _Refusal(rule, f"matches the user exclusion '{hit}'")
+        raise _Refusal(rule, "excluded project (not inspected further)", excluded=True)
     blocked = env.builtin_block(path)
     if blocked is not None:
         raise _Refusal(rule, f"the safety validator blocks it ({blocked})")
@@ -507,6 +593,17 @@ def _list_worktrees(run: GitRunner, repo: Path) -> list[LinkedWorktree] | None:
     ]
 
 
+def _resolve_gitdir(text: str, base: Path) -> Path | None:
+    """The admin dir a `.git` pointer file names. `gitdir: <path>`; a relative path (git's
+    `--relative-paths`) is relative to the directory holding the pointer, not to our cwd."""
+    if not text.lower().startswith("gitdir:"):
+        return None
+    admin = Path(text[7:].strip())
+    if not admin.is_absolute():
+        admin = Path(os.path.normpath(base / admin))
+    return admin
+
+
 def find_repo_of_worktree(path: Path) -> Path | None:
     """Main repository root of a linked worktree, from its `.git` pointer file."""
     pointer = path / ".git"
@@ -514,13 +611,39 @@ def find_repo_of_worktree(path: Path) -> Path | None:
         text = pointer.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
-    if not text.lower().startswith("gitdir:"):
+    admin = _resolve_gitdir(text, path)
+    if admin is None:
         return None
-    admin = Path(text[7:].strip())
     # <repo>/.git/worktrees/<name>
     if admin.parent.name.lower() != "worktrees" or admin.parent.parent.name.lower() != ".git":
         return None
     return admin.parent.parent.parent
+
+
+def _path_excluded(env: AgentEnv, *paths: Path) -> bool:
+    """An excluded project, decided from path strings only: each path AND its real location (a
+    junction or symlink alias of an excluded repository is the same repository)."""
+    for path in paths:
+        if env.pattern_match(path) is not None:
+            return True
+        try:
+            real = Path(os.path.realpath(path))
+        except (OSError, ValueError):
+            continue
+        if env.pattern_match(real) is not None:
+            return True
+    return False
+
+
+def _slug_excluded(env: AgentEnv, name: str) -> bool:
+    """The exclusion globs against a Claude project slug (every non-alphanumeric is `-` there, so
+    an excluded `my_proj` appears as `my-proj`); the patterns get the same rewrite."""
+    patterns = [
+        re.sub(r"[^a-z0-9*?\[\]]", "-", pattern.lower())
+        for pattern in env.exclusion_patterns
+        if not pattern.startswith("re:")
+    ]
+    return first_matching_pattern(_slug(name), patterns) is not None
 
 
 def _excluded(kind: str, path: Path, project: str, repo: Path | None = None) -> ArtifactVerdict:
@@ -543,7 +666,7 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
     project = repo.name
     # Exclusions first, from the path strings alone: an excluded project's worktree or repository
     # is not touched at all (no git runs in it), not merely refused later.
-    if env.pattern_match(path) is not None or env.pattern_match(repo) is not None:
+    if _path_excluded(env, path, repo):
         return _excluded("worktree", path, project, repo)
     try:
         listed = list_worktrees(env, repo)
@@ -569,7 +692,8 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
         held.append("W6 no recent session transcript for this worktree")
         _prove_not_excluded(env, path, held, "W7")
         _prove_ignored(env, path, held)
-        _prove_tree(env, path, held)
+        facts = _prove_tree(env, path, held)
+        _prove_nested(env, path, facts, held, "W9", include_root=False)
         _prove_vault_volume(env, path, held)
         branch, commit_ts, fetched = _repo_facts(env, path)
         return ArtifactVerdict(
@@ -577,8 +701,10 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
             last_commit_ts=commit_ts, refs_fetched_ts=fetched, repo_root=repo,
         )  # fmt: skip
     except _Refusal as refusal:
-        return ArtifactVerdict(path, "worktree", False, tuple(held), refusal.rule, refusal.detail,
-                       project=project, repo_root=repo)  # fmt: skip
+        return ArtifactVerdict(
+            path, "worktree", False, tuple(held), refusal.rule, refusal.detail,
+            project=project, repo_root=repo, excluded=refusal.excluded,
+        )  # fmt: skip
 
 
 # --- throwaway clones ---------------------------------------------------------------------
@@ -592,7 +718,7 @@ def matches_clone_name(env: AgentEnv, path: Path) -> bool:
 def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
     held: list[str] = []
     project = path.name
-    if env.pattern_match(path) is not None:
+    if _path_excluded(env, path):
         return _excluded("clone", path, project, path)
     try:
         if not matches_clone_name(env, path):
@@ -614,7 +740,8 @@ def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
         _prove_unused(env, path, held, "C5")
         _prove_not_excluded(env, path, held, "C7")
         _prove_ignored(env, path, held)
-        _prove_tree(env, path, held)
+        facts = _prove_tree(env, path, held)
+        _prove_nested(env, path, facts, held, "C8", include_root=False)
         _prove_vault_volume(env, path, held)
         branch, commit_ts, fetched = _repo_facts(env, path)
         return ArtifactVerdict(
@@ -622,8 +749,10 @@ def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
             last_commit_ts=commit_ts, refs_fetched_ts=fetched, repo_root=path,
         )  # fmt: skip
     except _Refusal as refusal:
-        return ArtifactVerdict(path, "clone", False, tuple(held), refusal.rule, refusal.detail,
-                       project=project, repo_root=path)  # fmt: skip
+        return ArtifactVerdict(
+            path, "clone", False, tuple(held), refusal.rule, refusal.detail,
+            project=project, repo_root=path, excluded=refusal.excluded,
+        )  # fmt: skip
 
 
 # --- session scratch ----------------------------------------------------------------------
@@ -640,7 +769,7 @@ def is_session_dir(env: AgentEnv, path: Path) -> bool:
 def evaluate_scratch(env: AgentEnv, path: Path) -> ArtifactVerdict:
     held: list[str] = []
     slug = path.parent.name
-    if env.pattern_match(path) is not None:
+    if _path_excluded(env, path) or _slug_excluded(env, slug):
         return _excluded("scratch", path, slug)
     try:
         if not is_session_dir(env, path):
@@ -676,29 +805,16 @@ def evaluate_scratch(env: AgentEnv, path: Path) -> ArtifactVerdict:
         held.append("S3 the session transcript is idle or absent")
         _prove_unused(env, path, held, "S4", path.name)
         _prove_not_excluded(env, path, held, "S5")
-        for git_entry in facts.git_entries:
-            repo = git_entry.parent
-            nested: list[str] = []
-            try:
-                _prove_clean(env, repo, nested)
-                _prove_no_stash(env, repo, nested)
-                _prove_pushed(env, repo, nested, everything=True, rule="S7")
-            except _Refusal as inner:
-                raise _Refusal(
-                    "S7", f"nested repository {repo}: {inner.rule} {inner.detail}"
-                ) from inner
-        held.append(
-            f"S7 {len(facts.git_entries)} nested repositories (0 is fine), "
-            "each clean and fully pushed"
-        )
+        _prove_nested(env, path, facts, held, "S7", include_root=True)
         _prove_vault_volume(env, path, held)
         return ArtifactVerdict(
             path, "scratch", True, tuple(held), project=slug, last_commit_ts=newest
         )
     except _Refusal as refusal:
         return ArtifactVerdict(
-            path, "scratch", False, tuple(held), refusal.rule, refusal.detail, project=slug
-        )
+            path, "scratch", False, tuple(held), refusal.rule, refusal.detail,
+            project=slug, excluded=refusal.excluded,
+        )  # fmt: skip
 
 
 # --- dispatch (detection and apply time share the same code) --------------------------------
@@ -708,7 +824,7 @@ def evaluate_path(env: AgentEnv, path: Path, category: str) -> ArtifactVerdict:
     """Re-prove ONE artifact from live state. This is what runs at detection and again, from
     scratch, right before an apply moves anything (the scan-time verdict is never trusted)."""
     if category == CAT_WORKTREE:
-        if env.pattern_match(path) is not None:
+        if _path_excluded(env, path):
             return _excluded("worktree", path, path.name)
         repo = find_repo_of_worktree(path)
         if repo is None:
@@ -726,36 +842,67 @@ def evaluate_path(env: AgentEnv, path: Path, category: str) -> ArtifactVerdict:
 # --- vault bookkeeping --------------------------------------------------------------------
 
 
+def _root_commits(run: GitRunner, repo: Path) -> list[str]:
+    result = run(("rev-list", "--max-parents=0", "--all"), repo)
+    return [line.strip() for line in result.out.splitlines() if line.strip()][:50]
+
+
 def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git) -> str | None:
-    """A worktree was just moved into the vault: keep a copy of its git admin dir inside the
-    vaulted directory, then `git worktree prune` so the repository stops listing a missing
-    directory. Returns None on success or a message (never raises: the item IS vaulted)."""
+    """A worktree was just moved into the vault. Keep a copy of its git admin dir inside the
+    vaulted directory, then remove EXACTLY that one admin entry so the repository stops listing a
+    missing directory. (`git worktree prune` is deliberately NOT used: it drops the entry of every
+    prunable worktree, including ones the user never asked to touch and whose directory is merely
+    on an offline drive; an independent review reproduced losing a staged index and a detached
+    unpushed commit that way.) Returns None on success or a message; never raises: the item IS
+    vaulted."""
     assert_not_real_profile_under_pytest(vault_path, operation="write a git admin backup into")
-    pointer = vault_path / ".git"
     try:
-        text = pointer.read_text(encoding="utf-8", errors="replace").strip()
-        admin = Path(text[7:].strip())
+        text = (vault_path / ".git").read_text(encoding="utf-8", errors="replace").strip()
+        admin = _resolve_gitdir(text, original)  # relative pointers: relative to where it WAS
+        if (
+            admin is None
+            or admin.parent.name.lower() != "worktrees"
+            or admin.parent.parent.name.lower() != ".git"
+        ):
+            return "the .git pointer does not name a worktree admin dir; nothing was removed"
         repo = admin.parent.parent.parent
+        owner_text = (admin / "gitdir").read_text(encoding="utf-8", errors="replace").strip()
+        owner = Path(owner_text)
+        if not _posix_eq(owner.parent if owner.name == ".git" else owner, original):
+            return "that admin dir belongs to another path; nothing was removed"
+        if (admin / "locked").exists():
+            return "the worktree is locked; its admin entry was kept"
         backup = vault_path / ADMIN_BACKUP_DIR
         backup.mkdir()
         shutil.copytree(admin, backup / "admin")
         (backup / "meta.json").write_text(
             json.dumps(
-                {"original_path": str(original), "repo_root": str(repo), "admin": str(admin)}
+                {
+                    "original_path": str(original),
+                    "repo_root": str(repo),
+                    "admin": str(admin),
+                    "root_commits": _root_commits(run, repo),
+                }
             ),
             encoding="utf-8",
         )
+        assert_not_real_profile_under_pytest(
+            admin, operation="remove one worktree admin entry from"
+        )
+        shutil.rmtree(admin)
     except (OSError, ValueError) as exc:
-        return f"could not keep the git admin dir ({exc}); the worktree entry was NOT pruned"
-    result = run(("worktree", "prune"), repo)
-    if result.rc != 0:
-        return f"git worktree prune failed (rc {result.rc}): {result.err.strip()[:160]}"
+        return f"could not keep or remove the git admin dir ({exc}); the entry was NOT removed"
+    listed = _list_worktrees(run, repo)
+    if listed is None or any(_posix_eq(w.path, original) for w in listed):
+        return "git still lists the worktree after its admin entry was removed"
     return None
 
 
 def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
-    """A vaulted worktree is back at its original path: put its git admin dir back if `prune`
-    removed it, drop our backup folder and run `git worktree repair`. None on success."""
+    """A vaulted worktree is back at its original path: put its git admin dir back, drop our
+    backup folder and run `git worktree repair`. None on success. If the repository is no longer
+    where it was, or a DIFFERENT repository now sits at that path, nothing is written into it and
+    the saved admin data stays in the restored directory for a manual `git worktree repair`."""
     assert_not_real_profile_under_pytest(restored, operation="restore git admin data into")
     backup = restored / ADMIN_BACKUP_DIR
     meta_file = backup / "meta.json"
@@ -765,7 +912,24 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
         meta = json.loads(meta_file.read_text(encoding="utf-8"))
         repo = Path(meta["repo_root"])
         admin = Path(meta["admin"])
+        saved_roots = set(meta.get("root_commits", []))
+        if not (repo / ".git").is_dir():
+            return (
+                f"restored, but the repository is no longer at {repo}; the saved admin data stays "
+                f"in {ADMIN_BACKUP_DIR}\\ for a manual `git worktree repair`"
+            )
+        if saved_roots and not saved_roots & set(_root_commits(run, repo)):
+            return (
+                f"restored, but a different repository is now at {repo}; nothing was written "
+                f"into it (the saved admin data stays in {ADMIN_BACKUP_DIR}\\)"
+            )
+        if not _posix_eq(admin.parent.parent, repo / ".git"):
+            return "restored, but the saved admin path is not inside that repository"
         if not admin.exists():
+            admin.parent.mkdir(exist_ok=True)  # `.git/worktrees`, inside a repository we checked
+            assert_not_real_profile_under_pytest(
+                admin, operation="restore a worktree admin dir into"
+            )
             shutil.copytree(backup / "admin", admin)
         shutil.rmtree(backup)
     except (OSError, ValueError, KeyError) as exc:
@@ -779,6 +943,12 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
     if listed is None or not any(_posix_eq(w.path, restored) for w in listed):
         return "restored, but git does not list the worktree after repair"
     return None
+
+
+def is_agent_candidate(category_group: str, category: str) -> bool:
+    """A candidate counts as an agent artifact by its group OR its category: a hand-built
+    candidate that lies about one of them must not slip past the apply-time re-proof."""
+    return category_group == GROUP or category in CATEGORIES
 
 
 def describe(verdict: ArtifactVerdict, size_bytes: int | None = None) -> str:
@@ -856,6 +1026,7 @@ def build_env(
         idle_seconds=settings.idle_days * 86400.0,
         clone_name_patterns=tuple(settings.clone_name_patterns),
         run_git=run,
+        exclusion_patterns=tuple(safety.exclusion_patterns),
         newest_mtime_hint=newest_mtime_hint,
     )
 
@@ -874,7 +1045,7 @@ def discover(index: ScanIndex, env: AgentEnv) -> list[tuple[str, Path]]:
         if record.is_dir:
             if matches_clone_name(env, owner) and not _inside(owner, env.temp_claude_dir):
                 found.setdefault(normalize_path(owner), (CAT_CLONE, owner))
-        elif env.pattern_match(owner) is not None or find_repo_of_worktree(owner) is not None:
+        elif _path_excluded(env, owner) or find_repo_of_worktree(owner) is not None:
             found.setdefault(normalize_path(owner), (CAT_WORKTREE, owner))
     for slug in index.direct_children(env.temp_claude_dir):
         if not slug.is_dir:

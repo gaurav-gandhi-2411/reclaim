@@ -490,3 +490,117 @@ def test_cli_dry_run_hides_excluded_projects_and_counts_them(
     assert rc == 0
     assert str(setup.wt) not in out and "proj-verify1" not in out  # never surfaced
     assert "belong to excluded projects (not inspected, not listed)" in out
+
+
+# === regression tests for the independent review (pass A) =========================================
+
+
+def test_review_a_vaulting_one_worktree_leaves_every_other_admin_entry_alone(
+    setup: Setup,
+) -> None:
+    """F7: a plain `git worktree prune` also drops the entry of ANOTHER prunable worktree (one whose
+    directory is merely elsewhere or offline), losing its staged index and an unpushed commit."""
+    other = add_worktree(setup.repo, "proj-wt-other", None)  # detached
+    commit_file(other, "precious.txt", "unpushed work\n", "unpushed detached commit")
+    (other / "staged.txt").write_text("staged", encoding="utf-8")
+    git(other, "add", "staged.txt")
+    other_admin = Path(git(other, "rev-parse", "--absolute-git-dir").stdout.strip())
+    sha = git(other, "rev-parse", "HEAD").stdout.strip()
+    moved = other.parent / "proj-wt-other-offline"
+    other.rename(moved)  # its directory is gone from where git expects it: prunable
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    assert report.files_succeeded == 1 and not setup.wt.exists()
+    assert other_admin.is_dir(), "another worktree's admin entry was removed"
+    assert (other_admin / "index").is_file() and (other_admin / "HEAD").is_file()
+    assert git(setup.repo, "cat-file", "-t", sha).stdout.strip() == "commit"
+    moved.rename(other)  # bring it back: it still works
+    assert git(other, "status", "--porcelain").stdout.strip().startswith("A  staged.txt")
+
+
+def test_review_a_only_the_vaulted_worktrees_own_entry_is_removed(setup: Setup) -> None:
+    admin = Path(git(setup.wt, "rev-parse", "--absolute-git-dir").stdout.strip())
+    found = _detect(setup)
+    _apply(setup, [found[aa.CAT_WORKTREE]])
+    assert not admin.exists()
+    assert (setup.repo / ".git" / "worktrees").is_dir()
+    assert not worktree_listed(setup.repo, setup.wt)
+
+
+def test_review_a_a_pointer_to_someone_elses_admin_dir_is_not_removed(
+    setup: Setup, tmp_path: Path
+) -> None:
+    """An edited `.git` pointer must not make us delete (or back up) a DIFFERENT entry."""
+    other = add_worktree(setup.repo, "proj-wt-victim", "victim")
+    victim_admin = Path(git(other, "rev-parse", "--absolute-git-dir").stdout.strip())
+    found = _detect(setup)
+    pointer = setup.wt / ".git"
+    pointer.unlink()
+    pointer.write_bytes(("gitdir: " + victim_admin.as_posix() + chr(10)).encode("utf-8"))
+    vaulted = tmp_path / "vaulted-copy"
+    shutil.copytree(setup.wt, vaulted)
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, vaulted)
+    assert note is not None and "belongs to another path" in note
+    assert victim_admin.is_dir()
+
+
+def test_review_a_a_candidate_that_lies_about_its_group_still_gets_the_reproof(
+    setup: Setup,
+) -> None:
+    """W4: the apply-time re-proof and the rename-only move key on group OR category."""
+    import dataclasses
+
+    found = _detect(setup)
+    (setup.wt / "README.md").write_text("uncommitted work", encoding="utf-8")
+    liar = dataclasses.replace(found[aa.CAT_WORKTREE], category_group="temp_and_browser_caches")
+    report = _apply(setup, [liar])
+    assert _skipped(report) == ["agent_artifact_not_provably_finished"]
+    assert (setup.wt / "README.md").read_text(encoding="utf-8") == "uncommitted work"
+    liar2 = dataclasses.replace(found[aa.CAT_SCRATCH], category="dev_artifact_pycache")
+    (setup.session / "scratchpad" / "fresh.txt").write_text("now", encoding="utf-8")
+    assert _skipped(_apply(setup, [liar2])) == ["agent_artifact_not_provably_finished"]
+    assert executor._rename_only("temp_and_browser_caches", aa.CAT_WORKTREE) == {
+        "allow_copy_fallback": False
+    }
+    assert executor._rename_only("dev_artifacts", "dev_artifact_pycache") == {}
+
+
+def test_review_a_restore_after_the_repository_moved_writes_nothing_at_the_old_path(
+    setup: Setup,
+) -> None:
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    moved_repo = setup.repo.parent / "proj-moved"
+    setup.repo.rename(moved_repo)
+    restored = restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert restored.files_succeeded == 1  # the directory is back
+    assert setup.wt.is_dir()
+    assert not setup.repo.exists(), "a ghost .git/worktrees skeleton was created at the old path"
+    assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()  # kept for a manual repair
+
+
+def test_review_a_restore_into_a_different_repository_writes_nothing_into_it(
+    setup: Setup,
+) -> None:
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    moved_repo = setup.repo.parent / "proj-moved"
+    setup.repo.rename(moved_repo)
+    stranger = make_repo(setup.root, "proj")  # a different repository now lives at the old path
+    commit_file(stranger, "other.txt", "different history\n", "a different root")
+    restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert setup.wt.is_dir()
+    assert not (stranger / ".git" / "worktrees").exists()
+
+
+def test_review_a_the_move_note_names_what_happened_when_prune_is_not_needed(setup: Setup) -> None:
+    found = _detect(setup)
+    moved = setup.vault / "manual"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(setup.wt), str(moved))
+    assert aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved) is None
+    assert not worktree_listed(setup.repo, setup.wt)
