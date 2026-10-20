@@ -44,10 +44,12 @@ default, forced off in SAFE mode (removal is a vault move, which SAFE mode never
    would be the failure mode this ADR exists to prevent. A candidate on another volume than the vault
    is not offered.
 5. **Worktree bookkeeping survives the move.** After the move the worktree's git admin directory is
-   copied into the vaulted directory (`.reclaim-gitadmin/`) and `git worktree prune` is run; restore
-   puts the admin directory back if prune removed it, deletes the helper folder and runs
-   `git worktree repair`, then verifies git lists the worktree. A failure of this bookkeeping is
-   logged and never fails or undoes the vault move.
+   copied into the vaulted directory (`.reclaim-gitadmin/`) and EXACTLY that one admin entry is
+   removed so the repository stops listing a missing directory (the effect of `git worktree prune`
+   limited to this worktree; see Addendum 1 for why plain `prune` is not used). Restore puts the
+   admin directory back, deletes the helper folder and runs `git worktree repair`, then verifies git
+   lists the worktree. A failure of this bookkeeping is logged and never fails or undoes the vault
+   move.
 6. **Nothing is trusted from scan time.** `executor._preflight_skip_reason` re-runs the whole proof
    from live state immediately before each move (`agent_artifacts.reverify`); an item that cannot be
    re-proven is skipped with `agent_artifact_not_provably_finished`, and one asked to go anywhere but
@@ -86,3 +88,45 @@ default, forced off in SAFE mode (removal is a vault move, which SAFE mode never
 - **Add `psutil`:** a new dependency for one function; ctypes is enough and keeps the frozen build
   small. A handle-enumeration pass (every open handle under the directory) was rejected as fragile;
   the rename is the handle test.
+
+## Addendum 1 (2026-10-20): changes forced by an independent hostile review
+
+A first review of the build (a verifier whose only job was to get something unsafe offered or moved)
+succeeded in 9 scenarios, 4 of them through to an actual move. Every one is fixed and has a regression
+test that reproduces the reported scenario. What changed:
+
+- **A commit counts as backed up only if BOTH the fetch and the push URL of the remote are real**
+  (`git remote get-url --all` and `--push --all`), not loopback (`ssh://localhost/...`) and not a
+  drive path (`ssh://host/D:/backup`). A `pushurl`/`pushInsteadOf` to a local path still updates
+  `refs/remotes/<name>/*` and is no backup. (My own first test fixtures relied on exactly that; they now
+  record a push the way git does, by setting the remote-tracking ref behind an `https` URL.)
+- **Clones and nested repositories are compared with `git rev-list --all`**, i.e. every ref namespace
+  (custom refs, `refs/original`, `refs/jj`, notes, stash), not just branches and tags. Commits that
+  exist only in a reflog are still not counted (accepted residual risk).
+- **Repositories INSIDE an artifact are proven too**, whatever the artifact is: a repository under
+  `node_modules`/`.venv` (pip editable VCS installs create `.venv/src/<pkg>`) must be clean and fully
+  pushed (rules W9 for worktrees, C8 for clones, S7 for scratch), and a bare repository inside (it can
+  hold the only copy of a commit and has no working tree to inspect) is refused outright.
+- **"Regenerable ignored content" is decided by ignored-ness AND tracking**: an ignored file inside a
+  directory that merely bears a regenerable name (`venv/`, `node_modules/`) is regenerable only if
+  nothing under that directory is tracked. A tracked `venv/tool.py` next to an ignored secret is a
+  project, not a cache. A lock file in the git dir (`index.lock`) means a git process is active.
+- **`git worktree prune` is NOT used.** It removes the admin entry of EVERY prunable worktree, not just
+  the one just vaulted, so a worktree whose directory is temporarily elsewhere (an offline drive, a
+  rename) lost its staged index and an unpushed detached commit. The build removes exactly the one
+  entry it just backed up, after checking the entry's `gitdir` file names this worktree. This departs
+  from the owner's instruction to run `git worktree prune`; the reason is data loss in a case the
+  owner never asked Reclaim to touch. Restore refuses to write into a repository that has moved or
+  has been replaced by a different one (matched by root commits), and relative `.git` pointers are
+  resolved against the worktree, not the process's cwd.
+- **Process matching resolves paths**: relative arguments against the process's own directory, `..`,
+  junction/symlink aliases, and a local administrative share (`\\localhost\D$\...`). The vendor-service
+  allow-list uses name globs (`python*`, `pycharm*`, `devenv*`, ...) and ignores a drive root.
+- **Exclusions are decided on real locations too** (a junction alias of an excluded repository), on the
+  Claude project slug (`my_proj` is `my-proj` there), and any exclusion hit, including one found only in
+  the content, makes the verdict hidden. The apply-time re-proof and the rename-only move key on the
+  group OR the category, so a candidate that lies about one still gets the strict treatment.
+- **Accepted, not fixed:** hidden work in an NTFS alternate data stream survives the rename (it is lost
+  only when the vault entry is purged); a stale or hand-made remote-tracking ref counts as pushed (no
+  network is used, so the answer is as fresh as the last fetch); one unreadable same-user tool process
+  outside the vendor classes blocks every item.
