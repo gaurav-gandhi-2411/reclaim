@@ -24,6 +24,7 @@ from agent_fixtures import (
     make_repo,
     make_session,
     make_world,
+    mark_pushed,
     push_branch,
 )
 
@@ -558,15 +559,12 @@ def test_mixed_case_slug_is_matched_for_transcripts(tmp_path: Path) -> None:
 
 
 def _clone_into(session: Path, name: str = "clone") -> Path:
-    bare = session.parent / f"{name}-remote.git"
-    git(session, "init", "-q", "--bare", "-b", "main", str(bare))
     repo = session / name
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     commit_file(repo, "a.txt", "a\n", "initial")
     git(repo, "remote", "add", "origin", "https://example.invalid/c.git")
-    git(repo, "remote", "set-url", "--push", "origin", str(bare))
-    git(repo, "push", "-q", "-u", "origin", "main")
+    mark_pushed(repo, "main")
     return repo
 
 
@@ -722,7 +720,7 @@ def test_user_exclusion_check_stands_on_its_own(tmp_path: Path) -> None:
     )
     v = aa.evaluate_worktree(env, wt, repo)
     _refused(v, "W7")
-    assert "user exclusion" in v.failed_detail
+    assert v.excluded and "excluded project" in v.failed_detail
 
 
 def test_validator_block_stands_on_its_own(tmp_path: Path) -> None:
@@ -867,3 +865,255 @@ def test_the_git_pointer_of_an_excluded_worktree_is_not_even_read(
     world = make_world(tmp_path, exclusions=("proj-wt-feat",), run=_no_git)
     v = aa.evaluate_path(world.env, wt, aa.CAT_WORKTREE)
     assert v.excluded and not v.offered
+
+
+# === regression tests for the independent review (pass A): each reproduces a reported hole ===
+
+
+def _bare(tmp_path: Path, name: str = "elsewhere.git") -> Path:
+    bare = tmp_path / name
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    return bare
+
+
+def test_review_a_push_url_that_is_a_local_path_is_not_a_backup(tmp_path: Path) -> None:
+    """F5: `pushurl` -> a local bare repo still updates refs/remotes/origin/*, but is no backup."""
+    repo, wt = _wt(tmp_path)
+    git(repo, "remote", "set-url", "--push", "origin", str(_bare(tmp_path)))
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W4")
+    assert "no remote with a real URL" in v.failed_detail
+
+
+def test_review_a_push_instead_of_rewriting_to_a_local_path_is_not_a_backup(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    bare = _bare(tmp_path)
+    git(repo, "config", f"url.{bare.as_posix()}.pushInsteadOf", "https://example.invalid/")
+    assert git(repo, "remote", "get-url", "--push", "origin").stdout.strip() == (
+        bare.as_posix() + "proj.git"
+    )
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a_a_second_push_url_that_is_local_taints_the_remote(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(repo, "remote", "set-url", "--push", "--add", "origin", "https://example.invalid/proj.git")
+    git(repo, "remote", "set-url", "--push", "--add", "origin", str(_bare(tmp_path)))
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a_a_real_https_push_url_is_fine(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(repo, "remote", "set-url", "--push", "origin", "https://example.invalid/other.git")
+    assert _verdict(make_world(tmp_path), wt, repo).offered
+
+
+@pytest.mark.parametrize(
+    ("url", "real"),
+    [
+        ("ssh://localhost/o/r.git", False),
+        ("ssh://127.0.0.1/o/r.git", False),
+        ("https://localhost/o/r.git", False),
+        ("ssh://host/D:/backup/proj.git", False),
+        ("ssh://host/d:\\backup\\proj.git", False),
+        ("git@localhost:o/r.git", False),
+        ("git@host:D:/backup/r.git", False),
+        ("https://", False),
+        ("ssh://git@github.com/o/r.git", True),
+        ("https://gitlab.com/o/r.git", True),
+        ("git@github.com:o/r.git", True),
+    ],
+)
+def test_review_a_remote_url_allow_list_rejects_loopback_and_drive_paths(
+    url: str, real: bool
+) -> None:
+    assert aa.is_real_remote_url(url) is real
+
+
+@pytest.mark.parametrize(
+    "ref", ["refs/wip/save", "refs/original/refs/heads/main", "refs/jj/keep/abc", "refs/custom/x"]
+)
+def test_review_a_commit_reachable_only_from_a_custom_ref_keeps_a_clone(
+    tmp_path: Path, ref: str
+) -> None:
+    """F2: `--branches --tags HEAD` ignored every other ref namespace."""
+    clone = _clone(tmp_path)
+    commit_file(clone, "work.txt", "only here\n", "unpushed work")
+    git(clone, "update-ref", ref, "HEAD")
+    git(clone, "reset", "-q", "--hard", "HEAD~1")  # HEAD, branches and tags are all pushed again
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def test_review_a_unpushed_notes_keep_a_clone(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    git(clone, "notes", "add", "-m", "an unpushed note", "HEAD")
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def _nested_repo(inside: Path, *, pushed: bool, dirty: bool = False) -> Path:
+    inside.mkdir(parents=True)
+    git(inside, "init", "-q", "-b", "main")
+    commit_file(inside, "dep.py", "x\n", "dep")
+    if pushed:
+        git(inside, "remote", "add", "origin", "https://example.invalid/dep.git")
+        mark_pushed(inside, "main")
+    if dirty:
+        (inside / "dirty.txt").write_text("d", encoding="utf-8")
+    return inside
+
+
+@pytest.mark.parametrize("where", ["node_modules/dep", ".venv/src/pkg"])
+def test_review_a_unpushed_repo_inside_a_regenerable_directory_keeps_the_worktree(
+    tmp_path: Path, where: str
+) -> None:
+    """F3: pip editable VCS installs create `.venv/src/<pkg>` repositories."""
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, ".gitignore", "node_modules/\n.venv/\n", "ignore")
+    push_branch(wt, "feat")
+    nested = _nested_repo(wt / where, pushed=False)
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W9")
+    assert str(nested) in v.failed_detail
+
+
+def test_review_a_dirty_repo_inside_a_regenerable_directory_keeps_the_worktree(
+    tmp_path: Path,
+) -> None:
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, ".gitignore", ".venv/\n", "ignore")
+    push_branch(wt, "feat")
+    _nested_repo(wt / ".venv" / "src" / "pkg", pushed=True, dirty=True)
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W9")
+
+
+def test_review_a_a_pushed_clean_repo_inside_does_not_block(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, ".gitignore", "node_modules/\n", "ignore")
+    push_branch(wt, "feat")
+    _nested_repo(wt / "node_modules" / "dep", pushed=True)
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+    assert "W9 1 nested repositories" in " ".join(v.held)
+
+
+def test_review_a_unpushed_repo_inside_a_clone_keeps_the_clone(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    commit_file(clone, ".gitignore", ".venv/\n", "ignore")
+    mark_pushed(clone, "main")
+    _nested_repo(clone / ".venv" / "src" / "pkg", pushed=False)
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C8")
+
+
+def test_review_a_bare_repository_in_scratch_keeps_the_session(tmp_path: Path) -> None:
+    """F6: the only copy of a commit can sit in a bare repository (no `.git` entry to find)."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    bare = session / "scratchpad" / "origin.git"
+    git(session, "init", "-q", "--bare", "-b", "main", str(bare))
+    scratch_repo = session / "scratchpad" / "writer"
+    scratch_repo.mkdir()
+    git(scratch_repo, "init", "-q", "-b", "main")
+    commit_file(scratch_repo, "a", "a", "a")
+    git(scratch_repo, "push", "-q", str(bare), "main")
+    shutil.rmtree(
+        scratch_repo, onexc=lambda func, path, _exc: (Path(path).chmod(0o700), func(path))
+    )  # now the bare repo holds the only copy
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert "bare repository" in v.failed_detail
+
+
+def test_review_a_bare_repository_inside_a_worktree_keeps_it(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, ".gitignore", "node_modules/\n", "ignore")
+    push_branch(wt, "feat")
+    (wt / "node_modules").mkdir()
+    git(wt, "init", "-q", "--bare", "-b", "main", str(wt / "node_modules" / "stash.git"))
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W9")
+    assert "bare repository" in v.failed_detail
+
+
+def test_review_a_the_repository_own_git_dir_is_not_mistaken_for_a_bare_repo(
+    tmp_path: Path,
+) -> None:
+    clone = _clone(tmp_path)  # has .git/{HEAD,objects,refs}
+    assert aa.evaluate_clone(make_world(tmp_path).env, clone).offered
+
+
+def test_review_a_a_tracked_directory_named_venv_is_source_not_a_cache(tmp_path: Path) -> None:
+    """F4: a project that ships a package called `venv` keeps its ignored files out of "cache"."""
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, "venv/tool.py", "print(1)\n", "tracked source")
+    commit_file(wt, ".gitignore", "*.secretlocal\n", "ignore")
+    push_branch(wt, "feat")
+    (wt / "venv" / "keys.secretlocal").write_text("only copy", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W8")
+    assert "tracked source lives under 'venv'" in v.failed_detail
+
+
+def test_review_a_tracked_node_modules_subdirectory_with_an_ignored_database(
+    tmp_path: Path,
+) -> None:
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, "src/node_modules/x.js", "x\n", "tracked")
+    commit_file(wt, ".gitignore", "*.db\n", "ignore")
+    push_branch(wt, "feat")
+    (wt / "src" / "node_modules" / "data.db").write_text("only copy", encoding="utf-8")
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W8")
+
+
+def test_review_a_index_lock_means_a_git_process_is_active(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    gitdir = Path(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip())
+    (gitdir / "index.lock").write_text("", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W2")
+    assert "index.lock" in v.failed_detail
+
+
+def test_review_a_a_junction_alias_of_an_excluded_repository_is_excluded(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, "secretproj")
+    wt = add_worktree(repo, "wt-feature", "feat")
+    alias = tmp_path / "neutral-name"
+    make_junction(alias, repo)
+    world = make_world(tmp_path, exclusions=("secretproj",), run=_no_git)
+    v = aa.evaluate_worktree(world.env, wt, alias)  # repo handed in through the alias
+    assert v.excluded and not v.offered
+
+
+@pytest.mark.parametrize("excluded", ["my_proj", "my.proj", "My_Proj"])
+def test_review_a_exclusion_matches_the_claude_slug_rewrite(tmp_path: Path, excluded: str) -> None:
+    world = make_world(tmp_path, exclusions=(excluded,), run=_no_git)
+    session = make_session(world, slug="C--work-my-proj", age_days=30)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered and v.failed_rule == "S5"
+
+
+def test_review_a_an_exclusion_found_inside_the_content_is_hidden_too(tmp_path: Path) -> None:
+    world = make_world(tmp_path, exclusions=("intent-router",))
+    session = make_session(world, age_days=30)
+    (session / "scratchpad" / "intent-router-notes").mkdir()
+    _age_tree(session, world, 30)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered
+    assert "intent-router" not in v.failed_detail
+    assert aa.report_lines([v]) == []
+
+
+def test_review_a_relative_gitdir_pointer_does_not_depend_on_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, wt = _wt(tmp_path)
+    admin = Path(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip())
+    pointer = wt / ".git"
+    pointer.unlink()  # a hidden file on Windows: cannot be opened for writing
+    relative = os.path.relpath(admin, wt).replace(chr(92), "/")
+    pointer.write_bytes(("gitdir: " + relative + chr(10)).encode("utf-8"))
+    world = make_world(tmp_path)
+    for cwd in (tmp_path, repo, wt, tmp_path.parent):
+        monkeypatch.chdir(cwd)
+        v = aa.evaluate_path(world.env, wt, aa.CAT_WORKTREE)
+        assert v.offered, (str(cwd), v.failed_rule, v.failed_detail)

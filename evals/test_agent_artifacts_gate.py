@@ -32,6 +32,7 @@ from agent_fixtures import (
     make_repo,
     make_session,
     make_world,
+    mark_pushed,
     push_branch,
 )
 
@@ -203,15 +204,12 @@ def _s_transcript(world: World, session: Path) -> None:
 
 
 def _s_nested_unpushed(world: World, session: Path) -> None:
-    bare = session / "r.git"
-    git(session, "init", "-q", "--bare", "-b", "main", str(bare))
     repo = session / "c"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     commit_file(repo, "a", "a", "a")
     git(repo, "remote", "add", "origin", "https://example.invalid/c.git")
-    git(repo, "remote", "set-url", "--push", "origin", str(bare))
-    git(repo, "push", "-q", "-u", "origin", "main")
+    mark_pushed(repo, "main")
     commit_file(repo, "b", "b", "unpushed")
     stamp = world.env.now - 30 * 86400
     for dirpath, dirnames, filenames in os.walk(session):

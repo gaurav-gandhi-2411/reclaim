@@ -106,7 +106,7 @@ hooks in `executor.py` (apply-time re-proof, rename-only move, prune/repair) and
    `reclaim undo`. The copy-verify-delete fallback is DISABLED for these categories: a refused rename
    is reported as a failed item and the directory is left untouched. An item on a different volume
    than the vault is not offered (rule V). Worktrees: the git admin directory is copied into the
-   vaulted directory (`.reclaim-gitadmin/`) and `git worktree prune` runs; restore puts it back,
+   vaulted directory (`.reclaim-gitadmin/`) and exactly that one entry is removed (item 12: not `git worktree prune`); restore puts it back,
    removes the helper folder, runs `git worktree repair` and checks git lists the worktree.
 4. **Always Tier B, off by default, forced off in SAFE mode** (added to
    `SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS`: SAFE mode never uses the vault). Assistant (MCP) requests go
@@ -138,3 +138,12 @@ hooks in `executor.py` (apply-time re-proof, rename-only move, prune/repair) and
 11. **Open items status.** 1 decided (item 7 above). 2, 3, 4 unchanged. 5 unchanged. 6: the weekly
     `aged_temp` sweep is untouched; both may see the same scratch directory, and whichever acts first
     wins (the other finds it gone). 7 done (item 9 above). 8, 9 unchanged.
+12. **Changes forced by the first independent review (2026-10-20; ADR-0043 Addendum 1).** Backed up
+    means BOTH fetch and push URL are real (no loopback, no drive path); clones and nested repositories
+    are compared against `--all` refs; repositories nested in `node_modules`/`.venv` and any bare
+    repository are proven or refused (W9, C8, S7); ignored content inside a regenerable-named directory
+    counts only if nothing under it is tracked; `index.lock` blocks; a worktree's admin entry is removed
+    EXACTLY (no `git worktree prune`, which also drops other prunable worktrees' entries), and restore
+    never writes into a moved or different repository; process matching resolves relative arguments,
+    `..`, junction aliases and local administrative shares; exclusions are checked on real locations and
+    on the Claude slug. Items 3 and 8 above are amended accordingly (prune -> exact entry removal).
