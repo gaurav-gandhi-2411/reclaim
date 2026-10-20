@@ -16,6 +16,7 @@ import send2trash
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from reclaim import agent_artifacts
 from reclaim.app_paths import data_root
 from reclaim.index import ScanIndex
 from reclaim.models import (
@@ -682,7 +683,7 @@ def rmtree_reparse_point_safe(path: str) -> None:
     shutil.rmtree(path, onexc=rmtree_clear_readonly)
 
 
-def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
+def _atomic_move(src: Path, dst: Path, *, is_dir: bool, allow_copy_fallback: bool = True) -> None:
     r"""Moves `src` to `dst` with an "either fully succeeds, or `src` is left completely
     untouched with zero orphaned debris at `dst`" guarantee — never a partial state, and never
     even an empty leftover directory shell (ADR-0004).
@@ -738,7 +739,12 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
     try:
         os.rename(long_src, long_dst)  # noqa: PTH104
     except OSError:
-        pass
+        if not allow_copy_fallback:
+            # Agent artifacts (docs/specs/agent-artifacts.md): a refused rename is the OS
+            # telling us something still holds the directory. Never copy-then-delete a tree
+            # that may be live; leave it untouched and report.
+            _cleanup_dst_and_empty_parent()
+            raise
     else:
         return
 
@@ -778,6 +784,12 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool) -> None:
                 f"destination {post_size} bytes"
             )
         unlink_clear_readonly(long_src)
+
+
+def _rename_only(category_group: str) -> dict[str, bool]:
+    """Extra `_atomic_move` keywords: agent artifacts (docs/specs/agent-artifacts.md) are only
+    ever MOVED by a rename; every other category keeps the copy-verify-delete fallback."""
+    return {"allow_copy_fallback": False} if category_group == agent_artifacts.GROUP else {}
 
 
 def _is_moved_not_freed(item: ItemApplyResult) -> bool:
@@ -1497,6 +1509,8 @@ def _preflight_skip_reason(
     item_method: QuarantineMethod,
     scan_index: ScanIndex | None,
     allowed_roots: Sequence[Path] | None,
+    safety: SafetyValidator | None = None,
+    vault_dir: Path | None = None,
 ) -> PreflightSkipReason | None:
     """Audit P0-1 (docs/AUDIT-2026-08.md) + P0-K1a (this session) + AE1 (this session): the
     pre-flight safety checks run in order, against one candidate right before `apply_batch` would
@@ -1563,6 +1577,21 @@ def _preflight_skip_reason(
             allowed_roots=[str(root) for root in allowed_roots],
         )
         return "outside_user_scope"
+
+    if candidate.category_group == agent_artifacts.GROUP:
+        # Spec docs/specs/agent-artifacts.md section 3: the scan-time verdict is never trusted.
+        # Every rule is re-proven from live state right now; anything that cannot be proven
+        # (no validator or vault to prove against, git failing, a process unreadable) refuses.
+        if item_method != "vault":
+            return "agent_artifact_requires_vault"
+        if safety is None or vault_dir is None:
+            return "agent_artifact_not_provably_finished"
+        failed = agent_artifacts.reverify(candidate, safety=safety, vault_dir=vault_dir)
+        if failed is not None:
+            logger.info(
+                "executor.agent_artifact_reverify_failed", path=str(candidate.path), detail=failed
+            )
+            return "agent_artifact_not_provably_finished"
 
     if check_file_in_use(candidate.path, is_dir=candidate.is_dir):
         return "file_in_use"
@@ -1925,6 +1954,8 @@ def apply_batch(
                 item_method=item_method,
                 scan_index=scan_index,
                 allowed_roots=allowed_roots,
+                safety=safety,
+                vault_dir=resolved_vault_dir,
             )
             if skip_reason is not None:
                 logger.info(
@@ -1979,7 +2010,12 @@ def apply_batch(
             try:
                 if item_method == "vault":
                     resolved_vault_path = _require_vault_path(vault_path)
-                    _atomic_move(candidate.path, resolved_vault_path, is_dir=candidate.is_dir)
+                    _atomic_move(
+                        candidate.path,
+                        resolved_vault_path,
+                        is_dir=candidate.is_dir,
+                        **_rename_only(candidate.category_group),
+                    )
                 elif item_method == "recycle_bin":
                     assert_not_real_profile_under_pytest(
                         candidate.path, operation="send to the Recycle Bin"
@@ -2066,6 +2102,14 @@ def apply_batch(
             # whose target now exists — `reclaim.recovery` reconciles it as "completed".
             done_entry = intent_entry.model_copy(update={"phase": "done"})
             _append_and_sync(manifest_fh, done_entry)
+            if item_method == "vault" and candidate.category == agent_artifacts.CAT_WORKTREE:
+                note = agent_artifacts.after_vault_move(
+                    candidate.path, _require_vault_path(vault_path)
+                )
+                if note is not None:
+                    logger.warning(
+                        "executor.agent_worktree_prune_note", path=str(candidate.path), note=note
+                    )
             items.append(
                 ItemApplyResult(
                     path=candidate.path,
@@ -2470,7 +2514,12 @@ def restore_batch(
             _append_and_sync(manifest_fh, intent_entry)
 
             try:
-                _atomic_move(entry.vault_path, entry.original_path, is_dir=entry.is_dir)
+                _atomic_move(
+                    entry.vault_path,
+                    entry.original_path,
+                    is_dir=entry.is_dir,
+                    **_rename_only(entry.category_group),
+                )
             except (OSError, VaultIntegrityError) as exc:
                 logger.warning(
                     "executor.restore_item_failed",
@@ -2503,6 +2552,14 @@ def restore_batch(
                     update={"phase": "done", "restored": True, "restored_at": now_ts}
                 ),
             )
+            if entry.category == agent_artifacts.CAT_WORKTREE:
+                note = agent_artifacts.after_restore(entry.original_path)
+                if note is not None:
+                    logger.warning(
+                        "executor.agent_worktree_repair_note",
+                        path=str(entry.original_path),
+                        note=note,
+                    )
             items.append(
                 RestoreItemResult(
                     original_path=entry.original_path,

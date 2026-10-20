@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from reclaim.config import Config, exclusion_patterns
+from reclaim.config import AgentArtifactsConfig, Config, exclusion_patterns
 from reclaim.models import FileRecord, SafetyResult, Verdict
 
 REASON_PROTECTED_SYSTEM_ROOT = "PROTECTED_SYSTEM_ROOT"
@@ -299,6 +299,13 @@ class SafetyValidator:
         self._dev_artifacts_enabled = config.categories.dev_artifacts.enabled
         # ADR-0039: `[safety] deny` + one glob per `[exclusions] project_names` entry.
         self._user_exclusions = exclusion_patterns(config)
+        self._agent_artifacts = config.categories.agent_artifacts
+
+    @property
+    def agent_artifacts_settings(self) -> AgentArtifactsConfig:
+        """`[categories.agent_artifacts]` as this validator was built from (idle window, clone
+        name patterns): the apply-time re-proof must use the same values as detection."""
+        return self._agent_artifacts
 
     @property
     def exclusion_patterns(self) -> tuple[str, ...]:

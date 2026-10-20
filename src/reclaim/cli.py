@@ -10,7 +10,7 @@ import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
-from reclaim import autoclean_schedule, autoclean_state, regenerable
+from reclaim import agent_artifacts, autoclean_schedule, autoclean_state, regenerable
 from reclaim.app_paths import data_root
 from reclaim.config import Config, exclusion_patterns, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
@@ -180,6 +180,23 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=_DB_HELP,
+    )
+
+    agent_parser = subparsers.add_parser(
+        "agent-artifacts",
+        help="DRY RUN, read-only: list the stale AI-agent git worktrees, throwaway verify clones "
+        "and idle agent scratch that are provably finished (every commit on a real remote, no "
+        "live process, ...) and would be offered for review, with sizes and the exact reasons. "
+        "Nothing is moved or deleted.",
+    )
+    agent_parser.add_argument("--db", type=Path, default=None, help=_DB_HELP)
+    agent_parser.add_argument(
+        "--config", type=Path, default=_DEFAULT_CONFIG_PATH, help="Path to config.toml."
+    )
+    agent_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also list every artifact that was KEPT, each with the first rule that failed.",
     )
 
     apply_parser = subparsers.add_parser(
@@ -765,6 +782,60 @@ def _run_index_prune(args: argparse.Namespace) -> int:
         print(  # noqa: T201
             f"reclaim index-prune: index file {size_before} -> {args.db.stat().st_size} bytes"
             + ("" if args.vacuum else " (pass --vacuum to return freed pages to the OS)")
+        )
+    return 0
+
+
+def _run_agent_artifacts(args: argparse.Namespace) -> int:
+    """Dry run of the agent-artifacts detector (docs/specs/agent-artifacts.md). It runs even
+    when `[categories.agent_artifacts] enabled` is false: looking is free, the category only
+    gates whether anything is ever OFFERED in the dashboard. Writes nothing."""
+    if not args.db.exists():
+        print(  # noqa: T201
+            f"reclaim agent-artifacts: no index found at {args.db} -- run `reclaim scan` first.",
+            file=sys.stderr,
+        )
+        return 1
+    config = _load_config_or_none("agent-artifacts", args.config)
+    if config is None:
+        return 1
+    safety = SafetyValidator(config)
+    settings = config.categories.agent_artifacts
+    with ScanIndex(args.db) as index:
+        env = agent_artifacts.build_env(safety, newest_mtime_hint=index.subtree_newest_mtime)
+        _candidates, verdicts = agent_artifacts.detect_agent_artifacts(
+            index, safety, retention_days=settings.retention_days, env=env
+        )
+        sizes = {v.path: index.subtree_size_bytes(v.path) for v in verdicts}
+    excluded = sum(1 for v in verdicts if v.excluded)
+    verdicts = [v for v in verdicts if not v.excluded]
+    offered = [v for v in verdicts if v.offered]
+    kept = [v for v in verdicts if not v.offered]
+    scan = env.procs
+    print(  # noqa: T201 -- CLI output, not application logging
+        f"reclaim agent-artifacts: DRY RUN (nothing is moved). examined {len(verdicts)}; "
+        f"would propose {len(offered)} ({sum(sizes[v.path] for v in offered) / 2**30:.2f} GiB); "
+        f"keep {len(kept)}; {excluded} belong to excluded projects (not inspected, not listed). "
+        f"Processes: {len(scan.processes)} readable, "
+        f"{len(scan.blocked)} unreadable same-user (blocking), "
+        f"{len(scan.set_aside)} vendor services set aside, {scan.other_or_system} other/system."
+    )
+    for kind in agent_artifacts.CATEGORIES:
+        mine = [v for v in offered if v.category == kind]
+        print(  # noqa: T201
+            f"  {kind}: {len(mine)} proposed, {sum(sizes[v.path] for v in mine) / 2**30:.2f} GiB"
+        )
+    shown = verdicts if args.all else offered
+    for line in agent_artifacts.report_lines(shown, sizes):
+        print(line)  # noqa: T201
+    if kept and not args.all:
+        reasons: dict[str, int] = {}
+        for v in kept:
+            reasons[v.failed_rule] = reasons.get(v.failed_rule, 0) + 1
+        print(  # noqa: T201
+            "kept, by first failed rule: "
+            + ", ".join(f"{rule} x{n}" for rule, n in sorted(reasons.items()))
+            + "  (use --all to list them)"
         )
     return 0
 
@@ -1764,6 +1835,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.db = _DEFAULT_DB_PATH
     if args.command == "scan":
         return _run_scan(args)
+    if args.command == "agent-artifacts":
+        return _run_agent_artifacts(args)
     if args.command == "reconcile":
         return _run_reconcile(args)
     if args.command == "index-prune":
