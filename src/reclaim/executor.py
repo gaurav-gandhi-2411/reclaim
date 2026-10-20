@@ -786,10 +786,13 @@ def _atomic_move(src: Path, dst: Path, *, is_dir: bool, allow_copy_fallback: boo
         unlink_clear_readonly(long_src)
 
 
-def _rename_only(category_group: str) -> dict[str, bool]:
+def _rename_only(category_group: str, category: str = "") -> dict[str, bool]:
     """Extra `_atomic_move` keywords: agent artifacts (docs/specs/agent-artifacts.md) are only
-    ever MOVED by a rename; every other category keeps the copy-verify-delete fallback."""
-    return {"allow_copy_fallback": False} if category_group == agent_artifacts.GROUP else {}
+    ever MOVED by a rename; every other category keeps the copy-verify-delete fallback. Keyed on the
+    group OR the category, so a candidate that lies about one still gets the strict treatment."""
+    if agent_artifacts.is_agent_candidate(category_group, category):
+        return {"allow_copy_fallback": False}
+    return {}
 
 
 def _is_moved_not_freed(item: ItemApplyResult) -> bool:
@@ -1578,7 +1581,7 @@ def _preflight_skip_reason(
         )
         return "outside_user_scope"
 
-    if candidate.category_group == agent_artifacts.GROUP:
+    if agent_artifacts.is_agent_candidate(candidate.category_group, candidate.category):
         # Spec docs/specs/agent-artifacts.md section 3: the scan-time verdict is never trusted.
         # Every rule is re-proven from live state right now; anything that cannot be proven
         # (no validator or vault to prove against, git failing, a process unreadable) refuses.
@@ -2014,7 +2017,7 @@ def apply_batch(
                         candidate.path,
                         resolved_vault_path,
                         is_dir=candidate.is_dir,
-                        **_rename_only(candidate.category_group),
+                        **_rename_only(candidate.category_group, candidate.category),
                     )
                 elif item_method == "recycle_bin":
                     assert_not_real_profile_under_pytest(
@@ -2518,7 +2521,7 @@ def restore_batch(
                     entry.vault_path,
                     entry.original_path,
                     is_dir=entry.is_dir,
-                    **_rename_only(entry.category_group),
+                    **_rename_only(entry.category_group, entry.category),
                 )
             except (OSError, VaultIntegrityError) as exc:
                 logger.warning(

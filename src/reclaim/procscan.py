@@ -20,11 +20,12 @@ working directory) or a file inside it open without delete sharing.
 from __future__ import annotations
 
 import ctypes
+import fnmatch
 import os
 import re
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -63,10 +64,30 @@ class ProcessScan:
     # Same-user processes that could not be read but whose image is a Windows / vendor service
     # binary (see `is_vendor_service`): reported, not blocking. `(pid, name, image path)`.
     set_aside: tuple[tuple[int, str, str], ...] = ()
+    # pid -> every absolute path the process mentions (cwd, path-like command-line arguments),
+    # normalised AND resolved (`..`, junctions, symlinks, local admin shares): once per scan.
+    _mentions: dict[int, tuple[str, ...]] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def usable(self) -> bool:
         return self.ok and not self.blocked
+
+    def mentions(self, proc: ProcessSnapshot) -> tuple[str, ...]:
+        cached = self._mentions.get(proc.pid)
+        if cached is not None:
+            return cached
+        found: list[str] = []
+        if proc.cwd:
+            found += [normalize_path(proc.cwd), resolve_path(proc.cwd)]
+        if proc.cmdline:
+            for token in _split_args(proc.cmdline):
+                for piece in _pieces(token):
+                    if "\\" in piece or "/" in piece or ":" in piece:
+                        # A relative argument means "relative to the process's own directory".
+                        found += [normalize_path(piece), resolve_path(piece, proc.cwd)]
+        unique = tuple(dict.fromkeys(x for x in found if x))
+        self._mentions[proc.pid] = unique
+        return unique
 
     def in_use(self, root: Path | str) -> list[str]:
         """Reasons `root` may be in use ([] = provably unused as far as this scan can see)."""
@@ -75,55 +96,77 @@ class ProcessScan:
             return [f"process inspection unavailable: {self.reason}"]
         for pid, name, why in self.blocked:
             reasons.append(f"cannot inspect same-user process {name} (pid {pid}): {why}")
-        wanted = normalize_path(root)
+        wanted = {w for w in (normalize_path(root), resolve_path(root)) if w}
         if not wanted:
             return ["empty path"]
-        pattern = re.compile(re.escape(wanted) + r"(?=$|[\\\s\"';,)])")
+        patterns = [re.compile(re.escape(w) + r"(?=$|[\\\s\"';,)])") for w in wanted]
         for proc in self.processes:
-            if proc.cwd is not None and _inside(normalize_path(proc.cwd), wanted):
+            cwd_forms = (
+                [normalize_path(proc.cwd), resolve_path(proc.cwd)] if proc.cwd is not None else []
+            )
+            if any(_inside(form, w) for form in cwd_forms for w in wanted):
                 reasons.append(f"{proc.name} (pid {proc.pid}) has its working directory inside")
                 continue
             if proc.cmdline is None:
                 continue
             cmd = normalize_path(proc.cmdline, expand_short=False)
-            if pattern.search(cmd) is not None or any(
-                _inside(normalize_path(tok), wanted) for tok in _path_tokens(proc.cmdline)
+            if any(pat.search(cmd) is not None for pat in patterns) or any(
+                _inside(mentioned, w) for mentioned in self.mentions(proc) for w in wanted
             ):
                 reasons.append(f"{proc.name} (pid {proc.pid}) has the path in its command line")
         return reasons
 
 
-# Image names that can host user work (shells, interpreters, runtimes, editors, VCS, agents).
-# An UNREADABLE process with one of these names blocks even when it lives under Program Files.
-_WORK_HOSTS = frozenset(
-    {
-        "cmd.exe", "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe", "py.exe",
-        "node.exe", "git.exe", "bash.exe", "sh.exe", "wsl.exe", "wslhost.exe", "java.exe",
-        "javaw.exe", "dotnet.exe", "go.exe", "cargo.exe", "rustc.exe", "docker.exe", "npm.exe",
-        "pnpm.exe", "yarn.exe", "code.exe", "cursor.exe", "claude.exe", "wt.exe",
-        "windowsterminal.exe", "conhost.exe", "openconsole.exe", "msbuild.exe", "gcc.exe",
-        "make.exe", "ruby.exe", "perl.exe", "php.exe", "deno.exe", "bun.exe", "uv.exe",
-        "ssh.exe", "winpty-agent.exe", "reclaim.exe",
-    }
+# Image-name globs of programs that can host user work (shells, interpreters, runtimes, editors and
+# IDEs, VCS, terminals, agents). An UNREADABLE process matching one blocks even when it lives under
+# Program Files. A review showed an exact-name list is too easy to miss (`python3.12.exe`,
+# `pycharm64.exe`), hence globs.
+_WORK_HOST_GLOBS = (
+    "cmd*", "powershell*", "pwsh*", "python*", "py.exe", "pip*", "conda*", "mamba*", "uv.exe",
+    "node*", "npm*", "npx*", "pnpm*", "yarn*", "bun*", "deno*", "tsc*", "vite*", "next*",
+    "webpack*",
+    "git*", "bash*", "sh.exe", "zsh*", "wsl*", "mintty*", "tmux*", "ssh*", "winpty*",
+    "java*", "kotlin*", "gradle*", "mvn*", "dotnet*", "msbuild*", "devenv*", "go.exe", "gofmt*",
+    "cargo*", "rustc*", "rust-analyzer*", "gcc*", "g++*", "clang*", "make*", "cmake*", "ninja*",
+    "ruby*", "perl*", "php*", "lua*", "julia*", "rscript*", "r.exe", "jupyter*", "ipython*",
+    "docker*", "podman*", "kubectl*", "terraform*",
+    "code*", "cursor*", "windsurf*", "zed*", "claude*", "codex*", "aider*", "copilot*",
+    "pycharm*", "idea*", "webstorm*", "clion*", "rider*", "goland*", "phpstorm*", "rubymine*",
+    "datagrip*", "studio*", "sublime*", "notepad++*", "atom*", "brackets*", "eclipse*", "netbeans*",
+    "vim*", "nvim*", "gvim*", "emacs*",
+    "wt.exe", "windowsterminal*", "conhost*", "openconsole*", "alacritty*", "wezterm*", "kitty*",
+    "hyper*", "terminus*", "reclaim*",
 )  # fmt: skip
+
+
+def _is_work_host(name: str) -> bool:
+    lowered = name.lower()
+    return any(fnmatch.fnmatch(lowered, glob) for glob in _WORK_HOST_GLOBS)
 
 
 def is_vendor_service(image_path: str | None, name: str) -> bool:
     """True for an unreadable same-user process that is a Windows or vendor service binary:
     its image lives under %SystemRoot%, Program Files (both) or ProgramData and its name is not a
-    shell, interpreter or other tool that could be working inside a repository. Such a process
+    shell, interpreter, IDE or other tool that could be working inside a repository. Such a process
     (an OEM hotkey helper, `ctfmon`, a WMI host) did not start in an agent's worktree. Anything
-    else unreadable -- an elevated terminal, a tool under the user's profile -- stays blocking."""
-    if not image_path or name.lower() in _WORK_HOSTS:
+    else unreadable -- an elevated terminal, a tool under the user's profile -- stays blocking.
+    The environment variables that name the trusted roots must all be set and absolute: if they are
+    not, nothing is trusted."""
+    if not image_path or _is_work_host(name):
         return False
-    if os.path.basename(image_path).lower() in _WORK_HOSTS:  # noqa: PTH119 -- plain string
+    if _is_work_host(os.path.basename(image_path)):  # noqa: PTH119 -- plain string
         return False
     roots = [
         os.environ.get(var, "")
         for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData")
     ]
     image = normalize_path(image_path, expand_short=False)
-    return any(root and _inside(image, normalize_path(root, expand_short=False)) for root in roots)
+    return any(
+        root
+        and len(normalize_path(root, expand_short=False)) > 3  # a drive root is never a vendor root
+        and _inside(image, normalize_path(root, expand_short=False))
+        for root in roots
+    )
 
 
 def _inside(candidate: str, root: str) -> bool:
@@ -150,10 +193,73 @@ def normalize_path(value: Path | str, *, expand_short: bool = True) -> str:
     expanded when the path exists (`GetLongPathNameW` works on a path, not on a raw substring)."""
     # Every extended-length prefix, wherever it sits (a command line can carry several), except
     # the `\\?\UNC\` form, which names a network path.
-    text = _EXTENDED_PREFIX.sub("", str(value)).replace("/", "\\")
+    text = _local_admin_share(_EXTENDED_PREFIX.sub("", str(value)).replace("/", "\\"))
     if expand_short and _IS_WINDOWS and "~" in text:
         text = _long_path_name(text) or text
     return text.casefold().rstrip("\\")
+
+
+_ADMIN_SHARE_PREFIX = re.compile(
+    r"^\\\\(?:\?\\UNC\\)?([^\\]+)\\([A-Za-z])\$(?=\\|$)", re.IGNORECASE
+)
+
+
+def _local_admin_share(text: str) -> str:
+    """`\\\\localhost\\D$\\x` (and this machine's own name, 127.0.0.1) is just `D:\\x`."""
+    match = _ADMIN_SHARE_PREFIX.match(text)
+    if match is None:
+        return text
+    host = match.group(1).lower()
+    local = {"localhost", "127.0.0.1", "[::1]", os.environ.get("COMPUTERNAME", "\0").lower()}
+    if host not in local:
+        return text
+    return match.group(2) + ":" + text[match.end() :]
+
+
+def resolve_path(value: Path | str, base: str | None = None) -> str:
+    """`normalize_path` of the REAL location of `value`: `..` collapsed, junctions and symlinks
+    followed, a local administrative share mapped to its drive. A relative `value` is relative to
+    `base` (a process's own working directory), never to ours."""
+    text = _local_admin_share(_EXTENDED_PREFIX.sub("", str(value)).replace("/", "\\"))
+    try:
+        if base and not Path(text).is_absolute():
+            text = os.path.join(base, text)  # noqa: PTH118 -- plain strings
+        return normalize_path(os.path.realpath(text))
+    except (OSError, ValueError):
+        return normalize_path(text)
+
+
+def _pieces(token: str) -> list[str]:
+    """A command-line argument and the parts that can carry a path: `--root=X`, `a;b`, `a,b`."""
+    parts = [token]
+    if "=" in token:
+        parts.append(token.split("=", 1)[1])
+    for sep in (";", ","):
+        for part in list(parts):
+            if sep in part:
+                parts.extend(piece for piece in part.split(sep) if piece)
+    return [p.strip("\"'") for p in parts if p]
+
+
+def _split_args(cmdline: str) -> list[str]:
+    """The arguments of a Windows command line, split the way the OS does (`CommandLineToArgvW`);
+    a quote-aware regex when that is unavailable."""
+    if _IS_WINDOWS:
+        try:
+            shell32 = ctypes.windll.shell32
+            shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+            count = ctypes.c_int(0)
+            pointer = shell32.CommandLineToArgvW(cmdline, ctypes.byref(count))
+            if pointer:
+                try:
+                    return [str(pointer[i]) for i in range(count.value)]
+                finally:
+                    ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+                    ctypes.windll.kernel32.LocalFree(pointer)
+        except (AttributeError, OSError):
+            pass
+    return re.findall(r'"[^"]*"|\S+', cmdline)
 
 
 def _long_path_name(text: str) -> str | None:

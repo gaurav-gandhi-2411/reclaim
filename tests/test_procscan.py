@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import os
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from agent_fixtures import make_junction
 
 from reclaim import procscan
 from reclaim.procscan import ProcessSnapshot, fake_scan, normalize_path, scan_processes
@@ -207,3 +209,101 @@ def test_set_aside_processes_do_not_block() -> None:
     )
     assert scan.usable
     assert scan.in_use("C:" + BS + "anything") == []
+
+
+# --- spellings of a path that string matching alone missed (independent review, finding F1) ------
+
+
+def _scan_of(cwd: Path | str, cmdline: str, name: str = "python.exe") -> procscan.ProcessScan:
+    return fake_scan([ProcessSnapshot(7, name, str(cwd), cmdline)])
+
+
+def test_relative_argument_is_resolved_against_the_process_directory(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    # the normal sibling layout: the process runs in the PARENT and names the worktree relatively
+    scan = _scan_of(tmp_path, "python proj-wt-feat" + BS + "server.py")
+    assert scan.in_use(wt), "relative argument not understood"
+    scan_forward = _scan_of(tmp_path, "python proj-wt-feat/server.py")
+    assert scan_forward.in_use(wt)
+    # the sibling that merely shares a prefix is not the same directory
+    (tmp_path / "proj-wt-feat2").mkdir()
+    assert not _scan_of(tmp_path, "python proj-wt-feat2" + BS + "server.py").in_use(wt)
+
+
+def test_dotdot_in_an_argument_is_collapsed(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    (tmp_path / "zz").mkdir()
+    wt.mkdir()
+    cmd = "python " + str(tmp_path / "zz" / ".." / "proj-wt-feat" / "server.py")
+    assert _scan_of(tmp_path / "zz", cmd).in_use(wt)
+    assert _scan_of(tmp_path, "python zz" + BS + ".." + BS + "proj-wt-feat" + BS + "x.py").in_use(
+        wt
+    )
+
+
+def test_a_junction_alias_in_an_argument_or_as_the_directory_is_resolved(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    alias = tmp_path / "alias"
+    make_junction(alias, wt)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert _scan_of(elsewhere, "python " + str(alias / "server.py")).in_use(wt)  # argument
+    assert _scan_of(alias, "python server.py").in_use(wt)  # working directory
+    assert _scan_of(elsewhere, "python " + str(wt / "server.py")).in_use(alias)  # the other way
+
+
+def test_local_administrative_share_spelling_is_the_same_directory(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    drive, rest = os.path.splitdrive(str(wt))
+    unc = BS + BS + "localhost" + BS + drive[0] + "$" + rest
+    assert _scan_of(tmp_path, "python " + unc + BS + "server.py").in_use(wt)
+    unc_cwd = BS + BS + "127.0.0.1" + BS + drive[0] + "$" + rest
+    assert _scan_of(unc_cwd, "python server.py").in_use(wt)
+    # another machine's administrative share is NOT this directory
+    other = BS + BS + "some-other-host" + BS + drive[0] + "$" + rest
+    assert not _scan_of(tmp_path, "python " + other + BS + "server.py").in_use(wt)
+
+
+def test_mentions_are_computed_once_per_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt = tmp_path / "w"
+    wt.mkdir()
+    scan = _scan_of(tmp_path, "python w" + BS + "x.py")
+    calls = {"n": 0}
+    real = procscan.resolve_path
+
+    def counting(*a: object, **k: object) -> str:
+        calls["n"] += 1
+        return real(*a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(procscan, "resolve_path", counting)
+    scan.in_use(wt)
+    first = calls["n"]
+    scan.in_use(wt)
+    # the per-process part is cached; only the root's own resolution repeats
+    assert calls["n"] - first < first
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["python3.12.exe", "pycharm64.exe", "devenv.exe", "sublime_text.exe", "windsurf.exe",
+     "Code.exe", "Cursor.exe", "node.exe", "bash.exe", "git-bash.exe", "idea64.exe", "nvim.exe"],
+)  # fmt: skip
+def test_work_hosts_are_never_set_aside(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ProgramFiles", "C:" + BS + "Program Files")
+    monkeypatch.setenv("SystemRoot", "C:" + BS + "Windows")
+    assert not procscan.is_vendor_service("C:" + BS + "Program Files" + BS + "x" + BS + name, name)
+
+
+def test_a_drive_root_is_never_a_vendor_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ProgramData", "D:" + BS)
+    assert not procscan.is_vendor_service("D:" + BS + "tool" + BS + "helper.exe", "helper.exe")
+    for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+        monkeypatch.delenv(var, raising=False)
+    assert not procscan.is_vendor_service("C:" + BS + "Windows" + BS + "x.exe", "x.exe")  # none set
