@@ -3,7 +3,53 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-20 (POST-SHUTDOWN STATE; #177 MERGED; BUILD 10 INSTALLED; INDEX CONVERTED) -- READ THIS FIRST
+## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- READ THIS FIRST
+
+VERIFIED = command run this session; BELIEVED = inferred. The owner said "pause all the work, we will continue after 23rd Oct". Everything below is the exact state at the pause. Supersedes the post-shutdown checkpoint under it for open work; its facts stay valid. Logs and scripts: `D:\reclaim-build` (names given).
+
+### State in one paragraph
+Nothing is running (no scan, serve, build, launcher, mutation run, verifier). Installed app = build 10 (unchanged). The owner's decisions of this round: (1) the repo-local git email `gaurav.gandhi2411@gmail.com` is deliberate and stays (CLAUDE.md rule 8, merged #180); (2) stale branches cleaned; (3) exclusion-matcher speedup; (4) agent-artifacts cleanup feature. (3) and (4) are built, tested and bundled in **draft release PR #182** (`release/2026-10-20`, head `1baff40`), which is **NOT ready to merge** (see "To resume").
+
+### Done and merged this round (VERIFIED)
+- #179 `e6ffbdd` (10-20 checkpoint) and #180 `57ef0b7` (CLAUDE.md rule 8: the repo-local git email is deliberate; use it for commits, never override it or rewrite history over it), both under the gate, CI green (one transient `ai-layer-with-extras` throughput failure on #179, passed on re-run).
+- Branch cleanup (owner-approved): 167 local branches whose upstream was gone; 14 deleted by `git branch -d`; of the 153 it refused, 130 had their tips on origin (mostly `pr/N` refs), 3 were patch-equivalent in main, and **20 had unique commits and were pushed to `origin/backup/<name>` with the SHA confirmed identical before the local delete**. Per-branch list: `D:\reclaim-build\branch_cleanup_20261020.tsv` (167 rows). `backup/q3-mcp-rebase-work` was pushed earlier.
+- Worktrees left: the main checkout and `reclaim-wt-work` (on `release/2026-10-20`, clean).
+
+### Draft release PR #182 (for the owner; do not merge as is)
+Two changes (details, numbers and the gate table are in the PR body):
+1. **`perf/exclusion-match-speedup`** (`safety.subtree_exclusion_match`: 358 of the 574 s warm-up). Same decisions: 49,295 common decisions identical on a D: copy of the real index, 22 mutants killed, two independent reviews (pass 1 found a real relative-root divergence, fixed; pass 2 found none but 8 test gaps, closed). Hot-cache 2.4-2.7x.
+2. **`feat/agent-artifacts`** (ADR-0043, spec section 10): reversible vault move of finished agent worktrees / throwaway verify clones / idle scratch; `reclaim agent-artifacts` dry run; `procscan.py`. Review pass A **falsified the first build in 9 scenarios (4 through to an actual move)**; all fixed with reproducing regression tests, including one departure from the owner's instruction: **`git worktree prune` is not used** (it deletes every prunable worktree's admin entry; exact-entry removal instead). 55 rule mutants killed, 0 surviving.
+
+### An incident to know about (VERIFIED, reported)
+The FIRST dry run of the agent-artifacts command ran **read-only git commands (`--no-optional-locks`) in 26 fr-en-transformer worktrees and its repository** before the code checked exclusions, which breaks the standing hard exclusion. Nothing was written (BELIEVED: no index refresh with `--no-optional-locks`; not verifiable after the fact). The code now decides exclusion from the path before any git call or walk and never lists excluded items; the re-run logged the working directory of every git call: 414 invocations, 0 in an excluded project's directory (`D:\reclaim-build\agent_dryrun2_git_cwds.txt`). shipdoc-extract and intent-router did not appear.
+
+### To resume (in this order)
+1. `git fetch`; check `gh pr view 182` CI table (it was queued when paused) and that main has not moved.
+2. **Run review pass B on the FIXED code**: export a snapshot (`git archive release/2026-10-20` into an empty dir under `D:\reclaim-build\tmp\`), have a fresh verifier (a) re-run pass A's reproduction scripts `D:\reclaim-build\tmp\verifier3\work\a1.py`..`a15.py`, `e2e.py` against it (they pin the old snapshot path; adapt), and (b) attack executor/restore/MCP/hermetic isolation with a different brief. All-confirmed means rerun with another brief.
+3. Re-run the full verify on the final head (`bash D:\reclaim-build\tools\verify_wt.sh <worktree>`; ~11 min; last full run was on `12046cd`: 2358 passed, 22 skipped).
+4. Re-run the dry run on the final code (the list below was produced BEFORE the review fixes): `scripts/scratch_index.py` copy of the real index on D:, then `D:\reclaim-build\tools\run_agent_dryrun2.py {DB}` (logs git cwds), summary via `summarize_dryrun.py`. Give the owner the list; apply nothing.
+5. Then build 11 (`launch_build11.py` pattern, RAM-wait, heat rule: one heavy step at a time), measure the warm-up on the installed-build equivalent (standalone `entry_point.dist\reclaim.exe serve` against a D: copy of the index; install only after the owner merges), report before/after (before: 636 s first run, 574 s hash-hot, summary 0.07 s).
+6. Update this file; remove `reclaim-wt-work` after #182 merges; delete the verifier scratch (list below).
+
+### Dry-run list as of the pre-fix build (NOT final; nothing was applied)
+74 examined, 14 proposed (0.22 GiB), 60 kept, 26 excluded-project items not inspected or listed. Proposed: worktrees `stylemaitri-wt-groq-deprecation`, `-groq-model-fix`, `-migrate-on-deploy`, `-migration-drift-gate` (0.01 GiB each), `dealhunter-wt-c2-rls`, `-staleness-check-fix` (0.00), `expense-tracker-wt-groq-deprecation` (0.07), `mindmeld-wt-firebaserc-fix` (0.03), `ml-projects\triage-iq-wt-cloudrec` (0.03), `triage-iq-wt-wif-monitoring` (0.03), `ml-projects\triage-iq-ui-wt-m21` (0.00), `-vercel` (0.01), `-z4` (0.00); scratch `%TEMP%\claude\C--Users-gaura-ml-projects-review-iq\22ccb23d-...` (0.00). The big kept items: scratch of live sessions (not idle: agentgauge 5.26 and 2.15 GiB, mbbs-mentor 3.18, ...), `oss-contrib\keras-verify` 2.66 GiB (a commit not on any remote ref), `adk-python-verify` 1.48 (untracked file), several worktrees with non-regenerable ignored files (`dist/`, `.coverage`, `*.tsbuildinfo`, `keras.egg-info`). Everything big the owner cleaned earlier is already gone: only about 25 GiB of agent leftovers remain at all.
+
+### MERGE LOG (this round)
+- #177 -> `c010a58` (merged by the owner). #179 -> `e6ffbdd`, #180 -> `57ef0b7` (merged by me under the gate; #179 needed one verifier pass that fixed 7 wrong or loose figures before merge; #180 is a one-line CLAUDE.md rule, no verifier pass, disclosed).
+- #181 closed (superseded by #182). #182 draft, owner-routed.
+
+### Footprint at the pause (VERIFIED 2026-10-20)
+C: 224.8 GB free, D: 1,422.2 GB free. Reclaim: install 0.78 GB; index `D:\reclaim-index` 1.37 GiB; vault: none exists; logs < 5 MB; `D:\reclaim-build` 10.44 GB (installers, logs, Nuitka cache, build output, tools).
+
+### WHEN GG HAS TIME
+1. **Decide about #182 after review pass B** (I will report it). Read the "deliberate departure" paragraph (no `git worktree prune`).
+2. First-run dialog on the installed Reclaim is still unacknowledged (click through once).
+3. Pagefile is on `C:\pagefile.sys` again (admin change to move it to D:). GPU driver crash (0x116, nvlddmkm) on 10-19: consider a driver update.
+4. Verifier scratch to delete when you agree: `D:\reclaim-build\tmp\verifier2` (126,885 empty files, 0 GB), `D:\reclaim-build\tmp\verifier3` (0.21 GB), `D:\reclaim-build\diff_real` (0.03 GB), old logs. Local-only branch `backup/agent-artifacts-prerebase` (the pre-squash feature history) can go after #182 merges.
+5. The `reclaim agent-artifacts` command exists only in source until a build is installed; enabling the category (`[categories.agent_artifacts] enabled = true`, power mode) is your call after you have read the final dry-run list.
+6. Lower priority (unchanged): duplicate `idx_files_path_lower` index, Docker disk image to D:, WSL export, 1.4 GB duplicate Nuitka cache, `reconciliation_volume` null in the summary.
+
+## CHECKPOINT 2026-10-20 (POST-SHUTDOWN STATE; #177 MERGED; BUILD 10 INSTALLED; INDEX CONVERTED) -- superseded for open work by the pause checkpoint above; its facts stay valid
 
 VERIFIED = command run this session; BELIEVED = inferred. Supersedes the 10-17 checkpoint below for repo state, install and open work; its measurements and the index/D: facts stay valid. Logs/scripts are in `D:\reclaim-build` (names given per item).
 
