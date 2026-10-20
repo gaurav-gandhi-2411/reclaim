@@ -604,3 +604,37 @@ def test_review_a_the_move_note_names_what_happened_when_prune_is_not_needed(set
     shutil.move(str(setup.wt), str(moved))
     assert aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved) is None
     assert not worktree_listed(setup.repo, setup.wt)
+
+
+def test_survivor_b11_after_restore_says_when_the_repository_is_no_longer_there(
+    setup: Setup,
+) -> None:
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    vaulted = next(i.vault_path for i in report.items if i.category == aa.CAT_WORKTREE)
+    assert vaulted is not None
+    shutil.move(str(vaulted), str(setup.wt))  # put the directory back by hand
+    setup.repo.rename(setup.repo.parent / "proj-gone")
+    note = aa.after_restore(setup.wt)
+    assert note is not None and "no longer at" in note
+    assert not setup.repo.exists()
+
+
+def test_survivor_b17_after_vault_move_notices_if_git_still_lists_the_worktree(
+    setup: Setup,
+) -> None:
+    found = _detect(setup)
+    real = aa.run_git
+
+    def lying(args: object, cwd: Path) -> aa.GitResult:
+        if tuple(args)[:2] == ("worktree", "list"):  # type: ignore[call-overload]
+            main = "worktree " + str(setup.repo)
+            ours = "worktree " + str(setup.wt)
+            return aa.GitResult(0, "\0".join([main, "HEAD x", "", ours, "HEAD y", "", ""]))
+        return real(args, cwd)  # type: ignore[arg-type]
+
+    moved = setup.vault / "manual"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(setup.wt), str(moved))
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, lying)
+    assert note is not None and "still lists the worktree" in note

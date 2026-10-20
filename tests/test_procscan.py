@@ -307,3 +307,14 @@ def test_a_drive_root_is_never_a_vendor_root(monkeypatch: pytest.MonkeyPatch) ->
     for var in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
         monkeypatch.delenv(var, raising=False)
     assert not procscan.is_vendor_service("C:" + BS + "Windows" + BS + "x.exe", "x.exe")  # none set
+
+
+def test_survivor_p04_a_junction_alias_as_the_working_directory_is_a_cwd_finding(
+    tmp_path: Path,
+) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    alias = tmp_path / "alias"
+    make_junction(alias, wt)
+    reasons = _scan_of(alias, "python server.py").in_use(wt)
+    assert any("working directory" in r for r in reasons), reasons
