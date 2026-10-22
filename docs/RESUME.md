@@ -9,7 +9,18 @@ Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2
 Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules, the merge-gate hook and the hard exclusions). On any new session or after compaction: re-read that spec, this section, `docs/run-log-2026-10.md` and `docs/REVIEW-2026-10-27.md` before acting. Queue: Phase A (finish #182) -> B (Relocate) -> C (assistant integration) -> D (hardening) -> E (maintenance). One task and one subagent at a time; heavy steps never overlap.
 
 ### Status (updated after every task)
-- 2026-10-23 02:38 IST: run started; state check done (run log). Next: R0 auto-resume, then A1.
+- 2026-10-23 02:38 IST: run started; state check done (run log).
+- 03:50 IST checkpoint:
+  - **Merged:** #185 (certifi CVE, `f389a1d`), #184 (run docs, `fb88db2`), #186 (A2 read-only git status, `3ef2f2e`). Main CI is green after each.
+  - **R0** auto-resume installed and tested (skip path).
+  - **A1 done:** #182 is 6/6 green on `fadbc3c`, and full verify passed (2425).
+  - **A4 in progress:** the perf speedup is split out as #187 (verify 2185 passed; third data-safety pass and CI running).
+  - **Next:**
+    1. Merge #187 after the bar.
+    2. Clean-check hardening PR (DECISIONS #4).
+    3. A3, the second review of the fixed agent-artifacts code plus a mutation re-run.
+    4. Put agent-artifacts on `integration/run-2026-10`.
+    5. A5, build 11.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
