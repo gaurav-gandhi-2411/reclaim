@@ -506,13 +506,18 @@ def _query_git_clean(repo_root: Path) -> bool:
         return False
     try:
         # Fixed argv; repo_root was discovered by walking the scan tree itself, not
-        # supplied by external/untrusted input.
+        # supplied by external/untrusted input. `git status` otherwise refreshes and rewrites
+        # the repo's `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan
+        # must not write into a user's repo, nor race a git command a live session is running
+        # there. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 make it strictly read-only;
+        # core.fsmonitor=false stops it starting a repo-configured fsmonitor daemon.
         result = subprocess.run(  # noqa: S603
-            [git_exe, "status", "--porcelain"],
+            [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             timeout=30,
         )
     except subprocess.CalledProcessError as exc:
