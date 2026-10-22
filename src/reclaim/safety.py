@@ -142,13 +142,36 @@ def first_matching_pattern(
     return _first_hit(tuple(patterns), _strip_candidate(base), other)
 
 
+UNREADABLE_PREFIX = "<unreadable directory: "
+
+
+def _io_path(path: str) -> str:
+    r"""The extended-length (`\\?\`) form of `path`, for I/O only, so a tree deeper than
+    MAX_PATH can be listed while long-path support is off. Never used as match text."""
+    if os.name != "nt" or path.startswith(("\\\\?\\", "//?/", "\\\\.\\", "//./")):
+        return path
+    full = os.path.abspath(path)  # noqa: PTH100 -- string in, string out, like scandir's paths
+    if full.startswith(("\\\\", "//")):
+        return "\\\\?\\UNC\\" + full.lstrip("\\/")
+    return "\\\\?\\" + full
+
+
 def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | None:
     """First pattern matched by `root` or by ANY entry (file or directory, by full path) beneath
-    it, else None. Name-only `os.scandir` walk (no stat), reparse points are not followed. Used
-    before deleting a whole directory: a directory that merely CONTAINS an excluded tree (e.g.
-    `%TEMP%/claude` holding `.../C--Users-...-<project>`) must not be deleted wholesale.
-    Unreadable directories are skipped, not treated as clean-and-safe-to-delete-silently: the
-    caller still gets every match found in what could be listed. No patterns -> no walk.
+    it, else None. Name-only `os.scandir` walk (no stat). Used before deleting a whole directory:
+    a directory that merely CONTAINS an excluded tree (e.g. `%TEMP%/claude` holding
+    `.../C--Users-...-<project>`) must not be deleted wholesale. No patterns -> no walk.
+
+    FAILS CLOSED: a directory below `root` that cannot be listed completely (access denied,
+    vanished mid-walk, an error while iterating, an entry whose type cannot be read) may hold an
+    excluded tree, so the walk stops and returns `"<unreadable directory: <path>>"`, which every
+    caller treats like a match (protected, not offered). Until 2026-10 such directories were
+    skipped and the walk could answer "nothing excluded" for a tree it had not seen (found by
+    the #187 data-safety verifier). Only a missing ROOT still returns None: nothing to delete.
+    Listing goes through the extended-length form of each path, so trees deeper than MAX_PATH
+    are seen (they were silently invisible); the match text is unchanged. Directory junctions
+    are descended as before (a junction into an excluded project still protects the candidate),
+    but one whose target was already walked is not walked again, so a junction loop ends.
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -164,26 +187,42 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     if hit is not None:
         return hit
     ordered = tuple(patterns)
-    stack = [str(root)]
+    root_text = str(root)
+    walked_targets = {os.path.normcase(os.path.realpath(root_text))}
+    stack = [(root_text, _io_path(root_text))]
+    # The rest of the tree is still walked after an unreadable directory, so a real match
+    # elsewhere is reported as itself; the marker is returned only when nothing else matched.
+    unreadable: str | None = None
     while stack:
-        current = stack.pop()
+        current, current_io = stack.pop()
         prefix = _child_text_prefix(current)
         try:
-            with os.scandir(current) as it:
+            with os.scandir(current_io) as it:
                 for entry in it:
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                    except OSError:
-                        is_dir = False
                     text = prefix + entry.name
                     hit = _first_hit(ordered, text)
                     if hit is not None:
                         return hit
-                    if is_dir:
-                        stack.append(entry.path)
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if entry.is_junction() or entry.is_symlink():
+                        target = os.path.normcase(os.path.realpath(entry.path))
+                        if target in walked_targets:
+                            continue
+                        walked_targets.add(target)
+                    stack.append(
+                        (
+                            os.path.join(current, entry.name),  # noqa: PTH118 -- = entry.path
+                            os.path.join(current_io, entry.name),  # noqa: PTH118
+                        )
+                    )
+        except FileNotFoundError:
+            if current == root_text:
+                return None
+            unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
         except OSError:
-            continue
-    return None
+            unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
+    return unreadable
 
 
 def _child_text_prefix(directory: str) -> str:

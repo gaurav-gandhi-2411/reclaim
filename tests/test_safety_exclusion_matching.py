@@ -3,7 +3,11 @@ subtree walk to the PREVIOUS implementation, which is copied here verbatim as th
 (`_ref_*`). Same input -> same returned pattern (not just the same yes/no), same traversal order.
 
 Why this exists: the candidates warm-up spent ~358 of 574 s in `subtree_exclusion_match`
-(7.3M `_pattern_matches` calls). The rewrite changes cost, never a decision."""
+(7.3M `_pattern_matches` calls). The rewrite changes cost, never a decision.
+
+Deliberate divergence from the oracle since 2026-10 (fail-closed walk): a directory that cannot be
+listed, or an entry whose type cannot be read, no longer counts as "nothing excluded here"; the
+walk returns an `<unreadable directory: ...>` marker instead (tests at the end of this file)."""
 
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ import pytest
 
 from reclaim import safety
 from reclaim.safety import (
+    UNREADABLE_PREFIX,
     _strip_local_extended_length_prefix,
     first_matching_pattern,
     subtree_exclusion_match,
@@ -257,7 +262,7 @@ def test_no_patterns_means_no_walk(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert subtree_exclusion_match(tmp_path, []) is None
 
 
-def test_unreadable_directory_is_skipped_like_before(
+def test_an_unreadable_directory_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "t"
@@ -272,8 +277,11 @@ def test_unreadable_directory_is_skipped_like_before(
 
     monkeypatch.setattr(os, "scandir", flaky)
     got = subtree_exclusion_match(root, ["*fr-en-transformer*"])
-    assert got is None  # the locked subtree is skipped, nothing else matches
-    assert got == _ref_subtree_exclusion_match(root, ["*fr-en-transformer*"])
+    # the old walk skipped the locked subtree and answered "nothing excluded" (fail open)
+    assert _ref_subtree_exclusion_match(root, ["*fr-en-transformer*"]) is None
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+    assert "locked" in got
     assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
 
 
@@ -492,6 +500,12 @@ class _FakeEntry:
         return self._link and follow_symlinks
 
 
+def _plain(path: object) -> str:
+    """The walk lists through the extended-length form of each path; the fakes key on the plain
+    one."""
+    return str(path).removeprefix(chr(92) * 2 + "?" + chr(92))
+
+
 class _FakeScan:
     def __init__(self, entries: list[_FakeEntry]) -> None:
         self._entries = entries
@@ -510,7 +524,7 @@ def test_pass2_entry_whose_is_dir_raises_is_still_matched(monkeypatch: pytest.Mo
     root = "C:" + chr(92) + "fake-root"
 
     def fake_scandir(path: object) -> _FakeScan:
-        assert str(path) == root
+        assert _plain(path) == root
         return _FakeScan([_FakeEntry(root, "intent-router", is_dir_raises=True)])
 
     monkeypatch.setattr(os, "scandir", fake_scandir)
@@ -525,8 +539,8 @@ def test_pass2_links_are_never_followed(monkeypatch: pytest.MonkeyPatch) -> None
     scanned: list[str] = []
 
     def fake_scandir(path: object) -> _FakeScan:
-        scanned.append(str(path))
-        if str(path) == root:
+        scanned.append(_plain(path))
+        if _plain(path) == root:
             return _FakeScan([link])
         raise AssertionError("a directory link must not be descended into")
 
@@ -543,3 +557,113 @@ def test_pass2_the_root_alone_can_match_without_any_children(tmp_path: Path) -> 
     protected.mkdir()
     assert subtree_exclusion_match(protected, ["*intent-router*"]) == "*intent-router*"
     assert subtree_exclusion_match(protected, ["*zzz*"]) is None
+
+
+# --- fail-closed walk (2026-10, from the #187 data-safety verifier) -----------------------------
+
+
+def test_an_entry_whose_type_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = "C:" + chr(92) + "fake-root"
+
+    def fake_scandir(path: object) -> _FakeScan:
+        assert _plain(path) == root
+        return _FakeScan([_FakeEntry(root, "opaque", is_dir_raises=True)])
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    got = subtree_exclusion_match(root, ["*intent-router*"])
+    assert _ref_subtree_exclusion_match(root, ["*intent-router*"]) is None  # old: fail open
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+
+
+def test_an_error_while_listing_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mid"
+    (root / "a").mkdir(parents=True)
+    real = os.scandir
+
+    class Broken:
+        def __init__(self, it: object) -> None:
+            self._it = it
+
+        def __enter__(self) -> Broken:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise OSError(59, "unexpected network error")
+
+    def flaky(path):  # type: ignore[no-untyped-def]
+        return Broken(real(path)) if str(path).endswith("a") else real(path)
+
+    monkeypatch.setattr(os, "scandir", flaky)
+    got = subtree_exclusion_match(root, ["*intent-router*"])
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+
+
+def test_a_subdirectory_that_vanishes_mid_walk_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the tree is changing under the walk (a live tree): what it held is unknown
+    root = tmp_path / "live"
+    (root / "gone").mkdir(parents=True)
+    real = os.scandir
+
+    def vanishing(path):  # type: ignore[no-untyped-def]
+        if str(path).endswith("gone"):
+            raise FileNotFoundError(2, "vanished")
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", vanishing)
+    got = subtree_exclusion_match(root, ["*intent-router*"])
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+
+
+def test_a_missing_root_still_answers_nothing_excluded(tmp_path: Path) -> None:
+    assert subtree_exclusion_match(tmp_path / "gone", ["*intent-router*"]) is None
+
+
+def test_an_unreadable_root_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    def denied(path):  # type: ignore[no-untyped-def]
+        raise PermissionError(5, "denied")
+
+    monkeypatch.setattr(os, "scandir", denied)
+    got = subtree_exclusion_match(root, ["*intent-router*"])
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MAX_PATH is a Windows limit")
+def test_a_match_deeper_than_max_path_is_found(tmp_path: Path) -> None:
+    root = tmp_path / "deep"
+    long_dir = "\\\\?\\" + str(root)
+    for i in range(6):
+        long_dir += "\\" + f"{i}" + "d" * 50
+    os.makedirs(long_dir + "\\intent-router")  # noqa: PTH103 -- needs the extended-length string
+    assert len(long_dir) > 300
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_loop_ends_and_a_junction_into_an_excluded_tree_still_protects(
+    tmp_path: Path,
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    root = tmp_path / "loop"
+    (root / "a").mkdir(parents=True)
+    _winapi.CreateJunction(str(root), str(root / "a" / "back"))
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+
+    side = tmp_path / "side"
+    (side / "intent-router").mkdir(parents=True)
+    _winapi.CreateJunction(str(side), str(root / "a" / "into-side"))
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
