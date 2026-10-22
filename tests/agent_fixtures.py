@@ -38,14 +38,21 @@ _IDENT = (
 
 
 def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 -- fixed argv, test helper
+    done = subprocess.run(  # noqa: S603 -- fixed argv, test helper
         ["git", *_IDENT, *args],  # noqa: S607 -- git from PATH
         cwd=str(cwd),
         capture_output=True,
         text=True,
-        check=check,
+        check=False,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
+    if check and done.returncode != 0:
+        # CalledProcessError's message drops stderr, which hid why a push failed only on CI.
+        raise AssertionError(
+            f"git {' '.join(args)} failed ({done.returncode}) in {cwd}\n"
+            f"stdout: {done.stdout}\nstderr: {done.stderr}"
+        )
+    return done
 
 
 def commit_file(repo: Path, name: str, text: str, message: str = "change") -> None:
