@@ -669,7 +669,7 @@ def current_commit_sha(repo_root: Path | None = None) -> str:
         return "unknown"
     try:
         result = subprocess.run(  # noqa: S603 -- fixed args, not untrusted input
-            [git_exe, "rev-parse", "HEAD"],
+            [git_exe, "--no-optional-locks", "rev-parse", "HEAD"],  # read-only: never lock
             cwd=repo_root,
             capture_output=True,
             text=True,
