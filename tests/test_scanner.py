@@ -969,6 +969,26 @@ def _edit_submodule_with_ignore_all(repo: Path, _mp: pytest.MonkeyPatch) -> None
     (repo / "mod" / "a.txt").write_text("edited", encoding="utf-8")
 
 
+def _add_submodule(repo: Path) -> Path:
+    sub = repo.parent / "sub"
+    _committed_repo(sub)
+    _git_in(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git_in(repo, "commit", "-q", "-m", "submodule")
+    return repo / "mod"
+
+
+def _edit_assume_unchanged_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _hide_untracked_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(mod, "config", "status.showUntrackedFiles", "no")
+    (mod / "new.txt").write_text("work", encoding="utf-8")
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 @pytest.mark.parametrize(
     "hide",
@@ -978,6 +998,8 @@ def _edit_submodule_with_ignore_all(repo: Path, _mp: pytest.MonkeyPatch) -> None
         _edit_assume_unchanged,
         _edit_skip_worktree,
         _edit_submodule_with_ignore_all,
+        _edit_assume_unchanged_inside_a_submodule,
+        _hide_untracked_inside_a_submodule,
     ],
 )
 def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
@@ -992,6 +1014,38 @@ def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
     _committed_repo(repo)
     hide(repo, monkeypatch)
 
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_survives_non_ascii_names_under_a_legacy_locale(tmp_path: Path) -> None:
+    """`ÁЁ` in UTF-8 contains bytes cp1252 cannot decode. With core.quotePath=false and text-mode
+    decoding in the locale, stdout came back None and the scan crashed (#189 verifier, R1)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    _git_in(repo, "config", "core.quotePath", "false")
+    (repo / "ÁЁ.txt").write_text("x", encoding="utf-8")
+    _git_in(repo, "add", "ÁЁ.txt")
+    _git_in(repo, "commit", "-q", "-m", "non-ascii")
+    assert scanner_module._query_git_clean(repo) is True
+    (repo / "Ё-new.txt").write_text("x", encoding="utf-8")
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.TimeoutExpired(["git"], 30), OSError("spawn failed")],
+    ids=["timeout", "oserror"],
+)
+def test_query_git_clean_fails_closed_when_git_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo = tmp_path / "repo"
+    repo.mkdir()
     assert scanner_module._query_git_clean(repo) is False
 
 

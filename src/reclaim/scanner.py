@@ -510,7 +510,9 @@ def _query_git_clean(repo_root: Path) -> bool:
     `status.showUntrackedFiles=no` or submodule `ignore=all` (global, repo or env config) are
     overridden on the command line, and an entry marked assume-unchanged or skip-worktree (git
     no longer compares it, so an edit to it is invisible) makes the repo not-clean. A sparse
-    checkout therefore never reads clean: the conservative direction.
+    checkout therefore never reads clean: the conservative direction. The same holds inside
+    submodules: `-c status.showUntrackedFiles=normal` reaches the submodule's own child git (a
+    command-line option does not), and `ls-files --recurse-submodules` lists their entries.
     """
     git_exe = shutil.which("git")
     if git_exe is None:
@@ -528,36 +530,42 @@ def _query_git_clean(repo_root: Path) -> bool:
         **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
         "GIT_OPTIONAL_LOCKS": "0",
     }
-    base = [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false"]
-    try:
-        result = subprocess.run(  # noqa: S603
-            [
-                *base,
-                "status",
-                "--porcelain",
-                "--untracked-files=normal",
-                "--ignore-submodules=none",
-            ],
+    # core.quotePath=true keeps file names in the output ASCII (octal escapes), and the output is
+    # decoded as UTF-8 with replacement either way: under the default cp1252 locale a UTF-8 name
+    # containing an undefined byte (0x81, 0x8D, ...; e.g. `Á`, `Ё`, much of CJK) failed to decode,
+    # left stdout None and crashed the whole scan instead of failing closed.
+    base = [
+        git_exe,
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.quotePath=true",
+        "-c",
+        "status.showUntrackedFiles=normal",
+    ]
+
+    def run(*args: str) -> str:
+        done = subprocess.run(  # noqa: S603
+            [*base, *args],
             cwd=repo_root,
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=30,
         )
-        if result.stdout.strip():
+        return done.stdout or ""
+
+    try:
+        if run(
+            "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"
+        ).strip():
             return False
         # `-v` tags assume-unchanged entries with a lowercase letter and skip-worktree ones
         # with `S` (`s` for both).
-        listing = subprocess.run(  # noqa: S603
-            [*base, "ls-files", "-v"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=30,
-        )
+        listing = run("ls-files", "-v", "--recurse-submodules")
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr or ""
         if _GIT_DUBIOUS_OWNERSHIP_MARKER in stderr.lower():
@@ -568,7 +576,7 @@ def _query_git_clean(repo_root: Path) -> bool:
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    return not any(line[:1].islower() or line[:1] == "S" for line in listing.stdout.splitlines())
+    return not any(line[:1].islower() or line[:1] == "S" for line in listing.splitlines())
 
 
 # Wave 1 finding #3 (2026-07-30 real-disk diagnosis): `build_record`'s `os.stat()` call was the
