@@ -901,12 +901,8 @@ def test_query_git_clean_other_failure_still_warns(
     assert any(event == "scan.git_status_failed" for event, _ in recorder.warnings)
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-def test_query_git_clean_never_writes_the_repo_index(tmp_path: Path) -> None:
-    """A scan must not write into a user's repo: plain `git status` refreshes stale stat data
-    and rewrites `.git/index` (taking `index.lock`, which can race a live session's own git
-    command). Stale stat data is the normal case on a real disk, so the test creates it."""
-    repo = tmp_path / "repo"
+def _committed_repo(repo: Path) -> Path:
+    """A repo with one committed file `a.txt`; returns that file."""
     repo.mkdir()
     ident = ["-c", "user.email=t@x.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
 
@@ -918,6 +914,31 @@ def test_query_git_clean_never_writes_the_repo_index(tmp_path: Path) -> None:
     tracked.write_text("a", encoding="utf-8")
     git("add", "a.txt")
     git("commit", "-q", "-m", "a")
+    return tracked
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_ignores_an_inherited_git_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inherited GIT_DIR/GIT_WORK_TREE would make git answer for that repo, not the one
+    being scanned: a dirty repo would read as clean (unsafe direction)."""
+    _committed_repo(tmp_path / "clean")
+    dirty_file = _committed_repo(tmp_path / "dirty")
+    dirty_file.write_text("changed", encoding="utf-8")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "clean" / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "clean"))
+
+    assert scanner_module._query_git_clean(tmp_path / "dirty") is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_never_writes_the_repo_index(tmp_path: Path) -> None:
+    """A scan must not write into a user's repo: plain `git status` refreshes stale stat data
+    and rewrites `.git/index` (taking `index.lock`, which can race a live session's own git
+    command). Stale stat data is the normal case on a real disk, so the test creates it."""
+    repo = tmp_path / "repo"
+    tracked = _committed_repo(repo)
     # Same content, different mtime: the index's cached stat no longer matches the file.
     old = time.time() - 3600
     os.utime(tracked, (old, old))

@@ -495,6 +495,11 @@ class GitRepoCache:
 # fixed 30MB budget (`logging_config.py`) with genuinely actionable warnings.
 _GIT_DUBIOUS_OWNERSHIP_MARKER = "detected dubious ownership"
 
+# Environment variables that override which repository / index git reads instead of the cwd.
+_GIT_REPO_ENV = frozenset(
+    {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY"}
+)
+
 
 def _query_git_clean(repo_root: Path) -> bool:
     """Runs `git status --porcelain` once for a repo root. Any failure (git missing, not a
@@ -509,15 +514,21 @@ def _query_git_clean(repo_root: Path) -> bool:
         # supplied by external/untrusted input. `git status` otherwise refreshes and rewrites
         # the repo's `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan
         # must not write into a user's repo, nor race a git command a live session is running
-        # there. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 make it strictly read-only;
-        # core.fsmonitor=false stops it starting a repo-configured fsmonitor daemon.
+        # there. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 stop every index write and
+        # lock (the one remaining effect: with core.splitIndex git bumps the shared index's
+        # mtime on read, contents unchanged, plain git does the same); core.fsmonitor=false
+        # stops it starting a repo-configured fsmonitor hook or daemon. Inherited GIT_DIR /
+        # GIT_WORK_TREE / GIT_INDEX_FILE would aim the check at another repo: dropped.
         result = subprocess.run(  # noqa: S603
             [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env={
+                **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
+                "GIT_OPTIONAL_LOCKS": "0",
+            },
             timeout=30,
         )
     except subprocess.CalledProcessError as exc:
