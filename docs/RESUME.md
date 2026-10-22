@@ -3,7 +3,16 @@
 Written for a session with zero prior context. Full depth/history: `docs/AUDIT-2026-08.md`. Always
 `git fetch origin` + `gh pr list` before trusting any claim below, including this one (rule 118a).
 
-## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- READ THIS FIRST
+<!-- AUTONOMOUS-RUN-BEGIN -->
+## AUTONOMOUS RUN 2026-10-23 to 2026-10-27 (owner unreachable) -- READ THIS FIRST
+
+Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules, the merge-gate hook and the hard exclusions). On any new session or after compaction: re-read that spec, this section, `docs/run-log-2026-10.md` and `docs/REVIEW-2026-10-27.md` before acting. Queue: Phase A (finish #182) -> B (Relocate) -> C (assistant integration) -> D (hardening) -> E (maintenance). One task and one subagent at a time; heavy steps never overlap.
+
+### Status (updated after every task)
+- 2026-10-23 02:38 IST: run started; state check done (run log). Next: R0 auto-resume, then A1.
+<!-- AUTONOMOUS-RUN-END -->
+
+## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
 
 VERIFIED = command run this session; BELIEVED = inferred. The owner said "pause all the work, we will continue after 23rd Oct". Everything below is the exact state at the pause. Supersedes the post-shutdown checkpoint under it for open work; its facts stay valid. Logs and scripts: `D:\reclaim-build` (names given).
 
