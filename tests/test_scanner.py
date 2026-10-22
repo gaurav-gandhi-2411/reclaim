@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -930,6 +931,68 @@ def test_query_git_clean_ignores_an_inherited_git_dir(
     monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "clean"))
 
     assert scanner_module._query_git_clean(tmp_path / "dirty") is False
+
+
+def _git_in(repo: Path, *args: str) -> None:
+    ident = ["-c", "user.email=t@x.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", *ident, *args], cwd=repo, check=True, capture_output=True)  # noqa: S603,S607
+
+
+def _hide_untracked_in_repo_config(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "new.txt").write_text("work", encoding="utf-8")
+
+
+def _hide_untracked_in_env_config(repo: Path, mp: pytest.MonkeyPatch) -> None:
+    mp.setenv("GIT_CONFIG_COUNT", "1")
+    mp.setenv("GIT_CONFIG_KEY_0", "status.showUntrackedFiles")
+    mp.setenv("GIT_CONFIG_VALUE_0", "no")
+    (repo / "new.txt").write_text("work", encoding="utf-8")
+
+
+def _edit_assume_unchanged(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "update-index", "--assume-unchanged", "a.txt")
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_skip_worktree(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "update-index", "--skip-worktree", "a.txt")
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_submodule_with_ignore_all(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    sub = repo.parent / "sub"
+    _committed_repo(sub)
+    _git_in(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git_in(repo, "commit", "-q", "-m", "submodule")
+    _git_in(repo, "config", "submodule.mod.ignore", "all")
+    (repo / "mod" / "a.txt").write_text("edited", encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.parametrize(
+    "hide",
+    [
+        _hide_untracked_in_repo_config,
+        _hide_untracked_in_env_config,
+        _edit_assume_unchanged,
+        _edit_skip_worktree,
+        _edit_submodule_with_ignore_all,
+    ],
+)
+def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hide: Callable[[Path, pytest.MonkeyPatch], None],
+) -> None:
+    """Each of these leaves uncommitted work that plain `git status --porcelain` does not show
+    (from the #186 verifier passes). "Clean" unlocks the node_modules exemption, so each must
+    read not-clean."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    hide(repo, monkeypatch)
+
+    assert scanner_module._query_git_clean(repo) is False
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")

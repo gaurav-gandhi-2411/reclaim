@@ -502,33 +502,60 @@ _GIT_REPO_ENV = frozenset(
 
 
 def _query_git_clean(repo_root: Path) -> bool:
-    """Runs `git status --porcelain` once for a repo root. Any failure (git missing, not a
-    repo, timeout) is treated as not-clean — conservative, matching SafetyValidator's
-    deny-by-default posture — and never crashes the scan.
+    """Runs `git status --porcelain` and `git ls-files -v` once for a repo root. Any failure
+    (git missing, not a repo, timeout) is treated as not-clean — conservative, matching
+    SafetyValidator's deny-by-default posture — and never crashes the scan.
+
+    "Clean" must not be decided by settings that hide work from `git status`: the user's
+    `status.showUntrackedFiles=no` or submodule `ignore=all` (global, repo or env config) are
+    overridden on the command line, and an entry marked assume-unchanged or skip-worktree (git
+    no longer compares it, so an edit to it is invisible) makes the repo not-clean. A sparse
+    checkout therefore never reads clean: the conservative direction.
     """
     git_exe = shutil.which("git")
     if git_exe is None:
         return False
+    # Fixed argv; repo_root was discovered by walking the scan tree itself, not supplied by
+    # external/untrusted input. `git status` otherwise refreshes and rewrites the repo's
+    # `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan must not write
+    # into a user's repo, nor race a git command a live session is running there.
+    # `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 stop every index write and lock (the one
+    # remaining effect: with core.splitIndex git bumps the shared index's mtime on read,
+    # contents unchanged, plain git does the same); core.fsmonitor=false stops it starting a
+    # repo-configured fsmonitor hook or daemon. Inherited GIT_DIR / GIT_WORK_TREE /
+    # GIT_INDEX_FILE would aim the check at another repo: dropped.
+    env = {
+        **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    base = [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false"]
     try:
-        # Fixed argv; repo_root was discovered by walking the scan tree itself, not
-        # supplied by external/untrusted input. `git status` otherwise refreshes and rewrites
-        # the repo's `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan
-        # must not write into a user's repo, nor race a git command a live session is running
-        # there. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 stop every index write and
-        # lock (the one remaining effect: with core.splitIndex git bumps the shared index's
-        # mtime on read, contents unchanged, plain git does the same); core.fsmonitor=false
-        # stops it starting a repo-configured fsmonitor hook or daemon. Inherited GIT_DIR /
-        # GIT_WORK_TREE / GIT_INDEX_FILE would aim the check at another repo: dropped.
         result = subprocess.run(  # noqa: S603
-            [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"],
+            [
+                *base,
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
-            env={
-                **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
-                "GIT_OPTIONAL_LOCKS": "0",
-            },
+            env=env,
+            timeout=30,
+        )
+        if result.stdout.strip():
+            return False
+        # `-v` tags assume-unchanged entries with a lowercase letter and skip-worktree ones
+        # with `S` (`s` for both).
+        listing = subprocess.run(  # noqa: S603
+            [*base, "ls-files", "-v"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
             timeout=30,
         )
     except subprocess.CalledProcessError as exc:
@@ -541,7 +568,7 @@ def _query_git_clean(repo_root: Path) -> bool:
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    return result.stdout.strip() == ""
+    return not any(line[:1].islower() or line[:1] == "S" for line in listing.stdout.splitlines())
 
 
 # Wave 1 finding #3 (2026-07-30 real-disk diagnosis): `build_record`'s `os.stat()` call was the
