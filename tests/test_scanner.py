@@ -989,6 +989,46 @@ def _hide_untracked_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> N
     (mod / "new.txt").write_text("work", encoding="utf-8")
 
 
+def _edit_both_assume_unchanged_and_skip_worktree(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    # two calls: one call with both flags sets only one of them (git 2.51, VERIFIED)
+    _git_in(repo, "update-index", "--skip-worktree", "a.txt")
+    _git_in(repo, "update-index", "--assume-unchanged", "a.txt")  # `ls-files -v` tag: `s`
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_inside_an_inactive_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(repo, "config", "submodule.mod.active", "false")
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_inside_an_unregistered_gitlink(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    # `git add <a clone>`: a gitlink with no .gitmodules entry (git warns, but it is common)
+    inner = repo / "embedded"
+    _committed_repo(inner)
+    _git_in(repo, "add", "embedded")
+    _git_in(repo, "commit", "-q", "-m", "embedded")
+    _git_in(inner, "update-index", "--skip-worktree", "a.txt")
+    (inner / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _hide_a_nested_submodule_with_its_parents_ignore_all(
+    repo: Path, _mp: pytest.MonkeyPatch
+) -> None:
+    mid = _add_submodule(repo)  # repo/mod
+    leaf_src = repo.parent / "leaf"
+    _committed_repo(leaf_src)
+    _git_in(
+        mid, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(leaf_src), "leaf"
+    )
+    _git_in(mid, "commit", "-q", "-m", "leaf")
+    _git_in(mid, "config", "submodule.leaf.ignore", "all")
+    _git_in(repo, "add", "mod")
+    _git_in(repo, "commit", "-q", "-m", "bump")
+    (mid / "leaf" / "new.txt").write_text("work", encoding="utf-8")
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 @pytest.mark.parametrize(
     "hide",
@@ -1000,6 +1040,10 @@ def _hide_untracked_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> N
         _edit_submodule_with_ignore_all,
         _edit_assume_unchanged_inside_a_submodule,
         _hide_untracked_inside_a_submodule,
+        _edit_both_assume_unchanged_and_skip_worktree,
+        _edit_inside_an_inactive_submodule,
+        _edit_inside_an_unregistered_gitlink,
+        _hide_a_nested_submodule_with_its_parents_ignore_all,
     ],
 )
 def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
@@ -1015,6 +1059,29 @@ def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
     hide(repo, monkeypatch)
 
     assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_not_clean_past_the_nesting_cap(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    assert scanner_module._query_git_clean(repo, scanner_module._GIT_CLEAN_MAX_DEPTH) is True
+    assert scanner_module._query_git_clean(repo, scanner_module._GIT_CLEAN_MAX_DEPTH + 1) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_clean_repos_with_submodules_as_clean(tmp_path: Path) -> None:
+    """The per-gitlink recursion must not turn ordinary clean shapes dirty: a checked-out
+    submodule, and a gitlink that is not checked out (fresh clone without --recurse)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    _add_submodule(repo)
+    assert scanner_module._query_git_clean(repo) is True
+
+    clone = tmp_path / "clone"
+    _git_in(tmp_path, "clone", "-q", str(repo), str(clone))
+    assert not (clone / "mod" / ".git").exists()
+    assert scanner_module._query_git_clean(clone) is True
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")

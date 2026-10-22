@@ -501,19 +501,29 @@ _GIT_REPO_ENV = frozenset(
 )
 
 
-def _query_git_clean(repo_root: Path) -> bool:
-    """Runs `git status --porcelain` and `git ls-files -v` once for a repo root. Any failure
-    (git missing, not a repo, timeout) is treated as not-clean — conservative, matching
+# Nested submodules deeper than this read not-clean rather than being walked further.
+_GIT_CLEAN_MAX_DEPTH = 8
+
+
+def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
+    """Runs `git status --porcelain`, `git ls-files -v` and `git ls-files -s -z` for a repo root,
+    then the same check in every checked-out gitlink (submodule or embedded repo) below it. Any
+    failure (git missing, not a repo, timeout) is treated as not-clean — conservative, matching
     SafetyValidator's deny-by-default posture — and never crashes the scan.
 
     "Clean" must not be decided by settings that hide work from `git status`: the user's
-    `status.showUntrackedFiles=no` or submodule `ignore=all` (global, repo or env config) are
-    overridden on the command line, and an entry marked assume-unchanged or skip-worktree (git
-    no longer compares it, so an edit to it is invisible) makes the repo not-clean. A sparse
-    checkout therefore never reads clean: the conservative direction. The same holds inside
-    submodules: `-c status.showUntrackedFiles=normal` reaches the submodule's own child git (a
-    command-line option does not), and `ls-files --recurse-submodules` lists their entries.
+    `status.showUntrackedFiles=no`, `diff.ignoreSubmodules` or submodule `ignore=all` (global,
+    repo or env config) are overridden on the command line, and an entry marked
+    assume-unchanged or skip-worktree (git no longer compares it, so an edit to it is
+    invisible) makes the repo not-clean. A sparse checkout and a `core.ignoreStat=true` repo
+    (git marks new entries assume-unchanged) therefore never read clean: the conservative
+    direction. Settings INSIDE a nested repo (an inactive submodule, a gitlink with no
+    `.gitmodules` entry, `submodule.<name>.ignore=all` in a submodule's own config) are not
+    reachable from the outer command line, so each checked-out gitlink is checked as a repo of
+    its own, under the same rules.
     """
+    if _depth > _GIT_CLEAN_MAX_DEPTH:
+        return False
     git_exe = shutil.which("git")
     if git_exe is None:
         return False
@@ -543,16 +553,18 @@ def _query_git_clean(repo_root: Path) -> bool:
         "core.quotePath=true",
         "-c",
         "status.showUntrackedFiles=normal",
+        "-c",
+        "diff.ignoreSubmodules=none",
     ]
 
-    def run(*args: str) -> str:
+    def run(*args: str, errors: str = "replace") -> str:
         done = subprocess.run(  # noqa: S603
             [*base, *args],
             cwd=repo_root,
             check=True,
             capture_output=True,
             encoding="utf-8",
-            errors="replace",
+            errors=errors,
             env=env,
             timeout=30,
         )
@@ -566,6 +578,11 @@ def _query_git_clean(repo_root: Path) -> bool:
         # `-v` tags assume-unchanged entries with a lowercase letter and skip-worktree ones
         # with `S` (`s` for both).
         listing = run("ls-files", "-v", "--recurse-submodules")
+        if any(line[:1].islower() or line[:1] == "S" for line in listing.splitlines()):
+            return False
+        # Gitlinks (mode 160000), NUL-separated and unquoted. Decoded strictly: a name mangled
+        # by replacement would look like an uninitialised submodule and skip its check.
+        staged = run("ls-files", "-s", "-z", errors="strict")
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr or ""
         if _GIT_DUBIOUS_OWNERSHIP_MARKER in stderr.lower():
@@ -573,10 +590,18 @@ def _query_git_clean(repo_root: Path) -> bool:
         else:
             logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    return not any(line[:1].islower() or line[:1] == "S" for line in listing.splitlines())
+    for record in staged.split("\0"):
+        meta, _, rel = record.partition("\t")
+        if not meta.startswith("160000 "):
+            continue
+        nested = repo_root / rel
+        # Not checked out (no `.git` dir or file): the gitlink is only a commit id, no work.
+        if (nested / ".git").exists() and not _query_git_clean(nested, _depth + 1):
+            return False
+    return True
 
 
 # Wave 1 finding #3 (2026-07-30 real-disk diagnosis): `build_record`'s `os.stat()` call was the
