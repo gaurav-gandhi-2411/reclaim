@@ -535,7 +535,7 @@ _SQL_ON_GUARDED_CONNECTION = (
 )
 ALLOWLIST: dict[str, str] = {
     "ai/eval_harness.py:current_commit_sha": "read-only subprocess: `git rev-parse HEAD`",
-    "scanner.py:_query_git_clean": (
+    "scanner.py:_query_git_clean.run": (
         "read-only subprocesses: `git --no-optional-locks status --porcelain` and `ls-files -v` "
         "(without the flag git status rewrites .git/index; "
         "test_query_git_clean_never_writes_the_repo_index)"
