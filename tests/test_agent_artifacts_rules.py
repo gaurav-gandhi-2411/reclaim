@@ -1009,15 +1009,21 @@ def test_review_a_bare_repository_in_scratch_keeps_the_session(tmp_path: Path) -
     world = make_world(tmp_path)
     session = make_session(world, age_days=20)
     bare = session / "scratchpad" / "origin.git"
-    git(session, "init", "-q", "--bare", "-b", "main", str(bare))
-    scratch_repo = session / "scratchpad" / "writer"
+    # Build the bare repo at a short path and move it into scratch: pushing into it in place
+    # made receive-pack write `objects/tmp_objdir-incoming-XXXXXX/<2>/<38>`, 265 characters
+    # on the CI runner's longer temp path, past MAX_PATH ("Filename too long").
+    staging = tmp_path / "_staging.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(staging))
+    scratch_repo = tmp_path / "_writer"
     scratch_repo.mkdir()
     git(scratch_repo, "init", "-q", "-b", "main")
     commit_file(scratch_repo, "a", "a", "a")
-    git(scratch_repo, "push", "-q", str(bare), "main")
+    git(scratch_repo, "push", "-q", str(staging), "main")
     shutil.rmtree(
         scratch_repo, onexc=lambda func, path, _exc: (Path(path).chmod(0o700), func(path))
     )  # now the bare repo holds the only copy
+    shutil.move(str(staging), str(bare))
+    assert git(bare, "rev-parse", "--verify", "-q", "main").stdout.strip()
     _age_tree(session, world, 20)
     v = aa.evaluate_scratch(world.env, session)
     _refused(v, "S7")
