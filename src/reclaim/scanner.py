@@ -14,7 +14,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import structlog
 
@@ -593,13 +593,30 @@ def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
+    root_real: Path | None = None
     for record in staged.split("\0"):
         meta, _, rel = record.partition("\t")
         if not meta.startswith("160000 "):
             continue
+        # git refuses such names when it writes an index, but not when it reads one (a crafted
+        # or foreign index): `repo / "C:"` is another drive's cwd. Never run git outside the
+        # repo: an odd gitlink name, or one whose real path leaves the repo (a junction), reads
+        # not-clean instead.
+        pure = PureWindowsPath(rel)
+        if not rel or pure.drive or pure.root or ".." in pure.parts:
+            return False
         nested = repo_root / rel
-        # Not checked out (no `.git` dir or file): the gitlink is only a commit id, no work.
-        if (nested / ".git").exists() and not _query_git_clean(nested, _depth + 1):
+        try:
+            # Not checked out (no `.git` dir or file): the gitlink is only a commit id, no work.
+            if not (nested / ".git").exists():
+                continue
+            root_real = root_real or repo_root.resolve()
+            if not nested.resolve().is_relative_to(root_real):
+                return False
+        except (OSError, RuntimeError):
+            # e.g. an access-denied `.git` (Path.exists raises PermissionError): unknown state
+            return False
+        if not _query_git_clean(nested, _depth + 1):
             return False
     return True
 

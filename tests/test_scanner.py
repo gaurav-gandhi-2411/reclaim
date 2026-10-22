@@ -1061,6 +1061,82 @@ def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
     assert scanner_module._query_git_clean(repo) is False
 
 
+@pytest.mark.parametrize("name", ["C:", "D:sub", "/abs", "\\root", "../up", "a/../../up", ""])
+def test_query_git_clean_never_follows_a_gitlink_out_of_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """git refuses these names when writing an index but not when reading one; `repo / "C:"`
+    is another drive's cwd (#189 verifier pass 3). Such a gitlink reads not-clean, and no git
+    command runs anywhere but the repo itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cwds: list[str] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        cwds.append(str(kwargs["cwd"]))
+        out = ""
+        if "-s" in argv:
+            out = f"160000 {'a' * 40} 0\t{name}\0"
+        elif "-v" in argv:
+            out = "H a.txt\n"
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert scanner_module._query_git_clean(repo) is False
+    assert set(cwds) == {str(repo)}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_does_not_run_git_through_a_junction_out_of_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    outside = tmp_path / "outside"
+    _committed_repo(outside)
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    inner = repo / "lib"
+    # a clone, so the junction target's HEAD equals the gitlink commit and the outer
+    # `git status` reads clean: only the containment check can refuse it
+    _git_in(tmp_path, "clone", "-q", str(outside), str(inner))
+    _git_in(repo, "add", "lib")  # a gitlink with no .gitmodules entry
+    _git_in(repo, "commit", "-q", "-m", "lib")
+    shutil.rmtree(inner, onexc=lambda func, path, _exc: (Path(path).chmod(0o700), func(path)))
+    _winapi.CreateJunction(str(outside), str(inner))
+    real_run = subprocess.run
+    cwds: list[str] = []
+
+    def recording_run(*args: object, **kwargs: object) -> object:
+        cwds.append(str(kwargs.get("cwd")))
+        return real_run(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    assert scanner_module._query_git_clean(repo) is False
+    assert str(inner) not in cwds
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_not_clean_when_a_submodule_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An access-denied submodule `.git` made Path.exists raise PermissionError outside the
+    try and aborted the whole scan (#189 verifier pass 3)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    mod = _add_submodule(repo)
+    real_exists = Path.exists
+
+    def denied(self: Path, *a: object, **k: object) -> bool:
+        if self == mod / ".git":
+            raise PermissionError(5, "Access is denied")
+        return real_exists(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "exists", denied)
+    assert scanner_module._query_git_clean(repo) is False
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 def test_query_git_clean_reads_not_clean_past_the_nesting_cap(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
