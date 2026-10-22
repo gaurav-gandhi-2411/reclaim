@@ -60,6 +60,10 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Setup:
     temp.mkdir()
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
     monkeypatch.setattr(aa, "scan_processes", lambda: fake_scan())
+    # The default vault is data_root()-relative: on the CI runner that is the checkout on D:
+    # while tmp_path is on C:, and rule V (vault on the candidate's volume) refuses every
+    # proposal. Pin it beside the tree, as the real app's vault sits beside the user's data.
+    monkeypatch.setattr(aa, "default_vault_dir", lambda: tmp_path / "vault")
     repo = make_repo(root, "proj")
     wt = add_worktree(repo, "proj-wt-feat", "feat")
     clone = make_repo(root, "proj-verify1")
