@@ -1073,3 +1073,22 @@ def test_the_alias_walk_budget_fails_closed(
     assert got.startswith(UNREADABLE_PREFIX)
     assert "too many junctions" in got
     assert subtree_exclusion_match(nm, ["*nothing-here*"]) is None  # name-only: no alias walk
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_cycle_between_two_outside_trees_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`root/j -> X`, `X/k -> Y`, `Y/k -> X`: both trees lie outside the candidate; each is
+    walked once (its target is recorded as covered), so the walk ends."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    x, y, root = tmp_path / "X", tmp_path / "Y", tmp_path / "root"
+    for d in (x, y, root):
+        d.mkdir()
+    _winapi.CreateJunction(str(x), str(root / "j"))
+    _winapi.CreateJunction(str(y), str(x / "k"))
+    _winapi.CreateJunction(str(x), str(y / "k"))
+    calls = _counting_scandir(monkeypatch)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+    assert len(calls) == 3  # root, X (via j), Y (via j/k)
