@@ -61,6 +61,18 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11.
     3. A6.
     4. B.
+- 21:55 IST checkpoint 6:
+  - **#195** (checkpoint 5 docs) merged as `69537f2`; main CI green after it.
+  - **Agent artifacts** (#193, draft, head `905bfa1`, rebased on `69537f2`):
+    - The fourth (data-safety) review FAILED: 1 high, 1 medium, 2 low. The high one: a repository inside an artifact backing a linked worktree OUTSIDE it, possibly in an excluded project. The vault move broke that worktree, and purge would lose its staged work. Fixed in `6794edc` (ADR addendum 4), with 8 tests that fail on the old head.
+    - The fifth review FAILED: 1 medium, 4 low. The medium one: a graft file hid an only-copy commit from the push proof. Fixed in `d2abb68` (addendum 5), with 11 tests that fail on the old head.
+    - Each round's targeted mutants were killed, apart from 2 shown equivalent.
+    - Full verify on `905bfa1`: 2536 passed, rc 0. The sixth review is running on that exact head.
+  - **Next:**
+    1. Sixth review, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
