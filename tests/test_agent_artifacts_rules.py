@@ -2263,3 +2263,13 @@ def test_review_a9_a_config_of_blank_lines_is_read_in_linear_time(tmp_path: Path
     started = time.monotonic()
     aa._gitdir_excluded(world.env, gitdir)
     assert time.monotonic() - started < 5.0
+
+
+def test_review_a9_a_bom_before_a_remote_line_still_names_the_project(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    config = clone / ".git" / "config"
+    original = config.read_text(encoding="utf-8")
+    line = f'﻿[remote "store"] url = {tmp_path.as_posix()}/zzexclproj/repos/data.git\n'
+    config.write_text(line + original, encoding="utf-8")
+    world, _ran_in = _no_git_world(tmp_path)
+    assert aa._gitdir_excluded(world.env, clone / ".git")
