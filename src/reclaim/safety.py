@@ -144,6 +144,11 @@ def first_matching_pattern(
 
 UNREADABLE_PREFIX = "<unreadable directory: "
 
+# Directories one walk may list again under a junction's own text (alias matching, only when a
+# path-keyed pattern is configured). Past it the walk fails closed: a pnpm tree of ~4.6k entries
+# costs ~24k such listings, so heavy users of path-keyed patterns get protection, not a hang.
+_ALIAS_WALK_BUDGET = 20_000
+
 
 def _io_path(path: str) -> str:
     r"""The extended-length (`\\?\`) form of `path`, for I/O only, so a tree deeper than
@@ -189,10 +194,14 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     real place, and if that place cannot be listed the walk fails closed anyway; a dangling one
     has nothing beneath it. So every junction cycle ends and the cost is the root's tree plus
     each distinct outside tree, once (rewalking every alias grew factorially and made pnpm
-    `node_modules` unwalkable; #190 verifier passes 3 and 4). Given up deliberately: a
-    path-keyed pattern spelled through a second alias's own name (e.g. `*/j2/secret.txt` when
-    `j1` and `j2` lead to the same tree); deleting a candidate removes a junction as a link and
-    never deletes through it, so that content is not at risk from this candidate.
+    `node_modules` unwalkable; #190 verifier passes 3 and 4).
+
+    Exception, only when a path-keyed pattern is configured (one with a separator, or any
+    regex): such a pattern can name content through a junction's own text, and content behind
+    a junction INTO the candidate is deleted with it at its real place (pnpm `node_modules/foo`
+    -> `.pnpm/foo@1/...`; #190 verifier pass 5). Those junctions are walked again for matching
+    only, with their own cycle guard and a budget of `_ALIAS_WALK_BUDGET` listings past which
+    the walk fails closed (`too many junctions`). Name-only patterns never need it.
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -216,14 +225,29 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         root_real = _real_path(root_io)
     except OSError:  # e.g. an invalid reparse point: never let the walk raise
         root_real = os.path.normcase(os.path.normpath(root_text))
-    covered = [root_real]
     covered_set = {root_real}
-    stack = [(root_text, root_io, root_real)]
+    # A path-keyed pattern (one spanning separators, or any regex) can name content THROUGH a
+    # junction's own text; a junction into the candidate's own tree does not move that content
+    # out of the deletion (pnpm: `node_modules/foo` -> `node_modules/.pnpm/foo@1/...`), so such
+    # aliases are walked again for matching (#190 verifier pass 5). Name-only patterns cannot
+    # need it: the junction's own name and the content's real path are both matched already.
+    path_keyed = any(p.startswith("re:") or "/" in p or "\\" in p for p in ordered)
+    # (text, io, real, alias): alias is None for the covering walk, else the real paths entered
+    # by this alias walk (its cycle guard).
+    stack: list[tuple[str, str, str, frozenset[str] | None]] = [
+        (root_text, root_io, root_real, None)
+    ]
+    alias_budget = _ALIAS_WALK_BUDGET
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
     while stack:
-        current, current_io, current_real = stack.pop()
+        current, current_io, current_real, alias = stack.pop()
+        if alias is not None:
+            alias_budget -= 1
+            if alias_budget < 0:
+                unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (too many junctions)>"
+                continue
         prefix = _child_text_prefix(current)
         try:
             with os.scandir(current_io) as it:
@@ -235,6 +259,8 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                     if not entry.is_dir(follow_symlinks=False):
                         continue
                     child_text = os.path.join(current, entry.name)  # noqa: PTH118 -- = entry.path
+                    child_io = os.path.join(current_io, entry.name)  # noqa: PTH118
+                    child_alias = alias
                     if entry.is_junction():
                         try:
                             os.stat(entry.path)  # noqa: PTH116 -- the extended-length str scandir gave
@@ -247,17 +273,23 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                         except OSError:
                             unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
                             continue
-                        if _within(child_real, covered):
-                            continue
-                        covered.append(child_real)
-                        covered_set.add(child_real)
+                        if not _within(child_real, covered_set):
+                            covered_set.add(child_real)  # outside: walked once, covering
+                            child_alias = None
+                        elif not path_keyed or (alias is not None and child_real in alias):
+                            continue  # covered content is listed at its real place / a cycle
+                        else:
+                            child_alias = (alias or frozenset()) | {child_real}
                     else:
                         child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
-                        if child_real in covered_set:
-                            continue  # back into a covered tree (e.g. via a junction above it)
-                    stack.append(
-                        (child_text, os.path.join(current_io, entry.name), child_real)  # noqa: PTH118
-                    )
+                        if alias is not None and child_real in alias:
+                            continue  # a cycle within this alias walk
+                        if alias is None and child_real in covered_set:
+                            # back into a covered tree (e.g. via a junction above it)
+                            if not path_keyed:
+                                continue
+                            child_alias = frozenset((child_real,))
+                    stack.append((child_text, child_io, child_real, child_alias))
         except (FileNotFoundError, NotADirectoryError):
             # The ROOT missing or being a file (callers pass top-level temp/crash-dump FILES
             # too): nothing below it, its own path was already matched above, as before.
@@ -269,9 +301,17 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     return unreadable
 
 
-def _within(real: str, roots: Sequence[str]) -> bool:
-    """`real` equals or lies under one of `roots` (all `_real_path` forms)."""
-    return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+def _within(real: str, roots: set[str]) -> bool:
+    """`real` equals or lies under one of `roots` (all `_real_path` forms). Walks up `real`'s
+    parents, O(depth), not O(len(roots)): 5,000 outside targets made the pairwise check
+    quadratic (#190 verifier pass 5)."""
+    while True:
+        if real in roots:
+            return True
+        parent = os.path.dirname(real)  # noqa: PTH120 -- str in, str out
+        if parent == real:
+            return False
+        real = parent
 
 
 def _real_path(path: str) -> str:

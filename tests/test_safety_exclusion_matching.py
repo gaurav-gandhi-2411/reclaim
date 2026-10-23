@@ -708,10 +708,9 @@ def test_aged_temp_still_offers_top_level_files_with_exclusions_configured(tmp_p
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
-def test_two_junctions_to_one_outside_tree_walk_it_once(tmp_path: Path) -> None:
-    """The outside tree is walked once, through the first junction listed; its content
-    protects the candidate. A path-keyed pattern spelled through the SECOND alias is the one
-    thing given up (documented): deleting the candidate never deletes through a junction."""
+def test_two_junctions_to_one_outside_tree_match_through_either_alias(tmp_path: Path) -> None:
+    """The outside tree is covered once; a path-keyed pattern spelled through the second
+    alias still matches (alias matching, only because a path-keyed pattern is configured)."""
     import _winapi  # Windows only; CreateJunction needs no admin rights
 
     outside = tmp_path / "outside"
@@ -721,9 +720,8 @@ def test_two_junctions_to_one_outside_tree_walk_it_once(tmp_path: Path) -> None:
     root.mkdir()
     _winapi.CreateJunction(str(outside), str(root / "j1"))
     _winapi.CreateJunction(str(outside), str(root / "j2"))
-    for pattern in ("*secret*", "*/j1/secret.txt"):
+    for pattern in ("*secret*", "*/j1/secret.txt", "*/j2/secret.txt", "re:j2[\\\\/]secret"):
         assert subtree_exclusion_match(root, [pattern]) == pattern
-    assert subtree_exclusion_match(root, ["*/j2/secret.txt"]) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
@@ -998,3 +996,80 @@ def test_a_junction_whose_real_path_cannot_be_resolved_fails_closed(
     got = subtree_exclusion_match(root, ["*intent-router*"])
     assert got is not None
     assert got.startswith(UNREADABLE_PREFIX)
+
+
+# --- #190 verifier pass 5 -------------------------------------------------------------------
+
+
+def _pnpm_app(tmp_path: Path) -> Path:
+    """`myapp/node_modules/foo` is a junction into the store inside the same node_modules."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    nm = tmp_path / "myapp" / "node_modules"
+    pkg = nm / ".pnpm" / "foo@1.0.0" / "node_modules" / "foo"
+    pkg.mkdir(parents=True)
+    (pkg / "index.js").write_text("x", encoding="utf-8")
+    _winapi.CreateJunction(str(pkg), str(nm / "foo"))
+    return nm
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "*/myapp/node_modules/foo/*",
+        "*/myapp/node_modules/foo/index.js",
+        "re:node_modules.foo.index",
+    ],
+)
+def test_a_path_keyed_deny_through_an_alias_inside_the_candidate_protects_it(
+    tmp_path: Path, pattern: str
+) -> None:
+    """The content behind the alias is deleted with the candidate at its real place, so a deny
+    spelled through the alias text must still protect the candidate (base did; the covering
+    walk alone did not)."""
+    nm = _pnpm_app(tmp_path)
+    assert subtree_exclusion_match(nm, [pattern]) == pattern
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_path_keyed_deny_through_a_junction_to_an_ancestor(tmp_path: Path) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    a = tmp_path / "a"
+    r = a / "r"
+    r.mkdir(parents=True)
+    (r / "f.txt").write_text("x", encoding="utf-8")
+    _winapi.CreateJunction(str(a), str(r / "up"))
+    assert subtree_exclusion_match(r, ["*/up/r/f.txt"]) == "*/up/r/f.txt"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_name_only_patterns_never_rewalk_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    a = tmp_path / "a"
+    r = a / "r"
+    (r / "sub").mkdir(parents=True)
+    (a / "other").mkdir()
+    _winapi.CreateJunction(str(a), str(r / "up"))  # above the root: walked once, covering
+    _winapi.CreateJunction(str(r / "sub"), str(r / "alias"))  # inside: not rewalked
+    calls = _counting_scandir(monkeypatch)
+    assert subtree_exclusion_match(r, ["*intent-router*"]) is None
+    # r, r/sub, a (via up), a/other; r is not entered again under a, the alias is skipped
+    assert len(calls) == 4
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_the_alias_walk_budget_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(safety, "_ALIAS_WALK_BUDGET", 0)
+    nm = _pnpm_app(tmp_path)
+    got = subtree_exclusion_match(nm, ["*/nothing/here/*"])
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+    assert "too many junctions" in got
+    assert subtree_exclusion_match(nm, ["*nothing-here*"]) is None  # name-only: no alias walk
