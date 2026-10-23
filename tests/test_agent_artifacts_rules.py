@@ -2083,15 +2083,29 @@ def test_review_a7_a_config_file_inside_an_excluded_project_hides_the_clone(
     assert ran_in == []
 
 
-def test_review_a7_an_include_path_elsewhere_does_not_hide(tmp_path: Path) -> None:
+def test_review_a7_an_excludes_file_elsewhere_does_not_hide(tmp_path: Path) -> None:
+    shared = tmp_path / "shared" / "team.gitignore"
+    shared.parent.mkdir()
+    shared.write_text("*.log\n", encoding="utf-8")
+    clone = _clone(tmp_path)
+    git(clone, "config", "core.excludesFile", shared.as_posix())
+    world, _ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+def test_review_a8_any_include_hides_the_clone(tmp_path: Path) -> None:
+    """A8, F2: an include can be nested, quoted, split or conditional; following it reliably
+    takes git, which would read the file. Any include in a git dir's own config hides it."""
     shared = tmp_path / "shared" / "team.gitconfig"
     shared.parent.mkdir()
     shared.write_text("[core]\n", encoding="utf-8")
     clone = _clone(tmp_path)
     git(clone, "config", "include.path", shared.as_posix())
-    world, _ran_in = _no_git_world(tmp_path)
+    world, ran_in = _no_git_world(tmp_path)
     v = aa.evaluate_clone(world.env, clone)
-    assert v.offered, (v.failed_rule, v.failed_detail)
+    assert v.excluded and not v.offered
+    assert ran_in == []
 
 
 def test_review_a7_a_clone_of_an_excluded_projects_git_dir_is_hidden(tmp_path: Path) -> None:
@@ -2132,6 +2146,45 @@ def test_review_a7_a_local_remote_inside_an_excluded_project_is_hidden_by_its_pa
     git(tmp_path, "init", "-q", "--bare", "-b", "main", str(store))
     clone = _clone(tmp_path)
     git(clone, "remote", "add", "store", scheme + store.as_posix())
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert ran_in == []
+
+
+# --- the eighth review, A8 (the A7 delta) ---------------------------------------------------------
+
+
+def test_review_a8_a_home_path_pathlib_cannot_expand_does_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1: `Path("~nosuchuser/x").expanduser()` raises RuntimeError, outside `except OSError`:
+    one such config aborted the whole detection run. It now counts as excluded."""
+    monkeypatch.setenv("USERNAME", "someone-else")
+    clone = _clone(tmp_path)
+    git(clone, "config", "core.excludesFile", "~nosuchuser/.gitignore")
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)  # must not raise
+    assert v.excluded and not v.offered
+    assert ran_in == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '[core] excludesFile = "{root}/zz"exclproj"/x.ignore"',  # quoted pieces, key on header
+        "[core]\n\texcludesFile = {root}/zz\\\n exclproj/x.ignore",  # a continued line
+        '[remote "store"] url = {root}/zzexclproj/repos/data.git',  # key on the header line
+        '[remote "store"]\n\turl = file://localhost/{root}/zzexclproj/repos/data.git',
+    ],
+)
+def test_review_a8_config_spellings_git_accepts_still_hide_the_clone(
+    tmp_path: Path, line: str
+) -> None:
+    """F2: the spellings that read a file in an excluded project past the A7 regexes."""
+    clone = _clone(tmp_path)
+    with (clone / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write("\n" + line.format(root=tmp_path.as_posix()) + "\n")
     world, ran_in = _no_git_world(tmp_path)
     v = aa.evaluate_clone(world.env, clone)
     assert v.excluded and not v.offered

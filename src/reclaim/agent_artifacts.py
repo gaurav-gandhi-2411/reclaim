@@ -783,16 +783,28 @@ def _raise(exc: OSError) -> None:
     raise exc
 
 
-_CORE_WORKTREE = re.compile(r"^\s*worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-_REMOTE_URL = re.compile(r"^\s*(?:push)?url\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-
-
-# Config values that make git READ another file: `[include]`/`[includeIf]` paths, and the
-# ignore and attribute files. One inside an excluded project is read by every git command.
-_CONFIG_FILE_REF = re.compile(
-    r"^\s*(?:path|excludesfile|attributesfile)\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+# Config keys read without git: a key may also sit on its section's header line (`[core]
+# worktree = x`), and git joins quoted pieces (`"zz"exclproj` is `zzexclproj`), so every value
+# has its quotes removed (A8 review, F2).
+_KEY_PREFIX = r"^\s*(?:\[[^\]\n]*\]\s*)?"
+_CORE_WORKTREE = re.compile(_KEY_PREFIX + r"worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_REMOTE_URL = re.compile(
+    _KEY_PREFIX + r"(?:push)?url\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
 )
-_LOCAL_URL = re.compile(r"^(?:file://)?(?:[A-Za-z]:[\\/]|[\\/])")
+# Files git READS on every command when the config names them: one inside an excluded project
+# was read by every proof (A7 review, F1).
+_CONFIG_FILE_REF = re.compile(
+    _KEY_PREFIX + r"(?:excludesfile|attributesfile)\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
+# An include (nested, quoted, conditional...) or a continued line cannot be followed reliably
+# without git, which would read the file itself: such a config counts as excluded (A8, F2).
+_UNFOLLOWABLE_CONFIG = re.compile(r"^\s*\[\s*include|\\\r?$", re.IGNORECASE | re.MULTILINE)
+_LOCAL_URL = re.compile(r"^(?:file://[^/\\]*)?(?:[A-Za-z]:[\\/]|[\\/])", re.IGNORECASE)
+_FILE_URL_PREFIX = re.compile(r"^file://[^/\\]*", re.IGNORECASE)  # `file://host` included
+
+
+def _config_value(raw: str) -> str:
+    return raw.replace('"', "")
 
 
 def _url_repo_name(url: str) -> str:
@@ -830,20 +842,27 @@ def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
             deeper.append(resolved)
         config = read(gitdir / "config")
         if config is not None:
+            if _UNFOLLOWABLE_CONFIG.search(config):
+                return True
             for match in _CORE_WORKTREE.finditer(config):
-                targets.append(Path(os.path.normpath(gitdir / match.group(1).strip('"'))))
+                value = _config_value(match.group(1))
+                targets.append(Path(os.path.normpath(gitdir / value)))
             # A clone of an excluded project is that project, wherever it sits: its remote
             # names it (`.../zzexclproj.git`) even when the folder does not (A5 review, F5).
             for match in _REMOTE_URL.finditer(config):
-                url = match.group(1).strip('"')
+                url = _config_value(match.group(1))
                 name = _url_repo_name(url)
                 if name:
                     targets.append(gitdir.parent / name / ".git")
                 if _LOCAL_URL.match(url):  # a local remote is a path: match it as one (A7, F2)
-                    local = url[len("file://") :] if url.lower().startswith("file://") else url
-                    targets.append(Path(os.path.normpath(local)))
+                    targets.append(Path(os.path.normpath(_FILE_URL_PREFIX.sub("", url))))
             for match in _CONFIG_FILE_REF.finditer(config):  # (A7 review, F1)
-                ref = Path(match.group(1).strip('"')).expanduser()
+                try:
+                    ref = Path(_config_value(match.group(1))).expanduser()
+                except (RuntimeError, ValueError):
+                    # `~otheruser/x`, or no home directory: pathlib cannot say where it points
+                    # (it raised, which aborted the whole detection run; A8 review, F1).
+                    return True
                 targets.append(Path(os.path.normpath(gitdir / ref)))
         objects = gitdir / "objects"
         alternates = read(objects / "info" / "alternates")
