@@ -945,16 +945,18 @@ def test_a_root_whose_real_path_cannot_be_resolved_does_not_raise(
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions; Win32 strips trailing spaces")
 def test_a_trailing_space_root_is_not_confused_with_its_sibling(tmp_path: Path) -> None:
-    """`tw ` holds a junction back to itself; a sibling `tw` exists. The root's real path came
-    from the plain form, i.e. the sibling, so the junction looked like a way into another tree
-    and `tw ` was mis-covered (#190 verifier pass 4)."""
+    """`tw ` holds a junction to its sibling `tw`, and only the sibling holds the excluded
+    entry. With the root's real path taken from the plain form (Win32 strips the space) the
+    root looked like `tw` itself, the junction looked like one back into the root, and the
+    walk skipped it: "nothing excluded" (#190 verifier pass 4)."""
     import _winapi  # Windows only; CreateJunction needs no admin rights
 
     prefix = chr(92) * 2 + "?" + chr(92)
     exact = prefix + str(tmp_path / "tw ")
-    os.makedirs(exact + chr(92) + "intent-router")  # noqa: PTH103 -- the exact name needs it
-    (tmp_path / "tw").mkdir()
-    _winapi.CreateJunction(exact, exact + chr(92) + "j")
+    os.makedirs(exact)  # noqa: PTH103 -- the exact name needs the prefix
+    sibling = tmp_path / "tw"
+    (sibling / "intent-router").mkdir(parents=True)
+    _winapi.CreateJunction(str(sibling), exact + chr(92) + "j")
     root = exact.removeprefix(prefix)
     assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
 
