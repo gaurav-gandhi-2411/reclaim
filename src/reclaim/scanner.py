@@ -608,7 +608,13 @@ def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
         nested = repo_root / rel
         try:
             # Not checked out (no `.git` dir or file): the gitlink is only a commit id, no work.
-            if not (nested / ".git").exists():
+            # \\?\-prefixed: a plain Path.exists() answers False past MAX_PATH, which would
+            # skip a checked-out submodule's check (#189 verifier pass 4). os.stat, not
+            # os.path.exists: only "does not exist" means not checked out; access denied and
+            # every other error must reach the except below (not-clean).
+            try:
+                os.stat(long_path(nested / ".git"))  # noqa: PTH116 -- \\?\ str
+            except (FileNotFoundError, NotADirectoryError):
                 continue
             root_real = root_real or repo_root.resolve()
             if not nested.resolve().is_relative_to(root_real):

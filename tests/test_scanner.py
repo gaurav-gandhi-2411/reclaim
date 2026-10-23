@@ -1126,14 +1126,38 @@ def test_query_git_clean_reads_not_clean_when_a_submodule_cannot_be_inspected(
     repo = tmp_path / "repo"
     _committed_repo(repo)
     mod = _add_submodule(repo)
+    real_stat = os.stat
+
+    def denied(path: object, *a: object, **k: object) -> os.stat_result:
+        if str(path).lower().endswith(str(mod / ".git").lower()):
+            raise PermissionError(5, "Access is denied")
+        return real_stat(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", denied)
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_does_not_trust_path_exists_for_a_submodule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past MAX_PATH a plain Path.exists() answers False for a checked-out submodule's `.git`
+    (#189 verifier pass 4), which would skip its check. Simulated: Path.exists lies; the
+    prefixed stat must still find it and see the hidden edit."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    mod = _add_submodule(repo)
+    _git_in(repo, "config", "submodule.mod.active", "false")  # outer flags cannot see inside
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
     real_exists = Path.exists
 
-    def denied(self: Path, *a: object, **k: object) -> bool:
-        if self == mod / ".git":
-            raise PermissionError(5, "Access is denied")
+    def lying(self: Path, *a: object, **k: object) -> bool:
+        if self.name == ".git":
+            return False
         return real_exists(self, *a, **k)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "exists", denied)
+    monkeypatch.setattr(Path, "exists", lying)
     assert scanner_module._query_git_clean(repo) is False
 
 
