@@ -130,3 +130,26 @@ test that reproduces the reported scenario. What changed:
   only when the vault entry is purged); a stale or hand-made remote-tracking ref counts as pushed (no
   network is used, so the answer is as fresh as the last fetch); one unreadable same-user tool process
   outside the vendor classes blocks every item.
+
+## Addendum 2 (2026-10-23): changes forced by the second hostile review (A3)
+
+A second, independent review, run against the rebased build `71803a1`, re-ran all nine pass-A scenarios; every one stayed fixed. It then found six new ways through, two of which lost data. Each is fixed with a regression test that reproduces the reported scenario and fails on `71803a1`.
+
+- **Per-worktree refs must be pushed too (F1, data loss).** W4 proved only HEAD of a worktree. Refs under `refs/worktree/`, `refs/bisect/` and `refs/rewritten/` live in the admin dir, which is removed after the move. Once that dir was gone, their commits were unreachable and `git gc` dropped them, while restore still reported success. W4 now also requires every such ref to be on a real remote.
+- **Restore never takes over an admin entry that belongs to another worktree (F2, data loss).** After a move, `git worktree add` may reuse the freed admin name. Restore used to skip the copy, delete its backup and run `worktree repair`. That repointed the newer worktree's index and HEAD, and a later `worktree remove` then lost that worktree's staged work. Now, when the admin dir exists and its `gitdir` names another path, restore writes nothing, keeps the backup and returns a note.
+- **Git may not stay silent about paths it cannot open (F3).**
+  - Every git call runs with `core.longpaths=true`.
+  - Any stderr from the status and ls-files proofs is a refusal: when git cannot open a directory, it warns, exits 0 and lists nothing.
+  - A name ending in a dot or a space, which Win32 tools including git cannot open, refuses a worktree or clone, or any nested repository that contains it.
+- **`.git` is matched case-insensitively (F4).** Git on Windows uses `.GIT` as the repository, and it skips content under `notes/.GIT/`.
+- **Nested `.git` pointers are checked against the exclusions before any git command runs in them (F5).** This covers the admin dir and its common dir, that is, the main repository of a linked worktree. A neutral-looking folder in scratch or in a clone can be a linked worktree of an excluded project, and only its pointer names that project. A pointer that cannot be read or parsed counts as excluded.
+- **A remote's tracking refs count only if nothing else can write them (F6).** `--remotes=<name>` reads `refs/remotes/<name>/*`. Another remote can write there in two ways:
+  - through its fetch refspec, for example a local `bak` mapped to `refs/remotes/origin/*`, where a push updates that ref;
+  - through its name, for example `origin/bak`.
+
+  A remote is dropped from the proof when any other remote's fetch destination overlaps its namespace, or when its name is a case-insensitive prefix match of another remote's name. Loose refs are files, so `ORIGIN` and `origin` share a namespace. A remote whose own name contains `/` is never used.
+- **Loopback and drive-path URL spellings are refused.** This covers loopback and unspecified addresses in every IPv4/IPv6 notation (`127.1`, decimal, hex, IPv4-mapped), a trailing-dot host, this computer's own name, and drive paths that are percent-encoded, use the `d|` form or follow doubled slashes. No DNS lookup is made.
+- **Accepted, not fixed, all in the safe direction or restorable:**
+  - Process matching misses a bare relative argument run from the parent directory, and some UNC loopback spellings. The rename still fails on any open handle, and git state, not process state, protects the work.
+  - A clone that another repository borrows objects from (`clone --shared`) can be moved. That breaks the borrower until restore; the objects are on the remote.
+  - A junction to a huge tree is walked for exclusions before the reparse check refuses it. The order stays, so an excluded name inside is never reported.
