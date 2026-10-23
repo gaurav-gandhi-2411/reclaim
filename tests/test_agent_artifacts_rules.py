@@ -2273,3 +2273,47 @@ def test_review_a9_a_bom_before_a_remote_line_still_names_the_project(tmp_path: 
     config.write_text(line + original, encoding="utf-8")
     world, _ran_in = _no_git_world(tmp_path)
     assert aa._gitdir_excluded(world.env, clone / ".git")
+
+
+# --- the tenth review, A10 ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[core][core] worktree = {root}/zzexclproj",  # two headers on one line: git honours it
+        '[remote "a]b"] url = {root}/zzexclproj/repos/data.git',  # `]` inside a quoted name
+    ],
+)
+def test_review_a10_header_spellings_git_honours_still_name_the_project(
+    tmp_path: Path, line: str
+) -> None:
+    clone = _clone(tmp_path)
+    with (clone / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write("\n" + line.format(root=tmp_path.as_posix()) + "\n")
+    world, _ran_in = _no_git_world(tmp_path)
+    assert aa._gitdir_excluded(world.env, clone / ".git")
+
+
+def test_review_a10_a_long_run_of_blanks_inside_a_value_is_read_in_linear_time(
+    tmp_path: Path,
+) -> None:
+    """A lazy value capture was quadratic: 32k spaces inside one value took 10 s."""
+    gitdir = tmp_path / "repo" / ".git"
+    gitdir.mkdir(parents=True)
+    text = (
+        "[core]\n\tworktree = a" + " " * 32_000 + "b\n[remote]\n\turl = a" + "\t" * 32_000 + "b\n"
+    )
+    (gitdir / "config").write_text(text, encoding="utf-8")
+    world, _ran_in = _no_git_world(tmp_path)
+    started = time.monotonic()
+    aa._gitdir_excluded(world.env, gitdir)
+    assert time.monotonic() - started < 2.0
+
+
+def test_review_a10_a_value_with_trailing_blanks_is_still_read(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    with (clone / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write(f'\n[remote "x"]\n\turl = {tmp_path.as_posix()}/zzexclproj/r.git \t \n')
+    world, _ran_in = _no_git_world(tmp_path)
+    assert aa._gitdir_excluded(world.env, clone / ".git")

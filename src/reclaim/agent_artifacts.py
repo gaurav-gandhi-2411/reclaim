@@ -788,8 +788,11 @@ def _raise(exc: OSError) -> None:
 # has its quotes removed (A8 review, F2).
 # `[ \t]`, never `\s`: `\s` also matches newlines, and on a config of blank lines the scan went
 # quadratic (50k blank lines took 213 s; A9 review, F3). A UTF-8 BOM may open the file.
-_KEY_PREFIX = r"^\ufeff?[ \t]*(?:\[[^\]\n]*\][ \t]*)?"
-_KEY_VALUE = r"[ \t]*=[ \t]*([^\r\n]+?)[ \t]*\r?$"
+# Any number of headers may precede the key (`[core][core] worktree = x`), and a `]` inside a
+# quoted subsection does not end one (A10 review, 1). The value is captured greedily to its
+# last non-blank character: a lazy capture was quadratic on a long run of blanks (A10, 2).
+_KEY_PREFIX = r'^\ufeff?[ \t]*(?:\[(?:"[^"\n]*"|[^\]"\n])*\][ \t]*)*'
+_KEY_VALUE = r"[ \t]*=[ \t]*([^\r\n]*[^ \t\r\n])[ \t]*\r?$"
 _CORE_WORKTREE = re.compile(_KEY_PREFIX + r"worktree" + _KEY_VALUE, re.IGNORECASE | re.MULTILINE)
 _REMOTE_URL = re.compile(_KEY_PREFIX + r"(?:push)?url" + _KEY_VALUE, re.IGNORECASE | re.MULTILINE)
 # Files git READS on every command when the config names them: one inside an excluded project
