@@ -144,13 +144,29 @@ def first_matching_pattern(
 
 UNREADABLE_PREFIX = "<unreadable directory: "
 
+# Directories reached THROUGH at least one junction that one walk may list before it stops and
+# fails closed. Junction-dense trees grow factorially (7 mutually-junctioned directories took
+# minutes; #190 verifier pass 3); trees without junctions never count against it, so a large
+# ordinary candidate (a big node_modules) is still walked in full.
+_JUNCTION_WALK_BUDGET = 20_000
+
 
 def _io_path(path: str) -> str:
     r"""The extended-length (`\\?\`) form of `path`, for I/O only, so a tree deeper than
-    MAX_PATH can be listed while long-path support is off. Never used as match text."""
+    MAX_PATH can be listed while long-path support is off. Never used as match text.
+
+    An absolute path is only normalised as a string: `os.path.abspath` calls GetFullPathNameW,
+    which strips a trailing space or dot from the last component, so a root named `sp ` became
+    a path that does not exist and the walk answered "nothing excluded" for it (#190 verifier
+    pass 3). With the `\\?\` prefix the exact name is used."""
     if os.name != "nt" or path.startswith(("\\\\?\\", "//?/", "\\\\.\\", "//./")):
         return path
-    full = os.path.abspath(path)  # noqa: PTH100 -- string in, string out, like scandir's paths
+    # relative / drive-relative input needs the (per-drive) cwd, so abspath only there
+    full = (
+        os.path.normpath(path)
+        if os.path.isabs(path)  # noqa: PTH117 -- str in, str out
+        else os.path.abspath(path)  # noqa: PTH100
+    )
     if full.startswith(("\\\\", "//")):
         return "\\\\?\\UNC\\" + full.lstrip("\\/")
     return "\\\\?\\" + full
@@ -204,8 +220,16 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
+    junction_budget = _JUNCTION_WALK_BUDGET
     while stack:
         current, current_io, current_real, entered = stack.pop()
+        if len(entered) > 1:  # reached through a junction
+            junction_budget -= 1
+            if junction_budget < 0:
+                # Not listed, so not seen: fails closed like an unreadable directory, while
+                # the directories outside junctions are still walked and matched.
+                unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (junction walk limit)>"
+                continue
         prefix = _child_text_prefix(current)
         try:
             with os.scandir(current_io) as it:

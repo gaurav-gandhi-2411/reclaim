@@ -828,3 +828,57 @@ def test_a_junction_whose_target_cannot_be_stat_ed_is_still_walked(
 
     monkeypatch.setattr(os, "stat", denied)
     assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+# --- #190 verifier pass 3 -------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 strips trailing spaces/dots")
+@pytest.mark.parametrize("name", ["sp ", "dot."])
+def test_a_root_named_with_a_trailing_space_or_dot_is_still_walked(
+    tmp_path: Path, name: str
+) -> None:
+    """abspath (GetFullPathNameW) strips the trailing space/dot, so the walk listed a path that
+    does not exist and answered "nothing excluded" while the deleter (exact name) would delete
+    the real directory with the excluded entry in it."""
+    prefix = chr(92) * 2 + "?" + chr(92)
+    exact = prefix + str(tmp_path / name)
+    os.makedirs(exact + chr(92) + "intent-router")  # noqa: PTH103 -- the exact name needs it
+    root = exact.removeprefix(prefix)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_to_a_file_hides_nothing(tmp_path: Path) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    f = tmp_path / "file.txt"
+    f.write_text("x", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    _winapi.CreateJunction(str(f), str(root / "j"))
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_the_junction_walk_budget_fails_closed_and_ignores_ordinary_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    monkeypatch.setattr(safety, "_JUNCTION_WALK_BUDGET", 3)
+    plain = tmp_path / "plain"
+    for i in range(10):
+        (plain / f"d{i}" / "e").mkdir(parents=True)
+    assert subtree_exclusion_match(plain, ["*intent-router*"]) is None  # 20 dirs, no junction
+
+    side = tmp_path / "side"
+    for i in range(10):
+        (side / f"s{i}").mkdir(parents=True)
+    root = tmp_path / "root"
+    root.mkdir()
+    _winapi.CreateJunction(str(side), str(root / "j"))
+    got = subtree_exclusion_match(root, ["*intent-router*"])
+    assert got is not None
+    assert got.startswith(UNREADABLE_PREFIX)
+    assert "junction walk limit" in got
