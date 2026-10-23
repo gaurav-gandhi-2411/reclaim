@@ -14,7 +14,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import structlog
 
@@ -501,36 +501,88 @@ _GIT_REPO_ENV = frozenset(
 )
 
 
-def _query_git_clean(repo_root: Path) -> bool:
-    """Runs `git status --porcelain` once for a repo root. Any failure (git missing, not a
-    repo, timeout) is treated as not-clean — conservative, matching SafetyValidator's
-    deny-by-default posture — and never crashes the scan.
+# Nested submodules deeper than this read not-clean rather than being walked further.
+_GIT_CLEAN_MAX_DEPTH = 8
+
+
+def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
+    """Runs `git status --porcelain`, `git ls-files -v` and `git ls-files -s -z` for a repo root,
+    then the same check in every checked-out gitlink (submodule or embedded repo) below it. Any
+    failure (git missing, not a repo, timeout) is treated as not-clean — conservative, matching
+    SafetyValidator's deny-by-default posture — and never crashes the scan.
+
+    "Clean" must not be decided by settings that hide work from `git status`: the user's
+    `status.showUntrackedFiles=no`, `diff.ignoreSubmodules` or submodule `ignore=all` (global,
+    repo or env config) are overridden on the command line, and an entry marked
+    assume-unchanged or skip-worktree (git no longer compares it, so an edit to it is
+    invisible) makes the repo not-clean. A sparse checkout and a `core.ignoreStat=true` repo
+    (git marks new entries assume-unchanged) therefore never read clean: the conservative
+    direction. Settings INSIDE a nested repo (an inactive submodule, a gitlink with no
+    `.gitmodules` entry, `submodule.<name>.ignore=all` in a submodule's own config) are not
+    reachable from the outer command line, so each checked-out gitlink is checked as a repo of
+    its own, under the same rules.
     """
+    if _depth > _GIT_CLEAN_MAX_DEPTH:
+        return False
     git_exe = shutil.which("git")
     if git_exe is None:
         return False
-    try:
-        # Fixed argv; repo_root was discovered by walking the scan tree itself, not
-        # supplied by external/untrusted input. `git status` otherwise refreshes and rewrites
-        # the repo's `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan
-        # must not write into a user's repo, nor race a git command a live session is running
-        # there. `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 stop every index write and
-        # lock (the one remaining effect: with core.splitIndex git bumps the shared index's
-        # mtime on read, contents unchanged, plain git does the same); core.fsmonitor=false
-        # stops it starting a repo-configured fsmonitor hook or daemon. Inherited GIT_DIR /
-        # GIT_WORK_TREE / GIT_INDEX_FILE would aim the check at another repo: dropped.
-        result = subprocess.run(  # noqa: S603
-            [git_exe, "--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"],
+    # Fixed argv; repo_root was discovered by walking the scan tree itself, not supplied by
+    # external/untrusted input. `git status` otherwise refreshes and rewrites the repo's
+    # `.git/index` (and takes `index.lock`) whenever stat data is stale: a scan must not write
+    # into a user's repo, nor race a git command a live session is running there.
+    # `--no-optional-locks` plus GIT_OPTIONAL_LOCKS=0 stop every index write and lock (the one
+    # remaining effect: with core.splitIndex git bumps the shared index's mtime on read,
+    # contents unchanged, plain git does the same); core.fsmonitor=false stops it starting a
+    # repo-configured fsmonitor hook or daemon. Inherited GIT_DIR / GIT_WORK_TREE /
+    # GIT_INDEX_FILE would aim the check at another repo: dropped.
+    env = {
+        **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    # core.quotePath=true keeps file names in the output ASCII (octal escapes), and the output is
+    # decoded as UTF-8 with replacement either way: under the default cp1252 locale a UTF-8 name
+    # containing an undefined byte (0x81, 0x8D, ...; e.g. `Á`, `Ё`, much of CJK) failed to decode,
+    # left stdout None and crashed the whole scan instead of failing closed.
+    base = [
+        git_exe,
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.quotePath=true",
+        "-c",
+        "status.showUntrackedFiles=normal",
+        "-c",
+        "diff.ignoreSubmodules=none",
+    ]
+
+    def run(*args: str, errors: str = "replace") -> str:
+        done = subprocess.run(  # noqa: S603
+            [*base, *args],
             cwd=repo_root,
             check=True,
             capture_output=True,
-            text=True,
-            env={
-                **{k: v for k, v in os.environ.items() if k.upper() not in _GIT_REPO_ENV},
-                "GIT_OPTIONAL_LOCKS": "0",
-            },
+            encoding="utf-8",
+            errors=errors,
+            env=env,
             timeout=30,
         )
+        return done.stdout or ""
+
+    try:
+        if run(
+            "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"
+        ).strip():
+            return False
+        # `-v` tags assume-unchanged entries with a lowercase letter and skip-worktree ones
+        # with `S` (`s` for both).
+        listing = run("ls-files", "-v", "--recurse-submodules")
+        if any(line[:1].islower() or line[:1] == "S" for line in listing.splitlines()):
+            return False
+        # Gitlinks (mode 160000), NUL-separated and unquoted. Decoded strictly: a name mangled
+        # by replacement would look like an uninitialised submodule and skip its check.
+        staged = run("ls-files", "-s", "-z", errors="strict")
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr or ""
         if _GIT_DUBIOUS_OWNERSHIP_MARKER in stderr.lower():
@@ -538,10 +590,41 @@ def _query_git_clean(repo_root: Path) -> bool:
         else:
             logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
         logger.warning("scan.git_status_failed", repo_root=str(repo_root), error=str(exc))
         return False
-    return result.stdout.strip() == ""
+    root_real: Path | None = None
+    for record in staged.split("\0"):
+        meta, _, rel = record.partition("\t")
+        if not meta.startswith("160000 "):
+            continue
+        # git refuses such names when it writes an index, but not when it reads one (a crafted
+        # or foreign index): `repo / "C:"` is another drive's cwd. Never run git outside the
+        # repo: an odd gitlink name, or one whose real path leaves the repo (a junction), reads
+        # not-clean instead.
+        pure = PureWindowsPath(rel)
+        if not rel or pure.drive or pure.root or ".." in pure.parts:
+            return False
+        nested = repo_root / rel
+        try:
+            # Not checked out (no `.git` dir or file): the gitlink is only a commit id, no work.
+            # \\?\-prefixed: a plain Path.exists() answers False past MAX_PATH, which would
+            # skip a checked-out submodule's check (#189 verifier pass 4). os.stat, not
+            # os.path.exists: only "does not exist" means not checked out; access denied and
+            # every other error must reach the except below (not-clean).
+            try:
+                os.stat(long_path(nested / ".git"))  # noqa: PTH116 -- \\?\ str
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            root_real = root_real or repo_root.resolve()
+            if not nested.resolve().is_relative_to(root_real):
+                return False
+        except (OSError, RuntimeError):
+            # e.g. an access-denied `.git` (Path.exists raises PermissionError): unknown state
+            return False
+        if not _query_git_clean(nested, _depth + 1):
+            return False
+    return True
 
 
 # Wave 1 finding #3 (2026-07-30 real-disk diagnosis): `build_record`'s `os.stat()` call was the

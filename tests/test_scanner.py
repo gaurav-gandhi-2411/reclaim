@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -930,6 +931,289 @@ def test_query_git_clean_ignores_an_inherited_git_dir(
     monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "clean"))
 
     assert scanner_module._query_git_clean(tmp_path / "dirty") is False
+
+
+def _git_in(repo: Path, *args: str) -> None:
+    ident = ["-c", "user.email=t@x.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", *ident, *args], cwd=repo, check=True, capture_output=True)  # noqa: S603,S607
+
+
+def _hide_untracked_in_repo_config(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "config", "status.showUntrackedFiles", "no")
+    (repo / "new.txt").write_text("work", encoding="utf-8")
+
+
+def _hide_untracked_in_env_config(repo: Path, mp: pytest.MonkeyPatch) -> None:
+    mp.setenv("GIT_CONFIG_COUNT", "1")
+    mp.setenv("GIT_CONFIG_KEY_0", "status.showUntrackedFiles")
+    mp.setenv("GIT_CONFIG_VALUE_0", "no")
+    (repo / "new.txt").write_text("work", encoding="utf-8")
+
+
+def _edit_assume_unchanged(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "update-index", "--assume-unchanged", "a.txt")
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_skip_worktree(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    _git_in(repo, "update-index", "--skip-worktree", "a.txt")
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_submodule_with_ignore_all(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    sub = repo.parent / "sub"
+    _committed_repo(sub)
+    _git_in(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git_in(repo, "commit", "-q", "-m", "submodule")
+    _git_in(repo, "config", "submodule.mod.ignore", "all")
+    (repo / "mod" / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _add_submodule(repo: Path) -> Path:
+    sub = repo.parent / "sub"
+    _committed_repo(sub)
+    _git_in(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "mod")
+    _git_in(repo, "commit", "-q", "-m", "submodule")
+    return repo / "mod"
+
+
+def _edit_assume_unchanged_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _hide_untracked_inside_a_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(mod, "config", "status.showUntrackedFiles", "no")
+    (mod / "new.txt").write_text("work", encoding="utf-8")
+
+
+def _edit_both_assume_unchanged_and_skip_worktree(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    # two calls: one call with both flags sets only one of them (git 2.51, VERIFIED)
+    _git_in(repo, "update-index", "--skip-worktree", "a.txt")
+    _git_in(repo, "update-index", "--assume-unchanged", "a.txt")  # `ls-files -v` tag: `s`
+    (repo / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_inside_an_inactive_submodule(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    mod = _add_submodule(repo)
+    _git_in(repo, "config", "submodule.mod.active", "false")
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _edit_inside_an_unregistered_gitlink(repo: Path, _mp: pytest.MonkeyPatch) -> None:
+    # `git add <a clone>`: a gitlink with no .gitmodules entry (git warns, but it is common)
+    inner = repo / "embedded"
+    _committed_repo(inner)
+    _git_in(repo, "add", "embedded")
+    _git_in(repo, "commit", "-q", "-m", "embedded")
+    _git_in(inner, "update-index", "--skip-worktree", "a.txt")
+    (inner / "a.txt").write_text("edited", encoding="utf-8")
+
+
+def _hide_a_nested_submodule_with_its_parents_ignore_all(
+    repo: Path, _mp: pytest.MonkeyPatch
+) -> None:
+    mid = _add_submodule(repo)  # repo/mod
+    leaf_src = repo.parent / "leaf"
+    _committed_repo(leaf_src)
+    _git_in(
+        mid, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(leaf_src), "leaf"
+    )
+    _git_in(mid, "commit", "-q", "-m", "leaf")
+    _git_in(mid, "config", "submodule.leaf.ignore", "all")
+    _git_in(repo, "add", "mod")
+    _git_in(repo, "commit", "-q", "-m", "bump")
+    (mid / "leaf" / "new.txt").write_text("work", encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+@pytest.mark.parametrize(
+    "hide",
+    [
+        _hide_untracked_in_repo_config,
+        _hide_untracked_in_env_config,
+        _edit_assume_unchanged,
+        _edit_skip_worktree,
+        _edit_submodule_with_ignore_all,
+        _edit_assume_unchanged_inside_a_submodule,
+        _hide_untracked_inside_a_submodule,
+        _edit_both_assume_unchanged_and_skip_worktree,
+        _edit_inside_an_inactive_submodule,
+        _edit_inside_an_unregistered_gitlink,
+        _hide_a_nested_submodule_with_its_parents_ignore_all,
+    ],
+)
+def test_query_git_clean_is_not_fooled_by_settings_that_hide_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hide: Callable[[Path, pytest.MonkeyPatch], None],
+) -> None:
+    """Each of these leaves uncommitted work that plain `git status --porcelain` does not show
+    (from the #186 verifier passes). "Clean" unlocks the node_modules exemption, so each must
+    read not-clean."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    hide(repo, monkeypatch)
+
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.parametrize("name", ["C:", "D:sub", "/abs", "\\root", "../up", "a/../../up", ""])
+def test_query_git_clean_never_follows_a_gitlink_out_of_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """git refuses these names when writing an index but not when reading one; `repo / "C:"`
+    is another drive's cwd (#189 verifier pass 3). Such a gitlink reads not-clean, and no git
+    command runs anywhere but the repo itself."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cwds: list[str] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        cwds.append(str(kwargs["cwd"]))
+        out = ""
+        if "-s" in argv:
+            out = f"160000 {'a' * 40} 0\t{name}\0"
+        elif "-v" in argv:
+            out = "H a.txt\n"
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert scanner_module._query_git_clean(repo) is False
+    assert set(cwds) == {str(repo)}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_does_not_run_git_through_a_junction_out_of_the_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    outside = tmp_path / "outside"
+    _committed_repo(outside)
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    inner = repo / "lib"
+    # a clone, so the junction target's HEAD equals the gitlink commit and the outer
+    # `git status` reads clean: only the containment check can refuse it
+    _git_in(tmp_path, "clone", "-q", str(outside), str(inner))
+    _git_in(repo, "add", "lib")  # a gitlink with no .gitmodules entry
+    _git_in(repo, "commit", "-q", "-m", "lib")
+    shutil.rmtree(inner, onexc=lambda func, path, _exc: (Path(path).chmod(0o700), func(path)))
+    _winapi.CreateJunction(str(outside), str(inner))
+    real_run = subprocess.run
+    cwds: list[str] = []
+
+    def recording_run(*args: object, **kwargs: object) -> object:
+        cwds.append(str(kwargs.get("cwd")))
+        return real_run(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    assert scanner_module._query_git_clean(repo) is False
+    assert str(inner) not in cwds
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_not_clean_when_a_submodule_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An access-denied submodule `.git` made Path.exists raise PermissionError outside the
+    try and aborted the whole scan (#189 verifier pass 3)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    mod = _add_submodule(repo)
+    real_stat = os.stat
+
+    def denied(path: object, *a: object, **k: object) -> os.stat_result:
+        if str(path).lower().endswith(str(mod / ".git").lower()):
+            raise PermissionError(5, "Access is denied")
+        return real_stat(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", denied)
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_does_not_trust_path_exists_for_a_submodule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past MAX_PATH a plain Path.exists() answers False for a checked-out submodule's `.git`
+    (#189 verifier pass 4), which would skip its check. Simulated: Path.exists lies; the
+    prefixed stat must still find it and see the hidden edit."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    mod = _add_submodule(repo)
+    _git_in(repo, "config", "submodule.mod.active", "false")  # outer flags cannot see inside
+    _git_in(mod, "update-index", "--assume-unchanged", "a.txt")
+    (mod / "a.txt").write_text("edited", encoding="utf-8")
+    real_exists = Path.exists
+
+    def lying(self: Path, *a: object, **k: object) -> bool:
+        if self.name == ".git":
+            return False
+        return real_exists(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "exists", lying)
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_not_clean_past_the_nesting_cap(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    assert scanner_module._query_git_clean(repo, scanner_module._GIT_CLEAN_MAX_DEPTH) is True
+    assert scanner_module._query_git_clean(repo, scanner_module._GIT_CLEAN_MAX_DEPTH + 1) is False
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_reads_clean_repos_with_submodules_as_clean(tmp_path: Path) -> None:
+    """The per-gitlink recursion must not turn ordinary clean shapes dirty: a checked-out
+    submodule, and a gitlink that is not checked out (fresh clone without --recurse)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    _add_submodule(repo)
+    assert scanner_module._query_git_clean(repo) is True
+
+    clone = tmp_path / "clone"
+    _git_in(tmp_path, "clone", "-q", str(repo), str(clone))
+    assert not (clone / "mod" / ".git").exists()
+    assert scanner_module._query_git_clean(clone) is True
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_query_git_clean_survives_non_ascii_names_under_a_legacy_locale(tmp_path: Path) -> None:
+    """`ÁЁ` in UTF-8 contains bytes cp1252 cannot decode. With core.quotePath=false and text-mode
+    decoding in the locale, stdout came back None and the scan crashed (#189 verifier, R1)."""
+    repo = tmp_path / "repo"
+    _committed_repo(repo)
+    _git_in(repo, "config", "core.quotePath", "false")
+    (repo / "ÁЁ.txt").write_text("x", encoding="utf-8")
+    _git_in(repo, "add", "ÁЁ.txt")
+    _git_in(repo, "commit", "-q", "-m", "non-ascii")
+    assert scanner_module._query_git_clean(repo) is True
+    (repo / "Ё-new.txt").write_text("x", encoding="utf-8")
+    assert scanner_module._query_git_clean(repo) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [subprocess.TimeoutExpired(["git"], 30), OSError("spawn failed")],
+    ids=["timeout", "oserror"],
+)
+def test_query_git_clean_fails_closed_when_git_cannot_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert scanner_module._query_git_clean(repo) is False
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
