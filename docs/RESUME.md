@@ -73,6 +73,17 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11.
     3. A6.
     4. B.
+- 23:10 IST checkpoint 7:
+  - **#196** (checkpoint 6 docs) merged as `1805429`; main CI green after it.
+  - **Agent artifacts** (#193, draft, head `eeeb493`, rebased on `1805429`):
+    - The sixth (data-safety) review FAILED: 1 medium, 2 low, 1 over-refusal. The medium one: an `nbstripout`-style clean filter left the only copy of notebook outputs in the working file, while `status` was empty. Fixed in `fb36f48` (ADR addendum 6), with 6 tests that fail on the old head. All 8 targeted mutants were killed.
+    - The fix's own suites pass (350). The full verify on `eeeb493` was stopped by Claude Code's low-memory reaper before it started (free RAM 5.2 GB, under the 8 GB floor). I do not restart a reaped job (WHEN GG HAS TIME, item 7).
+    - The seventh review waits for free RAM to recover.
+  - **Next:**
+    1. Seventh review when RAM allows. Full verify on `eeeb493` needs your go (item 7). Then A4.
+    2. A5: build 11.
+    3. A6.
+    4. B.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
