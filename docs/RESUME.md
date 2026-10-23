@@ -23,6 +23,17 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     4. A4: `integration/run-2026-10`.
     5. A5: build 11.
     6. A6.
+- 11:55 IST checkpoint 3:
+  - **Merged:** #189 (clean-check hardening, `46a1627`) and #191 (checkpoint 2 docs, `739759b`). Main CI is green after each.
+  - **#190** (fail-closed subtree walk, head `f66b30e`): 7 verifier passes, all findings fixed with tests. Passes 5–7 found unsafe regressions in my junction redesigns; each is fixed and pinned, and the run log carries the record. The design is now two modes: cover-once for `*lit*` patterns and a full walk otherwise. Full verify on `f66b30e`: 2262 passed. Pass 8 on the exact head is running.
+  - **Incident (process, no data effect):** the low-memory reaper killed a mutation run and left a mutant in the working copy. It was caught before any commit. Mutation tools now keep an on-disk backup (`mutate_guard.py`).
+  - **Next:**
+    1. Merge #190 after pass 8, CI and the merge gate.
+    2. Real-index old-vs-new run (waiting on RAM).
+    3. A3: second review of the agent-artifacts fixes.
+    4. A4: `integration/run-2026-10`.
+    5. A5: build 11.
+    6. A6.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
