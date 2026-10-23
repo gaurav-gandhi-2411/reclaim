@@ -61,9 +61,18 @@ def _reasons_for(pid: int, root: Path | str) -> list[str]:
     """Reasons `root` is in use. NOT filtered by `pid`: `sys.executable` here is a venv launcher
     stub, and the interpreter that actually holds the directory is its child with another pid."""
     del pid
-    scan = scan_processes()
-    assert scan.ok, scan.reason
-    return [r for r in scan.in_use(root) if "cannot inspect" not in r]
+    # "cannot inspect" reasons are dropped (other processes on the machine), but the child itself
+    # can be unreadable for one scan under load (CI, run 39956988999): its reason was dropped too
+    # and the scan looked empty. Only that ambiguous case is scanned again.
+    for _ in range(3):
+        scan = scan_processes()
+        assert scan.ok, scan.reason
+        raw = scan.in_use(root)
+        reasons = [r for r in raw if "cannot inspect" not in r]
+        if reasons or len(raw) == len(reasons):
+            return reasons
+        time.sleep(0.2)
+    return reasons
 
 
 def test_working_directory_inside_is_found(tmp_path: Path) -> None:
