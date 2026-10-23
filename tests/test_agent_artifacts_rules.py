@@ -1868,3 +1868,15 @@ def test_review_a5_git_refuses_to_run_when_the_no_graft_dir_exists(tmp_path: Pat
     (Path(tempfile.gettempdir()) / "reclaim-no-graft-file-0f4c2b7e").mkdir()
     result = aa.run_git(("--version",), tmp_path)
     assert result.rc == -1 and "must not" in result.err
+
+
+def test_review_a5_a_replace_ref_onto_a_pushed_commit_does_not_hide_the_only_copy(
+    tmp_path: Path,
+) -> None:
+    """`git replace T A`: the replace ref points at the PUSHED commit A, so no unpushed tip is
+    left to refuse, and with replacements honoured the local-only T reads as A."""
+    clone, only = _clone_with_local_history(tmp_path)
+    git(clone, "replace", only, "main")
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    _refused(v, "C4")
+    assert only[:12] in v.failed_detail
