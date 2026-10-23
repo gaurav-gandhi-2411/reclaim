@@ -1530,3 +1530,58 @@ def test_review_a3b_an_alternates_chain_into_an_excluded_repo_is_followed(tmp_pa
     world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
     v = aa.evaluate_clone(world.env, clone)
     assert v.excluded and not v.offered
+
+# --- survivors of the bad3e67 mutation run: each check pinned on its own -------------------------
+
+
+def test_review_a3b_a_glob_destination_covering_every_remote_taints_origin(tmp_path: Path) -> None:
+    """N9b: `refs/remotes/*` is wider than origin's namespace, so a fetch from `bak` of its
+    branch `origin/feat` writes refs/remotes/origin/feat. Only the reverse prefix test sees it."""
+    repo, wt = _wt(tmp_path)
+    bare = _bare(tmp_path)
+    git(repo, "remote", "add", "bak", str(bare))
+    git(repo, "config", "--replace-all", "remote.bak.fetch", "+refs/heads/*:refs/remotes/*")
+    commit_file(wt, "work.txt", "only here\n", "unpushed")
+    git(wt, "update-ref", "refs/remotes/origin/feat", "HEAD")  # what that fetch records
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a3b_a_remote_named_under_origin_taints_origin_without_a_refspec(
+    tmp_path: Path,
+) -> None:
+    """N10: `origin/bak` with no fetch refspec of its own is no writer, yet a fetch named on the
+    command line (`git fetch origin/bak feat:refs/remotes/origin/bak/feat`) lands inside
+    origin's namespace. The name alone must taint origin."""
+    repo, wt = _wt(tmp_path)
+    bare = _bare(tmp_path)
+    git(repo, "config", "remote.origin/bak.url", str(bare))
+    commit_file(wt, "work.txt", "only here\n", "unpushed")
+    git(wt, "update-ref", "refs/remotes/origin/bak/feat", "HEAD")
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a3b_a_remote_whose_name_holds_a_slash_is_never_a_proof(tmp_path: Path) -> None:
+    """N10b: a remote named `up/stream` shares refs/remotes/up/* with any remote `up`; its
+    namespace proves nothing, even with a real URL and nothing else configured."""
+    repo, wt = _wt(tmp_path)
+    git(repo, "remote", "remove", "origin")
+    git(repo, "config", "remote.up/stream.url", "https://example.invalid/r.git")
+    git(repo, "config", "remote.up/stream.fetch", "+refs/heads/*:refs/remotes/up/stream/*")
+    commit_file(wt, "work.txt", "only here\n", "unpushed")
+    git(wt, "update-ref", "refs/remotes/up/stream/feat", "HEAD")
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a3b_the_host_name_alone_marks_this_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """N14: with COMPUTERNAME unset, `socket.gethostname()` is the only local name left."""
+    import socket
+
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    assert aa.is_real_remote_url(f"https://{socket.gethostname()}/o/r.git") is False
+
+
+def test_review_a3b_computername_alone_marks_this_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aa.socket, "gethostname", lambda: "some-other-box")
+    monkeypatch.setenv("COMPUTERNAME", "BUILDBOX7")
+    assert aa.is_real_remote_url("https://buildbox7/o/r.git") is False
+    assert aa.is_real_remote_url("https://buildbox8/o/r.git") is True

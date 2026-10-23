@@ -747,3 +747,35 @@ def test_review_a3b_a_refused_restore_detaches_the_pointer_from_the_other_worktr
     assert not (setup.wt / ".git").exists()
     assert (setup.wt / aa.DETACHED_POINTER).is_file()
     assert worktree_listed(setup.repo, newer)
+
+def test_review_a3b_restore_refuses_an_admin_dir_with_our_head_but_no_owner(setup: Setup) -> None:
+    """N2b: the same HEAD is not proof of ownership; a stranger worktree at our commit leaves an
+    identical HEAD. Without a readable `gitdir` the admin dir is not ours."""
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    vaulted = next(i.vault_path for i in report.items if i.category == aa.CAT_WORKTREE)
+    assert vaulted is not None
+    shutil.move(str(vaulted), str(setup.wt))  # put the directory back by hand
+    backup = setup.wt / aa.ADMIN_BACKUP_DIR
+    admin = Path(json.loads((backup / "meta.json").read_text(encoding="utf-8"))["admin"])
+    admin.mkdir(parents=True)
+    shutil.copyfile(backup / "admin" / "HEAD", admin / "HEAD")  # same HEAD, no `gitdir`
+    note = aa.after_restore(setup.wt)
+    assert note is not None and "belongs to another worktree" in note
+    assert sorted(p.name for p in admin.iterdir()) == ["HEAD"]  # nothing was copied into it
+    assert (backup / "meta.json").is_file()
+
+
+def test_review_a3b_after_vault_move_keeps_an_admin_entry_with_no_readable_owner(
+    setup: Setup,
+) -> None:
+    found = _detect(setup)
+    admin = setup.repo / ".git" / "worktrees" / setup.wt.name
+    moved = setup.vault / "manual"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(setup.wt), str(moved))
+    (admin / "gitdir").unlink()
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved)
+    assert note is not None and "belongs to another path" in note
+    assert (admin / "HEAD").is_file()
+    assert not (moved / aa.ADMIN_BACKUP_DIR).exists()
