@@ -1719,3 +1719,14 @@ def test_review_a4_an_unreadable_worktrees_entry_counts_as_worktrees(tmp_path: P
     (gitdir / "worktrees").rmdir()
     (gitdir / "worktrees").write_text("not a directory", encoding="utf-8")
     assert aa._has_linked_worktrees(gitdir) is True
+
+
+def test_review_a4_an_unreadable_worktrees_entry_counts_as_excluded(tmp_path: Path) -> None:
+    """Fail closed in the exclusion check too: a worktree list that cannot be read may name a
+    worktree inside an excluded project, so the artifact is hidden, not merely refused."""
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    gitdir = tmp_path / "repo" / ".git"
+    gitdir.mkdir(parents=True)
+    assert aa._gitdir_excluded(world.env, gitdir) is False
+    (gitdir / "worktrees").write_text("not a directory", encoding="utf-8")
+    assert aa._gitdir_excluded(world.env, gitdir) is True
