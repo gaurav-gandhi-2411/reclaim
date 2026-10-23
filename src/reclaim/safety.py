@@ -142,13 +142,68 @@ def first_matching_pattern(
     return _first_hit(tuple(patterns), _strip_candidate(base), other)
 
 
+UNREADABLE_PREFIX = "<unreadable directory: "
+
+# Directories the full walk (see subtree_exclusion_match) may list through at least one
+# junction before it stops and fails closed. A real pnpm node_modules (~1,000 packages, 4
+# dependents, 10 directories each) needs ~40k; crafted junction meshes grow without bound.
+_JUNCTION_WALK_BUDGET = 100_000
+
+
+def _io_path(path: str) -> str:
+    r"""The extended-length (`\\?\`) form of `path`, for I/O only, so a tree deeper than
+    MAX_PATH can be listed while long-path support is off. Never used as match text.
+
+    An absolute path is only normalised as a string: `os.path.abspath` calls GetFullPathNameW,
+    which strips a trailing space or dot from the last component, so a root named `sp ` became
+    a path that does not exist and the walk answered "nothing excluded" for it (#190 verifier
+    pass 3). With the `\\?\` prefix the exact name is used."""
+    if os.name != "nt" or path.startswith(("\\\\?\\", "//?/", "\\\\.\\", "//./")):
+        return path
+    # relative / drive-relative input needs the (per-drive) cwd, so abspath only there
+    full = (
+        os.path.normpath(path)
+        if os.path.isabs(path)  # noqa: PTH117 -- str in, str out
+        else os.path.abspath(path)  # noqa: PTH100
+    )
+    if full.startswith(("\\\\", "//")):
+        return "\\\\?\\UNC\\" + full.lstrip("\\/")
+    return "\\\\?\\" + full
+
+
 def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | None:
     """First pattern matched by `root` or by ANY entry (file or directory, by full path) beneath
-    it, else None. Name-only `os.scandir` walk (no stat), reparse points are not followed. Used
-    before deleting a whole directory: a directory that merely CONTAINS an excluded tree (e.g.
-    `%TEMP%/claude` holding `.../C--Users-...-<project>`) must not be deleted wholesale.
-    Unreadable directories are skipped, not treated as clean-and-safe-to-delete-silently: the
-    caller still gets every match found in what could be listed. No patterns -> no walk.
+    it, else None. Name-only `os.scandir` walk (no stat). Used before deleting a whole directory:
+    a directory that merely CONTAINS an excluded tree (e.g. `%TEMP%/claude` holding
+    `.../C--Users-...-<project>`) must not be deleted wholesale. No patterns -> no walk.
+
+    FAILS CLOSED: a directory below `root` that cannot be listed completely (access denied,
+    vanished mid-walk, an error while iterating, an entry whose type cannot be read) may hold an
+    excluded tree, so the walk stops and returns `"<unreadable directory: <path>>"`, which every
+    caller treats like a match (protected, not offered). Until 2026-10 such directories were
+    skipped and the walk could answer "nothing excluded" for a tree it had not seen (found by
+    the #187 data-safety verifier). Only a missing ROOT, or a root that is a file, still returns
+    None: nothing beneath it. Listing goes through the extended-length form of each path, so
+    trees deeper than MAX_PATH are seen (they were silently invisible); the match text is
+    unchanged.
+
+    Junctions, two modes (#190 verifier passes 3-6):
+    - Every pattern of the form `*lit*` with no wildcard and no separator in `lit` (the
+      `[exclusions] project_names` form): such a pattern can only match inside ONE path
+      component, and every component name is listed at its real place, so each tree is walked
+      once. A junction leading outside every covered tree is descended and its target becomes
+      covered; one leading into a covered tree is not (its content is, or will be, listed at
+      its real place; if that place cannot be listed the walk fails closed); a dangling one has
+      nothing beneath it. Linear, every cycle ends.
+    - Any other pattern (a glob wildcard or `?`/`[...]` can span separators, a separator, any
+      regex) can name content only through a junction's own text, and content behind a
+      junction INTO the candidate is deleted with it at its real place (pnpm). So every
+      junction is descended as before; only a junction whose target is already on the current
+      walk path is cut (a cycle: its repeat-lap text, which the old walk only reached by
+      looping until MAX_PATH, is the one thing lost; a junction back to the root still gets
+      its first lap). Directories listed through a junction
+      count against `_JUNCTION_WALK_BUDGET`; past it the walk fails closed
+      (`too many junctions`) instead of running for minutes.
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -164,26 +219,115 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     if hit is not None:
         return hit
     ordered = tuple(patterns)
-    stack = [str(root)]
+    root_text = str(root)
+    root_io = _io_path(root_text)
+    try:
+        # From the exact (\\?\) form: Win32 parsing of the plain form strips a trailing
+        # space/dot and could name a sibling (#190 verifier pass 4).
+        root_real = _real_path(root_io)
+    except OSError:  # e.g. an invalid reparse point: never let the walk raise
+        root_real = os.path.normcase(os.path.normpath(root_text))
+    cover_once = all(_one_component_only(p) for p in ordered)
+    covered_set = {root_real}
+    # (text, io, real, entered): entered = the junction targets on this walk path (the full
+    # mode's cycle guard; unused by cover-once). The root is deliberately NOT in it: a junction
+    # back to the root gets its one lap, as one to any directory below it does, because that
+    # lap's text names real content inside the candidate (#190 verifier pass 7).
+    stack: list[tuple[str, str, str, frozenset[str]]] = [
+        (root_text, root_io, root_real, frozenset())
+    ]
+    budget = _JUNCTION_WALK_BUDGET
+    # The rest of the tree is still walked after an unreadable directory, so a real match
+    # elsewhere is reported as itself; the marker is returned only when nothing else matched.
+    unreadable: str | None = None
     while stack:
-        current = stack.pop()
+        current, current_io, current_real, entered = stack.pop()
+        if not cover_once and entered:  # listed through a junction
+            budget -= 1
+            if budget < 0:
+                unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (too many junctions)>"
+                continue
         prefix = _child_text_prefix(current)
         try:
-            with os.scandir(current) as it:
+            with os.scandir(current_io) as it:
                 for entry in it:
-                    try:
-                        is_dir = entry.is_dir(follow_symlinks=False)
-                    except OSError:
-                        is_dir = False
                     text = prefix + entry.name
                     hit = _first_hit(ordered, text)
                     if hit is not None:
                         return hit
-                    if is_dir:
-                        stack.append(entry.path)
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    child_text = os.path.join(current, entry.name)  # noqa: PTH118 -- = entry.path
+                    child_io = os.path.join(current_io, entry.name)  # noqa: PTH118
+                    child_entered = entered
+                    if entry.is_junction():
+                        try:
+                            os.stat(entry.path)  # noqa: PTH116 -- the extended-length str scandir gave
+                        except (FileNotFoundError, NotADirectoryError):
+                            continue  # dangling: nothing beneath it, deleting it removes a link
+                        except OSError:
+                            pass  # unknown: try to walk it, so listing it fails closed below
+                        try:
+                            child_real = _real_path(entry.path)
+                        except OSError:
+                            unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
+                            continue
+                        if cover_once:
+                            if _within(child_real, covered_set):
+                                continue  # listed at its real place (or fails closed there)
+                            covered_set.add(child_real)
+                        else:
+                            if child_real in entered:
+                                continue  # a cycle on this walk path
+                            child_entered = entered | {child_real}
+                    else:
+                        child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
+                        if cover_once and child_real in covered_set:
+                            continue  # back into a covered tree (e.g. via a junction above it)
+                    stack.append((child_text, child_io, child_real, child_entered))
+        except (FileNotFoundError, NotADirectoryError):
+            # The ROOT missing or being a file (callers pass top-level temp/crash-dump FILES
+            # too): nothing below it, its own path was already matched above, as before.
+            if current == root_text:
+                return None
+            unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
         except OSError:
-            continue
-    return None
+            unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
+    return unreadable
+
+
+def _one_component_only(pattern: str) -> bool:
+    """True when `pattern` can only match inside a single path component: `*lit*` with no
+    wildcard and no separator in `lit`. A glob `*`/`?`/`[...]` matches separators in fnmatch,
+    so `*link*data*` spans directories (#190 verifier pass 6); regexes are never treated so."""
+    if pattern.startswith("re:"):
+        return False
+    literal = _compile_pattern(pattern).literal
+    return literal is not None and "/" not in literal and "\\" not in literal
+
+
+def _within(real: str, roots: set[str]) -> bool:
+    """`real` equals or lies under one of `roots` (all `_real_path` forms). Walks up `real`'s
+    parents, O(depth), not O(len(roots)): 5,000 outside targets made the pairwise check
+    quadratic (#190 verifier pass 5)."""
+    while True:
+        if real in roots:
+            return True
+        parent = os.path.dirname(real)  # noqa: PTH120 -- str in, str out
+        if parent == real:
+            return False
+        real = parent
+
+
+def _real_path(path: str) -> str:
+    """`os.path.realpath`, without the extended-length prefix realpath keeps on `\\\\?\\` input,
+    case-folded, so real paths from plain and prefixed inputs compare equal."""
+    real = os.path.realpath(path)
+    if real.startswith("\\\\?\\UNC\\"):
+        real = "\\\\" + real[8:]
+    elif real.startswith("\\\\?\\"):
+        real = real[4:]
+    return os.path.normcase(real)
 
 
 def _child_text_prefix(directory: str) -> str:
@@ -318,6 +462,11 @@ class SafetyValidator:
         hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
         if hit is None and is_dir:
             hit = subtree_exclusion_match(canonical, patterns)
+            # resolve() parses through Win32, which strips a trailing space/dot: for `sp ` it
+            # can name a clean sibling `sp` while the deleter (exact name) acts on `sp `. Walk
+            # the exact path too whenever the two differ (#190 verifier pass 4, pre-existing).
+            if hit is None and str(path) != str(canonical):
+                hit = subtree_exclusion_match(path, patterns)
         return hit
 
     def evaluate(self, record: FileRecord) -> SafetyResult:
@@ -346,6 +495,17 @@ class SafetyValidator:
         # ADR-0039: `[exclusions] project_names` (and, for a directory candidate, a user pattern
         # matched by anything INSIDE it -- deleting the directory would delete that content).
         exclusion_hit = self.exclusion_match(record.path, is_dir=record.is_dir)
+        if exclusion_hit is not None and exclusion_hit.startswith(UNREADABLE_PREFIX):
+            return SafetyResult(
+                record=record,
+                verdict=Verdict.BLOCKED,
+                reason_code=REASON_USER_EXCLUSION,
+                rationale=(
+                    f"Part of this directory could not be read ({exclusion_hit[1:-1]}), so it "
+                    "cannot be checked against your exclusions in config.toml "
+                    "[exclusions]/[safety] — kept rather than risk deleting excluded content."
+                ),
+            )
         if exclusion_hit is not None:
             return SafetyResult(
                 record=record,
