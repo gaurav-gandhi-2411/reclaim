@@ -770,3 +770,61 @@ def test_the_unreadable_reason_says_what_happened(
     result = validator.evaluate(record)
     assert "could not be read" in result.rationale
     assert "matches the user exclusion" not in result.rationale
+
+
+# --- #190 verifier pass 2 -------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_to_a_directory_above_the_root_is_walked(tmp_path: Path) -> None:
+    """`cand/j -> A` where cand sits in A: the walk must still see A's other children (the
+    ancestor-prefix cycle check skipped it and missed `A/other/intent-router`)."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    a = tmp_path / "A"
+    (a / "other" / "intent-router").mkdir(parents=True)
+    cand = a / "cand"
+    cand.mkdir()
+    _winapi.CreateJunction(str(a), str(cand / "j"))
+    assert subtree_exclusion_match(cand, ["*intent-router*"]) == "*intent-router*"
+    assert subtree_exclusion_match(cand, ["*nothing-here*"]) is None  # and it ends
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_cycle_through_two_junctions_ends_without_a_marker(tmp_path: Path) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    d = tmp_path / "D"
+    (d / "a").mkdir(parents=True)
+    (d / "b").mkdir()
+    _winapi.CreateJunction(str(d / "b"), str(d / "a" / "j"))
+    _winapi.CreateJunction(str(d / "a"), str(d / "b" / "k"))
+    (d / "b" / "two").mkdir()
+    _winapi.CreateJunction(str(d / "a"), str(d / "b" / "two" / "k2"))  # two exits per lap
+    assert subtree_exclusion_match(d, ["*intent-router*"]) is None
+    (d / "b" / "intent-router").mkdir()
+    assert subtree_exclusion_match(d, ["*intent-router*"]) == "*intent-router*"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_whose_target_cannot_be_stat_ed_is_still_walked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only "does not exist" means dangling; access denied must walk it (and fail closed if
+    listing fails too), never skip it."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    target = tmp_path / "target"
+    (target / "intent-router").mkdir(parents=True)
+    root = tmp_path / "root"
+    root.mkdir()
+    _winapi.CreateJunction(str(target), str(root / "j"))
+    real_stat = os.stat
+
+    def denied(path, *a, **k):  # type: ignore[no-untyped-def]
+        if str(path).endswith(chr(92) + "j"):
+            raise PermissionError(5, "Access is denied")
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(os, "stat", denied)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"

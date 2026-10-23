@@ -171,8 +171,11 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     None: nothing beneath it. Listing goes through the extended-length form of each path, so
     trees deeper than MAX_PATH are seen (they were silently invisible); the match text is
     unchanged. Directory junctions are descended as before (a junction into an excluded project
-    still protects the candidate), except a dangling one (nothing beneath it) and one that leads
-    back to a directory on the current path (a cycle, which used to run until MAX_PATH).
+    still protects the candidate), except a dangling one (nothing beneath it); a directory is not
+    entered again when its real path is the root or a junction target already on the current
+    walk path, which ends every junction cycle (they used to run until MAX_PATH or forever). The
+    one text lost: a path-keyed pattern spelled through a cycle junction's own name; the same
+    content is still matched at its direct path.
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -189,15 +192,20 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         return hit
     ordered = tuple(patterns)
     root_text = str(root)
-    # (match text, I/O path, real path) per directory. The real path is tracked incrementally
-    # (parent's real path + name; a junction's resolved target) so the loop check costs no
-    # extra system call except at junctions.
-    stack = [(root_text, _io_path(root_text), _real_path(root_text))]
+    # (match text, I/O path, real path, entered) per directory. The real path is tracked
+    # incrementally (parent's real path + name; a junction's resolved target), so only junctions
+    # cost a system call. `entered` holds the real paths this walk path came in through: the
+    # root and every junction target on it. A directory whose real path is already in it is not
+    # entered again; any cycle passes through a junction whose target is in it by its second
+    # lap, so every cycle ends. A target above the root is NOT in it and is walked (the content
+    # beside the root under it must still be matched; #190 verifier pass 2).
+    root_real = _real_path(root_text)
+    stack = [(root_text, _io_path(root_text), root_real, frozenset((root_real,)))]
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
     while stack:
-        current, current_io, current_real = stack.pop()
+        current, current_io, current_real, entered = stack.pop()
         prefix = _child_text_prefix(current)
         try:
             with os.scandir(current_io) as it:
@@ -216,20 +224,20 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                         except OSError:
                             pass  # unknown: walk it, so listing it fails closed below
                         child_real = _real_path(entry.path)
-                        # Skipped ONLY when it leads back to an ancestor (a cycle). A second
-                        # junction to an already-walked tree is walked again under its own text,
-                        # so a path-keyed pattern through it still matches (#190 verifier).
-                        if current_real == child_real or current_real.startswith(
-                            child_real.rstrip(os.sep) + os.sep
-                        ):
-                            continue
+                        child_entered = entered | {child_real}
                     else:
                         child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
+                        child_entered = entered
+                    # A second junction to an already-walked (non-cycle) tree is walked again
+                    # under its own text, so a path-keyed pattern through it still matches.
+                    if child_real in entered:
+                        continue
                     stack.append(
                         (
                             os.path.join(current, entry.name),  # noqa: PTH118 -- = entry.path
                             os.path.join(current_io, entry.name),  # noqa: PTH118
                             child_real,
+                            child_entered,
                         )
                     )
         except (FileNotFoundError, NotADirectoryError):
