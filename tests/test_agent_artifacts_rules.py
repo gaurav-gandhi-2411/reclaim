@@ -1730,3 +1730,141 @@ def test_review_a4_an_unreadable_worktrees_entry_counts_as_excluded(tmp_path: Pa
     assert aa._gitdir_excluded(world.env, gitdir) is False
     (gitdir / "worktrees").write_text("not a directory", encoding="utf-8")
     assert aa._gitdir_excluded(world.env, gitdir) is True
+
+
+# --- the fifth (data-safety) review, A5 -----------------------------------------------------------
+
+
+def _clone_with_local_history(tmp_path: Path) -> tuple[Path, str]:
+    """`proj-verify1`: main is pushed; branch `old` is an orphan commit that exists ONLY here."""
+    clone = _clone(tmp_path)
+    git(clone, "checkout", "-q", "--orphan", "old")
+    commit_file(clone, "ancient.txt", "only copy of this history\n", "imported history")
+    only = git(clone, "rev-parse", "HEAD").stdout.strip()
+    git(clone, "checkout", "-q", "-f", "main")
+    return clone, only
+
+
+@pytest.mark.parametrize("advice", [True, False])
+def test_review_a5_a_graft_file_does_not_hide_an_only_copy_commit(
+    tmp_path: Path, advice: bool
+) -> None:
+    """F1: `info/grafts` "A T" made T look reachable from origin/main; with the deprecation
+    advice silenced nothing on stderr refused it either, and C4 offered the only copy."""
+    clone, only = _clone_with_local_history(tmp_path)
+    main = git(clone, "rev-parse", "main").stdout.strip()
+    (clone / ".git" / "info").mkdir(exist_ok=True)
+    (clone / ".git" / "info" / "grafts").write_text(f"{main} {only}\n", encoding="ascii")
+    if not advice:
+        git(clone, "config", "advice.graftFileDeprecated", "false")
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    assert not v.offered
+    assert v.failed_rule in ("C4", "W2"), (v.failed_rule, v.failed_detail)
+    if not advice:
+        assert v.failed_rule == "C4" and only[:12] in v.failed_detail
+
+
+def test_review_a5_a_replace_ref_does_not_hide_an_only_copy_commit(tmp_path: Path) -> None:
+    clone, only = _clone_with_local_history(tmp_path)
+    git(clone, "replace", "--graft", "main", only)
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def test_review_a5_a_clone_holding_git_annex_objects_is_refused(tmp_path: Path) -> None:
+    """F2: the same class as Git LFS: content outside the commits, not proven pushed."""
+    clone = _clone(tmp_path)
+    obj = clone / ".git" / "annex" / "objects" / "ab" / "cd" / "SHA256E-s5--x" / "SHA256E-s5--x"
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"only")
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def test_review_a5_the_proof_never_runs_the_configured_gpg_program(tmp_path: Path) -> None:
+    """F3(ii): `log.showSignature=true` made `log -1` in the proof run `gpg.program`."""
+    marker = tmp_path / "outside" / "gpg-marker.txt"
+    marker.parent.mkdir()
+    clone = _clone(tmp_path)
+    tree = git(clone, "rev-parse", "HEAD^{tree}").stdout.strip()
+    parent = git(clone, "rev-parse", "HEAD").stdout.strip()
+    body = (
+        f"tree {tree}\nparent {parent}\nauthor t <t@x> 1700000000 +0000\n"
+        "committer t <t@x> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n"
+        " AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n"
+    )
+    raw = tmp_path / "commit.txt"
+    raw.write_bytes(body.encode())
+    sha = git(clone, "hash-object", "-t", "commit", "-w", str(raw)).stdout.strip()
+    git(clone, "update-ref", "refs/heads/main", sha)
+    git(clone, "update-ref", "refs/remotes/origin/main", sha)
+    script = tmp_path / "fakegpg.sh"
+    script.write_text(f'#!/bin/sh\necho ran >> "{marker.as_posix()}"\nexit 1\n', encoding="utf-8")
+    git(clone, "config", "log.showSignature", "true")
+    git(clone, "config", "gpg.program", script.as_posix())
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+    assert not marker.exists()
+
+
+def test_review_a5_a_clone_whose_remote_names_an_excluded_project_is_hidden(
+    tmp_path: Path,
+) -> None:
+    """F5: `_verify-pr12` cloned from `.../zzexclproj.git`: the folder does not name it."""
+    clone = make_repo(tmp_path, "_verify-pr12")
+    git(clone, "remote", "set-url", "origin", "https://github.com/u/zzexclproj.git")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://h/u/zzexclproj.git",
+        "git@h:u/zzexclproj",
+        "ssh://h/zzexclproj.git/",
+        "D:\\r\\zzexclproj",
+    ],
+)
+def test_review_a5_the_repository_name_of_a_remote_url(url: str) -> None:
+    assert aa._url_repo_name(url) == "zzexclproj"
+
+
+def test_review_a5_an_excluded_name_in_the_status_listing_is_hidden(tmp_path: Path) -> None:
+    """F4: W2 refused first and printed `?? zzexclproj/secret_notes.txt` in the report."""
+    repo, wt = _wt(tmp_path)
+    (wt / "zzexclproj").mkdir()
+    (wt / "zzexclproj" / "secret_notes.txt").write_text("x", encoding="utf-8")
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    v = _verdict(world, wt, repo)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+
+
+def test_review_a5_an_ordinary_untracked_file_is_still_reported(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    (wt / "notes.txt").write_text("x", encoding="utf-8")
+    v = _verdict(make_world(tmp_path, exclusions=("zzexclproj",)), wt, repo)
+    _refused(v, "W2")
+    assert not v.excluded and "notes.txt" in v.failed_detail
+
+
+def test_review_a5_an_inherited_git_dir_does_not_redirect_the_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIT_DIR from a hook or a shell pointed every proof at another, fully pushed repository."""
+    clone = _clone(tmp_path)
+    commit_file(clone, "work.txt", "only here\n", "unpushed")
+    other = make_repo(tmp_path / "elsewhere", "pushed")
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def test_review_a5_git_refuses_to_run_when_the_no_graft_dir_exists(tmp_path: Path) -> None:
+    """The graft file named to git must be missing; if its directory exists, fail closed."""
+    import tempfile
+
+    (Path(tempfile.gettempdir()) / "reclaim-no-graft-file-0f4c2b7e").mkdir()
+    result = aa.run_git(("--version",), tmp_path)
+    assert result.rc == -1 and "must not" in result.err

@@ -15,8 +15,11 @@ Rule ids (kept in the reasons shown to the user):
   scratch   S1 identity  S2 idle  S3 transcript idle  S4 no live process  S5 not excluded
             S7 every nested repository clean and pushed  S8 no reparse point  V
 
-Every git command runs as `git --no-optional-locks -c core.fsmonitor=false ...` (a plain status
-rewrites the index, and fsmonitor would run a program named in the repo's own config).
+Every git command runs as `git --no-optional-locks -c core.fsmonitor=false -c
+log.showSignature=false ...` with no graft file and no replace objects (a plain status rewrites the
+index; fsmonitor and gpg would run programs the config names; grafts and replace refs change
+which commits look pushed). NOT prevented: a clean filter configured for a stat-dirty tracked
+file (`git lfs` among them) runs during `status`, as in any `git status` (ADR-0043 addendum 5).
 """
 
 # ruff: noqa: TRY301 -- `_Refusal` is deliberate control flow: each rule check raises, one handler reports
@@ -64,7 +67,21 @@ ADMIN_BACKUP_DIR = ".reclaim-gitadmin"  # inside a vaulted worktree: its git adm
 
 # core.longpaths: without it git on Windows cannot open an untracked tree deeper than MAX_PATH,
 # warns, and still reports the repository clean (A3 review, F3).
-_GIT = ("git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.longpaths=true")
+# log.showSignature: `log` would run `gpg.program`, a program the config names (A5 review, F3).
+_GIT = (
+    "git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.longpaths=true",
+    "-c", "log.showSignature=false",
+)  # fmt: skip
+# Variables that point git at another repository, index, object store or ref view, or inject
+# config: inherited from a hook or a shell, every proof would describe the wrong thing.
+_GIT_ENV_SCRUB = frozenset(
+    {
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE", "GIT_QUARANTINE_PATH", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+        "GIT_PREFIX", "GIT_INTERNAL_SUPER_PREFIX",
+    }
+)  # fmt: skip
 _GIT_TIMEOUT_SECONDS = 120.0
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _SCP_REMOTE = re.compile(r"^[\w.-]+@[\w.-]+:[^\\/\s].*$")
@@ -100,7 +117,24 @@ def run_git(args: Sequence[str], cwd: Path) -> GitResult:
     (Under pytest it refuses a working directory inside the real profile, like every mutating
     site: `worktree prune`/`repair` rewrite repository metadata.)"""
     assert_not_real_profile_under_pytest(cwd, operation="run git in")
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k.upper() not in _GIT_ENV_SCRUB
+        and not k.upper().startswith("GIT_CONFIG_KEY_")
+        and not k.upper().startswith("GIT_CONFIG_VALUE_")
+    }
+    # Grafts and replace refs rewrite history as git sees it: a graft file made an only-copy
+    # commit look reachable from origin, so C4 offered it (A5 review, F1). The proofs read the
+    # real commit graph. The graft file must be MISSING: an existing one, even `nul`, makes git
+    # print a deprecation hint on every command, and the silent-output rule would refuse all.
+    no_grafts = Path(tempfile.gettempdir()) / "reclaim-no-graft-file-0f4c2b7e" / "grafts"
+    if no_grafts.parent.exists():
+        return GitResult(-1, "", f"{no_grafts.parent} exists; it must not (it disables grafts)")
+    env.update(
+        GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_GRAFT_FILE=str(no_grafts),
+        GIT_NO_REPLACE_OBJECTS="1",
+    )  # fmt: skip
     try:
         proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell
             [*_GIT, *args],
@@ -471,9 +505,13 @@ def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bo
         "--ignore-submodules=none",
     )  # fmt: skip
     if status.strip():
-        raise _Refusal(
-            "W2", f"uncommitted or untracked changes: {status.strip().splitlines()[0][:120]}"
-        )
+        lines = status.strip().splitlines()
+        # A path in the listing can name an excluded project (`?? zzexclproj/notes.txt`): the
+        # refusal is then hidden like any other exclusion hit, not reported (A5 review, F4).
+        named = [p.strip('"') for line in lines for p in line[3:].split(" -> ")]
+        if _path_excluded(env, *(repo / p for p in named if p)):
+            raise _Refusal("W2", "excluded project (not inspected further)", excluded=True)
+        raise _Refusal("W2", f"uncommitted or untracked changes: {lines[0][:120]}")
     for line in _must_silent(env, repo, "W2", "ls-files", "-v").splitlines():
         if line and line[0] != "H":
             raise _Refusal("W2", f"hidden change flag '{line[0]}' on {line[2:][:100]}")
@@ -607,7 +645,9 @@ def _prove_nested(
         if _has_linked_worktrees(entry):
             raise _Refusal(rule, f"nested repository {entry.parent} has linked worktrees")
         if _has_lfs_objects(entry):
-            raise _Refusal(rule, f"nested repository {entry.parent} holds Git LFS objects")
+            raise _Refusal(
+                rule, f"nested repository {entry.parent} holds Git LFS or git-annex objects"
+            )
     repos = sorted({e.parent for e in entries})
     for repo in repos:
         hidden = next((p for p in facts.odd_names if _inside(p, repo)), None)
@@ -658,19 +698,25 @@ def _has_linked_worktrees(gitdir: Path) -> bool:
         return True
 
 
+# Large-file stores whose content lives outside the commits: C4/W4 prove commits are on a remote,
+# not the content their pointers name (A4 review, F2: Git LFS; A5 review, F2: git-annex).
+_LARGE_FILE_STORES = (("lfs", "objects"), ("annex", "objects"))
+
+
 def _has_lfs_objects(gitdir: Path) -> bool:
-    """Any file under `gitdir/lfs/objects`. C4/W4 prove commits are on a remote, not that the LFS
-    content their pointers name was pushed (a skipped or failed `git lfs push`, or git-lfs not
-    installed when pushing); without a network call nothing proves it (A4 review, F2)."""
-    store = gitdir / "lfs" / "objects"
-    if not store.exists():
-        return False
-    try:
-        for _dirpath, _dirs, files in os.walk(store, onerror=_raise):
-            if files:
-                return True
-    except OSError:
-        return True
+    """Any file in a large-file store (Git LFS or git-annex) of `gitdir`. A skipped or failed
+    `git lfs push`/`git annex copy`, or the tool missing when pushing, leaves the only copy here;
+    without a network call nothing proves otherwise."""
+    for parts in _LARGE_FILE_STORES:
+        store = gitdir.joinpath(*parts)
+        if not store.exists():
+            continue
+        try:
+            for _dirpath, _dirs, files in os.walk(store, onerror=_raise):
+                if files:
+                    return True
+        except OSError:
+            return True
     return False
 
 
@@ -679,6 +725,13 @@ def _raise(exc: OSError) -> None:
 
 
 _CORE_WORKTREE = re.compile(r"^\s*worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_REMOTE_URL = re.compile(r"^\s*(?:push)?url\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _url_repo_name(url: str) -> str:
+    """The repository name a remote URL ends in: `https://h/u/zzexclproj.git` -> `zzexclproj`."""
+    tail = re.split(r"[\\/:]", url.strip().strip('"').rstrip("\\/"))[-1]
+    return tail[:-4] if tail.lower().endswith(".git") else tail
 
 
 def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
@@ -708,6 +761,12 @@ def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
         if config is not None:
             for match in _CORE_WORKTREE.finditer(config):
                 targets.append(Path(os.path.normpath(gitdir / match.group(1).strip('"'))))
+            # A clone of an excluded project is that project, wherever it sits: its remote
+            # names it (`.../zzexclproj.git`) even when the folder does not (A5 review, F5).
+            for match in _REMOTE_URL.finditer(config):
+                name = _url_repo_name(match.group(1))
+                if name:
+                    targets.append(gitdir.parent / name / ".git")
         objects = gitdir / "objects"
         alternates = read(objects / "info" / "alternates")
         # A linked worktree of this repository lives wherever its admin `gitdir` file says; one
@@ -1005,7 +1064,9 @@ def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
         _prove_no_stash(env, path, held)
         _prove_pushed(env, path, held, everything=True, rule="C4")
         if _has_lfs_objects(path / ".git"):
-            raise _Refusal("C4", "Git LFS objects are present; nothing proves they were pushed")
+            raise _Refusal(
+                "C4", "Git LFS or git-annex objects are present; nothing proves they were pushed"
+            )
         listed = list_worktrees(env, path)
         if listed is None:
             raise _Refusal("C6", "git worktree list failed")
