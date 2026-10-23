@@ -708,9 +708,10 @@ def test_aged_temp_still_offers_top_level_files_with_exclusions_configured(tmp_p
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
-def test_a_second_junction_to_a_walked_tree_is_matched_under_its_own_text(tmp_path: Path) -> None:
-    """Only a cycle is skipped. Two junctions to the same tree: a path-keyed pattern through
-    the second one still matches (the first loop guard lost it)."""
+def test_two_junctions_to_one_outside_tree_walk_it_once(tmp_path: Path) -> None:
+    """The outside tree is walked once, through the first junction listed; its content
+    protects the candidate. A path-keyed pattern spelled through the SECOND alias is the one
+    thing given up (documented): deleting the candidate never deletes through a junction."""
     import _winapi  # Windows only; CreateJunction needs no admin rights
 
     outside = tmp_path / "outside"
@@ -720,8 +721,9 @@ def test_a_second_junction_to_a_walked_tree_is_matched_under_its_own_text(tmp_pa
     root.mkdir()
     _winapi.CreateJunction(str(outside), str(root / "j1"))
     _winapi.CreateJunction(str(outside), str(root / "j2"))
-    for pattern in ("*/j1/secret.txt", "*/j2/secret.txt", "re:j2[\\/]secret"):
+    for pattern in ("*secret*", "*/j1/secret.txt"):
         assert subtree_exclusion_match(root, [pattern]) == pattern
+    assert subtree_exclusion_match(root, ["*/j2/secret.txt"]) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
@@ -861,24 +863,136 @@ def test_a_junction_to_a_file_hides_nothing(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
-def test_the_junction_walk_budget_fails_closed_and_ignores_ordinary_trees(
+def _counting_scandir(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    real = os.scandir
+
+    def counting(path):  # type: ignore[no-untyped-def]
+        calls.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", counting)
+    return calls
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_pnpm_shaped_tree_is_listed_once_per_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pnpm: packages live in .pnpm, every dependency is a junction to one of them. Rewalking
+    each alias made such trees exceed any budget (#190 verifier pass 4); junctions into the
+    candidate's own tree are not descended, so each directory is listed once."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    nm = tmp_path / "node_modules"
+    store = nm / ".pnpm"
+    pkgs = []
+    for i in range(12):
+        pkg = store / f"p{i}@1" / "node_modules" / f"p{i}"
+        (pkg / "lib" / "deep").mkdir(parents=True)
+        pkgs.append(pkg)
+    for i, pkg in enumerate(pkgs):
+        _winapi.CreateJunction(str(pkg), str(nm / f"p{i}"))  # top-level alias
+        for j in range(6):  # every package depends on six others
+            dep = pkgs[(i + j + 1) % len(pkgs)]
+            _winapi.CreateJunction(str(dep), str(pkg.parent / f"dep{j}"))
+    plain_dirs = sum(1 for _ in nm.rglob("*") if _.is_dir() and not _.is_junction())
+    calls = _counting_scandir(monkeypatch)
+    assert subtree_exclusion_match(nm, ["*intent-router*"]) is None
+    assert len(calls) <= plain_dirs + 1  # listed once each, no alias rewalked
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_dense_junction_cycle_ends_quickly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import _winapi  # Windows only; CreateJunction needs no admin rights
 
-    monkeypatch.setattr(safety, "_JUNCTION_WALK_BUDGET", 3)
-    plain = tmp_path / "plain"
-    for i in range(10):
-        (plain / f"d{i}" / "e").mkdir(parents=True)
-    assert subtree_exclusion_match(plain, ["*intent-router*"]) is None  # 20 dirs, no junction
+    root = tmp_path / "dense"
+    dirs = [root / f"n{i}" for i in range(8)]
+    for d in dirs:
+        d.mkdir(parents=True)
+    for a in dirs:  # every directory links to every other one: factorial for alias rewalks
+        for b in dirs:
+            if a != b:
+                _winapi.CreateJunction(str(b), str(a / f"to-{b.name}"))
+    calls = _counting_scandir(monkeypatch)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+    assert len(calls) <= len(dirs) + 1
 
-    side = tmp_path / "side"
-    for i in range(10):
-        (side / f"s{i}").mkdir(parents=True)
+
+# --- #190 verifier pass 4 -------------------------------------------------------------------
+
+
+def test_a_root_whose_real_path_cannot_be_resolved_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """realpath re-raises some reparse errors (WinError 4392 on an invalid mount point); the
+    walk must answer, never raise into the caller (scan, evaluate, executor last-line check)."""
+    root = tmp_path / "root"
+    (root / "intent-router").mkdir(parents=True)
+    real = safety._real_path
+
+    def broken(path: str) -> str:
+        if path.rstrip(chr(92)).endswith("root"):
+            raise OSError(4392, "The data present in the reparse point buffer is invalid")
+        return real(path)
+
+    monkeypatch.setattr(safety, "_real_path", broken)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+    assert subtree_exclusion_match(root, ["*nothing*"]) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions; Win32 strips trailing spaces")
+def test_a_trailing_space_root_is_not_confused_with_its_sibling(tmp_path: Path) -> None:
+    """`tw ` holds a junction back to itself; a sibling `tw` exists. The root's real path came
+    from the plain form, i.e. the sibling, so the junction looked like a way into another tree
+    and `tw ` was mis-covered (#190 verifier pass 4)."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    prefix = chr(92) * 2 + "?" + chr(92)
+    exact = prefix + str(tmp_path / "tw ")
+    os.makedirs(exact + chr(92) + "intent-router")  # noqa: PTH103 -- the exact name needs it
+    (tmp_path / "tw").mkdir()
+    _winapi.CreateJunction(exact, exact + chr(92) + "j")
+    root = exact.removeprefix(prefix)
+    assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 strips trailing spaces")
+def test_exclusion_match_walks_the_exact_path_when_resolve_names_a_sibling(tmp_path: Path) -> None:
+    from reclaim.config import Config, SafetyConfig
+    from reclaim.safety import SafetyValidator
+
+    prefix = chr(92) * 2 + "?" + chr(92)
+    exact = prefix + str(tmp_path / "sp2 ")
+    os.makedirs(exact + chr(92) + "intent-router")  # noqa: PTH103 -- the exact name needs it
+    (tmp_path / "sp2").mkdir()  # the clean sibling resolve() lands on
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=["*intent-router*"])))
+    assert validator.exclusion_match(Path(exact.removeprefix(prefix)), is_dir=True) == (
+        "*intent-router*"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_junction_whose_real_path_cannot_be_resolved_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    target = tmp_path / "target"
+    target.mkdir()
     root = tmp_path / "root"
     root.mkdir()
-    _winapi.CreateJunction(str(side), str(root / "j"))
+    _winapi.CreateJunction(str(target), str(root / "j"))
+    real = safety._real_path
+
+    def broken(path: str) -> str:
+        if path.endswith(chr(92) + "j"):
+            raise OSError(4392, "The data present in the reparse point buffer is invalid")
+        return real(path)
+
+    monkeypatch.setattr(safety, "_real_path", broken)
     got = subtree_exclusion_match(root, ["*intent-router*"])
     assert got is not None
     assert got.startswith(UNREADABLE_PREFIX)
-    assert "junction walk limit" in got

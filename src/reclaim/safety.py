@@ -144,12 +144,6 @@ def first_matching_pattern(
 
 UNREADABLE_PREFIX = "<unreadable directory: "
 
-# Directories reached THROUGH at least one junction that one walk may list before it stops and
-# fails closed. Junction-dense trees grow factorially (7 mutually-junctioned directories took
-# minutes; #190 verifier pass 3); trees without junctions never count against it, so a large
-# ordinary candidate (a big node_modules) is still walked in full.
-_JUNCTION_WALK_BUDGET = 20_000
-
 
 def _io_path(path: str) -> str:
     r"""The extended-length (`\\?\`) form of `path`, for I/O only, so a tree deeper than
@@ -186,12 +180,19 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     the #187 data-safety verifier). Only a missing ROOT, or a root that is a file, still returns
     None: nothing beneath it. Listing goes through the extended-length form of each path, so
     trees deeper than MAX_PATH are seen (they were silently invisible); the match text is
-    unchanged. Directory junctions are descended as before (a junction into an excluded project
-    still protects the candidate), except a dangling one (nothing beneath it); a directory is not
-    entered again when its real path is the root or a junction target already on the current
-    walk path, which ends every junction cycle (they used to run until MAX_PATH or forever). The
-    one text lost: a path-keyed pattern spelled through a cycle junction's own name; the same
-    content is still matched at its direct path.
+    unchanged.
+
+    Junctions: the walk keeps the real paths of the trees it covers, starting with the root's.
+    A junction leading OUTSIDE every covered tree is descended once (a junction into an excluded
+    project still protects the candidate) and its target becomes covered; a junction leading
+    into a covered tree is not descended, because that content is (or will be) listed at its
+    real place, and if that place cannot be listed the walk fails closed anyway; a dangling one
+    has nothing beneath it. So every junction cycle ends and the cost is the root's tree plus
+    each distinct outside tree, once (rewalking every alias grew factorially and made pnpm
+    `node_modules` unwalkable; #190 verifier passes 3 and 4). Given up deliberately: a
+    path-keyed pattern spelled through a second alias's own name (e.g. `*/j2/secret.txt` when
+    `j1` and `j2` lead to the same tree); deleting a candidate removes a junction as a link and
+    never deletes through it, so that content is not at risk from this candidate.
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -208,28 +209,21 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         return hit
     ordered = tuple(patterns)
     root_text = str(root)
-    # (match text, I/O path, real path, entered) per directory. The real path is tracked
-    # incrementally (parent's real path + name; a junction's resolved target), so only junctions
-    # cost a system call. `entered` holds the real paths this walk path came in through: the
-    # root and every junction target on it. A directory whose real path is already in it is not
-    # entered again; any cycle passes through a junction whose target is in it by its second
-    # lap, so every cycle ends. A target above the root is NOT in it and is walked (the content
-    # beside the root under it must still be matched; #190 verifier pass 2).
-    root_real = _real_path(root_text)
-    stack = [(root_text, _io_path(root_text), root_real, frozenset((root_real,)))]
+    root_io = _io_path(root_text)
+    try:
+        # From the exact (\\?\) form: Win32 parsing of the plain form strips a trailing
+        # space/dot and could name a sibling (#190 verifier pass 4).
+        root_real = _real_path(root_io)
+    except OSError:  # e.g. an invalid reparse point: never let the walk raise
+        root_real = os.path.normcase(os.path.normpath(root_text))
+    covered = [root_real]
+    covered_set = {root_real}
+    stack = [(root_text, root_io, root_real)]
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
-    junction_budget = _JUNCTION_WALK_BUDGET
     while stack:
-        current, current_io, current_real, entered = stack.pop()
-        if len(entered) > 1:  # reached through a junction
-            junction_budget -= 1
-            if junction_budget < 0:
-                # Not listed, so not seen: fails closed like an unreadable directory, while
-                # the directories outside junctions are still walked and matched.
-                unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (junction walk limit)>"
-                continue
+        current, current_io, current_real = stack.pop()
         prefix = _child_text_prefix(current)
         try:
             with os.scandir(current_io) as it:
@@ -240,29 +234,29 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                         return hit
                     if not entry.is_dir(follow_symlinks=False):
                         continue
+                    child_text = os.path.join(current, entry.name)  # noqa: PTH118 -- = entry.path
                     if entry.is_junction():
                         try:
                             os.stat(entry.path)  # noqa: PTH116 -- the extended-length str scandir gave
                         except (FileNotFoundError, NotADirectoryError):
                             continue  # dangling: nothing beneath it, deleting it removes a link
                         except OSError:
-                            pass  # unknown: walk it, so listing it fails closed below
-                        child_real = _real_path(entry.path)
-                        child_entered = entered | {child_real}
+                            pass  # unknown: try to walk it, so listing it fails closed below
+                        try:
+                            child_real = _real_path(entry.path)
+                        except OSError:
+                            unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
+                            continue
+                        if _within(child_real, covered):
+                            continue
+                        covered.append(child_real)
+                        covered_set.add(child_real)
                     else:
                         child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
-                        child_entered = entered
-                    # A second junction to an already-walked (non-cycle) tree is walked again
-                    # under its own text, so a path-keyed pattern through it still matches.
-                    if child_real in entered:
-                        continue
+                        if child_real in covered_set:
+                            continue  # back into a covered tree (e.g. via a junction above it)
                     stack.append(
-                        (
-                            os.path.join(current, entry.name),  # noqa: PTH118 -- = entry.path
-                            os.path.join(current_io, entry.name),  # noqa: PTH118
-                            child_real,
-                            child_entered,
-                        )
+                        (child_text, os.path.join(current_io, entry.name), child_real)  # noqa: PTH118
                     )
         except (FileNotFoundError, NotADirectoryError):
             # The ROOT missing or being a file (callers pass top-level temp/crash-dump FILES
@@ -273,6 +267,11 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         except OSError:
             unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
     return unreadable
+
+
+def _within(real: str, roots: Sequence[str]) -> bool:
+    """`real` equals or lies under one of `roots` (all `_real_path` forms)."""
+    return any(real == r or real.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
 def _real_path(path: str) -> str:
@@ -418,6 +417,11 @@ class SafetyValidator:
         hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
         if hit is None and is_dir:
             hit = subtree_exclusion_match(canonical, patterns)
+            # resolve() parses through Win32, which strips a trailing space/dot: for `sp ` it
+            # can name a clean sibling `sp` while the deleter (exact name) acts on `sp `. Walk
+            # the exact path too whenever the two differ (#190 verifier pass 4, pre-existing).
+            if hit is None and str(path) != str(canonical):
+                hit = subtree_exclusion_match(path, patterns)
         return hit
 
     def evaluate(self, record: FileRecord) -> SafetyResult:
