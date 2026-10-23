@@ -1063,16 +1063,16 @@ def test_name_only_patterns_never_rewalk_aliases(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
-def test_the_alias_walk_budget_fails_closed(
+def test_the_junction_walk_budget_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(safety, "_ALIAS_WALK_BUDGET", 0)
+    monkeypatch.setattr(safety, "_JUNCTION_WALK_BUDGET", 0)
     nm = _pnpm_app(tmp_path)
     got = subtree_exclusion_match(nm, ["*/nothing/here/*"])
     assert got is not None
     assert got.startswith(UNREADABLE_PREFIX)
     assert "too many junctions" in got
-    assert subtree_exclusion_match(nm, ["*nothing-here*"]) is None  # name-only: no alias walk
+    assert subtree_exclusion_match(nm, ["*nothing-here*"]) is None  # cover-once: no budget
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
@@ -1092,3 +1092,77 @@ def test_a_junction_cycle_between_two_outside_trees_ends(
     calls = _counting_scandir(monkeypatch)
     assert subtree_exclusion_match(root, ["*intent-router*"]) is None
     assert len(calls) == 3  # root, X (via j), Y (via j/k)
+
+
+# --- #190 verifier pass 6 -------------------------------------------------------------------
+
+
+def _inner_link(tmp_path: Path) -> Path:
+    """`cand/link` is a junction into `cand/store/pkg`, which holds `data.txt`."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    cand = tmp_path / "cand"
+    pkg = cand / "store" / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "data.txt").write_text("x", encoding="utf-8")
+    _winapi.CreateJunction(str(pkg), str(cand / "link"))
+    return cand
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        "*link*data*",  # glob `*` spans separators: not a one-component pattern
+        "*link?data.txt",
+        "*link[!a]data.txt",
+        "*" + chr(92) + "link" + chr(92) + "data.txt",  # the HOWTO's backslash form
+        "re:link.data[.]txt$",  # regex without a separator
+    ],
+)
+def test_patterns_spanning_components_match_through_an_inner_junction(
+    tmp_path: Path, pattern: str
+) -> None:
+    cand = _inner_link(tmp_path)
+    assert subtree_exclusion_match(cand, [pattern]) == pattern
+
+
+@pytest.mark.parametrize(
+    ("pattern", "one_component"),
+    [
+        ("*intent-router*", True),
+        ("*fr-en-transformer*", True),
+        ("*link*data*", False),
+        ("*a?b*", False),
+        ("*a[b]c*", False),
+        ("*/x/*", False),
+        ("*" + chr(92) + "x" + chr(92) + "*", False),
+        ("re:abc", False),
+        ("abc*", False),
+    ],
+)
+def test_only_star_literal_star_patterns_take_the_cover_once_walk(
+    pattern: str, one_component: bool
+) -> None:
+    assert safety._one_component_only(pattern) is one_component
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_realistic_pnpm_tree_with_a_path_keyed_pattern_is_still_offered(
+    tmp_path: Path,
+) -> None:
+    """A full walk of a pnpm-shaped tree (120 packages, 4 dependents each, 4 directories per
+    package: ~2.4k junction-reached listings) stays far under the budget and answers None."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    nm = tmp_path / "node_modules"
+    pkgs = []
+    for i in range(120):
+        pkg = nm / ".pnpm" / f"p{i}@1" / "node_modules" / f"p{i}"
+        (pkg / "lib" / "a" / "b").mkdir(parents=True)
+        pkgs.append(pkg)
+    for i, pkg in enumerate(pkgs):
+        _winapi.CreateJunction(str(pkg), str(nm / f"p{i}"))
+        for j in range(4):
+            _winapi.CreateJunction(str(pkgs[(i + j + 1) % len(pkgs)]), str(pkg.parent / f"d{j}"))
+    assert subtree_exclusion_match(nm, ["*/nothing/here/*"]) is None
