@@ -8,6 +8,7 @@ from pathlib import Path
 
 import structlog
 
+from reclaim import agent_artifacts
 from reclaim.config import Config
 from reclaim.freshstat import fresh_stat_signature
 from reclaim.index import ScanIndex
@@ -972,6 +973,34 @@ def _reclaimable_bytes_for_candidate(
     return reclaimable
 
 
+def _with_agent_artifacts(
+    candidates: list[Candidate],
+    index: ScanIndex,
+    config: Config,
+    safety: SafetyValidator,
+    now_ts: float,
+) -> list[Candidate]:
+    """Stale agent worktrees/clones/scratch (`agent_artifacts.py`), proven finished from live git
+    and process state. Off by default and in SAFE mode. An artifact that is offered takes over
+    any ordinary candidate inside it (spec open item 7), so a `node_modules` in a finished
+    worktree is offered once, as part of the worktree, not twice."""
+    settings = config.categories.agent_artifacts
+    if not settings.enabled or config.mode == Mode.SAFE:
+        return candidates
+    artifacts, _verdicts = agent_artifacts.detect_agent_artifacts(
+        index, safety, retention_days=settings.retention_days, now=now_ts
+    )
+    if not artifacts:
+        return candidates
+    roots = [a.path for a in artifacts]
+    kept = [c for c in candidates if not any(_is_within(c.path, root) for root in roots)]
+    return [*kept, *artifacts]
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def generate_candidates(
     index: ScanIndex, config: Config, safety: SafetyValidator, *, now: float | None = None
 ) -> list[Candidate]:
@@ -1047,4 +1076,4 @@ def generate_candidates(
                 mtime=record.mtime,
             )
         )
-    return candidates
+    return _with_agent_artifacts(candidates, index, config, safety, now_ts)
