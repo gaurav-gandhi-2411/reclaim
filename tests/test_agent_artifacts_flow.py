@@ -780,3 +780,26 @@ def test_review_a3b_after_vault_move_keeps_an_admin_entry_with_no_readable_owner
     assert note is not None and "belongs to another path" in note
     assert (admin / "HEAD").is_file()
     assert not (moved / aa.ADMIN_BACKUP_DIR).exists()
+
+
+@pytest.mark.parametrize("relative_config", [False, True])
+def test_review_a4_restore_does_not_rewrite_another_worktrees_links(
+    setup: Setup, relative_config: bool
+) -> None:
+    """F3: `git worktree repair` rewrites EVERY linked worktree into the configured path style;
+    with `worktree.useRelativePaths=true` it rewrote another worktree's `.git` file and admin
+    `gitdir`, outside the vault."""
+    found = _detect(setup)
+    other = setup.root / "proj-wt-abs"
+    git(setup.repo, "worktree", "add", "-q", "-b", "absb", str(other))
+    if relative_config:
+        git(setup.repo, "config", "worktree.useRelativePaths", "true")
+    other_admin = setup.repo / ".git" / "worktrees" / other.name
+    pointer, owner = (other / ".git").read_bytes(), (other_admin / "gitdir").read_bytes()
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert worktree_listed(setup.repo, setup.wt)  # ours is repaired
+    assert (other / ".git").read_bytes() == pointer
+    assert (other_admin / "gitdir").read_bytes() == owner

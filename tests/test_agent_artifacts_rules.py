@@ -1586,3 +1586,136 @@ def test_review_a3b_computername_alone_marks_this_machine(monkeypatch: pytest.Mo
     monkeypatch.setenv("COMPUTERNAME", "BUILDBOX7")
     assert aa.is_real_remote_url("https://buildbox7/o/r.git") is False
     assert aa.is_real_remote_url("https://buildbox8/o/r.git") is True
+
+
+# --- the fourth (data-safety) review, A4 ----------------------------------------------------------
+
+
+def _external_worktree(repo: Path, where: Path) -> Path:
+    """A linked worktree of `repo` OUTSIDE the artifact, holding staged-only work."""
+    git(repo, "worktree", "add", "-q", "--detach", str(where))
+    (where / "staged.txt").write_text("only copy of staged work", encoding="utf-8")
+    git(where, "add", "staged.txt")
+    (where / "staged.txt").write_text("working copy differs", encoding="utf-8")
+    return where
+
+
+def test_review_a4_scratch_backing_a_worktree_in_an_excluded_project_is_excluded(
+    tmp_path: Path,
+) -> None:
+    """F1: the scratch clone's `.git/worktrees/wt` holds the index and HEAD of a worktree in
+    `zzexclproj`; vaulting the scratch broke that worktree (`fatal: not a git repository`)."""
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    session = make_session(world, age_days=20)
+    clone = _clone_into(session)
+    ext = _external_worktree(clone, tmp_path / "zzexclproj" / "wt")
+    _age_tree(session, world, 20)
+    ran_in: list[Path] = []
+
+    def recording(args: object, cwd: Path) -> aa.GitResult:
+        ran_in.append(Path(cwd))
+        return aa.run_git(args, cwd)  # type: ignore[arg-type]
+
+    world.env.run_git = recording
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+    assert ran_in == []  # decided from paths alone, before any git
+    assert git(ext, "status", "--porcelain").returncode == 0
+
+
+def test_review_a4_scratch_backing_any_outside_worktree_is_refused(tmp_path: Path) -> None:
+    """F1/P1b: the same with a worktree in an ordinary folder: refused, not hidden."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    clone = _clone_into(session)
+    _external_worktree(clone, tmp_path / "otherwt")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert "linked worktrees" in v.failed_detail and not v.excluded
+
+
+def test_review_a4_a_prunable_outside_worktree_still_refuses(tmp_path: Path) -> None:
+    """The admin entry alone holds the staged index; git lists it as prunable, the filesystem
+    check still sees it."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    clone = _clone_into(session)
+    ext = _external_worktree(clone, tmp_path / "offline" / "wt")
+    shutil.rmtree(ext.parent)  # e.g. an unplugged drive
+    _age_tree(session, world, 20)
+    _refused(aa.evaluate_scratch(world.env, session), "S7")
+
+
+def test_review_a4_a_clone_whose_nested_repo_has_an_outside_worktree_is_refused(
+    tmp_path: Path,
+) -> None:
+    """F1/P5: rule C8 proved the nested repository clean and pushed, but not worktree-free."""
+    clone = _clone(tmp_path, "proj-verify3")
+    (clone / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    git(clone, "add", ".gitignore")
+    git(clone, "commit", "-q", "-m", "ignore")
+    mark_pushed(clone, "main")
+    nested = make_repo(clone / ".venv" / "src", "pkg")
+    _external_worktree(nested, tmp_path / "pkg-wt")
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    _refused(v, "C8")
+    assert "linked worktrees" in v.failed_detail
+
+
+def test_review_a4_a_clone_backing_a_worktree_in_an_excluded_project_is_excluded(
+    tmp_path: Path,
+) -> None:
+    clone = _clone(tmp_path)
+    _external_worktree(clone, tmp_path / "zzexclproj" / "wt")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+
+
+def _lfs_object(gitdir: Path) -> Path:
+    oid = "a" * 64
+    obj = gitdir / "lfs" / "objects" / oid[:2] / oid[2:4] / oid
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(b"the only copy of a large model file")
+    return obj
+
+
+def test_review_a4_a_clone_holding_lfs_objects_is_refused(tmp_path: Path) -> None:
+    """F2: C4 proves the commits (and so the pointer files) are pushed, not the LFS content."""
+    clone = _clone(tmp_path)
+    _lfs_object(clone / ".git")
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "C4")
+
+
+def test_review_a4_an_empty_lfs_store_does_not_refuse(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    (clone / ".git" / "lfs" / "objects" / "aa").mkdir(parents=True)  # e.g. after `lfs prune`
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+def test_review_a4_a_nested_repo_holding_lfs_objects_keeps_the_session(tmp_path: Path) -> None:
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    clone = _clone_into(session)
+    _lfs_object(clone / ".git")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert "LFS" in v.failed_detail
+
+
+def test_review_a4_an_unreadable_worktrees_entry_counts_as_worktrees(tmp_path: Path) -> None:
+    """Fail closed: `.git/worktrees` that cannot be listed (here a file) may hide a worktree.
+    (Through the evaluators the exclusion check, which fails closed on the same error, hides the
+    artifact first; this pins the helper on its own.)"""
+    gitdir = tmp_path / "repo" / ".git"
+    gitdir.mkdir(parents=True)
+    assert aa._has_linked_worktrees(gitdir) is False
+    (gitdir / "worktrees").mkdir()
+    assert aa._has_linked_worktrees(gitdir) is False  # empty: git removed the last one
+    (gitdir / "worktrees").rmdir()
+    (gitdir / "worktrees").write_text("not a directory", encoding="utf-8")
+    assert aa._has_linked_worktrees(gitdir) is True

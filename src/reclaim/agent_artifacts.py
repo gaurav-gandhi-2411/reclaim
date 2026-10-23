@@ -599,6 +599,15 @@ def _prove_nested(
     for entry in entries:
         if _nested_git_excluded(env, entry):
             raise _Refusal(rule, "excluded project (not inspected further)", excluded=True)
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        # A linked worktree OUTSIDE the artifact keeps its index, HEAD and objects in this git
+        # dir: moving it breaks that worktree and purging loses its staged work (A4, F1).
+        if _has_linked_worktrees(entry):
+            raise _Refusal(rule, f"nested repository {entry.parent} has linked worktrees")
+        if _has_lfs_objects(entry):
+            raise _Refusal(rule, f"nested repository {entry.parent} holds Git LFS objects")
     repos = sorted({e.parent for e in entries})
     for repo in repos:
         hidden = next((p for p in facts.odd_names if _inside(p, repo)), None)
@@ -638,6 +647,37 @@ def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
     return _gitdir_excluded(env, admin)
 
 
+def _has_linked_worktrees(gitdir: Path) -> bool:
+    """`gitdir/worktrees` has any entry (an unreadable one counts: fail closed). Read from the
+    filesystem, so it also sees a worktree git itself would list as prunable."""
+    try:
+        return any((gitdir / "worktrees").iterdir())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _has_lfs_objects(gitdir: Path) -> bool:
+    """Any file under `gitdir/lfs/objects`. C4/W4 prove commits are on a remote, not that the LFS
+    content their pointers name was pushed (a skipped or failed `git lfs push`, or git-lfs not
+    installed when pushing); without a network call nothing proves it (A4 review, F2)."""
+    store = gitdir / "lfs" / "objects"
+    if not store.exists():
+        return False
+    try:
+        for _dirpath, _dirs, files in os.walk(store, onerror=_raise):
+            if files:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
+
+
 _CORE_WORKTREE = re.compile(r"^\s*worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
@@ -670,6 +710,17 @@ def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
                 targets.append(Path(os.path.normpath(gitdir / match.group(1).strip('"'))))
         objects = gitdir / "objects"
         alternates = read(objects / "info" / "alternates")
+        # A linked worktree of this repository lives wherever its admin `gitdir` file says; one
+        # inside an excluded project depends on these objects and this admin data (A4, F1).
+        try:
+            admins = list((gitdir / "worktrees").iterdir())
+        except FileNotFoundError:
+            admins = []
+        for admin in admins:
+            owner = read(admin / "gitdir")
+            if owner is not None and owner.strip():
+                pointer = Path(os.path.normpath(admin / owner.strip()))  # relative: to the admin
+                targets += [pointer, pointer.parent]
     except OSError:
         return True
     for line in (alternates or "").splitlines():
@@ -953,6 +1004,8 @@ def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
         _prove_clean(env, path, held)
         _prove_no_stash(env, path, held)
         _prove_pushed(env, path, held, everything=True, rule="C4")
+        if _has_lfs_objects(path / ".git"):
+            raise _Refusal("C4", "Git LFS objects are present; nothing proves they were pushed")
         listed = list_worktrees(env, path)
         if listed is None:
             raise _Refusal("C6", "git worktree list failed")
@@ -1233,7 +1286,12 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
         shutil.rmtree(backup)
     except (OSError, ValueError, KeyError) as exc:
         return f"restored, but the git admin dir could not be put back ({exc})"
-    result = run(("worktree", "repair", str(restored)), repo)
+    # `repair` rewrites EVERY linked worktree of the repository into the configured path style:
+    # with `worktree.useRelativePaths=true` it rewrote another worktree's `.git` file and admin
+    # `gitdir` (A4 review, F3). With the setting forced off it only fixes links that are broken.
+    result = run(
+        ("-c", "worktree.useRelativePaths=false", "worktree", "repair", str(restored)), repo
+    )
     if result.rc != 0:
         return (
             f"restored, but git worktree repair failed (rc {result.rc}): {result.err.strip()[:160]}"
