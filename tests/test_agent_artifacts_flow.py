@@ -748,6 +748,7 @@ def test_review_a3b_a_refused_restore_detaches_the_pointer_from_the_other_worktr
     assert (setup.wt / aa.DETACHED_POINTER).is_file()
     assert worktree_listed(setup.repo, newer)
 
+
 def test_review_a3b_restore_refuses_an_admin_dir_with_our_head_but_no_owner(setup: Setup) -> None:
     """N2b: the same HEAD is not proof of ownership; a stranger worktree at our commit leaves an
     identical HEAD. Without a readable `gitdir` the admin dir is not ours."""

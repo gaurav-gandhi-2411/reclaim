@@ -1175,6 +1175,7 @@ def _same_head(admin: Path, saved: Path) -> bool:
 def _detach_pointer(restored: Path) -> str:
     """Rename the restored folder's `.git` pointer so git no longer follows it into an admin dir
     that is not ours; returns a sentence for the note."""
+    assert_not_real_profile_under_pytest(restored, operation="detach the git pointer of")
     try:
         (restored / ".git").rename(restored / DETACHED_POINTER)
     except OSError as exc:

@@ -1531,6 +1531,7 @@ def test_review_a3b_an_alternates_chain_into_an_excluded_repo_is_followed(tmp_pa
     v = aa.evaluate_clone(world.env, clone)
     assert v.excluded and not v.offered
 
+
 # --- survivors of the bad3e67 mutation run: each check pinned on its own -------------------------
 
 
