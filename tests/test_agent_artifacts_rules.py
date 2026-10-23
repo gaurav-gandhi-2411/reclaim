@@ -2120,3 +2120,19 @@ def test_review_a7_a_clone_of_an_excluded_projects_git_dir_is_hidden(tmp_path: P
 )
 def test_review_a7_the_repository_name_skips_a_trailing_git_dir(url: str, name: str) -> None:
     assert aa._url_repo_name(url) == name
+
+
+@pytest.mark.parametrize("scheme", ["", "file:///"])
+def test_review_a7_a_local_remote_inside_an_excluded_project_is_hidden_by_its_path(
+    tmp_path: Path, scheme: str
+) -> None:
+    """The repository NAME (`data`) does not give the project away; only the remote's path
+    (`...\\zzexclproj\\repos\\data.git`) does."""
+    store = tmp_path / "zzexclproj" / "repos" / "data.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(store))
+    clone = _clone(tmp_path)
+    git(clone, "remote", "add", "store", scheme + store.as_posix())
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert ran_in == []
