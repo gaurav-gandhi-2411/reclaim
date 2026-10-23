@@ -84,6 +84,18 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11.
     3. A6.
     4. B.
+- 02:10 IST checkpoint 8 (24 Oct):
+  - **#197** (checkpoint 7 docs) merged as `c1a9300`.
+  - **Agent artifacts** (#193, draft, head `89f6010`):
+    - **The seventh review PASSED for data safety:** no realistic state loses work, changes another worktree or writes outside the vault. It left two read-only exclusion gaps, closed in `b1254a3`.
+    - A narrow eighth review of that fix FAILED on a crash I introduced: an unexpandable `~user` path raised outside `except OSError` and aborted detection. No data was at risk. Fixed in `22cff8b`; includes in a git dir's config now count as excluded.
+    - Full verify on `89f6010`: 2566 passed. The reaped verify (item 7) is superseded and resolved.
+    - A narrow ninth review of the two small fixes is running.
+  - **Next:**
+    1. Ninth review, then A4 `integration/run-2026-10`.
+    2. A5: build 11 from it.
+    3. A6.
+    4. B.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
