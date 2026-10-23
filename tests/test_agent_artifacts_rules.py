@@ -1880,3 +1880,140 @@ def test_review_a5_a_replace_ref_onto_a_pushed_commit_does_not_hide_the_only_cop
     v = aa.evaluate_clone(make_world(tmp_path).env, clone)
     _refused(v, "C4")
     assert only[:12] in v.failed_detail
+
+
+# --- the sixth (data-safety) review, A6 -----------------------------------------------------------
+
+
+def _stripping_repo(tmp_path: Path, attrs_in_info: bool = True) -> Path:
+    """`nbstripout --install`-style: a clean filter that drops everything after line 1."""
+    repo = make_repo(tmp_path, "proj")
+    git(repo, "config", "filter.strip.clean", "sed -n 1p")
+    git(repo, "config", "filter.strip.smudge", "cat")
+    git(repo, "config", "filter.strip.required", "true")
+    if attrs_in_info:
+        attrs = repo / ".git" / "info" / "attributes"
+        attrs.parent.mkdir(parents=True, exist_ok=True)
+        attrs.write_text("*.ipynb filter=strip\n", encoding="utf-8")
+    commit_file(repo, "analysis.ipynb", "{cells}\n", "notebook")
+    mark_pushed(repo, "main")
+    return repo
+
+
+def test_review_a6_a_clean_filter_that_drops_content_keeps_the_worktree(tmp_path: Path) -> None:
+    """F1: run the notebook, commit, push. The commit holds the stripped notebook, `status` is
+    empty, and the outputs exist only in the working file."""
+    repo = _stripping_repo(tmp_path)
+    wt = add_worktree(repo, "proj-wt-nb", "nb")
+    notebook = wt / "analysis.ipynb"
+    notebook.write_text("{cells v2}\nOUTPUT: hours of GPU results\n", encoding="utf-8")
+    git(wt, "add", "analysis.ipynb")
+    git(wt, "commit", "-q", "-m", "v2")
+    mark_pushed(wt, "nb")
+    assert git(wt, "status", "--porcelain", "-uall").stdout == ""  # the trap
+    assert "OUTPUT" not in git(wt, "cat-file", "-p", "HEAD:analysis.ipynb").stdout
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W2")
+    assert "clean filter 'strip'" in v.failed_detail
+
+
+def test_review_a6_a_clean_filter_in_a_clone_keeps_the_clone(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    git(clone, "config", "filter.strip.clean", "sed -n 1p")
+    (clone / ".git" / "info").mkdir(exist_ok=True)
+    (clone / ".git" / "info" / "attributes").write_text("*.md filter=strip\n", encoding="utf-8")
+    _refused(aa.evaluate_clone(make_world(tmp_path).env, clone), "W2")
+
+
+def test_review_a6_a_filter_driver_no_tracked_file_uses_does_not_refuse(tmp_path: Path) -> None:
+    """A globally installed filter (e.g. `nbstripout --global`) in a repo with no notebooks."""
+    repo, wt = _wt(tmp_path)
+    git(repo, "config", "filter.strip.clean", "sed -n 1p")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("*.ipynb filter=strip\n", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+def test_review_a6_git_lfs_as_the_filter_does_not_refuse(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(repo, "config", "filter.lfs.clean", "git-lfs clean -- %f")
+    git(repo, "config", "filter.lfs.process", "git-lfs filter-process")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("*.md filter=lfs\n", encoding="utf-8")
+    # Called directly: git-lfs is not installed here, so `status` itself would show the file
+    # modified once it is marked `filter=lfs` (a real LFS checkout holds the pointer).
+    aa._prove_no_hiding_filter(make_world(tmp_path).env, wt)  # does not raise
+
+
+def test_review_a6_a_filter_named_lfs_that_is_not_git_lfs_refuses(tmp_path: Path) -> None:
+    """The exemption follows the program, not the driver's name."""
+    repo, wt = _wt(tmp_path)
+    git(repo, "config", "filter.lfs.clean", "sed -n 1p")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("*.md filter=lfs\n", encoding="utf-8")
+    # Called directly: through the evaluator `status` may already see the file modified.
+    with pytest.raises(aa._Refusal, match="clean filter 'lfs'"):
+        aa._prove_no_hiding_filter(make_world(tmp_path).env, wt)
+
+
+def test_review_a6_a_skip_worktree_path_naming_an_excluded_project_is_hidden(
+    tmp_path: Path,
+) -> None:
+    """F2: a skip-worktree flag (sparse checkout sets one on every path outside the cone) on a
+    path naming an excluded project: the W2 detail printed it. The file is not on disk, so only
+    the path itself can be matched."""
+    repo, wt = _wt(tmp_path)
+    commit_file(wt, "content/zzexclproj/notes.md", "x\n", "notes")
+    push_branch(wt, "feat")
+    git(wt, "update-index", "--skip-worktree", "content/zzexclproj/notes.md")
+    shutil.rmtree(wt / "content")  # as sparse checkout leaves it
+    v = _verdict(make_world(tmp_path, exclusions=("zzexclproj",)), wt, repo)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+
+
+def test_review_a6_an_ordinary_skip_worktree_flag_is_still_reported(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(wt, "update-index", "--skip-worktree", "README.md")
+    v = _verdict(make_world(tmp_path, exclusions=("zzexclproj",)), wt, repo)
+    _refused(v, "W2")
+    assert not v.excluded and "hidden change flag" in v.failed_detail
+
+
+def test_review_a6_a_scratch_junction_inside_an_excluded_copy_is_hidden(tmp_path: Path) -> None:
+    """F3: S8 refused first and printed `...\\zzexclproj\\node_modules\\pkg` in the report."""
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    session = make_session(world, age_days=30)
+    target = tmp_path / "store" / "pkg"
+    target.mkdir(parents=True)
+    modules = session / "zzexclproj" / "node_modules"
+    modules.mkdir(parents=True)
+    make_junction(modules / "pkg", target)
+    _age_tree(session, world, 30)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+
+
+def test_review_a6_a_scratch_junction_elsewhere_is_still_reported(tmp_path: Path) -> None:
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    session = make_session(world, age_days=30)
+    target = tmp_path / "store" / "pkg"
+    target.mkdir(parents=True)
+    make_junction(session / "pkg", target)
+    _age_tree(session, world, 30)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S8")
+    assert not v.excluded
+
+
+def test_review_a6_status_show_untracked_files_no_does_not_refuse_everything(
+    tmp_path: Path,
+) -> None:
+    """O1: `--ignored=matching` with a configured `status.showUntrackedFiles=no` is a fatal
+    error, so every worktree and clone was refused at W8."""
+    repo, wt = _wt(tmp_path)
+    git(repo, "config", "status.showUntrackedFiles", "no")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert v.offered, (v.failed_rule, v.failed_detail)

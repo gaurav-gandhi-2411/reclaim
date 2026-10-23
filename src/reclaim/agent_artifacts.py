@@ -514,11 +514,65 @@ def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bo
         raise _Refusal("W2", f"uncommitted or untracked changes: {lines[0][:120]}")
     for line in _must_silent(env, repo, "W2", "ls-files", "-v").splitlines():
         if line and line[0] != "H":
+            if _path_excluded(env, repo / line[2:]):  # a sparse-checkout path is not on disk
+                raise _Refusal("W2", "excluded project (not inspected further)", excluded=True)
             raise _Refusal("W2", f"hidden change flag '{line[0]}' on {line[2:][:100]}")
+    _prove_no_hiding_filter(env, repo)
     held.append(
         "W2 no uncommitted, untracked or hidden changes, no submodule, no operation in progress"
     )
     return gitdir
+
+
+_FILTER_KEY = re.compile(r"^filter\.(.+)\.(clean|process)$", re.IGNORECASE)
+_CHECK_ATTR_CHUNK = 100  # paths per `check-attr` call: well inside the Windows command-line limit
+
+
+def _prove_no_hiding_filter(env: AgentEnv, repo: Path) -> None:
+    """W2: no clean filter other than Git LFS applies to a tracked file. A clean filter can drop
+    content on its way into the index (`nbstripout` drops notebook outputs): once that commit is
+    pushed and the index stat matches, `status` is empty while the only copy of the dropped bytes
+    is the working file (A6 review, F1). Git LFS keeps what it drops in its store, which W2/C4
+    check. Nothing here runs a filter: `config` and `check-attr` only read."""
+    result = _git(env, repo, "config", "--get-regexp", r"^filter\..*\.(clean|process)$")
+    if result.rc not in (0, 1):
+        raise _Refusal("W2", f"git config failed (rc {result.rc}): {result.err.strip()[:120]}")
+    drivers = set()
+    for line in result.out.splitlines():
+        key, _, value = line.partition(" ")
+        match = _FILTER_KEY.match(key)
+        if match is not None and not value.strip().startswith("git-lfs "):
+            drivers.add(match.group(1))
+    if not drivers:
+        return
+    tracked = [p for p in _must_silent(env, repo, "W2", "ls-files", "-z").split("\0") if p]
+    for start in range(0, len(tracked), _CHECK_ATTR_CHUNK):
+        chunk = tracked[start : start + _CHECK_ATTR_CHUNK]
+        out = _must_silent(env, repo, "W2", "check-attr", "-z", "filter", "--", *chunk)
+        fields = out.split("\0")
+        for path, value in zip(fields[0::3], fields[2::3], strict=False):
+            if value in drivers:
+                raise _Refusal(
+                    "W2",
+                    f"the clean filter '{value}' applies to {path[:100]}: what is committed may "
+                    "not be what is on disk",
+                )
+
+
+def _hidden_if_excluded(env: AgentEnv, path: Path, refusal: _Refusal) -> _Refusal:
+    """A refusal's detail can name a path inside the artifact (W2, W8, S2, S8...), and those
+    rules run before the subtree exclusion walk: an artifact holding an excluded project's name
+    is then hidden like any exclusion hit, never reported (A6 review, F2/F3). A walk that fails
+    counts as a hit (fail closed)."""
+    if refusal.excluded:
+        return refusal
+    try:
+        hit = env.exclusion_match(path, True)
+    except OSError:
+        hit = "unreadable"
+    if hit is None:
+        return refusal
+    return _Refusal(refusal.rule, "excluded project (not inspected further)", excluded=True)
 
 
 def _prove_pushed(
@@ -597,7 +651,12 @@ def _prove_ignored(env: AgentEnv, repo: Path, held: list[str]) -> None:
     """W8: the only ignored content is regenerable directories."""
     # `--ignored=matching` cannot be combined with `--untracked-files=no`: untracked entries are
     # listed too (`?? `), and any of them here (W2 already proved none) is a refusal as well.
-    out = _must_silent(env, repo, "W8", "status", "--ignored=matching", "--porcelain=v1", "-z")
+    # `--untracked-files=normal` is the default, spelled out: a configured
+    # `status.showUntrackedFiles=no` made every status here fail (A6 review, O1).
+    out = _must_silent(
+        env, repo, "W8", "status", "--ignored=matching", "--untracked-files=normal",
+        "--porcelain=v1", "-z",
+    )  # fmt: skip
     for item in out.split("\0"):
         if item.startswith("?? "):
             raise _Refusal("W8", f"untracked content appeared: {item[3:][:120]}")
@@ -1032,6 +1091,7 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
             last_commit_ts=commit_ts, refs_fetched_ts=fetched, repo_root=repo,
         )  # fmt: skip
     except _Refusal as refusal:
+        refusal = _hidden_if_excluded(env, path, refusal)
         return ArtifactVerdict(
             path, "worktree", False, tuple(held), refusal.rule, refusal.detail,
             project=project, repo_root=repo, excluded=refusal.excluded,
@@ -1085,6 +1145,7 @@ def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
             last_commit_ts=commit_ts, refs_fetched_ts=fetched, repo_root=path,
         )  # fmt: skip
     except _Refusal as refusal:
+        refusal = _hidden_if_excluded(env, path, refusal)
         return ArtifactVerdict(
             path, "clone", False, tuple(held), refusal.rule, refusal.detail,
             project=project, repo_root=path, excluded=refusal.excluded,
@@ -1147,6 +1208,7 @@ def evaluate_scratch(env: AgentEnv, path: Path) -> ArtifactVerdict:
             path, "scratch", True, tuple(held), project=slug, last_commit_ts=newest
         )
     except _Refusal as refusal:
+        refusal = _hidden_if_excluded(env, path, refusal)
         return ArtifactVerdict(
             path, "scratch", False, tuple(held), refusal.rule, refusal.detail,
             project=slug, excluded=refusal.excluded,
