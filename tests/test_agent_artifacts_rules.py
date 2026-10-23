@@ -1123,3 +1123,204 @@ def test_review_a_relative_gitdir_pointer_does_not_depend_on_the_cwd(
         monkeypatch.chdir(cwd)
         v = aa.evaluate_path(world.env, wt, aa.CAT_WORKTREE)
         assert v.offered, (str(cwd), v.failed_rule, v.failed_detail)
+
+
+# === regression tests for the second independent review (A3): each reproduces a reported hole ===
+
+
+def _unpushed_commit(wt: Path) -> str:
+    """A commit that exists only locally and is reachable from no branch (`commit-tree`)."""
+    tree = git(wt, "rev-parse", "HEAD^{tree}").stdout.strip()
+    return git(wt, "commit-tree", tree, "-p", "HEAD", "-m", "wip").stdout.strip()
+
+
+@pytest.mark.parametrize("ref", ["refs/worktree/wip", "refs/bisect/bad", "refs/rewritten/x"])
+def test_review_a3_an_unpushed_commit_on_a_per_worktree_ref_keeps_the_worktree(
+    tmp_path: Path, ref: str
+) -> None:
+    """F1: these refs live in the admin dir removed after the move; `git gc` then drops the
+    commit for good."""
+    repo, wt = _wt(tmp_path)
+    git(wt, "update-ref", ref, _unpushed_commit(wt))
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W4")
+    assert "is not on any remote ref" in v.failed_detail
+
+
+def test_review_a3_a_per_worktree_ref_at_a_pushed_commit_does_not_block(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(wt, "update-ref", "refs/worktree/mark", "HEAD")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+    assert "per-worktree refs" in " ".join(v.held)
+
+
+def test_review_a3_a_git_warning_with_an_empty_status_is_a_refusal(tmp_path: Path) -> None:
+    """F3: git that cannot open a directory warns on stderr, exits 0 and lists nothing."""
+    repo, wt = _wt(tmp_path)
+
+    def warns(args: object, cwd: Path) -> aa.GitResult:
+        result = aa.run_git(args, cwd)  # type: ignore[arg-type]
+        if tuple(args)[:1] == ("status",):  # type: ignore[call-overload]
+            return aa.GitResult(
+                0, "", "warning: could not open directory 'deep/': Filename too long\n"
+            )
+        return result
+
+    v = _verdict(make_world(tmp_path, run=warns), wt, repo)
+    _refused(v, "W2")
+    assert "could not open directory" in v.failed_detail
+
+
+def test_review_a3_an_untracked_file_deeper_than_max_path_keeps_the_worktree(
+    tmp_path: Path,
+) -> None:
+    repo, wt = _wt(tmp_path)
+    deep = Path("\\\\?\\" + str(wt)) / ("a" * 120) / ("b" * 120) / ("c" * 40)
+    deep.mkdir(parents=True)
+    (deep / "results.csv").write_text("only copy", encoding="utf-8")
+    assert len(str(wt)) + 300 > 260
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W2")
+
+
+@pytest.mark.parametrize("name", ["data.", "notes "])
+def test_review_a3_a_name_git_cannot_open_keeps_the_worktree(tmp_path: Path, name: str) -> None:
+    """F3: Win32 strips a trailing dot or space, so git cannot open `data.` or `notes `."""
+    repo, wt = _wt(tmp_path)
+    odd = Path("\\\\?\\" + str(wt / name))
+    odd.mkdir(parents=True)
+    (odd / "results.csv").write_text("only copy", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert not v.offered, f"WRONG OFFER: {v.held}"
+    assert v.failed_rule in {"W2", "W8"}, (v.failed_rule, v.failed_detail)
+
+
+def _upper_git(repo: Path, spelling: str) -> None:
+    """Rename `.git` to another case (two steps: NTFS ignores a case-only rename target)."""
+    (repo / ".git").rename(repo / ".git-tmp")
+    (repo / ".git-tmp").rename(repo / spelling)
+
+
+@pytest.mark.parametrize("spelling", [".GIT", ".Git"])
+def test_review_a3_a_nested_repo_whose_git_dir_is_not_lowercase_is_proven_too(
+    tmp_path: Path, spelling: str
+) -> None:
+    """F4: git on Windows uses `.GIT` as the repository; the walk compared case-sensitively."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    nested = _nested_repo(session / "scratchpad" / "dep", pushed=False)
+    _upper_git(nested, spelling)
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert str(nested) in v.failed_detail
+
+
+def test_review_a3_content_under_a_dot_git_spelled_upper_case_keeps_the_worktree(
+    tmp_path: Path,
+) -> None:
+    """F4: git skips `notes/.GIT/` entirely, so untracked work in it never shows in status."""
+    repo, wt = _wt(tmp_path)
+    (wt / "notes" / ".GIT").mkdir(parents=True)
+    (wt / "notes" / ".GIT" / "secret-work.txt").write_text("only copy", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert not v.offered, f"WRONG OFFER: {v.held}"
+
+
+def test_review_a3_a_linked_worktree_of_an_excluded_repo_inside_scratch_is_never_touched(
+    tmp_path: Path,
+) -> None:
+    """F5: only the nested `.git` pointer names the excluded repository; no git may run in it.
+    (A stand-in name, never one of the real excluded projects.)"""
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    session = make_session(world, age_days=20)
+    checkout = session / "scratchpad" / "checkout"
+    git(excluded, "worktree", "add", "-q", "--detach", str(checkout))
+    _age_tree(session, world, 20)
+    ran_in: list[Path] = []
+
+    def recording(args: object, cwd: Path) -> aa.GitResult:
+        ran_in.append(Path(cwd))
+        return aa.run_git(args, cwd)  # type: ignore[arg-type]
+
+    world.env.run_git = recording
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered and v.failed_rule == "S7"
+    assert aa.report_lines([v]) == []
+    assert not [c for c in ran_in if str(c).lower().startswith(str(checkout).lower())]
+
+
+def test_review_a3_an_unreadable_nested_git_pointer_counts_as_excluded(tmp_path: Path) -> None:
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    session = make_session(world, age_days=20)
+    odd = session / "scratchpad" / "odd"
+    odd.mkdir()
+    (odd / ".git").write_text("not a pointer\n", encoding="utf-8")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    assert not v.offered and v.excluded
+
+
+def test_review_a3_a_local_remote_writing_into_origins_namespace_is_no_proof(
+    tmp_path: Path,
+) -> None:
+    """F6a: a push to a local `bak` whose fetch refspec maps to refs/remotes/origin/* updates
+    origin's tracking ref, so the commit looked pushed to origin."""
+    repo, wt = _wt(tmp_path)
+    bare = _bare(tmp_path)
+    git(repo, "remote", "add", "bak", str(bare))
+    git(repo, "config", "--replace-all", "remote.bak.fetch", "+refs/heads/*:refs/remotes/origin/*")
+    commit_file(wt, "work.txt", "only here\n", "unpushed")
+    git(wt, "push", "-q", "bak", "feat")
+    assert (
+        git(wt, "rev-parse", "refs/remotes/origin/feat").stdout
+        == git(wt, "rev-parse", "HEAD").stdout
+    )  # the trap: it looks pushed to origin
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a3_a_remote_named_under_origin_taints_origin(tmp_path: Path) -> None:
+    """F6b: `origin/bak` (config accepts the name, `git remote add` does not) has its refs under
+    refs/remotes/origin/bak/*, which `--remotes=origin` reads."""
+    repo, wt = _wt(tmp_path)
+    bare = _bare(tmp_path)
+    git(repo, "config", "remote.origin/bak.url", str(bare))
+    git(repo, "config", "remote.origin/bak.fetch", "+refs/heads/*:refs/remotes/origin/bak/*")
+    commit_file(wt, "work.txt", "only here\n", "unpushed")
+    git(wt, "update-ref", "refs/remotes/origin/bak/feat", "HEAD")  # what a push there records
+    _refused(_verdict(make_world(tmp_path), wt, repo), "W4")
+
+
+def test_review_a3_a_second_real_remote_does_not_taint_origin(tmp_path: Path) -> None:
+    repo, wt = _wt(tmp_path)
+    git(repo, "remote", "add", "upstream", "https://example.invalid/upstream.git")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ssh://127.0.0.2/o/r.git",
+        "ssh://127.1/o/r.git",
+        "ssh://2130706433/o/r.git",
+        "ssh://0x7f000001/o/r.git",
+        "ssh://localhost./o/r.git",
+        "ssh://[0:0:0:0:0:0:0:1]/o/r.git",
+        "ssh://[::ffff:127.0.0.1]/o/r.git",
+        "git@127.0.0.2:o/r.git",
+        "git@localhost.:o/r.git",
+        "ssh://host//D:/backup/r.git",
+        "ssh://host/%44:/backup/r.git",
+        "ssh://host/d|/backup/r.git",
+    ],
+)
+def test_review_a3_more_spellings_of_this_machine_or_a_drive_are_not_a_backup(url: str) -> None:
+    assert aa.is_real_remote_url(url) is False
+
+
+def test_review_a3_this_computers_own_name_is_not_a_backup() -> None:
+    import socket
+
+    assert aa.is_real_remote_url(f"https://{socket.gethostname()}/o/r.git") is False

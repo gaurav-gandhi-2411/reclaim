@@ -642,3 +642,30 @@ def test_survivor_b17_after_vault_move_notices_if_git_still_lists_the_worktree(
     shutil.move(str(setup.wt), str(moved))
     note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, lying)
     assert note is not None and "still lists the worktree" in note
+
+
+def test_review_a3_restore_never_takes_over_a_newer_worktree_that_reused_the_admin_name(
+    setup: Setup,
+) -> None:
+    """F2: after the move, `git worktree add` reuses the freed admin name; restoring then
+    deleted our backup and `worktree repair` repointed the NEW worktree's index and HEAD."""
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    newer = setup.root / "other" / setup.wt.name
+    newer.parent.mkdir()
+    git(setup.repo, "worktree", "add", "-q", "--detach", str(newer))
+    admin = Path(git(newer, "rev-parse", "--absolute-git-dir").stdout.strip())
+    assert admin.name == setup.wt.name  # the trap: the same admin dir name as the vaulted one
+    (newer / "staged.txt").write_text("staged work", encoding="utf-8")
+    git(newer, "add", "staged.txt")
+    owner_before = (admin / "gitdir").read_text(encoding="utf-8")
+    restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert setup.wt.is_dir()  # the directory itself is back
+    assert (admin / "gitdir").read_text(encoding="utf-8") == owner_before
+    assert worktree_listed(setup.repo, newer)
+    assert "A  staged.txt" in git(newer, "status", "--porcelain").stdout
+    assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()  # kept for a manual repair
+    note = aa.after_restore(setup.wt)
+    assert note is not None and "belongs to another worktree" in note

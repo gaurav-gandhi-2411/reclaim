@@ -23,10 +23,12 @@ rewrites the index, and fsmonitor would run a program named in the repo's own co
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -60,7 +62,9 @@ REASON_CODE = "AGENT_ARTIFACT_PROVEN_FINISHED"
 
 ADMIN_BACKUP_DIR = ".reclaim-gitadmin"  # inside a vaulted worktree: its git admin dir + metadata
 
-_GIT = ("git", "--no-optional-locks", "-c", "core.fsmonitor=false")
+# core.longpaths: without it git on Windows cannot open an untracked tree deeper than MAX_PATH,
+# warns, and still reports the repository clean (A3 review, F3).
+_GIT = ("git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.longpaths=true")
 _GIT_TIMEOUT_SECONDS = 120.0
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _SCP_REMOTE = re.compile(r"^[\w.-]+@[\w.-]+:[^\\/\s].*$")
@@ -116,22 +120,50 @@ def run_git(args: Sequence[str], cwd: Path) -> GitResult:
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})  # noqa: S104 -- a deny-list entry
-_DRIVE_IN_PATH = re.compile(r"^/?[A-Za-z]:[\\/]")
+# A drive in the path, also percent-encoded (`/%44:/x`) or in the legacy `d|` form, after any
+# number of leading slashes (`ssh://host//D:/x`).
+_DRIVE_IN_PATH = re.compile(r"^[\\/]*[A-Za-z][:|]([\\/]|$)")
+
+
+def _is_local_host(host: str) -> bool:
+    """This machine, in any spelling: a loopback or unspecified address in any IPv4 notation
+    (`127.1`, `2130706433`, `0x7f000001`), IPv6 (`[0:0:0:0:0:0:0:1]`, `::ffff:127.0.0.1`), a
+    trailing-dot name (`localhost.`), or this computer's own name (A3 review)."""
+    name = host.strip("[]").rstrip(".").lower()
+    if not name or name in _LOOPBACK_HOSTS or name.endswith(".localhost"):
+        return True
+    # No getfqdn(): it can block on DNS. The local names need no lookup.
+    if name in {socket.gethostname().lower(), os.environ.get("COMPUTERNAME", "").lower()} - {""}:
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        try:  # the BSD notations getaddrinfo also accepts (`127.1`, decimal, hex)
+            address = ipaddress.IPv4Address(socket.inet_aton(name))
+        except (OSError, ValueError):
+            return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback or address.is_unspecified
 
 
 def is_real_remote_url(url: str) -> bool:
     """Allow-list: https://, ssh://, git:// or scp-style user@host:path, with a real host. A
-    drive-letter path, a UNC path, file://, any local path, a loopback host (`ssh://localhost/...`)
-    or a path that names a drive (`ssh://host/D:/backup`) is NOT a backup (spec W3)."""
+    drive-letter path, a UNC path, file://, any local path, a host that is this machine
+    (`ssh://localhost/...`, `127.1`, its own name) or a path that names a drive
+    (`ssh://host/D:/backup`) is NOT a backup (spec W3)."""
     text = url.strip()
     if text.lower().startswith(_REMOTE_SCHEMES):
         parts = urllib.parse.urlsplit(text)
-        host = (parts.hostname or "").lower()
-        return bool(host) and host not in _LOOPBACK_HOSTS and not _DRIVE_IN_PATH.match(parts.path)
+        host = parts.hostname or ""
+        path = urllib.parse.unquote(parts.path)
+        return bool(host) and not _is_local_host(host) and not _DRIVE_IN_PATH.match(path)
     if not _SCP_REMOTE.match(text):
         return False
-    host = text.split("@", 1)[1].split(":", 1)[0].lower()
-    return host not in _LOOPBACK_HOSTS and not _DRIVE_IN_PATH.match(text.split(":", 1)[1])
+    host = text.split("@", 1)[1].split(":", 1)[0]
+    path = text.split(":", 1)[1]
+    return not _is_local_host(host) and not _DRIVE_IN_PATH.match(path)
 
 
 # --- environment --------------------------------------------------------------------------
@@ -229,6 +261,20 @@ def _must(env: AgentEnv, cwd: Path, rule: str, *args: str) -> str:
     return result.out
 
 
+def _must_silent(env: AgentEnv, cwd: Path, rule: str, *args: str) -> str:
+    """`_must` for a listing whose EMPTY output proves something (status, ls-files): git reports
+    a directory it could not open only as a warning on stderr and still exits 0 with nothing
+    listed (A3 review, F3), so any stderr at all is a refusal."""
+    result = _git(env, cwd, *args)
+    if result.rc != 0 or result.err.strip():
+        raise _Refusal(
+            rule,
+            f"git {' '.join(args[:3])} (rc {result.rc}) reported: "
+            f"{result.err.strip().splitlines()[0][:160] if result.err.strip() else 'no output'}",
+        )
+    return result.out
+
+
 def _is_reparse(entry: os.DirEntry[str]) -> bool:
     try:
         if entry.is_symlink() or entry.is_junction():
@@ -248,6 +294,8 @@ class TreeFacts:
     # Directories that look like a BARE repository (HEAD + objects + refs) outside any `.git`: a
     # bare repo can hold the only copy of a commit and has no working tree to inspect.
     bare_repos: tuple[Path, ...] = ()
+    # Entries whose name ends with a dot or a space: invisible to git (and to most Win32 tools).
+    odd_names: tuple[Path, ...] = ()
 
 
 def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
@@ -260,6 +308,7 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
     reparse: str | None = None
     git_entries: list[Path] = []
     bare_repos: list[Path] = []
+    odd_names: list[Path] = []
     error: str | None = None
     stack = [root]
     try:
@@ -288,8 +337,13 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
                         newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
                     except OSError as exc:
                         error = error or f"{path}: {exc}"
-                    if entry.name == ".git":
+                    # Git on Windows treats `.GIT`/`.Git` as `.git` (A3 review, F4).
+                    if entry.name.casefold() == ".git":
                         git_entries.append(path)
+                    if entry.name.endswith((".", " ")):
+                        # Win32 path parsing strips these, so git cannot open such an entry and
+                        # leaves it out of its listings without failing (A3 review, F3).
+                        odd_names.append(path)
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(path)
         except OSError as exc:
@@ -298,7 +352,9 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
             part.lower() for part in current.relative_to(root).parts
         ]:
             bare_repos.append(current)
-    return TreeFacts(newest, reparse, tuple(git_entries), error, tuple(bare_repos))
+    return TreeFacts(
+        newest, reparse, tuple(git_entries), error, tuple(bare_repos), tuple(odd_names)
+    )
 
 
 # --- shared repository proofs -------------------------------------------------------------
@@ -319,7 +375,59 @@ def _remotes(env: AgentEnv, repo: Path) -> list[str]:
         urls = [u.strip() for u in urls if u.strip()]
         if fetch.rc == 0 and push.rc == 0 and urls and all(is_real_remote_url(u) for u in urls):
             allowed.append(name)
-    return allowed
+    if not allowed:
+        return allowed
+    # `--remotes=<name>` reads `refs/remotes/<name>/*`. Another remote can write there too: a
+    # local `bak` whose fetch refspec maps into `refs/remotes/origin/*` (a push updates that
+    # tracking ref), or a remote named `origin/bak` (A3 review, F6). Such a namespace proves
+    # nothing about where a commit really is.
+    # Loose refs live in files, so on Windows `Origin` and `origin` share one namespace.
+    writers = _fetch_destinations(env, repo)
+    trusted = []
+    for name in allowed:
+        ns = f"refs/remotes/{name}/".casefold()
+        folded = name.casefold()
+        if "/" in name:
+            continue
+        if any(
+            other != name
+            and (other.casefold() == folded or other.casefold().startswith(f"{folded}/"))
+            for other in names
+        ):
+            continue  # `origin/bak` (or `ORIGIN`) writes into origin's namespace by its name
+        if any(
+            other != name and _ns_overlap(dst.casefold(), ns)
+            for other, dsts in writers.items()
+            for dst in dsts
+        ):
+            continue
+        trusted.append(name)
+    return trusted
+
+
+def _fetch_destinations(env: AgentEnv, repo: Path) -> dict[str, list[str]]:
+    """remote name -> the destination side of each of its fetch refspecs. Raises on a git
+    failure other than "no such key" (rc 1)."""
+    result = _git(env, repo, "config", "--get-regexp", r"^remote\..*\.fetch$")
+    if result.rc not in (0, 1):
+        raise _Refusal("W3", f"git config failed (rc {result.rc}): {result.err.strip()[:120]}")
+    out: dict[str, list[str]] = {}
+    for line in result.out.splitlines():
+        key, _, spec = line.partition(" ")
+        name = key[len("remote.") : -len(".fetch")]
+        spec = spec.strip().lstrip("+")
+        if not spec or spec.startswith("^"):
+            continue  # a negative refspec writes nothing
+        dst = spec.partition(":")[2]
+        if dst:  # no destination: the fetch updates no tracking ref
+            out.setdefault(name, []).append(dst)
+    return out
+
+
+def _ns_overlap(dst: str, namespace: str) -> bool:
+    """A refspec destination (possibly a `*` glob) can name a ref inside `namespace`."""
+    static = dst.split("*", 1)[0]
+    return static.startswith(namespace) or namespace.startswith(static)
 
 
 def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bool = True) -> Path:
@@ -340,10 +448,10 @@ def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bo
         raise _Refusal("W2", f"{lock.name} present: a git process is working in it")
     if (repo / ".gitmodules").exists() or (gitdir / "modules").exists():
         raise _Refusal("W2", "submodules present (their git dir lives inside the removed area)")
-    staged = _must(env, repo, "W2", "ls-files", "-s")
+    staged = _must_silent(env, repo, "W2", "ls-files", "-s")
     if any(line.startswith("160000 ") for line in staged.splitlines()):
         raise _Refusal("W2", "a gitlink (submodule or nested repo) is tracked")
-    status = _must(
+    status = _must_silent(
         env, repo, "W2", "status", "--porcelain=v1", "--untracked-files=all",
         "--ignore-submodules=none",
     )  # fmt: skip
@@ -351,7 +459,7 @@ def _prove_clean(env: AgentEnv, repo: Path, held: list[str], *, gitdir_state: bo
         raise _Refusal(
             "W2", f"uncommitted or untracked changes: {status.strip().splitlines()[0][:120]}"
         )
-    for line in _must(env, repo, "W2", "ls-files", "-v").splitlines():
+    for line in _must_silent(env, repo, "W2", "ls-files", "-v").splitlines():
         if line and line[0] != "H":
             raise _Refusal("W2", f"hidden change flag '{line[0]}' on {line[2:][:100]}")
     held.append(
@@ -372,7 +480,10 @@ def _prove_pushed(
         raise _Refusal(rule, "no commit at HEAD")
     # `--all` = every ref (branches, tags, notes, stash, refs/original, refs/jj, custom namespaces)
     # plus HEAD. Commits that exist only in a reflog are NOT counted (accepted residual risk).
-    tips = ["--all"] if everything else ["HEAD"]
+    # A linked worktree's shared refs stay in its repository, but its PER-WORKTREE refs live in
+    # the admin dir that is removed after the move: once that is gone their commits are
+    # unreachable and `git gc` drops them (A3 review, F1), so they must be on a remote too.
+    tips = ["--all"] if everything else ["HEAD", *_per_worktree_refs(env, repo, rule)]
     remotes = [f"--remotes={name}" for name in allowed]
     result = _git(env, repo, "rev-list", *tips, "--not", *remotes, "-n", "1")
     if result.rc != 0:
@@ -384,10 +495,21 @@ def _prove_pushed(
             rule, f"commit {result.out.strip()[:12]} is not on any remote ref of {allowed}"
         )
     held.append(
-        f"{rule} every commit of {'every ref and HEAD' if everything else 'HEAD'} is on a "
+        f"{rule} every commit of "
+        f"{'every ref and HEAD' if everything else 'HEAD and its per-worktree refs'} is on a "
         f"remote ref of {', '.join(allowed)}"
     )
     return allowed
+
+
+_PER_WORKTREE_REF_PREFIXES = ("refs/worktree/", "refs/bisect/", "refs/rewritten/")
+
+
+def _per_worktree_refs(env: AgentEnv, repo: Path, rule: str) -> list[str]:
+    """The refs that belong to this worktree alone (git: `refs/worktree/`, `refs/bisect/`,
+    `refs/rewritten/`), read in the worktree itself."""
+    out = _must(env, repo, rule, "for-each-ref", "--format=%(refname)", *_PER_WORKTREE_REF_PREFIXES)
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def _prove_no_stash(env: AgentEnv, repo: Path, held: list[str]) -> None:
@@ -422,7 +544,7 @@ def _prove_ignored(env: AgentEnv, repo: Path, held: list[str]) -> None:
     """W8: the only ignored content is regenerable directories."""
     # `--ignored=matching` cannot be combined with `--untracked-files=no`: untracked entries are
     # listed too (`?? `), and any of them here (W2 already proved none) is a refusal as well.
-    out = _must(env, repo, "W8", "status", "--ignored=matching", "--porcelain=v1", "-z")
+    out = _must_silent(env, repo, "W8", "status", "--ignored=matching", "--porcelain=v1", "-z")
     for item in out.split("\0"):
         if item.startswith("?? "):
             raise _Refusal("W8", f"untracked content appeared: {item[3:][:120]}")
@@ -438,7 +560,7 @@ def _prove_ignored(env: AgentEnv, repo: Path, held: list[str]) -> None:
         # `node_modules/`): regenerable only if that directory holds no tracked source. A tracked
         # `venv/tool.py` next to an ignored `venv/keys.secretlocal` is a project, not a cache.
         root = _regenerable_root(rel)
-        tracked = _must(env, repo, "W8", "ls-files", "-z", "--", f":(literal){root}")
+        tracked = _must_silent(env, repo, "W8", "ls-files", "-z", "--", f":(literal){root}")
         if tracked.strip("\0"):
             raise _Refusal(
                 "W8", f"tracked source lives under '{root}', so ignored {rel[:100]} is kept"
@@ -455,8 +577,18 @@ def _prove_nested(
     own (worktree, clone) unless the artifact is a scratch directory, where it is a nested repo."""
     if facts.bare_repos:
         raise _Refusal(rule, f"bare repository inside: {facts.bare_repos[0]}")
-    repos = sorted({e.parent for e in facts.git_entries if include_root or e.parent != root})
+    entries = [e for e in facts.git_entries if include_root or e.parent != root]
+    # Exclusions first, from paths alone, before ANY git command runs in a nested repository: a
+    # neutral-looking folder can be a linked worktree of an excluded repository, which only its
+    # `.git` pointer names (A3 review, F5).
+    for entry in entries:
+        if _nested_git_excluded(env, entry):
+            raise _Refusal(rule, "excluded project (not inspected further)", excluded=True)
+    repos = sorted({e.parent for e in entries})
     for repo in repos:
+        hidden = next((p for p in facts.odd_names if _inside(p, repo)), None)
+        if hidden is not None:
+            raise _Refusal(rule, f"nested repository {repo}: git cannot see {hidden}")
         nested: list[str] = []
         try:
             _prove_clean(env, repo, nested)
@@ -471,12 +603,42 @@ def _prove_nested(
     )
 
 
+def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
+    """A `.git` entry inside an artifact belongs to an excluded project: by its own path, or, for
+    a pointer FILE, by the admin dir it names and that admin dir's common dir (a linked
+    worktree's main repository). A pointer that cannot be read or parsed counts as excluded:
+    nothing proves it is not (fail closed)."""
+    if _path_excluded(env, entry.parent):
+        return True
+    if entry.is_dir():
+        return False
+    try:
+        admin = _resolve_gitdir(
+            entry.read_text(encoding="utf-8", errors="replace").strip(), entry.parent
+        )
+    except OSError:
+        return True
+    if admin is None:
+        return True
+    targets = [admin]
+    try:
+        common = (admin / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+        targets.append(Path(os.path.normpath(admin / common)))
+    except OSError:
+        pass  # no commondir: a separate git dir, not a linked worktree
+    return _path_excluded(env, *targets, *(t.parent for t in targets))
+
+
 def _prove_tree(env: AgentEnv, path: Path, held: list[str]) -> TreeFacts:
     facts = walk_facts(path)
     if facts.reparse is not None:
         raise _Refusal("W8", f"reparse point (junction or symlink) inside: {facts.reparse}")
     if facts.error is not None:
         raise _Refusal("W8", f"tree could not be fully read: {facts.error}")
+    if facts.odd_names:
+        raise _Refusal(
+            "W8", f"git cannot see a name ending in a dot or space: {facts.odd_names[0]}"
+        )
     held.append("W8 no junction or symlink anywhere in the tree")
     return facts
 
@@ -847,6 +1009,15 @@ def _root_commits(run: GitRunner, repo: Path) -> list[str]:
     return [line.strip() for line in result.out.splitlines() if line.strip()][:50]
 
 
+def _admin_owned_by(admin: Path, worktree: Path) -> bool:
+    """The admin dir's `gitdir` file names `worktree` (its `.git` pointer). Unreadable: False."""
+    try:
+        owner = Path((admin / "gitdir").read_text(encoding="utf-8", errors="replace").strip())
+    except OSError:
+        return False
+    return _posix_eq(owner.parent if owner.name.lower() == ".git" else owner, worktree)
+
+
 def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git) -> str | None:
     """A worktree was just moved into the vault. Keep a copy of its git admin dir inside the
     vaulted directory, then remove EXACTLY that one admin entry so the repository stops listing a
@@ -866,9 +1037,7 @@ def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git)
         ):
             return "the .git pointer does not name a worktree admin dir; nothing was removed"
         repo = admin.parent.parent.parent
-        owner_text = (admin / "gitdir").read_text(encoding="utf-8", errors="replace").strip()
-        owner = Path(owner_text)
-        if not _posix_eq(owner.parent if owner.name == ".git" else owner, original):
+        if not _admin_owned_by(admin, original):
             return "that admin dir belongs to another path; nothing was removed"
         if (admin / "locked").exists():
             return "the worktree is locked; its admin entry was kept"
@@ -925,6 +1094,13 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
             )
         if not _posix_eq(admin.parent.parent, repo / ".git"):
             return "restored, but the saved admin path is not inside that repository"
+        if admin.exists() and not _admin_owned_by(admin, restored):
+            # `git worktree add` reused the freed admin name for ANOTHER worktree: repairing
+            # would repoint that worktree's index and HEAD here (A3 review, F2). Write nothing.
+            return (
+                f"restored, but {admin} now belongs to another worktree; nothing was written "
+                f"(the saved admin data stays in {ADMIN_BACKUP_DIR}\\ for a manual repair)"
+            )
         if not admin.exists():
             admin.parent.mkdir(exist_ok=True)  # `.git/worktrees`, inside a repository we checked
             assert_not_real_profile_under_pytest(
