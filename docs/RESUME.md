@@ -49,6 +49,18 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11.
     3. A6.
     4. B.
+- 19:31 IST checkpoint 5:
+  - **Agent artifacts** (#193, draft, head `0ef5811`, rebased on `eaf734d`):
+    - The A3b third hostile review FAILED with 5 findings (2 unsafe offers, 1 read-only exclusion bypass, 1 race, 1 restore adoption). All are fixed in `d6826ad` (was `bad3e67` before the rebase), each with a test that fails on the old head. ADR-0043 addendum 3 records them.
+    - Mutation: 29 targeted mutants on the fix, 23 killed. The 6 survivors were checks shadowed by a neighbour; 7 new tests now kill 5 of them, and the sixth is equivalent on Python 3.12.12.
+    - Head `0ef5811` adds two fixes on top: a hermetic guard that the fix commit missed (`a69b599`), and a CI flake fix (`0ef5811`). Full verify: 2509 passed, rc 0. CI is still running, and the fourth (data-safety) review is under way.
+    - Next: a fourth, data-safety review on the exact head (merge bar 7), then A4.
+  - **#190**: unchanged. It is blocked only on the real-machine dry run (WHEN GG HAS TIME, item 6).
+  - **Next:**
+    1. Fourth review of agent artifacts, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
