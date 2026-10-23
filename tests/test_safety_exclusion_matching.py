@@ -1166,3 +1166,31 @@ def test_a_realistic_pnpm_tree_with_a_path_keyed_pattern_is_still_offered(
         for j in range(4):
             _winapi.CreateJunction(str(pkgs[(i + j + 1) % len(pkgs)]), str(pkg.parent / f"d{j}"))
     assert subtree_exclusion_match(nm, ["*/nothing/here/*"]) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_the_full_walk_cuts_cycles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path-keyed pattern selects the full walk; its cycle guard (a junction whose target is
+    already on the walk path) must still end every cycle quickly."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    d = tmp_path / "D"
+    (d / "a").mkdir(parents=True)
+    (d / "b").mkdir()
+    _winapi.CreateJunction(str(d / "b"), str(d / "a" / "j"))
+    _winapi.CreateJunction(str(d / "a"), str(d / "b" / "k"))
+    _winapi.CreateJunction(str(d), str(d / "a" / "up"))
+    calls = _counting_scandir(monkeypatch)
+    assert subtree_exclusion_match(d, ["*/nothing/here/*"]) is None
+    assert len(calls) < 30
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_the_full_walk_budget_ignores_trees_without_junctions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(safety, "_JUNCTION_WALK_BUDGET", 3)
+    plain = tmp_path / "plain"
+    for i in range(10):
+        (plain / f"d{i}" / "e").mkdir(parents=True)
+    assert subtree_exclusion_match(plain, ["*/nothing/here/*"]) is None  # 20 dirs, no junction
