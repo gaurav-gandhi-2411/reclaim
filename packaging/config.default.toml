@@ -111,6 +111,16 @@ enabled = false
 # restore for 30 days; `reclaim purge` then permanently deletes past that window.
 retention_days = 30
 
+[categories.agent_artifacts]
+# Finished AI-agent leftovers: git worktrees and throwaway verify clones whose every commit is on
+# a real remote and that no process uses, and idle %TEMP%\claude session scratch. Other tools'
+# data, so OFF by default and never offered in safe mode. Always a review item (you click), and
+# removal is a move into the vault (undoable for retention_days), never a permanent delete.
+enabled = false
+retention_days = 14
+idle_days = 7
+clone_name_patterns = ["*-verify*", "_verify*"]
+
 [categories.large_logs]
 # Log files above min_size_bytes not modified in stale_days.
 enabled = false
