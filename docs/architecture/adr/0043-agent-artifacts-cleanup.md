@@ -246,3 +246,11 @@ A ninth independent review, of the addendum 7 and 8 changes (`89f6010` against `
 - **An include anywhere counts (F2).** Git honours `[include]` after another header on the same line, and after a UTF-8 BOM. Both were missed. `[include` is now matched anywhere in the file, and the key prefix allows a BOM.
 - **Config scans are linear (F3).** `^\s*` with MULTILINE went quadratic on blank lines: 50,000 blank lines took 213 s, where git takes 0.03 s. Every pattern now uses `[ \t]*`, and values stop at the line end.
 - **Checked and still offered:** configs written by mainstream tools: `git lfs install --local`, Git Credential Manager settings, `gh` remote markers, VS Code branch settings, `lfs.url`, and `core.excludesFile = ~/.gitignore_global`.
+
+## Addendum 10 (2026-10-24): the tenth review (A10) passed; two older matching gaps closed
+
+A tenth, very narrow review of the addendum-9 regex change, checked against real git 2.51 on 35 crafted configs, **passed**. That change lets git read nothing that the previous head hid. The review noted two older issues, not regressions. Both are fixed, with tests that fail on the previous head.
+
+- **Several headers before a key.** Git honours `[core][core] worktree = <path>` and a `]` inside a quoted subsection name (`[remote "a]b"] url = ...`). The key prefix allowed only one header without quotes, so such a value naming an excluded project was missed. Only a hand edit produces either form.
+- **Linear value capture.** The lazy value capture was quadratic on a long run of blanks inside a value (32,000 spaces took 10 s). The capture is now greedy, up to the last non-blank character.
+- **Review stops here.** These lines got targeted mutants and the full verify, but no eleventh review. Ten independent reviews have run. Three of the last four passed for data safety, and the fourth (A8) failed on a robustness crash in a fix, with no data at risk. The changes since are small, read-only exclusion matching, each pinned by a test that fails on the head before it.
