@@ -237,3 +237,12 @@ A narrow eighth review of the addendum-7 change (`98218ce`) found a regression a
   - Repository-local includes are rare, and hiding is the safe direction.
   - The other values read (`core.worktree`, remote URLs, `core.excludesFile`, `core.attributesFile`) have their quotes removed, as git joins quoted pieces, and are also matched when written on their section's header line. `file://host/` prefixes are stripped.
 - **Not covered, on purpose:** other keys that name files (`core.hooksPath`, `commit.template`, `mailmap.file`). None of the read-only proofs reads them: the proofs run `status`, `ls-files`, `rev-list`, `for-each-ref`, `config`, `check-attr` and `log -1 --format`, never a commit or a hook. (This is reasoned from that command list, not tested key by key.)
+
+## Addendum 9 (2026-10-24): the ninth review (A9) passed; one realistic over-exclusion fixed
+
+A ninth independent review, of the addendum 7 and 8 changes (`89f6010` against `eeeb493`), **passed for data safety**. Nothing newly offered, and none of 15 crafted configs raised: binary junk, UTF-16, a config that is a directory, NULs, 120k-character values, device and UNC paths. It found one realistic over-exclusion and two smaller issues, all fixed with tests that fail on `89f6010`.
+
+- **An escaped trailing backslash is no continued line (F1, realistic).** Git writes a value's trailing backslash as `\\`. The addendum-8 check read that as a continued line, so any clone whose remote URL, excludes file or alias ended in a backslash was hidden. A Windows path from tab completion is enough (`git clone D:\repos\x\ dest` stores `url = D:\\repos\\x\\`). A continued line is now an *odd* run of trailing backslashes.
+- **An include anywhere counts (F2).** Git honours `[include]` after another header on the same line, and after a UTF-8 BOM. Both were missed. `[include` is now matched anywhere in the file, and the key prefix allows a BOM.
+- **Config scans are linear (F3).** `^\s*` with MULTILINE went quadratic on blank lines: 50,000 blank lines took 213 s, where git takes 0.03 s. Every pattern now uses `[ \t]*`, and values stop at the line end.
+- **Checked and still offered:** configs written by mainstream tools: `git lfs install --local`, Git Credential Manager settings, `gh` remote markers, VS Code branch settings, `lfs.url`, and `core.excludesFile = ~/.gitignore_global`.
