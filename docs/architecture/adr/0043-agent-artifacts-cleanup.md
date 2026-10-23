@@ -215,3 +215,14 @@ A sixth independent review, run against `905bfa1`, found one medium and two low 
   - A skip-worktree path, which is not on disk under sparse checkout, is matched on its own.
 - **`status.showUntrackedFiles=no` no longer refuses everything (O1).** With that setting configured, W8's `status --ignored=matching` was a fatal git error. W8 now passes the default `--untracked-files=normal` explicitly.
 - **Known, safe direction (O2):** in a reftable repository the admin HEAD is `ref: refs/heads/.invalid`. `after_vault_move` therefore always keeps the admin entry, and the worktree shows as prunable. No commit is lost; only the bookkeeping is skipped.
+
+## Addendum 7 (2026-10-24): the seventh review (A7, data safety) passed; two read-only gaps closed
+
+A seventh independent review, run against `eeeb493`, **passed for data safety**. It found no realistic disk state in which applying the offer, and optionally restoring, loses work, changes another worktree, or writes outside the vault. It left two low-realism gaps in which git *read* an excluded project's files. Nothing could be offered through either. Both are closed, each with a test that fails on `eeeb493`.
+
+- **Config file references are exclusion targets (F1).** A git dir's config can name files that git reads on every command: `[include]` and `[includeIf]` paths, `core.excludesFile` and `core.attributesFile`. One inside an excluded project was read by every proof. These targets are now matched before any git runs.
+- **A local remote is matched as a path (F2).** `git clone <root>\zzexclproj\.git` produces a remote URL ending in `.git` itself, so no repository name came out of it. The name now skips a trailing `.git` part, and a local remote's own path (a drive, root or `file://` path) is matched against the exclusions as a path.
+- **Recorded, safe direction, not changed:**
+  - Worktrees of a bare repository are refused at W1, because the admin dir's parent is not named `.git`.
+  - A worktree whose admin `gitdir` is relative keeps its admin entry, so the bookkeeping is skipped and the worktree shows as prunable.
+  - If the user rebuilds a vaulted worktree by hand on the same branch and then deletes that folder, restore can adopt the leftover admin entry, whose HEAD is identical. What is lost is the saved index, proven clean, and the reflog: the accepted class.
