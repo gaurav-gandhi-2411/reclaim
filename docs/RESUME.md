@@ -34,6 +34,21 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     4. A4: `integration/run-2026-10`.
     5. A5: build 11.
     6. A6.
+- 13:00 IST checkpoint 4:
+  - **#192** (checkpoint 3 docs) merged as `c01f483`; main CI green after it. Its first CI run hit a performance-floor flake on a docs-only change; the re-run passed, and the flake is logged as one.
+  - **#190** (head `ce79f43`): verifier pass 8 PASS, CI 6/6, full verify 2262 passed, merge gate eligible. It is blocked only on the real-machine dry run: Claude Code's low-memory reaper stopped that run while it waited for RAM, and I may not restart a reaped job on my own (WHEN GG HAS TIME, item 6).
+  - **Agent artifacts** (#193, draft, head `7cc15b1`):
+    - The A3 second hostile review FAILED with 6 bypasses, 2 of them data loss.
+    - All are fixed in `3e9b659`, each with a test that reproduces the scenario and fails on the old head.
+    - Full verify 2481 passed, CI 6/6.
+    - The third review (A3b) and the mutation re-run are running.
+    - A4 and A6 stay blocked until they pass.
+  - **Cleanup:** about 9.1 GB of verifier scratch deleted on D:, with check and delete as separate commands.
+  - **Next:**
+    1. A3b verdict, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
