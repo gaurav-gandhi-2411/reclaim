@@ -1186,6 +1186,22 @@ def test_the_full_walk_cuts_cycles(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+@pytest.mark.parametrize("pattern", ["*\\j\\a\\secret.txt", "*j?a?secret*", "*J*a*secret*"])
+def test_the_full_walk_gives_a_junction_to_the_root_its_first_lap(
+    tmp_path: Path, pattern: str
+) -> None:
+    """`cand\\J -> cand`: the first lap's text names real content inside the candidate, as it
+    does for a junction to any directory below the root (#190 verifier pass 7, F1)."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    cand = tmp_path / "cand"
+    (cand / "a").mkdir(parents=True)
+    (cand / "a" / "secret.txt").write_text("x")
+    _winapi.CreateJunction(str(cand), str(cand / "J"))
+    assert subtree_exclusion_match(cand, [pattern]) == pattern
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
 def test_the_full_walk_budget_ignores_trees_without_junctions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

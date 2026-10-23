@@ -200,7 +200,8 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
       junction INTO the candidate is deleted with it at its real place (pnpm). So every
       junction is descended as before; only a junction whose target is already on the current
       walk path is cut (a cycle: its repeat-lap text, which the old walk only reached by
-      looping until MAX_PATH, is the one thing lost). Directories listed through a junction
+      looping until MAX_PATH, is the one thing lost; a junction back to the root still gets
+      its first lap). Directories listed through a junction
       count against `_JUNCTION_WALK_BUDGET`; past it the walk fails closed
       (`too many junctions`) instead of running for minutes.
 
@@ -228,10 +229,12 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         root_real = os.path.normcase(os.path.normpath(root_text))
     cover_once = all(_one_component_only(p) for p in ordered)
     covered_set = {root_real}
-    # (text, io, real, entered): entered = the root and the junction targets on this walk path
-    # (the full mode's cycle guard; unused by cover-once).
+    # (text, io, real, entered): entered = the junction targets on this walk path (the full
+    # mode's cycle guard; unused by cover-once). The root is deliberately NOT in it: a junction
+    # back to the root gets its one lap, as one to any directory below it does, because that
+    # lap's text names real content inside the candidate (#190 verifier pass 7).
     stack: list[tuple[str, str, str, frozenset[str]]] = [
-        (root_text, root_io, root_real, frozenset((root_real,)))
+        (root_text, root_io, root_real, frozenset())
     ]
     budget = _JUNCTION_WALK_BUDGET
     # The rest of the tree is still walked after an unreadable directory, so a real match
@@ -239,7 +242,7 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     unreadable: str | None = None
     while stack:
         current, current_io, current_real, entered = stack.pop()
-        if not cover_once and len(entered) > 1:  # listed through a junction
+        if not cover_once and entered:  # listed through a junction
             budget -= 1
             if budget < 0:
                 unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (too many junctions)>"
