@@ -2048,3 +2048,75 @@ def test_review_a6_an_exclusion_walk_that_fails_hides_the_refusal(tmp_path: Path
     world.env.exclusion_match = failing
     v = _verdict(world, wt, repo)
     assert v.excluded and not v.offered
+
+
+# --- the seventh (data-safety) review, A7 ---------------------------------------------------------
+
+
+def _no_git_world(tmp_path: Path) -> tuple[World, list[Path]]:
+    """A world whose git runner records every call (exclusions are decided before any git)."""
+    world = make_world(tmp_path, exclusions=("zzexclproj",))
+    ran_in: list[Path] = []
+
+    def recording(args: object, cwd: Path) -> aa.GitResult:
+        ran_in.append(Path(cwd))
+        return aa.run_git(args, cwd)  # type: ignore[arg-type]
+
+    world.env.run_git = recording
+    return world, ran_in
+
+
+@pytest.mark.parametrize("key", ["include.path", "core.excludesFile", "core.attributesFile"])
+def test_review_a7_a_config_file_inside_an_excluded_project_hides_the_clone(
+    tmp_path: Path, key: str
+) -> None:
+    """F1: git READS the file an `include.path` (or the ignore/attribute file) names: one inside
+    an excluded project was read by every proof."""
+    shared = tmp_path / "zzexclproj" / "shared.gitconfig"
+    shared.parent.mkdir()
+    shared.write_text("[core]\n", encoding="utf-8")
+    clone = _clone(tmp_path)
+    git(clone, "config", key, shared.as_posix())
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert ran_in == []
+
+
+def test_review_a7_an_include_path_elsewhere_does_not_hide(tmp_path: Path) -> None:
+    shared = tmp_path / "shared" / "team.gitconfig"
+    shared.parent.mkdir()
+    shared.write_text("[core]\n", encoding="utf-8")
+    clone = _clone(tmp_path)
+    git(clone, "config", "include.path", shared.as_posix())
+    world, _ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+def test_review_a7_a_clone_of_an_excluded_projects_git_dir_is_hidden(tmp_path: Path) -> None:
+    """F2: `git clone <root>\\zzexclproj\\.git`: the URL ends in `.git` itself, so no repository
+    name came out of it, and its local path was never matched."""
+    excluded = make_repo(tmp_path, "zzexclproj")
+    clone = tmp_path / "work" / "_verify-pr12"
+    clone.parent.mkdir()
+    git(tmp_path, "clone", "-q", str(excluded / ".git"), str(clone))
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+    assert ran_in == []
+
+
+@pytest.mark.parametrize(
+    ("url", "name"),
+    [
+        ("D:\\r\\zzexclproj\\.git", "zzexclproj"),
+        ("D:/r/zzexclproj/.git/", "zzexclproj"),
+        ("file:///D:/r/zzexclproj/.git", "zzexclproj"),
+        ("https://h/u/proj.git", "proj"),
+        (".git", ""),
+    ],
+)
+def test_review_a7_the_repository_name_skips_a_trailing_git_dir(url: str, name: str) -> None:
+    assert aa._url_repo_name(url) == name

@@ -787,9 +787,21 @@ _CORE_WORKTREE = re.compile(r"^\s*worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.
 _REMOTE_URL = re.compile(r"^\s*(?:push)?url\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
+# Config values that make git READ another file: `[include]`/`[includeIf]` paths, and the
+# ignore and attribute files. One inside an excluded project is read by every git command.
+_CONFIG_FILE_REF = re.compile(
+    r"^\s*(?:path|excludesfile|attributesfile)\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
+_LOCAL_URL = re.compile(r"^(?:file://)?(?:[A-Za-z]:[\\/]|[\\/])")
+
+
 def _url_repo_name(url: str) -> str:
-    """The repository name a remote URL ends in: `https://h/u/zzexclproj.git` -> `zzexclproj`."""
-    tail = re.split(r"[\\/:]", url.strip().strip('"').rstrip("\\/"))[-1]
+    """The repository name a remote URL ends in: `https://h/u/zzexclproj.git` -> `zzexclproj`,
+    and `D:\\r\\zzexclproj\\.git` (a clone of a working copy's git dir) -> `zzexclproj`."""
+    parts = [p for p in re.split(r"[\\/:]", url.strip().strip('"')) if p]
+    while parts and parts[-1].lower() == ".git":
+        parts.pop()
+    tail = parts[-1] if parts else ""
     return tail[:-4] if tail.lower().endswith(".git") else tail
 
 
@@ -823,9 +835,16 @@ def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
             # A clone of an excluded project is that project, wherever it sits: its remote
             # names it (`.../zzexclproj.git`) even when the folder does not (A5 review, F5).
             for match in _REMOTE_URL.finditer(config):
-                name = _url_repo_name(match.group(1))
+                url = match.group(1).strip('"')
+                name = _url_repo_name(url)
                 if name:
                     targets.append(gitdir.parent / name / ".git")
+                if _LOCAL_URL.match(url):  # a local remote is a path: match it as one (A7, F2)
+                    local = url[len("file://") :] if url.lower().startswith("file://") else url
+                    targets.append(Path(os.path.normpath(local)))
+            for match in _CONFIG_FILE_REF.finditer(config):  # (A7 review, F1)
+                ref = Path(match.group(1).strip('"')).expanduser()
+                targets.append(Path(os.path.normpath(gitdir / ref)))
         objects = gitdir / "objects"
         alternates = read(objects / "info" / "alternates")
         # A linked worktree of this repository lives wherever its admin `gitdir` file says; one
