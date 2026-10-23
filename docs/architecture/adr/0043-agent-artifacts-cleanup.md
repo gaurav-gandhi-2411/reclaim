@@ -226,3 +226,14 @@ A seventh independent review, run against `eeeb493`, **passed for data safety**.
   - Worktrees of a bare repository are refused at W1, because the admin dir's parent is not named `.git`.
   - A worktree whose admin `gitdir` is relative keeps its admin entry, so the bookkeeping is skipped and the worktree shows as prunable.
   - If the user rebuilds a vaulted worktree by hand on the same branch and then deletes that folder, restore can adopt the leftover admin entry, whose HEAD is identical. What is lost is the saved index, proven clean, and the reflog: the accepted class.
+
+## Addendum 8 (2026-10-24): the eighth review (A8) found a crash in the addendum-7 change
+
+A narrow eighth review of the addendum-7 change (`98218ce`) found a regression and some remaining spellings. Nothing that the earlier head refused was offered, so no data was at risk. Each fix has a test that fails on `98218ce`.
+
+- **A home path that cannot be expanded no longer crashes detection (F1).** `Path("~otheruser/x").expanduser()` raises `RuntimeError`, which `except OSError` did not catch. So a single `core.excludesFile = ~nosuchuser/...`, or a `[submodule] path = ~lib` that git accepts, aborted the whole detection run. Such a path now counts as excluded. The `path` key is no longer read at all: it also matched `[submodule] path`.
+- **Includes are not followed; any include counts as excluded (F2).** An include can be nested, quoted in pieces, continued across lines or conditional. Following one reliably would take git, and git would read the included file itself.
+  - Any `[include]` or `[includeIf]` section, or any continued line, in a git dir's own config therefore hides the artifact before git runs.
+  - Repository-local includes are rare, and hiding is the safe direction.
+  - The other values read (`core.worktree`, remote URLs, `core.excludesFile`, `core.attributesFile`) have their quotes removed, as git joins quoted pieces, and are also matched when written on their section's header line. `file://host/` prefixes are stripped.
+- **Not covered, on purpose:** other keys that name files (`core.hooksPath`, `commit.template`, `mailmap.file`). None of the read-only proofs reads them: the proofs run `status`, `ls-files`, `rev-list`, `for-each-ref`, `config`, `check-attr` and `log -1 --format`, never a commit or a hook. (This is reasoned from that command list, not tested key by key.)
