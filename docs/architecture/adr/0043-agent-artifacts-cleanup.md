@@ -199,3 +199,19 @@ A fifth independent review, run against `5f4d7a9`, found five issues: one medium
 - **A listing never names an excluded project (F4).** When W2 refused first, its detail printed an untracked path under an excluded project into the report. A status listing that names an excluded path now hides the verdict like any other exclusion hit.
 - **A clone of an excluded project is excluded wherever it sits (F5).** Remote URLs in a git dir's config (`url`, `pushurl`) are exclusion targets, checked before any git runs. A clone named `_verify-pr12` of `.../zzexclproj.git` is therefore hidden.
 - **Hardening: inherited git variables are dropped.** Variables that point git at another repository, index, object store or ref view, or that inject config (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG_PARAMETERS` and the like), are removed before git runs. Inherited from a hook or a shell, they made every proof describe another repository. `GIT_CONFIG_GLOBAL` is kept, since a user can choose it deliberately.
+
+## Addendum 6 (2026-10-23): changes forced by the sixth review (A6, data safety)
+
+A sixth independent review, run against `905bfa1`, found one medium and two low issues, plus one over-refusal. Each fix has a test that reproduces the reported scenario, and those tests fail on `905bfa1`.
+
+- **A clean filter can hide the only copy (F1, medium).** This narrows what addendum 5 accepted: a filter *running* is still accepted, but a filter *hiding content* is not.
+  - A clean filter that drops content on its way into the index, such as `nbstripout` dropping notebook outputs, leaves the working file different from the commit. Once that commit is pushed and the index stat matches, `git status` is empty, and the dropped bytes exist only on disk.
+  - W2, which every clone and nested repository also goes through, now refuses when any clean or process filter applies to a tracked file. Git LFS is the exception: it keeps what it replaces in its store, which is checked separately.
+  - The exemption follows the configured program (`git-lfs ...`), not the driver's name.
+  - Comparing `hash-object --no-filters` against the blob would be more precise, but it mismatches every file that `core.autocrlf` converts on Windows, so it was not used.
+  - A filter installed globally but applying to no tracked file does not refuse.
+- **No refusal detail names an excluded project (F2, F3).** Some rules run before the subtree exclusion walk (W2, W8, S2, S8), and their details can name a path inside the artifact.
+  - Every evaluator's refusal is now hidden when the artifact's subtree holds an excluded name. A walk that fails counts as a hit.
+  - A skip-worktree path, which is not on disk under sparse checkout, is matched on its own.
+- **`status.showUntrackedFiles=no` no longer refuses everything (O1).** With that setting configured, W8's `status --ignored=matching` was a fatal git error. W8 now passes the default `--untracked-files=normal` explicitly.
+- **Known, safe direction (O2):** in a reftable repository the admin HEAD is `ref: refs/heads/.invalid`. `after_vault_move` therefore always keeps the admin entry, and the worktree shows as prunable. No commit is lost; only the bookkeeping is skipped.
