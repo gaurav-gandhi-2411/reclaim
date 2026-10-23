@@ -2017,3 +2017,34 @@ def test_review_a6_status_show_untracked_files_no_does_not_refuse_everything(
     git(repo, "config", "status.showUntrackedFiles", "no")
     v = _verdict(make_world(tmp_path), wt, repo)
     assert v.offered, (v.failed_rule, v.failed_detail)
+
+
+def test_review_a6_the_filter_check_reads_every_chunk_of_tracked_files(tmp_path: Path) -> None:
+    """`check-attr` runs on 100 paths at a time: a filtered file past the first chunk counts."""
+    repo, wt = _wt(tmp_path)
+    for i in range(150):
+        (wt / f"f{i:03d}.txt").write_text("x\n", encoding="utf-8")
+    (wt / "zz_last.ipynb").write_text("{cells}\n", encoding="utf-8")
+    git(wt, "add", ".")
+    git(wt, "commit", "-q", "-m", "many files")
+    push_branch(wt, "feat")
+    git(repo, "config", "filter.strip.clean", "sed -n 1p")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("*.ipynb filter=strip\n", encoding="utf-8")
+    with pytest.raises(aa._Refusal, match=r"zz_last.ipynb"):
+        aa._prove_no_hiding_filter(make_world(tmp_path).env, wt)
+
+
+def test_review_a6_an_exclusion_walk_that_fails_hides_the_refusal(tmp_path: Path) -> None:
+    """Fail closed: if the subtree exclusion walk cannot run, the refusal detail may name an
+    excluded project, so it is hidden."""
+    repo, wt = _wt(tmp_path)
+    (wt / "notes.txt").write_text("x", encoding="utf-8")
+    world = make_world(tmp_path)
+
+    def failing(path: Path, is_dir: bool) -> str | None:
+        raise OSError("walk failed")
+
+    world.env.exclusion_match = failing
+    v = _verdict(world, wt, repo)
+    assert v.excluded and not v.offered
