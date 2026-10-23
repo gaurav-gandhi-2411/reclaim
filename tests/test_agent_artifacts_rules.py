@@ -2189,3 +2189,77 @@ def test_review_a8_config_spellings_git_accepts_still_hide_the_clone(
     v = aa.evaluate_clone(world.env, clone)
     assert v.excluded and not v.offered
     assert ran_in == []
+
+
+# --- the ninth review, A9 -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key_value",
+    [
+        ("remote.trail.url", "C:\\repos\\x\\"),
+        ("core.excludesFile", "C:\\Users\\me\\ignores\\"),
+        ("alias.ll", "log --format=%h\\"),
+    ],
+)
+def test_review_a9_a_value_ending_in_a_backslash_does_not_hide_the_clone(
+    tmp_path: Path, key_value: tuple[str, str]
+) -> None:
+    """F1: git writes a trailing `\\` as `\\\\`; that is no continued line. Such values come
+    from tab completion of Windows paths, and they hid the clone."""
+    clone = _clone(tmp_path)
+    git(clone, "config", *key_value)
+    config = (clone / ".git" / "config").read_text(encoding="utf-8")
+    assert "\\\\\n" in config  # git escaped the backslash
+    world, _ran_in = _no_git_world(tmp_path)
+    assert not aa._gitdir_excluded(world.env, clone / ".git")
+
+
+def test_review_a9_a_clone_from_a_path_with_a_trailing_backslash_is_not_hidden(
+    tmp_path: Path,
+) -> None:
+    source = make_repo(tmp_path, "srcrepo")
+    clone = tmp_path / "proj-verify1"
+    git(tmp_path, "clone", "-q", str(source) + "\\", str(clone))
+    world, _ran_in = _no_git_world(tmp_path)
+    assert not aa._gitdir_excluded(world.env, clone / ".git")
+
+
+def test_review_a9_a_continued_line_still_hides(tmp_path: Path) -> None:
+    clone = _clone(tmp_path)
+    with (clone / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write("\n[alias]\n\tll = log \\\\\\\n --oneline\n")  # `\\` then a continuation `\`
+    world, _ran_in = _no_git_world(tmp_path)
+    assert aa._gitdir_excluded(world.env, clone / ".git")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["[core] [include] path = {target}\n", "\ufeff[include]\n\tpath = {target}\n"],
+)
+def test_review_a9_an_include_git_honours_anywhere_hides_the_clone(
+    tmp_path: Path, text: str
+) -> None:
+    """F2: an include after another header on the same line, or after a BOM, was missed."""
+    target = tmp_path / "zzexclproj" / "x.cfg"
+    target.parent.mkdir()
+    target.write_text("[user]\n\tname = fromexcluded\n", encoding="utf-8")
+    clone = _clone(tmp_path)
+    config = clone / ".git" / "config"
+    original = config.read_text(encoding="utf-8")
+    config.write_text(text.format(target=target.as_posix()) + original, encoding="utf-8")
+    world, ran_in = _no_git_world(tmp_path)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered
+    assert ran_in == []
+
+
+def test_review_a9_a_config_of_blank_lines_is_read_in_linear_time(tmp_path: Path) -> None:
+    """F3: `^\\s*` with MULTILINE went quadratic: 50k blank lines took 213 s."""
+    gitdir = tmp_path / "repo" / ".git"
+    gitdir.mkdir(parents=True)
+    (gitdir / "config").write_text("\n" * 50_000 + " " * 50 + "\n" * 1000, encoding="utf-8")
+    world, _ran_in = _no_git_world(tmp_path)
+    started = time.monotonic()
+    aa._gitdir_excluded(world.env, gitdir)
+    assert time.monotonic() - started < 5.0

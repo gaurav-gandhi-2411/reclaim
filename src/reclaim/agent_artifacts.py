@@ -786,19 +786,25 @@ def _raise(exc: OSError) -> None:
 # Config keys read without git: a key may also sit on its section's header line (`[core]
 # worktree = x`), and git joins quoted pieces (`"zz"exclproj` is `zzexclproj`), so every value
 # has its quotes removed (A8 review, F2).
-_KEY_PREFIX = r"^\s*(?:\[[^\]\n]*\]\s*)?"
-_CORE_WORKTREE = re.compile(_KEY_PREFIX + r"worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-_REMOTE_URL = re.compile(
-    _KEY_PREFIX + r"(?:push)?url\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
-)
+# `[ \t]`, never `\s`: `\s` also matches newlines, and on a config of blank lines the scan went
+# quadratic (50k blank lines took 213 s; A9 review, F3). A UTF-8 BOM may open the file.
+_KEY_PREFIX = r"^\ufeff?[ \t]*(?:\[[^\]\n]*\][ \t]*)?"
+_KEY_VALUE = r"[ \t]*=[ \t]*([^\r\n]+?)[ \t]*\r?$"
+_CORE_WORKTREE = re.compile(_KEY_PREFIX + r"worktree" + _KEY_VALUE, re.IGNORECASE | re.MULTILINE)
+_REMOTE_URL = re.compile(_KEY_PREFIX + r"(?:push)?url" + _KEY_VALUE, re.IGNORECASE | re.MULTILINE)
 # Files git READS on every command when the config names them: one inside an excluded project
 # was read by every proof (A7 review, F1).
 _CONFIG_FILE_REF = re.compile(
-    _KEY_PREFIX + r"(?:excludesfile|attributesfile)\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE
+    _KEY_PREFIX + r"(?:excludesfile|attributesfile)" + _KEY_VALUE, re.IGNORECASE | re.MULTILINE
 )
 # An include (nested, quoted, conditional...) or a continued line cannot be followed reliably
 # without git, which would read the file itself: such a config counts as excluded (A8, F2).
-_UNFOLLOWABLE_CONFIG = re.compile(r"^\s*\[\s*include|\\\r?$", re.IGNORECASE | re.MULTILINE)
+# `[include` ANYWHERE: git honours one after another header on the same line, or after a BOM
+# (A9, F2). A continued line ends in an ODD run of backslashes: `\\` at the end is git's own
+# escape of one backslash, as in `url = D:\\repos\\x\\` (A9 review, F1: that hid such clones).
+_UNFOLLOWABLE_CONFIG = re.compile(
+    r"\[[ \t]*include|(?<!\\)(?:\\\\)*\\\r?$", re.IGNORECASE | re.MULTILINE
+)
 _LOCAL_URL = re.compile(r"^(?:file://[^/\\]*)?(?:[A-Za-z]:[\\/]|[\\/])", re.IGNORECASE)
 _FILE_URL_PREFIX = re.compile(r"^file://[^/\\]*", re.IGNORECASE)  # `file://host` included
 
