@@ -348,9 +348,10 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
                         stack.append(path)
         except OSError as exc:
             error = error or f"{current}: {exc}"
-        if {"head", "objects", "refs"} <= names and ".git" not in [
-            part.lower() for part in current.relative_to(root).parts
-        ]:
+        # Only a repository's OWN git dir (named `.git`) is exempt; a bare repository anywhere
+        # below it (`.git/backup.git`) can hold the only copy of a commit too (A3b review, N2).
+        # `.git/modules/<name>` is a full git dir as well and is flagged: submodules are refused.
+        if {"head", "objects", "refs"} <= names and current.name.casefold() != ".git":
             bare_repos.append(current)
     return TreeFacts(
         newest, reparse, tuple(git_entries), error, tuple(bare_repos), tuple(odd_names)
@@ -362,6 +363,20 @@ def walk_facts(root: Path, *, stop_at_reparse: bool = True) -> TreeFacts:
 
 def _remotes(env: AgentEnv, repo: Path) -> list[str]:
     """Names of the remotes whose URL is a real remote. Raises on a git failure."""
+    # Git still honours the legacy `$GIT_COMMON_DIR/remotes/<name>` and `branches/<name>` files:
+    # such a remote is missing from `git remote` and from `remote.*.fetch`, yet its `Pull:` line
+    # can write into refs/remotes/origin/* (A3b review, N1). Not parsed: refused.
+    common_text = _must(env, repo, "W3", "rev-parse", "--git-common-dir").strip()
+    common = Path(common_text) if Path(common_text).is_absolute() else repo / common_text
+    for legacy in ("remotes", "branches"):
+        try:
+            entries = [p.name for p in (common / legacy).iterdir()]
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _Refusal("W3", f"cannot read {common / legacy}: {exc}") from exc
+        if entries:
+            raise _Refusal("W3", f"a legacy remote definition is present: {legacy}/{entries[0]}")
     names = [n for n in _must(env, repo, "W3", "remote").split() if n]
     allowed = []
     for name in names:
@@ -604,14 +619,14 @@ def _prove_nested(
 
 
 def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
-    """A `.git` entry inside an artifact belongs to an excluded project: by its own path, or, for
-    a pointer FILE, by the admin dir it names and that admin dir's common dir (a linked
-    worktree's main repository). A pointer that cannot be read or parsed counts as excluded:
-    nothing proves it is not (fail closed)."""
+    """A `.git` entry inside an artifact belongs to an excluded project: by its own path, or by
+    what its git dir (the directory itself, or the admin dir a pointer FILE names) refers to
+    (`_gitdir_excluded`). A pointer that cannot be read or parsed counts as excluded: nothing
+    proves it is not (fail closed)."""
     if _path_excluded(env, entry.parent):
         return True
     if entry.is_dir():
-        return False
+        return _gitdir_excluded(env, entry)
     try:
         admin = _resolve_gitdir(
             entry.read_text(encoding="utf-8", errors="replace").strip(), entry.parent
@@ -620,13 +635,53 @@ def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
         return True
     if admin is None:
         return True
-    targets = [admin]
+    return _gitdir_excluded(env, admin)
+
+
+_CORE_WORKTREE = re.compile(r"^\s*worktree\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
+    """Git run in `gitdir` would read an excluded project: the git dir itself, its common dir (a
+    linked worktree's main repository), any object store it borrows through
+    `objects/info/alternates` (`clone --shared`), or a `core.worktree` it names (A3b review, N4:
+    these held for `.git` FILES only, so a `.git` DIRECTORY with a commondir read the excluded
+    repository). A file that exists but cannot be read counts as excluded (fail closed)."""
+    if depth > 4:
+        return True  # an alternates chain this long is not a normal repository
+    targets = [gitdir, gitdir.parent]
+    deeper: list[Path] = []  # git dirs whose own settings apply too
+
+    def read(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return None
+
     try:
-        common = (admin / "commondir").read_text(encoding="utf-8", errors="replace").strip()
-        targets.append(Path(os.path.normpath(admin / common)))
+        common = read(gitdir / "commondir")
+        if common is not None and common.strip():
+            resolved = Path(os.path.normpath(gitdir / common.strip()))
+            targets += [resolved, resolved.parent]
+            deeper.append(resolved)
+        config = read(gitdir / "config")
+        if config is not None:
+            for match in _CORE_WORKTREE.finditer(config):
+                targets.append(Path(os.path.normpath(gitdir / match.group(1).strip('"'))))
+        objects = gitdir / "objects"
+        alternates = read(objects / "info" / "alternates")
     except OSError:
-        pass  # no commondir: a separate git dir, not a linked worktree
-    return _path_excluded(env, *targets, *(t.parent for t in targets))
+        return True
+    for line in (alternates or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        store = Path(os.path.normpath(objects / line))  # relative to the objects dir
+        targets += [store, store.parent]
+        deeper.append(store.parent)
+    if _path_excluded(env, *targets):
+        return True
+    return any(_gitdir_excluded(env, d, depth + 1) for d in deeper if d != gitdir)
 
 
 def _prove_tree(env: AgentEnv, path: Path, held: list[str]) -> TreeFacts:
@@ -828,7 +883,11 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
     project = repo.name
     # Exclusions first, from the path strings alone: an excluded project's worktree or repository
     # is not touched at all (no git runs in it), not merely refused later.
-    if _path_excluded(env, path, repo):
+    pointer_file = (path / ".git").is_file()  # anything else is refused visibly by W1 below
+    if _path_excluded(env, path, repo) or (
+        pointer_file and _nested_git_excluded(env, path / ".git")
+    ):
+        # The pointer's admin dir can name an excluded common dir (A3b review, N4/F5h).
         return _excluded("worktree", path, project, repo)
     try:
         listed = list_worktrees(env, repo)
@@ -880,7 +939,8 @@ def matches_clone_name(env: AgentEnv, path: Path) -> bool:
 def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
     held: list[str] = []
     project = path.name
-    if _path_excluded(env, path):
+    if _path_excluded(env, path) or _gitdir_excluded(env, path / ".git"):
+        # e.g. `clone --shared` of an excluded project reads its objects (A3b review, N4/F5g)
         return _excluded("clone", path, project, path)
     try:
         if not matches_clone_name(env, path):
@@ -1018,6 +1078,35 @@ def _admin_owned_by(admin: Path, worktree: Path) -> bool:
     return _posix_eq(owner.parent if owner.name.lower() == ".git" else owner, worktree)
 
 
+def _admin_tips_not_on_a_remote(admin: Path, repo: Path, run: GitRunner) -> str | None:
+    """None when the admin entry's detached HEAD and every per-worktree ref it holds are on a
+    remote-tracking ref, else what is not (or why it could not be checked). A HEAD that names a
+    branch is fine: the branch lives in the repository, not here. Commits reachable only from
+    this worktree's reflog or ORIG_HEAD are the accepted reflog class (ADR-0043)."""
+    tips: list[str] = []
+    try:
+        head = (admin / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if not head.startswith("ref:"):
+            tips.append(head)
+        refs_dir = admin / "refs"
+        if refs_dir.is_dir():
+            for ref in refs_dir.rglob("*"):
+                if ref.is_file():
+                    tips.append(ref.read_text(encoding="utf-8", errors="replace").strip())
+    except OSError as exc:
+        return f"the admin entry could not be read ({exc})"
+    if not tips:
+        return None
+    if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tip) for tip in tips):
+        return "the admin entry holds a ref that is not a plain commit id"
+    result = run(("rev-list", "-n", "1", *tips, "--not", "--remotes"), repo)
+    if result.rc != 0:
+        return f"could not check the worktree's own commits (rc {result.rc})"
+    if result.out.strip():
+        return f"commit {result.out.strip()[:12]} of this worktree is not on any remote ref"
+    return None
+
+
 def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git) -> str | None:
     """A worktree was just moved into the vault. Keep a copy of its git admin dir inside the
     vaulted directory, then remove EXACTLY that one admin entry so the repository stops listing a
@@ -1041,6 +1130,11 @@ def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git)
             return "that admin dir belongs to another path; nothing was removed"
         if (admin / "locked").exists():
             return "the worktree is locked; its admin entry was kept"
+        unbacked = _admin_tips_not_on_a_remote(admin, repo, run)
+        if unbacked is not None:
+            # The proof ran before the move; a commit made since (A3b review, N5) is reachable
+            # only through this admin entry, and `git gc` would drop it once the entry is gone.
+            return f"{unbacked}; the admin entry was kept so git keeps that commit"
         backup = vault_path / ADMIN_BACKUP_DIR
         backup.mkdir()
         shutil.copytree(admin, backup / "admin")
@@ -1067,6 +1161,27 @@ def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git)
     return None
 
 
+DETACHED_POINTER = ".git.reclaim-detached"
+
+
+def _same_head(admin: Path, saved: Path) -> bool:
+    """The live admin dir's HEAD is the one we saved (both readable and byte-identical)."""
+    try:
+        return (admin / "HEAD").read_bytes() == (saved / "HEAD").read_bytes()
+    except OSError:
+        return False
+
+
+def _detach_pointer(restored: Path) -> str:
+    """Rename the restored folder's `.git` pointer so git no longer follows it into an admin dir
+    that is not ours; returns a sentence for the note."""
+    try:
+        (restored / ".git").rename(restored / DETACHED_POINTER)
+    except OSError as exc:
+        return f". Its .git pointer could NOT be renamed ({exc}): do not run git in it"
+    return f". Its .git pointer was renamed to {DETACHED_POINTER} so git does not use it"
+
+
 def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
     """A vaulted worktree is back at its original path: put its git admin dir back, drop our
     backup folder and run `git worktree repair`. None on success. If the repository is no longer
@@ -1091,15 +1206,22 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
             return (
                 f"restored, but a different repository is now at {repo}; nothing was written "
                 f"into it (the saved admin data stays in {ADMIN_BACKUP_DIR}\\)"
+                + _detach_pointer(restored)
             )
         if not _posix_eq(admin.parent.parent, repo / ".git"):
             return "restored, but the saved admin path is not inside that repository"
-        if admin.exists() and not _admin_owned_by(admin, restored):
-            # `git worktree add` reused the freed admin name for ANOTHER worktree: repairing
-            # would repoint that worktree's index and HEAD here (A3 review, F2). Write nothing.
+        if admin.exists() and not (
+            _admin_owned_by(admin, restored) and _same_head(admin, backup / "admin")
+        ):
+            # Not the entry we removed: `git worktree add` reused the freed admin name for
+            # ANOTHER worktree (A3 review, F2), or another worktree was added at this very path
+            # and later deleted, leaving its own HEAD and index here (A3b review, N6). Repairing
+            # would mix the two. Write nothing, keep our backup, and detach our pointer so git
+            # run in this folder cannot read or write that other worktree's index and HEAD.
             return (
                 f"restored, but {admin} now belongs to another worktree; nothing was written "
                 f"(the saved admin data stays in {ADMIN_BACKUP_DIR}\\ for a manual repair)"
+                + _detach_pointer(restored)
             )
         if not admin.exists():
             admin.parent.mkdir(exist_ok=True)  # `.git/worktrees`, inside a repository we checked

@@ -1324,3 +1324,209 @@ def test_review_a3_this_computers_own_name_is_not_a_backup() -> None:
     import socket
 
     assert aa.is_real_remote_url(f"https://{socket.gethostname()}/o/r.git") is False
+
+
+# --- survivors of the A3b mutation run: each check pinned on its own ------------------------------
+
+
+def test_review_a3b_a_session_directory_that_is_itself_a_repository_is_proven(
+    tmp_path: Path,
+) -> None:
+    """M23: in scratch, a `.git` directly in the session dir is a nested repo, not the artifact's
+    own; an unpushed commit there must keep the session."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    git(session, "init", "-q", "-b", "main")
+    commit_file(session, "scratchpad/notes.txt", "scratch", "only copy")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert f"nested repository {session}" in v.failed_detail
+
+
+def test_review_a3b_git_lists_an_untracked_file_deeper_than_max_path(tmp_path: Path) -> None:
+    """N3: with core.longpaths git SEES the deep file (an untracked entry), instead of only
+    warning that it could not open the directory."""
+    repo, wt = _wt(tmp_path)
+    deep = Path("\\\\?\\" + str(wt)) / ("a" * 120) / ("b" * 120) / ("c" * 40)
+    deep.mkdir(parents=True)
+    (deep / "results.csv").write_text("only copy", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W2")
+    assert "uncommitted or untracked changes" in v.failed_detail, v.failed_detail
+
+
+@pytest.mark.parametrize("name", ["data.", "notes "])
+def test_review_a3b_the_walk_records_names_git_cannot_open(tmp_path: Path, name: str) -> None:
+    """N5c."""
+    odd = Path("\\\\?\\" + str(tmp_path / "t" / name))
+    odd.mkdir(parents=True)
+    facts = aa.walk_facts(tmp_path / "t")
+    assert [p.name for p in facts.odd_names] == [name]
+
+
+def test_review_a3b_a_name_git_cannot_open_refuses_the_tree_on_its_own(tmp_path: Path) -> None:
+    """N5: the tree check refuses by itself, whatever git printed."""
+    tree = tmp_path / "t"
+    Path("\\\\?\\" + str(tree / "data.")).mkdir(parents=True)
+    with pytest.raises(aa._Refusal) as refused:
+        aa._prove_tree(make_world(tmp_path).env, tree, [])
+    assert refused.value.rule == "W8" and "dot or space" in refused.value.detail
+
+
+def test_review_a3b_a_name_git_cannot_open_inside_a_nested_repo_keeps_the_session(
+    tmp_path: Path,
+) -> None:
+    """N5b: refused before any git command runs in the nested repository."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    nested = _nested_repo(session / "scratchpad" / "dep", pushed=True)
+    Path("\\\\?\\" + str(nested / "data.")).mkdir()
+    (Path("\\\\?\\" + str(nested / "data.")) / "results.csv").write_text("x", encoding="utf-8")
+    _age_tree(Path("\\\\?\\" + str(session)), world, 20)  # the plain form cannot reach `data.`
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert "git cannot see" in v.failed_detail
+
+
+def test_review_a3b_a_pointer_whose_common_dir_is_an_excluded_repo_is_excluded(
+    tmp_path: Path,
+) -> None:
+    """N8b: the admin dir sits under a neutral name, and only its `commondir` names the excluded
+    repository. No git may run at all."""
+    excluded_git = tmp_path / "elsewhere" / "zzexclproj" / ".git"
+    excluded_git.mkdir(parents=True)
+    admin = tmp_path / "neutral-admin"
+    admin.mkdir()
+    (admin / "commondir").write_text(str(excluded_git) + "\n", encoding="utf-8")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    session = make_session(world, age_days=20)
+    checkout = session / "scratchpad" / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered and v.failed_rule == "S7"
+
+
+# === regression tests for the third independent review (A3b): each reproduces a reported hole ===
+
+
+@pytest.mark.parametrize("legacy", ["remotes", "branches"])
+def test_review_a3b_a_legacy_remote_file_is_refused(tmp_path: Path, legacy: str) -> None:
+    """N1: `.git/remotes/bak` is invisible to `git remote` and to `remote.*.fetch`, yet its
+    `Pull:` line can write refs/remotes/origin/*."""
+    clone = _clone(tmp_path)
+    folder = clone / ".git" / legacy
+    folder.mkdir()
+    (folder / "bak").write_text(
+        "URL: D:/usbstick/bak.git\nPull: +refs/heads/*:refs/remotes/origin/*\n", encoding="utf-8"
+    )
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    assert not v.offered, f"WRONG OFFER: {v.held}"
+    assert v.failed_rule == "W3" and "legacy remote definition" in v.failed_detail
+
+
+def test_review_a3b_a_legacy_remote_file_of_the_main_repo_keeps_a_worktree(
+    tmp_path: Path,
+) -> None:
+    repo, wt = _wt(tmp_path)
+    (repo / ".git" / "remotes").mkdir()
+    (repo / ".git" / "remotes" / "bak").write_text("URL: D:/x.git\n", encoding="utf-8")
+    v = _verdict(make_world(tmp_path), wt, repo)
+    _refused(v, "W3")
+    assert "legacy remote definition" in v.failed_detail
+
+
+def test_review_a3b_a_bare_repository_inside_a_git_dir_is_found(tmp_path: Path) -> None:
+    """N2: the bare-repo check skipped everything below any `.git`."""
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    nested = _nested_repo(session / "scratchpad" / "dep", pushed=True)
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(nested / ".git" / "backup.git"))
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    _refused(v, "S7")
+    assert "bare repository" in v.failed_detail and "backup.git" in v.failed_detail
+
+
+def test_review_a3b_a_bare_repository_in_a_clones_own_git_dir_keeps_the_clone(
+    tmp_path: Path,
+) -> None:
+    clone = _clone(tmp_path)
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(clone / ".git" / "stash.git"))
+    v = aa.evaluate_clone(make_world(tmp_path).env, clone)
+    _refused(v, "C8")
+    assert "bare repository" in v.failed_detail
+
+
+def test_review_a3b_a_git_dir_whose_commondir_is_an_excluded_repo_is_never_touched(
+    tmp_path: Path,
+) -> None:
+    """N4/F5e: a nested `.git` DIRECTORY with a `commondir` into the excluded repository."""
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    session = make_session(world, age_days=20)
+    fake = session / "scratchpad" / "checkout" / ".git"
+    fake.mkdir(parents=True)
+    (fake / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (fake / "commondir").write_text(str(excluded / ".git") + "\n", encoding="utf-8")
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered and v.failed_rule == "S7"
+
+
+def test_review_a3b_a_shared_clone_of_an_excluded_repo_is_never_touched(tmp_path: Path) -> None:
+    """N4/F5g: `clone --shared` reads the excluded object store through objects/info/alternates."""
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    clone = tmp_path / "proj-verify1"
+    git(tmp_path, "clone", "-q", "--shared", str(excluded), str(clone))
+    git(clone, "remote", "set-url", "origin", "https://example.invalid/neutral.git")
+    mark_pushed(clone, "main")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered and v.failed_rule == "C7"
+
+
+def test_review_a3b_a_worktree_whose_admin_commondir_is_excluded_is_never_touched(
+    tmp_path: Path,
+) -> None:
+    """N4/F5h: the worktree is listed by a neutral repository, but its admin dir's commondir
+    names the excluded one."""
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    repo, wt = _wt(tmp_path)
+    admin = Path(git(wt, "rev-parse", "--absolute-git-dir").stdout.strip())
+    (admin / "commondir").write_text(str(excluded / ".git") + "\n", encoding="utf-8")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    v = aa.evaluate_worktree(world.env, wt, repo)
+    assert v.excluded and not v.offered and v.failed_rule == "W7"
+
+
+def test_review_a3b_a_core_worktree_naming_an_excluded_repo_is_hidden(tmp_path: Path) -> None:
+    """N4/F5f: refused before, but the excluded path showed in the visible refusal detail."""
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    session = make_session(world, age_days=20)
+    nested = _nested_repo(session / "scratchpad" / "dep", pushed=True)
+    git(nested, "config", "core.worktree", str(excluded))
+    _age_tree(session, world, 20)
+    v = aa.evaluate_scratch(world.env, session)
+    assert v.excluded and not v.offered
+    assert aa.report_lines([v]) == []
+
+
+def test_review_a3b_an_alternates_chain_into_an_excluded_repo_is_followed(tmp_path: Path) -> None:
+    excluded = make_repo(tmp_path / "elsewhere", "zzexclproj")
+    middle = tmp_path / "middle.git"
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(middle))
+    (middle / "objects" / "info" / "alternates").write_text(
+        str(excluded / ".git" / "objects") + "\n", encoding="utf-8"
+    )
+    clone = _clone(tmp_path)
+    (clone / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (clone / ".git" / "objects" / "info" / "alternates").write_text(
+        str(middle / "objects") + "\n", encoding="utf-8"
+    )
+    world = make_world(tmp_path, exclusions=("zzexclproj",), run=_no_git)
+    v = aa.evaluate_clone(world.env, clone)
+    assert v.excluded and not v.offered

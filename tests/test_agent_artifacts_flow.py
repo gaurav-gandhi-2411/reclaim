@@ -3,6 +3,7 @@ re-proof (the scan-time verdict is never trusted)."""
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -669,3 +670,80 @@ def test_review_a3_restore_never_takes_over_a_newer_worktree_that_reused_the_adm
     assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()  # kept for a manual repair
     note = aa.after_restore(setup.wt)
     assert note is not None and "belongs to another worktree" in note
+
+
+def test_review_a3b_restore_treats_an_admin_dir_without_a_readable_owner_as_not_ours(
+    setup: Setup,
+) -> None:
+    """N2b: an admin dir at the saved path whose `gitdir` file is missing names no owner; it may
+    belong to another worktree, so restore writes nothing and keeps the backup."""
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    vaulted = next(i.vault_path for i in report.items if i.category == aa.CAT_WORKTREE)
+    assert vaulted is not None
+    shutil.move(str(vaulted), str(setup.wt))  # put the directory back by hand
+    meta = (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").read_text(encoding="utf-8")
+    admin = Path(json.loads(meta)["admin"])
+    admin.mkdir(parents=True)  # present, but no `gitdir` file to say whose it is
+    note = aa.after_restore(setup.wt)
+    assert note is not None and "belongs to another worktree" in note
+    assert list(admin.iterdir()) == []  # nothing was copied into it
+    assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()
+
+
+def test_review_a3b_a_commit_made_after_the_proof_keeps_the_admin_entry(setup: Setup) -> None:
+    """N5: a detached commit made between the re-proof and the move is reachable only through
+    the worktree's admin entry; removing it would let `git gc` drop the commit."""
+    found = _detect(setup)
+    moved = setup.vault / "manual"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    git(setup.wt, "checkout", "-q", "--detach")
+    commit_file(setup.wt, "late.txt", "written after the proof\n", "late commit")
+    late = git(setup.wt, "rev-parse", "HEAD").stdout.strip()
+    shutil.move(str(setup.wt), str(moved))
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved)
+    assert note is not None and "admin entry was kept" in note
+    admin = setup.repo / ".git" / "worktrees" / setup.wt.name
+    assert (admin / "HEAD").read_text(encoding="utf-8").strip() == late
+    assert not (moved / aa.ADMIN_BACKUP_DIR).exists()
+    git(setup.repo, "gc", "-q", "--prune=now")
+    assert git(setup.repo, "cat-file", "-e", late, check=False).returncode == 0
+
+
+def test_review_a3b_restore_does_not_adopt_a_strangers_admin_dir_at_the_same_path(
+    setup: Setup,
+) -> None:
+    """N6/Q2b: another worktree was added at THIS path after the move and its folder deleted;
+    its admin dir names our path but holds its own HEAD and index."""
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    git(setup.repo, "worktree", "add", "-q", "-b", "stranger", str(setup.wt))
+    shutil.rmtree(setup.wt)  # its folder is gone, its admin entry stays
+    admin = setup.repo / ".git" / "worktrees" / setup.wt.name
+    stranger_head = (admin / "HEAD").read_bytes()
+    restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert setup.wt.is_dir()
+    assert (admin / "HEAD").read_bytes() == stranger_head  # nothing written into it
+    assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()  # our backup is kept
+    assert not (setup.wt / ".git").exists()  # detached: git in here cannot use the stranger's
+    assert (setup.wt / aa.DETACHED_POINTER).is_file()
+
+
+def test_review_a3b_a_refused_restore_detaches_the_pointer_from_the_other_worktree(
+    setup: Setup,
+) -> None:
+    """N6/p2: after the F2 refusal, git run in the restored folder used the NEWER worktree's
+    admin dir (its index and HEAD)."""
+    found = _detect(setup)
+    report = _apply(setup, [found[aa.CAT_WORKTREE]])
+    newer = setup.root / "other" / setup.wt.name
+    newer.parent.mkdir()
+    git(setup.repo, "worktree", "add", "-q", "--detach", str(newer))
+    restore_batch(
+        report.batch_id, manifest_path=setup.manifest, vault_dir=setup.vault, safety=setup.safety
+    )
+    assert not (setup.wt / ".git").exists()
+    assert (setup.wt / aa.DETACHED_POINTER).is_file()
+    assert worktree_listed(setup.repo, newer)
