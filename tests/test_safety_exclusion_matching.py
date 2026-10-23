@@ -667,3 +667,106 @@ def test_a_junction_loop_ends_and_a_junction_into_an_excluded_tree_still_protect
     (side / "intent-router").mkdir(parents=True)
     _winapi.CreateJunction(str(side), str(root / "a" / "into-side"))
     assert subtree_exclusion_match(root, ["*intent-router*"]) == "*intent-router*"
+
+
+# --- #190 verifier pass 1 -------------------------------------------------------------------
+
+
+def test_a_file_as_root_answers_by_its_own_path(tmp_path: Path) -> None:
+    """Callers pass top-level temp/crash-dump FILES too; a file root is not an unreadable
+    directory (it made every top-level temp file and every crash dump read excluded)."""
+    f = tmp_path / "old.tmp"
+    f.write_text("x", encoding="utf-8")
+    assert subtree_exclusion_match(f, ["*intent-router*"]) is None
+    assert subtree_exclusion_match(f, ["*old.tmp*"]) == "*old.tmp*"
+
+
+def test_aged_temp_still_offers_top_level_files_with_exclusions_configured(tmp_path: Path) -> None:
+    import time
+
+    from reclaim import regenerable as r
+
+    temp = tmp_path / "Temp"
+    (temp / "old_dir").mkdir(parents=True)
+    (temp / "old_dir" / "a.bin").write_bytes(b"x" * 100)
+    (temp / "old_file.tmp").write_bytes(b"y" * 200)
+    old = time.time() - 30 * 86400
+    for p in (temp / "old_dir" / "a.bin", temp / "old_dir", temp / "old_file.tmp"):
+        os.utime(p, (old, old))
+
+    def never(*_a: object, **_k: object) -> object:
+        raise AssertionError("dry run must not run commands")
+
+    env = r.RegenerableEnv(
+        home=tmp_path, local_appdata=tmp_path, temp_roots=(temp,), crash_dump_roots=(),
+        running_process_names=lambda: frozenset(), which=lambda _n: None, run_command=never,
+        has_open_handle=lambda _p: False, excluded_patterns=("*intent-router*",),
+    )  # fmt: skip
+    res = r._aged_children(temp, env, "aged_temp", "temp", "Temp", apply=False)
+    assert res.excluded == []
+    assert (res.bytes_removed, res.files_removed) == (300, 2)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_second_junction_to_a_walked_tree_is_matched_under_its_own_text(tmp_path: Path) -> None:
+    """Only a cycle is skipped. Two junctions to the same tree: a path-keyed pattern through
+    the second one still matches (the first loop guard lost it)."""
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("x", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    _winapi.CreateJunction(str(outside), str(root / "j1"))
+    _winapi.CreateJunction(str(outside), str(root / "j2"))
+    for pattern in ("*/j1/secret.txt", "*/j2/secret.txt", "re:j2[\\/]secret"):
+        assert subtree_exclusion_match(root, [pattern]) == pattern
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS junctions")
+def test_a_dangling_junction_hides_nothing(tmp_path: Path) -> None:
+    import _winapi  # Windows only; CreateJunction needs no admin rights
+
+    root = tmp_path / "root"
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    root.mkdir()
+    _winapi.CreateJunction(str(gone), str(root / "dangling"))
+    gone.rmdir()
+    assert subtree_exclusion_match(root, ["*intent-router*"]) is None
+
+
+def test_the_unreadable_reason_says_what_happened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.config import Config, SafetyConfig
+    from reclaim.models import FileRecord
+    from reclaim.safety import SafetyValidator
+
+    root = tmp_path / "cand"
+    (root / "locked").mkdir(parents=True)
+    real = os.scandir
+
+    def flaky(path):  # type: ignore[no-untyped-def]
+        if str(path).endswith("locked"):
+            raise PermissionError(5, "denied")
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", flaky)
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=["*intent-router*"])))
+    hit = validator.exclusion_match(root, is_dir=True)
+    assert hit is not None
+    assert hit.startswith(UNREADABLE_PREFIX)
+    record = FileRecord(
+        path=root,
+        is_dir=True,
+        size_bytes=0,
+        attributes=0,
+        ext="",
+        git_repo_root=None,
+        git_repo_clean=False,
+    )
+    result = validator.evaluate(record)
+    assert "could not be read" in result.rationale
+    assert "matches the user exclusion" not in result.rationale

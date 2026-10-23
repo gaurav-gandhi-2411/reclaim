@@ -167,11 +167,12 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     excluded tree, so the walk stops and returns `"<unreadable directory: <path>>"`, which every
     caller treats like a match (protected, not offered). Until 2026-10 such directories were
     skipped and the walk could answer "nothing excluded" for a tree it had not seen (found by
-    the #187 data-safety verifier). Only a missing ROOT still returns None: nothing to delete.
-    Listing goes through the extended-length form of each path, so trees deeper than MAX_PATH
-    are seen (they were silently invisible); the match text is unchanged. Directory junctions
-    are descended as before (a junction into an excluded project still protects the candidate),
-    but one whose target was already walked is not walked again, so a junction loop ends.
+    the #187 data-safety verifier). Only a missing ROOT, or a root that is a file, still returns
+    None: nothing beneath it. Listing goes through the extended-length form of each path, so
+    trees deeper than MAX_PATH are seen (they were silently invisible); the match text is
+    unchanged. Directory junctions are descended as before (a junction into an excluded project
+    still protects the candidate), except a dangling one (nothing beneath it) and one that leads
+    back to a directory on the current path (a cycle, which used to run until MAX_PATH).
 
     The match text of an entry is its directory's prefix (`_child_text_prefix`, from pathlib once
     per directory) + its name, instead of re-parsing every entry's path with `pathlib` (identical
@@ -188,13 +189,15 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
         return hit
     ordered = tuple(patterns)
     root_text = str(root)
-    walked_targets = {os.path.normcase(os.path.realpath(root_text))}
-    stack = [(root_text, _io_path(root_text))]
+    # (match text, I/O path, real path) per directory. The real path is tracked incrementally
+    # (parent's real path + name; a junction's resolved target) so the loop check costs no
+    # extra system call except at junctions.
+    stack = [(root_text, _io_path(root_text), _real_path(root_text))]
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
     while stack:
-        current, current_io = stack.pop()
+        current, current_io, current_real = stack.pop()
         prefix = _child_text_prefix(current)
         try:
             with os.scandir(current_io) as it:
@@ -205,24 +208,50 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                         return hit
                     if not entry.is_dir(follow_symlinks=False):
                         continue
-                    if entry.is_junction() or entry.is_symlink():
-                        target = os.path.normcase(os.path.realpath(entry.path))
-                        if target in walked_targets:
+                    if entry.is_junction():
+                        try:
+                            os.stat(entry.path)  # noqa: PTH116 -- the extended-length str scandir gave
+                        except (FileNotFoundError, NotADirectoryError):
+                            continue  # dangling: nothing beneath it, deleting it removes a link
+                        except OSError:
+                            pass  # unknown: walk it, so listing it fails closed below
+                        child_real = _real_path(entry.path)
+                        # Skipped ONLY when it leads back to an ancestor (a cycle). A second
+                        # junction to an already-walked tree is walked again under its own text,
+                        # so a path-keyed pattern through it still matches (#190 verifier).
+                        if current_real == child_real or current_real.startswith(
+                            child_real.rstrip(os.sep) + os.sep
+                        ):
                             continue
-                        walked_targets.add(target)
+                    else:
+                        child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
                     stack.append(
                         (
                             os.path.join(current, entry.name),  # noqa: PTH118 -- = entry.path
                             os.path.join(current_io, entry.name),  # noqa: PTH118
+                            child_real,
                         )
                     )
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # The ROOT missing or being a file (callers pass top-level temp/crash-dump FILES
+            # too): nothing below it, its own path was already matched above, as before.
             if current == root_text:
                 return None
             unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
         except OSError:
             unreadable = unreadable or f"{UNREADABLE_PREFIX}{current}>"
     return unreadable
+
+
+def _real_path(path: str) -> str:
+    """`os.path.realpath`, without the extended-length prefix realpath keeps on `\\\\?\\` input,
+    case-folded, so real paths from plain and prefixed inputs compare equal."""
+    real = os.path.realpath(path)
+    if real.startswith("\\\\?\\UNC\\"):
+        real = "\\\\" + real[8:]
+    elif real.startswith("\\\\?\\"):
+        real = real[4:]
+    return os.path.normcase(real)
 
 
 def _child_text_prefix(directory: str) -> str:
@@ -385,6 +414,17 @@ class SafetyValidator:
         # ADR-0039: `[exclusions] project_names` (and, for a directory candidate, a user pattern
         # matched by anything INSIDE it -- deleting the directory would delete that content).
         exclusion_hit = self.exclusion_match(record.path, is_dir=record.is_dir)
+        if exclusion_hit is not None and exclusion_hit.startswith(UNREADABLE_PREFIX):
+            return SafetyResult(
+                record=record,
+                verdict=Verdict.BLOCKED,
+                reason_code=REASON_USER_EXCLUSION,
+                rationale=(
+                    f"Part of this directory could not be read ({exclusion_hit[1:-1]}), so it "
+                    "cannot be checked against your exclusions in config.toml "
+                    "[exclusions]/[safety] — kept rather than risk deleting excluded content."
+                ),
+            )
         if exclusion_hit is not None:
             return SafetyResult(
                 record=record,
