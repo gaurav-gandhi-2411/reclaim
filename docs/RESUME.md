@@ -10,17 +10,19 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
 
 ### Status (updated after every task)
 - 2026-10-23 02:38 IST: run started; state check done (run log).
-- 03:50 IST checkpoint:
-  - **Merged:** #185 (certifi CVE, `f389a1d`), #184 (run docs, `fb88db2`), #186 (A2 read-only git status, `3ef2f2e`). Main CI is green after each.
-  - **R0** auto-resume installed and tested (skip path).
-  - **A1 done:** #182 is 6/6 green on `fadbc3c`, and full verify passed (2425).
-  - **A4 in progress:** the perf speedup is split out as #187 (verify 2185 passed; third data-safety pass and CI running).
+- 03:50 IST checkpoint 1: #185 (certifi CVE), #184 (run docs) and #186 (A2 read-only git status) merged; R0 installed; A1 done on CI (#182 6/6 green).
+- 07:20 IST checkpoint 2:
+  - **Merged:** #187 (exclusion-matcher speedup, `8f129d7`) and #188 (checkpoint docs, `aafbff1`). Main CI is green after each.
+  - **#189** (clean-check hardening, head `c308d48`): four verifier rounds. All findings are fixed with tests: 2 regressions I introduced, plus pre-existing hiding shapes. 17 non-redundant mutants killed. Its final full verify is waiting on machine load.
+  - **#190** (fail-closed subtree walk, head `6c16df4`): two verifier rounds. All findings are fixed with tests: a file-root regression, a cycle-guard fail-open, and loop gaps. 15 mutants killed. Pass 3 and full verify are running.
+  - **Load:** another session's 10-worker job keeps the machine at 68-100% CPU and 6.6-9.5 GB free RAM. Full verifies wait on a gate (RAM >= 9.5 GB, CPU < 60%) rather than run under contention. One verify run under load gave a timing-only failure (cold-start budget).
   - **Next:**
-    1. Merge #187 after the bar.
-    2. Clean-check hardening PR (DECISIONS #4).
-    3. A3, the second review of the fixed agent-artifacts code plus a mutation re-run.
-    4. Put agent-artifacts on `integration/run-2026-10`.
-    5. A5, build 11.
+    1. Merge #189 and #190 after the bar.
+    2. Real-index old-vs-new run for #190.
+    3. A3: second review of the agent-artifacts fixes.
+    4. A4: `integration/run-2026-10`.
+    5. A5: build 11.
+    6. A6.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
