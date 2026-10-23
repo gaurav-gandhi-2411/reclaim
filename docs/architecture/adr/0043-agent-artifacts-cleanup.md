@@ -153,3 +153,22 @@ A second, independent review, run against the rebased build `71803a1`, re-ran al
   - Process matching misses a bare relative argument run from the parent directory, and some UNC loopback spellings. The rename still fails on any open handle, and git state, not process state, protects the work.
   - A clone that another repository borrows objects from (`clone --shared`) can be moved. That breaks the borrower until restore; the objects are on the remote.
   - A junction to a huge tree is walked for exclusions before the reparse check refuses it. The order stays, so an excluded name inside is never reported.
+
+## Addendum 3 (2026-10-23): changes forced by the third hostile review (A3b)
+
+A third independent review, run against `7cc15b1`, re-ran every earlier attack. All were still refused. It then found five new ways through, and its mutation run left seven checks without a test of their own. Every finding is fixed, each with a test that reproduces the reported scenario; those tests fail on `7cc15b1`. Each surviving check now has its own test.
+
+- **Legacy remote files are refused (N1).** Git still honours `$GIT_COMMON_DIR/remotes/<name>` and `branches/<name>`. Such a remote is missing from `git remote` and from `remote.*.fetch`, so the addendum-2 namespace checks never saw a `Pull:` line writing `refs/remotes/origin/*`. Any legacy remote definition is now refused (W3).
+- **A bare repository inside a git dir counts (N2).** Only a directory named `.git` is exempt from the bare-repository check, not everything below it. `nested/.git/backup.git` can hold the only copy of a commit.
+- **Every git dir is checked against the exclusions before git runs in it (N4).** This covers a nested `.git` directory, a clone's own git dir, and the admin dir a worktree's pointer names. For each one, the check covers:
+  - its common dir;
+  - every object store it borrows through `objects/info/alternates`, followed as a chain (`clone --shared` of an excluded project);
+  - any `core.worktree` it names.
+
+  A file that exists but cannot be read counts as excluded.
+- **A late commit keeps the admin entry (N5).** Before the one admin entry is removed after the move, its detached HEAD and per-worktree refs are checked again against the remote-tracking refs. A commit made between the apply-time re-proof and the rename is otherwise reachable only through that entry, and `git gc` would drop it. When one is not on a remote, the entry is kept and no backup is written; the worktree then shows as prunable, and its commit stays in the repository.
+- **Restore adopts an existing admin dir only if it is ours (N6).** That means its `gitdir` names our path and its HEAD is the HEAD we saved. Another worktree added at the same path and later deleted leaves an admin dir that names our path but holds its own HEAD and index. When restore refuses, the restored folder's `.git` pointer is renamed to `.git.reclaim-detached`, so git run in that folder cannot read or write another worktree's index and HEAD.
+- **Stated precisely: what the vault does not keep for a worktree (N3).**
+  - A worktree's objects live in its repository, not in the worktree folder. So commits reachable only from the worktree's own reflog or `ORIG_HEAD` become collectable as soon as its admin entry is removed, and `git gc --prune=now` drops them at once. Before the move, the worktree's reflog would have protected them for the reflog expiry period.
+  - This is the accepted reflog class of addendum 1. It is now stated for worktrees explicitly, because the vault does not make those commits restorable.
+  - For a clone the whole object store moves with the vault, so its reflog-only commits do survive until purge.
