@@ -16,16 +16,18 @@ Status: plan written 2026-10-24 (autonomous run, item D8). Not built. Any part t
 
 That is about 85 GiB, the largest lever after the 185 GiB Hugging Face move (relocate spec, section 1).
 
-Relocate classifies both as GUIDED (`relocate.default_policy`) and lists them at 0 bytes, because `classify()` returns before sizing a guided folder. That is a defect, logged for the relocate branch: the list must show the real size, read-only.
+The Docker image is growing: GAPS-2026-10 recorded `docker_data.vhdx` at 50.60 GB (2026-10-07, itself +34.5 GB since the 2026-10-02 compaction), and it is 57.08 GiB now. GAPS does not say whether its GB is decimal, so the growth over those 17 days is 6.5-10.0 GiB, about 2.7-4.1 GiB per week (BELIEVED: two readings from different tools).
+
+Relocate classifies both as GUIDED (`relocate.default_policy`). It listed them at 0 bytes, because `classify()` returned before sizing a guided folder. Fixed on `feat/relocate` (`eba2f55`, PR #202): guided rows are sized read-only from their files, without opening them.
 
 ## 2. Why relocate's junction move is the wrong tool here
 
-- **Docker Desktop** stores its data in a VHDX that its WSL backend mounts. It has its own setting for the location (Settings > Resources > Advanced > Disk image location), which moves the image and updates its own configuration. A junction under a running backend risks a corrupt image, and an update could replace the folder.
+- **Docker Desktop** stores its data in a VHDX that its WSL backend mounts. It has its own setting for the location (Settings > Resources > Advanced > Disk image location), which moves the image and updates its own configuration. A junction under a running backend risks a corrupt image, and an update could replace the folder (both BELIEVED: not tested, and no Docker documentation was checked for them).
 - **A WSL distribution** is registered by path in the user's registry (`HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss`). It is moved with `wsl --export` / `--unregister` / `--import`. Newer WSL releases also offer `wsl --manage <name> --move <folder>` (BELIEVED: not checked on this machine's `wsl --version`). `--unregister` deletes the distribution's disk irreversibly.
 
 ## 3. Phases
 
-**Phase 0 (a fix, not a feature):** size guided rows read-only in `relocate list` and on the page. Show the steps beside the real size.
+**Phase 0 (a fix, not a feature):** size guided rows read-only in `relocate list` and on the page. Show the steps beside the real size. Done on `feat/relocate` (`eba2f55`).
 
 **Phase 1, guided (read-only, recommended next):**
 - Detect Docker Desktop and every WSL distribution: `wsl --list --verbose` is read-only, and the registry key is read, never written.
@@ -42,16 +44,16 @@ Relocate classifies both as GUIDED (`relocate.default_policy`) and lists them at
    - the journal drive has room;
    - the name is not excluded.
 2. **Prefer `wsl --manage <name> --move <folder>`** where the installed WSL has it: one program-owned step.
-3. **Otherwise, a journaled sequence like relocate's:**
-   - export to a tar on the target;
-   - verify the tar is readable and its size is plausible;
-   - import under a temporary name into the target folder;
-   - prove it starts (`wsl -d <temp> -- true`) and that `/etc/wsl.conf`'s default user survives (an import resets it otherwise);
-   - only then unregister the original;
-   - re-import or rename to the original name;
-   - keep the tar until the user confirms, with the same keep period and `delete-old` step as relocate's old copy.
+3. **Otherwise, a journaled sequence like relocate's.** WSL has no rename for a distribution, so the copy that is proven to start must be the one imported under the original name:
+   1. export to a tar on the target, and check the tar is readable and its size plausible;
+   2. import the tar under a temporary name into a scratch folder, prove it starts (`wsl -d <temp> -- true`), then unregister the temporary one. This proves the tar, not the final copy;
+   3. unregister the original. This is the one irreversible step, and the proven tar is on disk when it runs;
+   4. import the tar under the original name into the target folder;
+   5. prove it starts, and that the default user from `/etc/wsl.conf` survives (BELIEVED: an import resets the default user otherwise; not tested here);
+   6. if step 4 or 5 fails, import the tar back to the old location under the original name and report;
+   7. keep the tar until the user confirms, with the same keep period and `delete-old` step as relocate's old copy.
 
-   Every step is recorded in the journal so that `recover` can finish or undo it. Unregistering the original is the one irreversible step; it runs last, only after the new copy has started, and the tar is still on disk then.
+   Every step is recorded in the journal so that `recover` can finish or undo it.
 4. **Docker** stays guided in every phase. The product never moves Docker's image itself.
 
 ## 4. Eval design
