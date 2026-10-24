@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import logging.handlers
+import sys
 from pathlib import Path
 
+import pytest
 import structlog
 
 from reclaim.logging_config import DEFAULT_LOG_PATH, configure_logging, get_audit_logger
@@ -53,6 +56,29 @@ def test_configure_logging_attaches_both_console_and_file_handlers(tmp_path: Pat
         and not isinstance(h, logging.handlers.RotatingFileHandler)
         for h in handlers
     )
+
+
+def test_console_output_follows_the_current_stderr_after_it_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The console handler was bound to the `sys.stderr` object of configure time. Once that
+    stream closed (under pytest: the capture stream of whichever test called `cli.main`), every
+    later log line failed in `emit()` and `Handler.handleError` printed a traceback -- whose
+    `linecache` stats broke `test_restat_decision_points`' os.stat count after
+    `test_relocate_cli.py` ran in the same process (D4)."""
+    first = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", first)
+    configure_logging(tmp_path / "reclaim.log")
+    first.close()
+    second = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", second)
+    errors: list[logging.LogRecord] = []
+    monkeypatch.setattr(logging.Handler, "handleError", lambda _self, record: errors.append(record))
+
+    structlog.get_logger("test_logging_config").info(_EVENT_NAME, marker="current-stderr")
+
+    assert errors == []
+    assert "current-stderr" in second.getvalue()
 
 
 def test_configure_logging_caps_file_size_and_backup_count(tmp_path: Path) -> None:
