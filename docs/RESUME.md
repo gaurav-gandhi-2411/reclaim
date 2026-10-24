@@ -117,6 +117,14 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     1. Third relocate review, full verify, PR into `integration/run-2026-10`.
     2. Phase C (MCP packaging and planner).
     3. Phase D.
+- 14:20 IST checkpoint 11 (24 Oct):
+  - **Relocate:** six hostile reviews; rollback after the swap redesigned without a merge (DECISIONS 12). Head `9474aa8`, 187 tests pass, mutation 87 mutants (all killed but 5 equivalent). Review 7 running. Draft **#202** (with the page).
+  - **Phase C:** planner, read-only tools, settings panel, HOWTO section 8, end-to-end smoke with Claude Code. Draft **#203**.
+  - **Owed:** the full verify of both (queued on an export; free RAM has been 6-7.7 GB all day). A5/A6 still wait for build 12.
+  - **Next:**
+    1. Review 7 result; full verify.
+    2. Merge #202 and #203 into `integration/run-2026-10`.
+    3. Phase D.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
