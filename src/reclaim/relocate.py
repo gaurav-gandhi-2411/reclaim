@@ -77,6 +77,20 @@ _CLOUD_BITS |= FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 # not-content-indexed.
 _COPIED_ATTRS = 0x1 | 0x2 | 0x4 | 0x20 | 0x2000
 _FILE_ATTRIBUTE_NORMAL = 0x80
+# EFS: a plain read-and-write copy would write the file back in the clear (or fail for another
+# user), so an encrypted tree is never moved (B7 L5).
+_FILE_ATTRIBUTE_ENCRYPTED = 0x4000
+# GetDriveTypeW: only a local fixed drive is a target; a network, removable or RAM drive can
+# vanish while the junction still points at it.
+_DRIVE_FIXED = 3
+_DRIVE_KINDS = {
+    0: "unknown",
+    1: "missing",
+    2: "removable",
+    4: "network",
+    5: "optical",
+    6: "RAM",
+}
 
 
 class Verdict(StrEnum):
@@ -150,6 +164,7 @@ class TreeScan:
     multi_linked: list[str] = field(default_factory=list)
     venv_markers: list[str] = field(default_factory=list)
     cloud_files: list[str] = field(default_factory=list)
+    encrypted: list[str] = field(default_factory=list)
     unreadable: list[str] = field(default_factory=list)
 
 
@@ -205,11 +220,21 @@ class Journal:
     # cleared as soon as anything starts changing it again. A restore folder without it may be
     # partial and is never put back as the folder (B7 H1).
     restore_verified: bool = False
+    # The user asked for the old copy to be put back; recover honours it (B7 L1).
+    use_old_copy: bool = False
+    # Set when the journal reaches ROLLED_BACK. A later DELETED_OLD then ends a move that was
+    # undone, so it no longer blocks the folder; without it the path is a live junction (B7 L3).
+    rolled_back: bool = False
+    # The volume (NTFS serial) of the original folder; a folder file ID alone is only unique
+    # per volume (B7 L5). 0 in journals written before this field.
+    source_dev: int = 0
     history: list[list[object]] = field(default_factory=list)
     path: str = ""
 
     def log(self, stage: Stage, note: str = "", clock: Callable[[], float] = time.time) -> None:
         self.stage = stage.value
+        if stage == Stage.ROLLED_BACK:
+            self.rolled_back = True
         self.history.append([round(clock(), 3), stage.value, note])
         self.save()
         logger.info("relocate_step", id=self.id, stage=stage.value, note=note)
@@ -379,6 +404,8 @@ _kernel32.GetVolumeInformationW.argtypes = [
     wintypes.DWORD,
 ]
 _kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+_kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetDriveTypeW.restype = wintypes.UINT
 _ERROR_HANDLE_EOF = 38
 _UNNAMED_STREAM = "::$DATA"
 
@@ -542,6 +569,8 @@ def scan_tree(root: str) -> TreeScan:
                     continue
                 if entry.name.casefold() in {".venv", "venv", "site-packages", "pyvenv.cfg"}:
                     out.venv_markers.append(rel)
+                if attrs & _FILE_ATTRIBUTE_ENCRYPTED:
+                    out.encrypted.append(rel)
                 if stat.S_ISDIR(st.st_mode):
                     out.dirs += 1
                     stack.append((rel, entry.path))
@@ -696,6 +725,18 @@ def _filesystem(path: str) -> str | None:
     name = ctypes.create_unicode_buffer(64)
     ok = _kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, name, len(name))
     return name.value if ok else None
+
+
+def _drive_type(path: str) -> int:
+    """GetDriveTypeW of the volume holding `path` (or its nearest existing ancestor); 0 when
+    it cannot be read, which is not a fixed drive."""
+    current = Path(_norm(path))
+    while not _exists(str(current)) and current.parent != current:
+        current = current.parent
+    root = ctypes.create_unicode_buffer(1024)
+    if not _kernel32.GetVolumePathNameW(long_path(current), root, len(root)):
+        return 0
+    return int(_kernel32.GetDriveTypeW(root.value))
 
 
 def _keep_root_flags(moved: str, link: str) -> None:
@@ -918,6 +959,11 @@ def classify(source: Path | str, policy: Policy) -> Classification:
             "it contains cloud placeholders that reading would download "
             f"({_sample(scan.cloud_files)})"
         )
+    if scan.encrypted:
+        reasons.append(
+            "it contains EFS-encrypted files or folders, which a copy would not keep encrypted "
+            f"({_sample(scan.encrypted)})"
+        )
     if scan.unreadable:
         reasons.append(f"some of it could not be read ({_sample(scan.unreadable)})")
     if scan.files == 0:
@@ -956,6 +1002,17 @@ def probe(source: str) -> None:
 _WORKING_SUFFIXES = (MOVED_SUFFIX, PROBE_SUFFIX, RESTORE_SUFFIX)
 
 
+def _kept_by(moved: str, journal_dir: Path | None) -> str | None:
+    """The id of the newest journal whose old copy is `moved`, if the journals can be read."""
+    if journal_dir is None:
+        return None
+    try:
+        mine = [j for j in journals(journal_dir) if _key(j.moved) == _key(moved)]
+    except (OSError, ValueError, TypeError, RelocateError):
+        return None
+    return max(mine, key=lambda j: j.created_at).id if mine else None
+
+
 def _overlap_reasons(src: str, tgt: str, journal_dir: Path | None) -> list[str]:
     """What ties this move to Reclaim's own working folders or to another move: any of those
     would let one move's rollback or delete reach into another's data (B1 finding 3)."""
@@ -971,10 +1028,14 @@ def _overlap_reasons(src: str, tgt: str, journal_dir: Path | None) -> list[str]:
         return reasons
     try:
         others = journals(journal_dir)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, RelocateError) as exc:
         return [*reasons, f"a move journal in {journal_dir} could not be read ({exc})"]
     for other in others:
-        if other.stage == Stage.ROLLED_BACK:
+        if other.stage == Stage.ROLLED_BACK or (
+            other.stage == Stage.DELETED_OLD and other.rolled_back
+        ):
+            # Undone moves hold nothing. A DELETED_OLD without the flag is a finished move: its
+            # path is a live junction, so it must keep blocking (B7 L3).
             continue
         busy = (other.source, other.target, other.moved, other.source + RESTORE_SUFFIX)
         if any(_relation(mine, theirs) for mine in (src, tgt) for theirs in busy):
@@ -1028,7 +1089,14 @@ def plan_move(
     if _exists(tgt):
         reasons.append(f"the target {tgt} already exists; choose a new folder")
     if _exists(moved):
-        reasons.append(f"{moved} already exists (left by an earlier move?): inspect it first")
+        kept_by = _kept_by(moved, journal_dir)
+        if kept_by is None:
+            reasons.append(f"{moved} already exists (left by an earlier move?): inspect it first")
+        else:
+            reasons.append(
+                f"{moved} is the old copy kept by move {kept_by}: delete it with "
+                f"`reclaim relocate delete-old {kept_by}` (or remove it yourself) first"
+            )
     for leftover in (probe_path, src + RESTORE_SUFFIX, tgt + PROBE_SUFFIX):
         if _exists(leftover):
             reasons.append(f"{leftover} already exists (left by an earlier run?): inspect it first")
@@ -1039,6 +1107,12 @@ def plan_move(
             # Folder IDs that survive a rename, named streams and junction targets are what
             # the move's safety rests on; all three are NTFS behaviour.
             reasons.append(f"the {label} is on a {fs or 'unknown'} volume; NTFS is required")
+    kind = _drive_type(tgt)
+    if kind != _DRIVE_FIXED:
+        reasons.append(
+            f"the target is on a {_DRIVE_KINDS.get(kind, 'non-fixed')} drive; only a local fixed "
+            "drive is allowed, because the junction would break whenever it went away"
+        )
     src_vol, tgt_vol = _volume_serial(src), _volume_serial(tgt)
     if src_vol is None or tgt_vol is None:
         reasons.append("the volume of the source or target could not be read")
@@ -1115,6 +1189,7 @@ def execute_move(
         created_at=clock(),
         source_free_before=plan.source_free,
         source_id=_folder_id(plan.source),
+        source_dev=_folder_dev(plan.source),
     )
     journal.path = str(journal_dir / f"relocate-{journal.id}.json")
     journal.log(Stage.PLANNED, f"{plan.files} files, {plan.bytes} bytes", clock)
@@ -1427,7 +1502,7 @@ def recover(
             journal.swapped_at = clock()
             journal.log(Stage.DONE, "finished after an interruption", clock)
             return Outcome(journal, f"finished the move; {journal.source} points to the copy")
-    return rollback(journal_path, clock=clock)
+    return rollback(journal_path, use_old_copy=journal.use_old_copy, clock=clock)
 
 
 def _only_written_through_the_junction(journal: Journal) -> bool:
@@ -1478,6 +1553,10 @@ def rollback(
     journal = Journal.load(journal_path)
     if journal.stage == Stage.ROLLED_BACK:
         return Outcome(journal, "already rolled back")
+    if journal.stage == Stage.DELETING_OLD:
+        journal.old_copy_partial = True  # Reclaim's own interrupted delete (B7 L2)
+    # Saved with the first entry: a kill and `recover` must do what the user chose (B7 L1).
+    journal.use_old_copy = use_old_copy
     journal.log(Stage.ROLLING_BACK, f"from {journal.stage}", clock)
     tgt = journal.target
     target_probe = tgt + PROBE_SUFFIX
@@ -1747,10 +1826,17 @@ def _finish_rollback(journal: Journal, clock: Callable[[], float], note: str) ->
         )
     kept = _discard_copy(journal)
     if _is_original(journal, journal.moved):
-        note += (
-            f"; the copy from before the move is kept unchanged at {journal.moved} (delete it "
-            "with delete-old once you are sure)"
-        )
+        if journal.old_copy_partial:
+            note += (
+                f"; the copy from before the move at {journal.moved} was partly deleted by an "
+                "interrupted delete, so what is left is incomplete (and unchanged); delete-old "
+                "finishes removing it"
+            )
+        else:
+            note += (
+                f"; the copy from before the move is kept unchanged at {journal.moved} (delete "
+                "it with delete-old once you are sure)"
+            )
     if kept:
         note += f"; kept {kept[0]} ({kept[1]})"
     journal.log(Stage.ROLLED_BACK, note, clock)
@@ -1792,10 +1878,20 @@ def _rollback_before_freeze(journal: Journal, clock: Callable[[], float]) -> Out
     return Outcome(journal, note, kept or ())
 
 
+def _folder_dev(path: str) -> int:
+    """The volume serial the folder at `path` is on (0 if it cannot be read)."""
+    st = _lstat(path)
+    return st.st_dev if st is not None else 0
+
+
 def _is_original(journal: Journal, path: str) -> bool:
-    """Whether `path` is the original folder itself, or the restore copy rollback made."""
+    """Whether `path` is the original folder itself, or the restore copy rollback made: the
+    file ID must match and, when the journal knows it, so must the volume (a file ID is only
+    unique within one volume, B7 L5)."""
     fid = _folder_id(path)
-    return fid != 0 and fid in {journal.source_id, journal.restore_id} - {0}
+    if fid == 0 or fid not in {journal.source_id, journal.restore_id} - {0}:
+        return False
+    return not journal.source_dev or _folder_dev(path) == journal.source_dev
 
 
 def _is_empty(path: str) -> bool:
@@ -2029,7 +2125,8 @@ def delete_old_copy(
         if not (journal.restore_id and _folder_id(src) == journal.restore_id):
             raise RelocateError(f"{src} is not the folder the rollback restored; nothing deleted")
     record = _read_manifest(journal)
-    changed = _old_copy_changes(journal, allow_missing=False, record=record)
+    # After Reclaim's own interrupted delete, the files it removed are not changes (B7 L2).
+    changed = _old_copy_changes(journal, allow_missing=journal.old_copy_partial, record=record)
     if changed:
         raise RelocateError(_changed_message(journal, changed))
     recorded: dict[str, list[Any]] = record["files"]
@@ -2138,6 +2235,13 @@ def _old_copy_changes(
 
 
 def _changed_message(journal: Journal, changed: Sequence[str]) -> str:
+    if journal.old_copy_partial:
+        return (
+            f"{len(changed)} files or folders in {journal.moved} differ from the record taken at "
+            f"the move ({_sample(changed)}), beyond what Reclaim's own interrupted delete "
+            "removed, so Reclaim will not delete it. Check it yourself and remove it if you no "
+            "longer need it"
+        )
     return (
         f"{len(changed)} files or folders in {journal.moved} changed since the move "
         f"({_sample(changed)}): something wrote into the old copy, so Reclaim will not delete "
@@ -2168,4 +2272,13 @@ def _finish_delete(
 def journals(journal_dir: Path) -> list[Journal]:
     if not journal_dir.is_dir():
         return []
-    return [Journal.load(p) for p in sorted(journal_dir.glob("relocate-*.json"))]
+    found = []
+    for path in sorted(journal_dir.glob("relocate-*.json")):
+        try:
+            found.append(Journal.load(path))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RelocateError(
+                f"the move journal {path} cannot be read ({exc}); it is not changed. Inspect "
+                "it, and move it out of the folder if it is not a journal"
+            ) from exc
+    return found
