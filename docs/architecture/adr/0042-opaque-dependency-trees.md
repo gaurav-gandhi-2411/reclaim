@@ -99,6 +99,8 @@ warm-up/summary queries over millions of rows.
 
 ## Plan only: duplicate case-insensitive path index
 
+> **Superseded by ADR-0045 (2026-10-24):** measured, the index is not a duplicate. Its key is Unicode-folded and the primary key's is not. It is 240 MB (16%) after the opaque collapse, and dropping it makes the detectors' path patterns about 100x slower. It stays. The text below is kept as it was written.
+
 `idx_files_path_lower` (2.80 GB, 25% of the index) duplicates the `path` primary-key index
 (2.79 GB). Replace it with `path COLLATE NOCASE` lookups served by one NOCASE-collated index (or make
 the PK itself NOCASE). It is a migration of every query that uses `path_lower`, so it needs its own ADR
