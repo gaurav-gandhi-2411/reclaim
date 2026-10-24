@@ -735,6 +735,119 @@ def test_full_drive_scan_with_exactly_one_fixed_drive_reports_it_as_root(
     assert status["root"] == only_drive.as_posix()  # single-root case reports it, unlike multi
 
 
+def _fake_volumes(monkeypatch: pytest.MonkeyPatch, used_by_root: dict[Path, int | None]) -> None:
+    """D1: fixture folders stand in for drive roots (a real `C:\\` is never scanned in a test).
+    A `None` used-bytes value makes `disk_usage` fail for that root, like an unplugged drive."""
+    import shutil
+    from collections import namedtuple
+
+    from reclaim import reconciliation
+    from reclaim.api import service
+
+    real_disk_usage = shutil.disk_usage
+    usage = namedtuple("usage", "total used free")
+    roots = {root.as_posix(): used for root, used in used_by_root.items()}
+
+    def fake_disk_usage(path: object) -> object:
+        key = Path(str(path)).as_posix()
+        if key not in roots:
+            return real_disk_usage(path)  # type: ignore[arg-type]
+        if roots[key] is None:
+            raise OSError("volume not mounted")
+        return usage(10**12, roots[key], 10**12)
+
+    def fake_is_volume_root(path: Path) -> bool:
+        return Path(path).as_posix() in roots
+
+    monkeypatch.setattr(reconciliation.shutil, "disk_usage", fake_disk_usage)
+    monkeypatch.setattr(reconciliation, "is_volume_root", fake_is_volume_root)
+    monkeypatch.setattr(service, "is_volume_root", fake_is_volume_root)
+
+
+def test_summary_reconciles_after_a_multi_drive_scan_and_after_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D1: `reconciliation_volume` was null after every multi-drive scan (no single root) and in
+    every process that had not itself run the scan (in-memory status only) -- i.e. always, on
+    the installed app."""
+    from reclaim.api import service
+
+    drive_a = tmp_path / "drive_a"
+    drive_b = tmp_path / "drive_b"
+    _build_small_tree(drive_a, file_count=3)
+    _build_small_tree(drive_b, file_count=5)
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
+    _fake_volumes(monkeypatch, {drive_a: 1_000_000, drive_b: 2_000_000})
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    assert _start_full_drive_scan(client).status_code == 202
+    body = client.get("/api/summary").json()
+    indexed_a = body["total_indexed_bytes"] - _indexed_bytes(tmp_path, drive_b)
+    assert body["reconciliation_volume"] == str(drive_a)  # first drive in sorted order
+    assert body["reconciliation_delta_bytes"] == 1_000_000 - indexed_a
+
+    restarted = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    assert restarted.get("/api/scan/status").json()["status"] == "idle"
+    after = restarted.get("/api/summary").json()
+    assert after["reconciliation_volume"] == str(drive_a)
+    assert after["reconciliation_delta_bytes"] == body["reconciliation_delta_bytes"]
+
+
+def _indexed_bytes(tmp_path: Path, under: Path) -> int:
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        return index.physical_size_bytes_total(under)
+
+
+def test_summary_reconciliation_skips_a_drive_whose_usage_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.api import service
+
+    drive_a = tmp_path / "drive_a"
+    drive_b = tmp_path / "drive_b"
+    _build_small_tree(drive_a, file_count=3)
+    _build_small_tree(drive_b, file_count=5)
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a, drive_b])
+    _fake_volumes(monkeypatch, {drive_a: None, drive_b: 2_000_000})
+
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    assert _start_full_drive_scan(client).status_code == 202
+    body = client.get("/api/summary").json()
+    assert body["reconciliation_volume"] == str(drive_b)
+    assert body["reconciliation_delta_bytes"] == 2_000_000 - _indexed_bytes(tmp_path, drive_b)
+
+
+def test_summary_reconciliation_is_null_for_non_volume_roots_and_while_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed scan of a folder that is not a drive root never reconciles (the index can't
+    have covered the volume), and a running scan never does (the index is mid-update)."""
+    from dataclasses import replace
+
+    from reclaim.api import service
+
+    drive_a = tmp_path / "drive_a"
+    sub = tmp_path / "sub"
+    _build_small_tree(drive_a, file_count=3)
+    _build_small_tree(sub, file_count=2)
+    _fake_volumes(monkeypatch, {drive_a: 1_000_000})
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [sub])
+    client = _make_app(tmp_path, config=_config(tmp_path / "tree"))
+    assert _start_full_drive_scan(client).status_code == 202
+    assert client.get("/api/summary").json()["reconciliation_volume"] is None
+
+    monkeypatch.setattr(service, "list_fixed_drives", lambda: [drive_a])
+    assert _start_full_drive_scan(client).status_code == 202
+    assert client.get("/api/summary").json()["reconciliation_volume"] == str(drive_a)
+
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    with state.lock:
+        state.scan_status = replace(state.scan_status, status="running")
+    body = client.get("/api/summary", params={}).json()
+    assert body["reconciliation_volume"] is None
+
+
 def test_full_drive_scan_already_running_returns_409(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

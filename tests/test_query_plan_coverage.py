@@ -396,6 +396,18 @@ _CASES: dict[str, Case] = {
         "confirm sqlite_autoindex_inaccessible_paths_1 is used when a prefix scope is given "
         "(verified empirically, not asserted here) -- this Case just can't observe it directly.",
     ),
+    "record_completed_scan_root": Case(
+        action=None,
+        expect_index=False,
+        reason="single-row upsert on the primary key + COMMIT -- the last captured statement is "
+        "COMMIT, which has no EXPLAIN QUERY PLAN rows (same shape as upsert_records)",
+    ),
+    "completed_scan_roots": Case(
+        lambda idx: idx.completed_scan_roots(),
+        expect_index=True,
+        reason="reads the whole table (one row per completed scan root, a handful) ORDER BY "
+        "root, which SQLite satisfies from sqlite_autoindex_completed_scan_roots_1",
+    ),
 }
 
 
