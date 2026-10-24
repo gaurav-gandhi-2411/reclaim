@@ -609,3 +609,64 @@ medium finding that predates addendum 10 and on several lows. Fixes:
   existed there. That code was removed, since a test writes only under `tmp_path`.
 
 Mutation `mutate_rl11`: one mutant per fix, 7 of 7 killed, the source restored byte-identical.
+
+## Addendum 12 (2026-10-24): twelfth, very narrow review (B12) of addendum 11, FAIL, fixed
+
+The twelfth review, of `240078c` and narrowed to addendum 11, found no lost byte and no false
+success. All 603 points of its one-OSError sweep over plan, move and rollback ended with the
+folder back and its content unchanged. `_final_name` held: no handle leak over 1,100 calls, an
+exclusively held folder read correctly, a lowercase drive letter and a 455-character path. It
+failed on three mediums about names and one rename, and on five lows
+(`tests/test_relocate_review_b12.py`). Fixes:
+
+- **M1 (UTF-16 length):** `_bad_text` counted code points, but NTFS counts UTF-16 units. A name
+  of 128 emoji (256 units) passed the plan, and the failed move's journal was stuck as in
+  B11 M1. Names are now measured in UTF-16 units.
+- **M2 (no room for the working copies):** the engine makes `<name>.reclaim-probe`,
+  `-moved` (14 more characters) and `-restore` (16 more). The effect depended on the length:
+  - a target leaf of 242-255 characters moved, and then every rollback was refused as "in use";
+  - a source leaf of 240-241 moved, and then its rollback could never make the restore folder,
+    with "reconnect" as the advice;
+  - a source of 242-255 was refused as "in use" for good.
+
+  The last part of the source and of the target must now leave room for the longest working
+  name: at most 239 characters (UTF-16 units). Anything longer is refused at the plan, saying
+  why and to rename first. **Deviation from the reviewer's probes:** they moved such a folder
+  and asserted that a rollback then works. They are replaced by a test of the refusal at the
+  plan, at 240, 250 and 255 for source and target, with nothing changed and no journal
+  written, and by a test that a 239-character source moves and rolls back.
+- **M3 (a dangling junction after one fault):** if renaming the target back after
+  rollback's in-use probe failed once, the original path was a junction to nothing until a
+  rerun. The code had marked that branch "only a racing writer", but a virus scanner or an
+  indexer opening the folder is a real, short hold. Both probes (the source's in the plan, the
+  target's in rollback) now retry the rename back up to 5 times, 0.2 s apart. The sweep's 3
+  dangling points are gone.
+- **L1:** reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, also with an extension)
+  are refused.
+- **L2:** a probe leftover reached through a link in a parent is no longer renamed. The plan
+  refuses such a source anyway.
+- **L3:** a parent folder made for the target is journaled before its `mkdir`, and the
+  parents are cleaned up whenever nothing of ours is left at the target, including a target
+  that was never made. Before, a failed save after the `mkdir`, or an early return, left them.
+  The sweep's leftover points went from 29 to 6.
+- **L5:** the message for a name ending in a dot or space says to rename first.
+- **Not changed (low, accepted on purpose):**
+  - **L4:** a fault in an `unlink` while our target copy is being removed leaves the rest. The
+    rerun keeps it and its journal says so ("kept ..., 1 of its files or folders differ"), most
+    likely because `rmtree` cleared the read-only bit before its failed unlink (BELIEVED). A
+    copy that no longer compares equal to the restored folder is never deleted. That is the
+    deliberate rule since B2, and it is not loosened for a leftover.
+  - A fault in the `rmdir` of an empty parent folder leaves empty folders, and the journal is
+    then inert. The reviewer's sweep is changed to accept exactly these two shapes (named
+    "known" in the test) and nothing else.
+- **Containment:** the reviewer's two ACL probes ran `icacls /deny`. One run left three test
+  folders in pytest's temp area whose deny needs elevation to remove (an inherited OWNER RIGHTS
+  ACE). They hold only random test bytes and are listed for the owner. The probes are not kept
+  in the repo, because a suite that runs on every build does not change ACLs.
+
+Mutation `mutate_rl12`: one mutant per fix (code points; no room; device names; no retry;
+through a link; journaled after the `mkdir`; parents not cleaned). 6 of 7 were killed by the
+reviewer's probes. "No retry" survived, because the sweep accepts a dangling junction that a
+rerun repairs. `tests/test_relocate_review_b12_fixes.py` now asserts that one transient
+failure of the rename back is absorbed in a single call, in the plan and in rollback, and
+kills it: 7 of 7, with the source restored byte-identical.
