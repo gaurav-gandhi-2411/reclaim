@@ -18,17 +18,32 @@ ADR_DIR = Path(__file__).resolve().parent.parent / "docs" / "architecture" / "ad
 INDEX_NAME = "README.md"
 # "# 0001. Title" and "# ADR-0038: Title" are both in use.
 _H1 = re.compile(r"^#\s+(?:ADR-)?(\d{4})[.:]\s*(.+?)\s*$")
+_FILE = re.compile(r"^\d{4}-[^.]+\.md$", re.IGNORECASE)
+
+
+def _escape(title: str) -> str:
+    """`|` would end the table cell (GFM needs `\\|` even inside a code span); `[` and `]` would
+    end the link text, except inside a code span, where a backslash would show literally."""
+    parts = title.split("`")
+    for i in range(0, len(parts), 2):  # outside code spans
+        parts[i] = re.sub(r"([\[\]])", r"\\\1", parts[i])
+    return "`".join(parts).replace("|", "\\|")
 
 
 def render(adr_dir: Path) -> str:
     rows: list[str] = []
     numbers: list[str] = []
-    for path in sorted(adr_dir.glob("[0-9][0-9][0-9][0-9]-*.md")):
+    for path in sorted(p for p in adr_dir.iterdir() if p.suffix.lower() == ".md"):
+        if path.name == INDEX_NAME:
+            continue
+        if not _FILE.match(path.name):
+            # Skipping it would leave the index silently incomplete while --check passes.
+            raise ValueError(f"{path.name}: an ADR file is named 'NNNN-kebab-title.md'")
         first = path.read_text(encoding="utf-8").splitlines()[0] if path.stat().st_size else ""
         match = _H1.match(first)
         if match is None or match.group(1) != path.name[:4]:
             raise ValueError(f"{path.name}: the first line must be '# NNNN. Title' (got {first!r})")
-        title = match.group(2).replace("|", "\\|")
+        title = _escape(match.group(2))
         numbers.append(match.group(1))
         rows.append(f"| {match.group(1)} | [{title}]({path.name}) |")
     shared = sorted({n for n in numbers if numbers.count(n) > 1})

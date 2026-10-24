@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -50,3 +51,18 @@ def test_a_malformed_first_line_is_refused(tmp_path: Path, first_line: str) -> N
     (tmp_path / "0003-x.md").write_text(first_line + ("\n" if first_line else ""), "utf-8")
     with pytest.raises(ValueError, match=r"0003-x\.md"):
         adr_index.render(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["0046_title.md", "0046.md", "ADR-0046-title.md", "46-title.md"])
+def test_an_adr_file_with_another_name_is_refused_not_skipped(tmp_path: Path, name: str) -> None:
+    (tmp_path / name).write_text("# 0046. Title\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("the index itself is not an ADR\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=re.escape(name)):
+        adr_index.render(tmp_path)
+
+
+def test_brackets_in_a_title_keep_the_link_intact(tmp_path: Path) -> None:
+    (tmp_path / "0001-a.md").write_text("# 0001. Keep [x] as `[y]` text\n", encoding="utf-8")
+    text = adr_index.render(tmp_path)
+    # Outside a code span escaped; inside one left alone (a backslash would show there).
+    assert "| 0001 | [Keep \\[x\\] as `[y]` text](0001-a.md) |" in text
