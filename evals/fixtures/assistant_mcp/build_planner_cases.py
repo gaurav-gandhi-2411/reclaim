@@ -173,7 +173,9 @@ def main() -> None:
                 "best_possible_bytes": best_any(pool, target, c.get("max_items")),  # type: ignore[arg-type]
             }
             path = HERE / f"case_{n:02d}.json"
-            path.write_text(json.dumps(case, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+            path.write_text(
+                json.dumps(case, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+            )
             n += 1
     print(f"wrote {n} cases to {HERE}")  # noqa: T201 -- a developer-run script
 

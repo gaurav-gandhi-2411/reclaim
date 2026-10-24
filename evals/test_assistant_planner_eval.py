@@ -105,13 +105,17 @@ def _largest_first_baseline(case: dict[str, object]) -> tuple[int, int]:
     return total, unsafe
 
 
+def _snapshot() -> dict[str, bytes]:
+    # Line endings normalised: a Windows checkout may turn the committed LF into CRLF.
+    return {p.name: p.read_bytes().replace(b"\r\n", b"\n") for p in CASES.glob("case_*.json")}
+
+
 def test_the_fixtures_are_current() -> None:
     """The committed cases are exactly what the seeded builder writes."""
-    before = {p.name: p.read_bytes() for p in CASES.glob("case_*.json")}
+    before = _snapshot()
     assert len(before) == 60
     subprocess.run([sys.executable, str(BUILDER)], check=True, capture_output=True)  # noqa: S603
-    after = {p.name: p.read_bytes() for p in CASES.glob("case_*.json")}
-    assert after == before, "re-run build_planner_cases.py and commit the result"
+    assert _snapshot() == before, "re-run build_planner_cases.py and commit the result"
 
 
 @pytest.mark.parametrize("case", _cases(), ids=lambda c: f"{c['case']}-{c['kind']}")
