@@ -248,3 +248,100 @@ def test_an_unreadable_journal_is_reported_not_hidden(setup: tuple[TestClient, P
     response = client.get("/api/relocate/moves")
     assert response.status_code == 500
     assert "relocate-abc123.json" in response.json()["detail"]
+
+
+def _run_move(client: TestClient, source: Path, target: Path | None = None) -> dict[str, object]:
+    body = {"source": str(source), **({"target": str(target)} if target else {})}
+    plan = client.post("/api/relocate/plan", json=body).json()
+    assert plan["ok"], plan
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    return plan
+
+
+def _rows(client: TestClient) -> dict[str, dict[str, object]]:
+    return {m["id"]: m for m in client.get("/api/relocate/moves").json()["moves"]}
+
+
+def test_old_copy_kept_is_false_for_a_deleted_old_journal_of_an_undone_move(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B8 BELIEVED 3. After rollback + delete-old the journal is inert, but a LATER move's old
+    copy sits at the same path with the first journal's restored-folder ID, so the identity
+    check alone said the first move still kept an old copy."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (first,) = _rows(client).values()
+    client.post(f"/api/relocate/{first['id']}/rollback")
+    assert _wait(client)["status"] == "done"
+    client.post(f"/api/relocate/{first['id']}/delete-old", json={"confirm": True})
+    assert _wait(client)["status"] == "done"
+    _run_move(client, source)
+    rows = _rows(client)
+    assert rows[str(first["id"])]["stage"] == "deleted_old"
+    assert rows[str(first["id"])]["old_copy_kept"] is False
+    (second,) = [m for i, m in rows.items() if i != first["id"]]
+    assert second["stage"] == "done" and second["old_copy_kept"] is True
+
+
+def test_old_copy_kept_is_false_for_a_rolled_back_journal_a_later_move_superseded(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """A use_old_copy rollback puts the old copy back at the path; the next move freezes that
+    folder to `<name>.reclaim-moved`, where it carries the first journal's folder ID again."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (first,) = _rows(client).values()
+    client.post(f"/api/relocate/{first['id']}/rollback?use_old_copy=true")
+    assert _wait(client)["status"] == "done"
+    assert _rows(client)[str(first["id"])]["old_copy_kept"] is False  # nothing kept yet
+    # The first move's target still holds the moved folder, so the next one needs its own.
+    _run_move(client, source, _d / "reclaim-relocated" / "second")
+    rows = _rows(client)
+    assert rows[str(first["id"])]["old_copy_kept"] is False
+    (second,) = [m for i, m in rows.items() if i != first["id"]]
+    assert second["old_copy_kept"] is True
+
+
+def test_delete_old_allowed_at_counts_from_when_the_old_copy_started_being_kept(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B8 BELIEVED 2. A swap a kill interrupted has no `swapped_at`; the engine counts the 7
+    days from the SWAPPING entry (`_kept_since`), and so must the page."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (move,) = _rows(client).values()
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    path = journals / f"relocate-{move['id']}.json"
+    journal = relocate.Journal.load(path)
+    swapping = [float(s[0]) for s in journal.history if s[1] == "swapping"]  # type: ignore[arg-type]
+    assert swapping and journal.swapped_at
+    journal.swapped_at = 0.0
+    journal.save()
+    row = _rows(client)[str(move["id"])]
+    assert row["delete_old_allowed_at"] == pytest.approx(
+        max(swapping) + relocate.KEEP_OLD_COPY_DAYS * 86400
+    )
+    assert row["delete_old_allowed_at"] == pytest.approx(
+        relocate._kept_since(relocate.Journal.load(path)) + relocate.KEEP_OLD_COPY_DAYS * 86400
+    )
+
+
+def test_delete_old_allowed_at_is_none_before_the_swap(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    _run_move(client, source)
+    (move,) = _rows(client).values()
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    journal = relocate.Journal.load(journals / f"relocate-{move['id']}.json")
+    journal.swapped_at, journal.junction_attempted = 0.0, False
+    journal.save()
+    assert _rows(client)[str(move["id"])]["delete_old_allowed_at"] is None

@@ -366,6 +366,24 @@ def status(request: Request) -> JobOut:
         return _job_out(runtime.job)
 
 
+def _old_copy_kept(journal: relocate.Journal, rows: list[relocate.Journal]) -> bool:
+    """Whether `<name>.reclaim-moved` is THIS move's kept old copy. Identity alone is not
+    enough: a later move of the same folder freezes a folder to the same path that can carry
+    this journal's folder ID again (B8). So an undone move whose old copy was deleted keeps
+    nothing, and neither does one a later, live move of the same folder has superseded. A
+    ROLLED_BACK move keeps it (the page offers delete-old for it, as the engine allows)."""
+    if journal.stage == relocate.Stage.DELETED_OLD and journal.rolled_back:
+        return False
+    superseded = any(
+        other.id != journal.id
+        and relocate._key(other.source) == relocate._key(journal.source)
+        and not relocate._is_inert(other)
+        and other.created_at >= journal.created_at
+        for other in rows
+    )
+    return not superseded and relocate._is_original(journal, journal.moved)
+
+
 @router.get("/moves", response_model=MovesOut)
 def moves(request: Request) -> MovesOut:
     try:
@@ -384,8 +402,12 @@ def moves(request: Request) -> MovesOut:
                 files=j.files,
                 bytes=j.bytes,
                 swapped_at=j.swapped_at,
-                delete_old_allowed_at=j.swapped_at + keep if j.swapped_at else None,
-                old_copy_kept=relocate._is_original(j, j.moved),
+                # The engine's own clock (`_kept_since`): a swap a kill interrupted has no
+                # `swapped_at`, and the 7 days count from its SWAPPING entry (B8).
+                delete_old_allowed_at=(
+                    relocate._kept_since(j) + keep if j.swapped_at or j.junction_attempted else None
+                ),
+                old_copy_kept=_old_copy_kept(j, rows),
                 history=j.history,
             )
             for j in reversed(rows)
