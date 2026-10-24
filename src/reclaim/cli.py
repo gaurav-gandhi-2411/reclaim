@@ -10,7 +10,7 @@ import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 
-from reclaim import autoclean_schedule, autoclean_state, regenerable
+from reclaim import autoclean_schedule, autoclean_state, regenerable, relocate_cli
 from reclaim.app_paths import data_root
 from reclaim.config import Config, exclusion_patterns, load_config, load_effective_config
 from reclaim.dedup import generate_duplicate_candidates, materiality_exclusion_stats
@@ -516,6 +516,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "a fresh preview_apply's selection_hash). No network transport exists for this command.",
     )
     _add_mcp_serve_arguments(mcp_serve_parser)
+    relocate_cli.add_parser(subparsers)
 
     return parser
 
@@ -1788,6 +1789,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_serve(args)
     if args.command == "dashboard":
         return _run_dashboard(args)
+    if args.command == "relocate":
+        return relocate_cli.run(args)
     if args.command == "mcp-serve":
         return _run_mcp_serve(args)
     parser.error(f"unknown command: {args.command}")
