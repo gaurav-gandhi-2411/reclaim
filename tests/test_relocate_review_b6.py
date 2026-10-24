@@ -37,7 +37,16 @@ from reclaim.relocate import (
     rollback,
 )
 
-OTHER_VOLUME = Path(r"D:\reclaim-build\tmp\verifierB6")
+def _other_volume_root(tmp_path: Path) -> Path:
+    """The root of a fixed drive other than tmp_path's, or skip. Only read (a junction inside
+    tmp_path points at it), so nothing is written outside the test's own folder. Was a fixed
+    folder on the review machine's D:, which failed on every other machine (CI)."""
+    from reclaim.drives import list_fixed_drives
+
+    for root in list_fixed_drives():
+        if root.drive.casefold() != tmp_path.drive.casefold():
+            return root
+    pytest.skip("needs a second fixed drive")
 
 
 def _restore(e: Env) -> Path:
@@ -51,8 +60,7 @@ def test_the_rollback_space_check_measures_the_source_volume(env: Env, tmp_path:
     """rollback calls free_bytes(src) while src is still the junction. _free_bytes(junction)
     -> shutil.disk_usage follows the junction, so it reports the TARGET volume's free space
     (the roomy one the data was moved to), not the source volume the copy-back fills."""
-    if tmp_path.drive.casefold() == OTHER_VOLUME.drive.casefold():
-        pytest.skip("needs tmp_path and the export on two volumes")
+    other_volume = _other_volume_root(tmp_path)
     _make_tree(env.source)
     env.move()
     calls: list[tuple[str, bool]] = []
@@ -66,11 +74,11 @@ def test_the_rollback_space_check_measures_the_source_volume(env: Env, tmp_path:
     assert calls and not calls[0][1], "the space check was handed the junction"
     # What the default free_bytes returns for a junction to another volume:
     link = tmp_path / "jprobe"
-    relocate._create_junction(str(link), str(OTHER_VOLUME))
+    relocate._create_junction(str(link), str(other_volume))
     try:
         got = relocate._free_bytes(str(link))
         here = shutil.disk_usage(_x(tmp_path)).free
-        there = shutil.disk_usage(str(OTHER_VOLUME)).free
+        there = shutil.disk_usage(str(other_volume)).free
     finally:
         relocate._remove_junction(str(link))
     assert abs(got - here) < abs(got - there), (
