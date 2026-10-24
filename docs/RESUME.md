@@ -142,6 +142,18 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     1. B10 result. Then the full verify (RAM), and #202/#203 into `integration/run-2026-10`, regenerating the ADR index there.
     2. D5 (warm-up profile) and the rest of D6 (HOWTO, README screenshots).
     3. Phase E.
+- 22:45 IST checkpoint 13 (24 Oct):
+  - **Merged:** #210, the ADR index (D6, `9a88e3c`), and checkpoint 12 (#211).
+  - **Relocate (#202):**
+    - reviews B10, B11 and B12 FAILED on narrower path and name edges, with no lost byte;
+    - all fixed (addenda 10-12), mutation 19 of 19;
+    - the series stops at twelve (DECISIONS 17);
+    - `feat/relocate-ui` = `82fa6b2`; 496 relocate, eval-gate and guard tests pass.
+  - **Full verify of `82fa6b2`:** waiting on its RAM gate.
+  - **Next:**
+    1. When the verify passes: merge #202 and #203 into `integration/run-2026-10`, regenerate the ADR index there (ADR-0043/0044), add `list_relocation_options`, and update #199.
+    2. D5 (warm-up profile).
+    3. Phase E.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
