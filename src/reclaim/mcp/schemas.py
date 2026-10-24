@@ -130,3 +130,38 @@ class DeleteResult(BaseModel):
     # paths, same no-enumeration posture as the rest of this model. `files_failed` includes them;
     # without this an agent cannot tell "skipped because it changed" from a real failure.
     skipped_by_reason: dict[str, int] = {}
+
+
+class PlannedSelection(BaseModel):
+    """One whole selection in a `plan_free_space` result: pass its `rule_id_or_category`,
+    `tier` and `selection_hash` to `delete` (which still asks the user)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id_or_category: str
+    category_group: str
+    tier: str
+    selection_hash: str
+    item_count: int
+    bytes_total: int
+    reversible: bool
+    risk_note: str
+
+
+class PlanFreeSpaceResult(BaseModel):
+    """`plan_free_space(...)`: a deterministic plan over the current scan. `reaches_target`
+    false means the constraints cannot reach the target: `shortfall_bytes` says by how much,
+    and no constraint was relaxed to hide it. `frees_now_bytes` is 0 by construction: every
+    assistant delete goes to the vault or the Recycle Bin (invariant I7), which frees the
+    space only when it is purged or emptied."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str
+    target_bytes: int
+    planned_bytes: int
+    reaches_target: bool
+    shortfall_bytes: int
+    frees_now_bytes: int
+    selections: list[PlannedSelection]
+    left_out: list[str]
