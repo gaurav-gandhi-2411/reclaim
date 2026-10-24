@@ -126,6 +126,16 @@ class InUseError(RelocateError):
     """A rename probe failed: some program holds a file open under the directory."""
 
 
+class NothingChangedError(RelocateError):
+    """A rollback refused before it changed anything (no space, a folder in use, nothing to put
+    back): the journal goes back to the stage it was at, so a DONE move stays DONE and its
+    `delete-old` still works (B8)."""
+
+
+class _TargetInUseError(InUseError, NothingChangedError):
+    """`InUseError` for the rollback's probe of the moved folder, before any change."""
+
+
 @dataclass(frozen=True, slots=True)
 class Policy:
     """What must never move, decided before anything else is looked at.
@@ -1630,11 +1640,31 @@ def rollback(
     if _is_inert(journal):
         return Outcome(journal, "already rolled back; nothing to do")
     _refuse_if_superseded(journal, journal_path)
+    previous = (journal.stage, journal.use_old_copy, journal.old_copy_partial)
+    entries = len(journal.history)
     if journal.stage == Stage.DELETING_OLD:
         journal.old_copy_partial = True  # Reclaim's own interrupted delete (B7 L2)
     # Saved with the first entry: a kill and `recover` must do what the user chose (B7 L1).
     journal.use_old_copy = use_old_copy
     journal.log(Stage.ROLLING_BACK, f"from {journal.stage}", clock)
+    try:
+        return _rollback_from_disk(journal, clock, use_old_copy, free_bytes)
+    except NothingChangedError:
+        # Refused before anything changed: the move is exactly what it was, so the journal
+        # says so (a DONE move stays DONE, B8). Only if nothing was logged after our entry.
+        if len(journal.history) == entries + 1:
+            journal.history.pop()
+            journal.stage, journal.use_old_copy, journal.old_copy_partial = previous
+            journal.save()
+        raise
+
+
+def _rollback_from_disk(
+    journal: Journal,
+    clock: Callable[[], float],
+    use_old_copy: bool,
+    free_bytes: Callable[[str], int],
+) -> Outcome:
     tgt = journal.target
     target_probe = tgt + PROBE_SUFFIX
     if not _exists(tgt) and journal.target_id and _folder_id(target_probe) == journal.target_id:
@@ -1684,11 +1714,13 @@ def _rollback_after_swap(
     src, tgt, moved = journal.source, journal.target, journal.moved
     restore = src + RESTORE_SUFFIX
     if _exists(moved) and not _is_original(journal, moved):
-        raise RelocateError(f"{moved} is not the folder this move renamed; refusing to touch it")
+        raise NothingChangedError(
+            f"{moved} is not the folder this move renamed; refusing to touch it"
+        )
     if _is_reparse(src):
         pointed = _junction_target(src)
         if pointed is None or _key(pointed) != _key(tgt):
-            raise RelocateError(f"{src} is a link, but not to {tgt}; refusing to change it")
+            raise NothingChangedError(f"{src} is a link, but not to {tgt}; refusing to change it")
     _settle_source(journal)
     if _is_original(journal, src):
         return _finish_rollback(journal, clock, "restored the folder")  # an earlier run did it
@@ -1699,7 +1731,7 @@ def _rollback_after_swap(
     try:
         files, _ = _listing(tgt)
     except RelocateError as exc:
-        raise RelocateError(
+        raise NothingChangedError(
             f"{exc}. Nothing changed. Rolling back with use_old_copy puts back the copy from "
             "before the move instead, and leaves the moved folder as it is"
         ) from exc
@@ -1708,7 +1740,7 @@ def _rollback_after_swap(
     # free (B6 L1); the free space is the source volume's, never measured through the junction.
     partial = sum(st.st_size for st in _listing(restore)[0].values()) if _exists(restore) else 0
     if free_bytes(_volume_anchor(src)) + partial < need:
-        raise RelocateError(
+        raise NothingChangedError(
             f"copying {tgt} back needs {need / 2**30:.1f} GiB free where it came from; nothing "
             "changed. Free that much, or roll back with use_old_copy (puts back the copy from "
             "before the move, without what was written since)"
@@ -1781,12 +1813,12 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
         # A delete of the old copy was interrupted: what is left is not the copy from before
         # the move (B6 M2). A verified restore copy of the moved folder is still whole, though.
         if target_here:
-            raise RelocateError(
+            raise NothingChangedError(
                 f"{moved} was partly deleted, so it is not the copy from before the move any "
                 "more; nothing changed. Roll back without use_old_copy to restore the moved folder"
             )
         if not restore_ok:
-            raise RelocateError(
+            raise NothingChangedError(
                 f"{tgt} is not reachable and {moved} was partly deleted; nothing changed. "
                 f"Reconnect the drive of {tgt} and roll back again"
             )
@@ -1796,7 +1828,7 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
     if old is None and not target_here and _exists(restore) and _is_original(journal, restore):
         # The restore copy exists but was never proved complete (a copy-back cut short): the
         # target holds the only whole copy of the moved folder (B7 H1).
-        raise RelocateError(
+        raise NothingChangedError(
             f"{restore} is only part of the moved folder (the copy back was interrupted), so it "
             f"is not put back; nothing changed. The moved data is on {tgt}: reconnect that "
             "drive and roll back again"
@@ -1808,11 +1840,11 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
                 # original path is never left empty by a refusal.
                 _create_junction(src, tgt)
                 _keep_root_flags(tgt, src)
-            raise RelocateError(
+            raise NothingChangedError(
                 "there is no copy from before the move left (it was deleted); nothing changed. "
                 "Roll back without use_old_copy to restore the moved folder"
             )
-        raise RelocateError(
+        raise NothingChangedError(
             f"there is nothing to put back: the copy from before the move is gone and {tgt} "
             "is not reachable"
         )
@@ -1848,7 +1880,9 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
     if old == restore:
         note = (
             f"put back the verified copy of the moved folder that an interrupted rollback made "
-            f"from {tgt}; the old copy of the folder had been deleted"
+            f"from {tgt}; the old copy of the folder had been deleted. {tgt} was not reachable, "
+            "so anything a program wrote through the junction after that copy was verified is "
+            f"only there: reconnect {tgt} to get it"
         )
     else:
         note = "put back the copy from before the move" + extra
@@ -2087,13 +2121,15 @@ def _rebuild_restore(journal: Journal) -> None:
 def _probe_target(target: str) -> None:
     probe_path = target + PROBE_SUFFIX
     if not _exists(target):
-        raise RelocateError(f"{target} is missing, so the moved data cannot be copied back")
+        raise NothingChangedError(f"{target} is missing, so the moved data cannot be copied back")
     if _exists(probe_path):
-        raise RelocateError(f"{probe_path} already exists; inspect it before rolling back")
+        raise NothingChangedError(f"{probe_path} already exists; inspect it before rolling back")
     try:
         _rename(target, probe_path)
     except OSError as exc:
-        raise InUseError(f"{target} is in use: close the program using it, then retry") from exc
+        raise _TargetInUseError(
+            f"{target} is in use: close the program using it, then retry"
+        ) from exc
     try:
         _rename(probe_path, target)
     except OSError as exc:  # pragma: no cover -- only a racing writer can recreate `target`
@@ -2196,6 +2232,7 @@ def delete_old_copy(
         _refuse_if_superseded(journal, journal_path)
         _refuse_if_excluded(journal, policy)
     if journal.stage == Stage.DELETING_OLD:
+        _require_live_folder(journal)
         changed = _old_copy_changes(journal, allow_missing=True)
         if changed:
             raise RelocateError(_changed_message(journal, changed))
@@ -2261,6 +2298,39 @@ def delete_old_copy(
         clock,
     )
     return _finish_delete(journal, clock, free_bytes)
+
+
+def _require_live_folder(journal: Journal) -> None:
+    """Before the rest of an interrupted delete goes: the folder that holds the other copy of
+    those files must be reachable and be the one this move made. The target drive may have been
+    unplugged or renamed since, and then the remains of the old copy are the only copy that can
+    be reached (B8 L-1). After a rollback the live folder is the restored one at the source."""
+    src, tgt = journal.source, journal.target
+    if journal.rolled_back:
+        live, ok = src, journal.restore_id != 0 and _folder_id(src) == journal.restore_id
+    else:
+        live = tgt
+        pointed = _junction_target(src)
+        try:
+            # Follows the junction on purpose: is the target reachable through it?
+            st = os.stat(long_path(Path(src)))  # noqa: PTH116
+        except OSError:
+            ok = False
+        else:
+            ok = (
+                pointed is not None
+                and _key(pointed) == _key(tgt)
+                and stat.S_ISDIR(st.st_mode)
+                and journal.target_id != 0
+                and st.st_ino == journal.target_id
+            )
+    if not ok:
+        raise RelocateError(
+            f"{live} is not reachable (or is not the folder this move made), so what is left of "
+            f"{journal.moved} is the only copy of those files that can be reached; nothing more "
+            f"is deleted. Reconnect the drive of {live} so that it is at the same path, then "
+            f"run `reclaim relocate delete-old {journal.id}` again"
+        )
 
 
 def _refuse_if_excluded(journal: Journal, policy: Policy) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: F811, PTH112
+# ruff: noqa: F811, PTH104, PTH112
 # Tests of the fixes for the eighth hostile review (B8; ADR-0044 addendum 8) that the reviewer's
 # probes (`test_relocate_review_b8.py`) do not cover: the second layer of M-A, the production
 # wiring of M-B, the retry after M-C/M-D, the BELIEVED items and G1. Every root is under
@@ -13,13 +13,16 @@ from pathlib import Path
 import pytest
 from test_relocate import (  # type: ignore[import-not-found]
     Env,
+    SimulatedCrash,
     _exists,
     _is_link,
     _make_tree,
     _manifest,
+    _write,
     _x,
     env,  # noqa: F401 -- the fixture
 )
+from test_relocate_review_b4 import _arm_deletes  # type: ignore[import-not-found]
 
 import reclaim.relocate as relocate
 from reclaim.config import Config, SafetyConfig
@@ -278,3 +281,106 @@ def test_a_failed_cleanup_of_our_restore_changes_nothing_and_a_rerun_succeeds(
     assert not _is_link(env.source) and _manifest(env.source) == before_move
     assert not _exists(_restore(env))
     assert _exists(env.target)  # use_old_copy leaves the moved folder as it is
+
+
+# ------------------------------------------------------------------ BELIEVED 1
+
+
+def test_a_rollback_refused_for_space_leaves_a_done_move_done(env: Env) -> None:
+    _make_tree(env.source)
+    env.move()
+    path = env.journal_path()
+    before = Journal.load(path)
+    with pytest.raises(RelocateError, match="needs"):
+        rollback(path, free_bytes=lambda _p: 0)
+    after = Journal.load(path)
+    assert after.stage == Stage.DONE and not after.use_old_copy
+    assert after.history == before.history and _is_link(env.source)
+    out = delete_old_copy(path, policy=env.policy, confirmed=True)  # still works
+    assert out.journal.stage == Stage.DELETED_OLD
+
+
+def test_a_rollback_refused_because_the_moved_folder_is_in_use_leaves_a_done_move_done(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    env.move()
+    path = env.journal_path()
+    before = Journal.load(path)
+    _Held(monkeypatch, str(env.target), str(env.target) + relocate.PROBE_SUFFIX)
+    with pytest.raises(relocate.InUseError):
+        rollback(path)
+    after = Journal.load(path)
+    assert after.stage == Stage.DONE and after.history == before.history
+    assert _is_link(env.source) and _exists(env.target)
+    out = delete_old_copy(path, policy=env.policy, confirmed=True)
+    assert out.journal.stage == Stage.DELETED_OLD
+
+
+def test_a_refused_use_old_copy_rollback_keeps_the_previous_choice(env: Env) -> None:
+    """The refusal restores the whole previous state, `use_old_copy` included, so a `recover`
+    never honours a choice whose rollback never started."""
+    _make_tree(env.source)
+    env.move()
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
+    path = env.journal_path()
+    with pytest.raises(RelocateError, match="nothing"):
+        rollback(path, use_old_copy=True)  # the old copy is gone: refused before any change
+    after = Journal.load(path)
+    assert after.stage == Stage.DELETED_OLD and not after.use_old_copy
+
+
+# ------------------------------------------------------------------ L-1
+
+
+def _interrupted_delete(e: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as m:
+        _arm_deletes(m, 3, relocate._key(_moved(e)))
+        with pytest.raises(SimulatedCrash):
+            delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
+    assert _stage(e) == Stage.DELETING_OLD
+
+
+def test_recover_finishes_an_interrupted_delete_once_the_target_is_back(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    env.move()
+    _interrupted_delete(env, monkeypatch)
+    left = _manifest(_moved(env))
+    os.rename(_x(env.target), _x(env.d / "unplugged"))
+    with pytest.raises(RelocateError, match="Reconnect") as info:
+        recover(env.journal_path(), policy=env.policy)
+    assert Journal.load(env.journal_path()).id in str(info.value)
+    assert _manifest(_moved(env)) == left and _stage(env) == Stage.DELETING_OLD
+    os.rename(_x(env.d / "unplugged"), _x(env.target))
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.DELETED_OLD and not _exists(_moved(env))
+
+
+def test_recover_does_not_finish_a_delete_when_another_folder_sits_at_the_target(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    env.move()
+    _interrupted_delete(env, monkeypatch)
+    left = _manifest(_moved(env))
+    os.rename(_x(env.target), _x(env.d / "ours-set-aside"))
+    _write(env.target / "foreign.txt", b"another folder, same path")  # reachable, wrong ID
+    with pytest.raises(RelocateError, match="not reachable"):
+        recover(env.journal_path(), policy=env.policy)
+    assert _manifest(_moved(env)) == left
+
+
+def test_recover_finishes_an_interrupted_delete_after_a_rollback(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a rollback the live folder is the restored one at the original path."""
+    _make_tree(env.source)
+    env.move()
+    rollback(env.journal_path())
+    _interrupted_delete(env, monkeypatch)
+    live = _manifest(env.source)
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.DELETED_OLD and not _exists(_moved(env))
+    assert _manifest(env.source) == live and not _is_link(env.source)
