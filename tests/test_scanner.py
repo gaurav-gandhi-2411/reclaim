@@ -1311,6 +1311,23 @@ def test_scan_tree_records_only_an_uncancelled_walk_as_a_completed_root(
         assert index.completed_scan_roots() == [Path(root.as_posix())]
 
 
+def test_scan_tree_never_records_a_root_it_could_not_list(tmp_path: Path) -> None:
+    """D1: an offline or unreadable root ends the walk uncancelled with nothing listed. It must
+    not be recorded as completed; a record from an earlier full walk of it stays."""
+    missing = tmp_path / "offline"
+    root = tmp_path / "root"
+    _make_fanout_tree(root)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(missing, index)
+        assert stats.cancelled is False
+        assert index.completed_scan_roots() == []
+
+        scan_tree(root, index)
+        root.rename(tmp_path / "unplugged")
+        scan_tree(root, index)
+        assert index.completed_scan_roots() == [Path(root.as_posix())]
+
+
 def test_scan_tree_cancel_event_never_prunes_a_partial_walk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
