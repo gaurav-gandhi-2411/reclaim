@@ -346,11 +346,14 @@ def rollback(
 def delete_old(
     move_id: str, payload: DeleteOldIn, background: BackgroundTasks, request: Request
 ) -> JobOut:
-    path = _journal_path(_state(request), move_id)
+    state = _state(request)
+    path = _journal_path(state, move_id)
+    # B7 M3: a delete never goes ahead for an excluded project, even a kept old copy.
+    policy = _policy(state)
 
     def work() -> relocate.Outcome:
         return relocate.delete_old_copy(
-            path, confirmed=payload.confirm, accept_missing=payload.accept_missing
+            path, policy=policy, confirmed=payload.confirm, accept_missing=payload.accept_missing
         )
 
     return _start(request, background, "delete-old", move_id, work)
@@ -365,7 +368,10 @@ def status(request: Request) -> JobOut:
 
 @router.get("/moves", response_model=MovesOut)
 def moves(request: Request) -> MovesOut:
-    rows = relocate.journals(journal_dir(_state(request)))
+    try:
+        rows = relocate.journals(journal_dir(_state(request)))
+    except relocate.RelocateError as exc:  # an unreadable journal: say which, never hide it
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     keep = relocate.KEEP_OLD_COPY_DAYS * 86400
     return MovesOut(
         moves=[

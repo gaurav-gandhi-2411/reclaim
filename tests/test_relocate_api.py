@@ -192,3 +192,59 @@ def test_rollback_with_the_old_copy_and_the_kept_flag(setup: tuple[TestClient, P
     (move,) = client.get("/api/relocate/moves").json()["moves"]
     assert move["stage"] == "rolled_back" and move["old_copy_kept"] is False
     assert Path(plan["target"], "w.bin").read_bytes() == b"edited through the junction"
+
+
+def _moved(client: TestClient, source: Path) -> dict[str, object]:
+    (source / "laterexcl").mkdir()
+    (source / "laterexcl" / "main.py").write_text("print(1)\n", encoding="utf-8")
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    return move
+
+
+def test_delete_old_never_deletes_an_old_copy_holding_an_excluded_project(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B7 M3 at the API: the dashboard's delete-old passes the exclusion policy too. The name
+    becomes excluded after the move, as in the review's CLI probe."""
+    client, source, _d = setup
+    move = _moved(client, source)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    state.config = Config(exclusions=ExclusionsConfig(project_names=["zzexclproj", "laterexcl"]))
+    response = client.post(f"/api/relocate/{move['id']}/delete-old", json={"confirm": True})
+    assert response.status_code == 202
+    job = _wait(client)
+    assert job["status"] == "failed"
+    assert "exclu" in str(job["error"])
+    assert Path(str(move["moved"]), "laterexcl", "main.py").is_file()
+
+
+def test_delete_old_removes_the_old_copy_when_nothing_is_excluded(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    move = _moved(client, source)
+    response = client.post(f"/api/relocate/{move['id']}/delete-old", json={"confirm": True})
+    assert response.status_code == 202
+    assert _wait(client)["status"] == "done"
+    assert not Path(str(move["moved"])).exists()
+    assert (source / "laterexcl" / "main.py").is_file()  # the live folder, through the junction
+
+
+def test_an_unreadable_journal_is_reported_not_hidden(setup: tuple[TestClient, Path, Path]) -> None:
+    client, _source, _d = setup
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    journals.mkdir(parents=True, exist_ok=True)
+    (journals / "relocate-abc123.json").write_text("{not json", encoding="utf-8")
+    response = client.get("/api/relocate/moves")
+    assert response.status_code == 500
+    assert "relocate-abc123.json" in response.json()["detail"]
