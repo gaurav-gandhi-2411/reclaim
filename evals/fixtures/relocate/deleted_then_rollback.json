@@ -1,0 +1,1 @@
+{"case": "deleted_then_rollback", "why": "After the old copy is deleted, a rollback copies the data back.", "files": [{"path": "a.bin", "size": 4000}, {"path": "s/b.bin", "size": 40}], "action": "delete_then_rollback", "expect": "rolled_back"}

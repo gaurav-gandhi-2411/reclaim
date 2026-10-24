@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-from reclaim.config import Config, exclusion_patterns
+from reclaim.config import AgentArtifactsConfig, Config, exclusion_patterns
 from reclaim.models import FileRecord, SafetyResult, Verdict
 
 REASON_PROTECTED_SYSTEM_ROOT = "PROTECTED_SYSTEM_ROOT"
@@ -299,6 +299,13 @@ class SafetyValidator:
         self._dev_artifacts_enabled = config.categories.dev_artifacts.enabled
         # ADR-0039: `[safety] deny` + one glob per `[exclusions] project_names` entry.
         self._user_exclusions = exclusion_patterns(config)
+        self._agent_artifacts = config.categories.agent_artifacts
+
+    @property
+    def agent_artifacts_settings(self) -> AgentArtifactsConfig:
+        """`[categories.agent_artifacts]` as this validator was built from (idle window, clone
+        name patterns): the apply-time re-proof must use the same values as detection."""
+        return self._agent_artifacts
 
     @property
     def exclusion_patterns(self) -> tuple[str, ...]:
@@ -306,15 +313,22 @@ class SafetyValidator:
         the same list outside `evaluate`, e.g. the regenerable tier and the apply report)."""
         return tuple(self._user_exclusions)
 
-    def exclusion_match(self, path: Path, *, is_dir: bool = False) -> str | None:
+    def exclusion_match(
+        self, path: Path, *, is_dir: bool = False, lexical: bool = False
+    ) -> str | None:
         """The user deny/exclusion pattern `path` matches (canonicalised first, like
         `evaluate`), or -- for a directory -- one matched by anything beneath it; else None.
         Stat-free for files; a directory costs one name-only subtree walk, and only when any
-        pattern is configured. Never consults the built-in deny list or the allow-list."""
+        pattern is configured. Never consults the built-in deny list or the allow-list.
+
+        `lexical=True` matches the path text exactly as given, without `resolve()`: a junction
+        stays the name the user excluded instead of turning into its target (relocate's
+        original path is a junction after a move, B8 M-B). Default off: every other caller
+        keeps the canonicalised behaviour."""
         patterns = self._user_exclusions
         if not patterns:
             return None
-        canonical = _canonical_path(path)
+        canonical = path if lexical else _canonical_path(path)
         hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
         if hit is None and is_dir:
             hit = subtree_exclusion_match(canonical, patterns)

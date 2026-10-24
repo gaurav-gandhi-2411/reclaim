@@ -1,0 +1,1 @@
+{"case": "acl_denied", "why": "An unreadable file fails the copy, which rolls back.", "files": [{"path": "ok.bin", "size": 100}, {"path": "locked.bin", "size": 100}], "extras": ["acl_deny"], "action": "move", "expect": "failed_rolled_back"}

@@ -2080,6 +2080,15 @@ def is_current_scan_id(state: AppState, scan_id: str) -> bool:
     return scan_id == scan_id_for_state(state)
 
 
+def candidates_for_planning(state: AppState) -> list[Candidate]:
+    """The same validator-filtered candidate universe `select_candidates_for_selector` reads
+    (single-flight cache, scope-filtered), for `reclaim.mcp.planner`: the planner groups it into
+    whole selections, and the MCP tool re-derives each one through the selector before handing
+    out its hash, so a plan can only ever name what `delete` would execute."""
+    with ScanIndex(state.db_path) as index:
+        return list(_cached_all_candidates(index, state))
+
+
 def select_candidates_for_selector(
     state: AppState, *, tier: str, rule_id_or_category: str
 ) -> list[Candidate]:

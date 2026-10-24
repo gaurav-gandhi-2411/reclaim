@@ -1,0 +1,1 @@
+{"case": "symlink_inside", "why": "A link inside the tree: a plain copy would follow or drop it.", "files": [{"path": "a.txt", "size": 3}], "extras": ["junction"], "action": "move", "expect": "refused", "reason": "links"}
