@@ -8,6 +8,8 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from mcp_gates import auto_approve
 from test_mcp import _build_power_mode_state, _poll_scan_status_until_completed, _write
 
+from reclaim import relocate
+from reclaim.api.relocate_routes import journal_dir as relocate_journal_dir
 from reclaim.api.relocate_routes import relocation_candidates
 from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, ExclusionsConfig
 from reclaim.mcp.server import build_mcp_server
@@ -161,8 +163,16 @@ async def test_find_unused_models_never_reads_an_excluded_project(
     assert not any("zzexclproj" in p.casefold() for p in opened)
 
 
-def _snapshot(root: Path) -> list[tuple[str, int]]:
-    return sorted((str(p), p.stat().st_size if p.is_file() else -1) for p in root.rglob("*"))
+def _snapshot(roots: list[Path], journal_dir: Path) -> list[tuple[str, int]]:
+    """What a tool that moved, probed or journaled would change: each listed folder's whole
+    tree, its parent's entries (a probe renames the folder next to itself) and the relocate
+    journal folder. Not the whole redirected profile: in CI that is pytest's shared base temp,
+    where other tests' logs still change size."""
+    seen: set[Path] = {journal_dir}
+    for root in roots:
+        seen.update(root.parent.iterdir())
+        seen.update(root.rglob("*"))
+    return sorted((str(p), p.stat().st_size if p.is_file() else -1) for p in seen if p.exists())
 
 
 async def test_list_relocation_options_is_the_pages_listing_and_changes_nothing(
@@ -172,13 +182,17 @@ async def test_list_relocation_options_is_the_pages_listing_and_changes_nothing(
     hub = home / ".cache" / "huggingface" / "hub"
     _write(hub / "models--org--big" / "blobs" / "b", b"w" * 4_096)
     state = _build_power_mode_state(tmp_path, config=_config())
-    before = _snapshot(home)
+    roots = [p for p in relocate.known_locations(os.environ) if p.exists()]
+    journals = relocate_journal_dir(state)
+    assert hub in roots
+    before = _snapshot(roots, journals)
     server = build_mcp_server(state, approval_gate=auto_approve())
     async with create_connected_server_and_client_session(server._mcp_server) as session:
         tools = {t.name: t for t in (await session.list_tools()).tools}
         assert tools["list_relocation_options"].inputSchema.get("properties", {}) == {}
         result = (await session.call_tool("list_relocation_options", {})).structuredContent
-    assert _snapshot(home) == before  # read-only: nothing renamed, written or journaled
+    assert _snapshot(roots, journals) == before  # read-only: nothing renamed or written
+    assert not journals.exists()  # and no move was journaled
     options = {o["path"]: o for o in result["options"]}
     assert options[str(hub)]["verdict"] == "movable"
     assert options[str(hub)]["size_bytes"] >= 4_096
