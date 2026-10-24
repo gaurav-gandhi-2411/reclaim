@@ -37,6 +37,7 @@ from reclaim.relocate import (
     rollback,
 )
 
+
 def _other_volume_root(tmp_path: Path) -> Path:
     """The root of a fixed drive other than tmp_path's, or skip. Only read (a junction inside
     tmp_path points at it), so nothing is written outside the test's own folder. Was a fixed
