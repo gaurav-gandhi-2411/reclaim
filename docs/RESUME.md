@@ -164,6 +164,7 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     - item 9, three ACL-locked test folders;
     - item 8, build 12.
   - **Next:** D5 when RAM allows, then Phase E (soak needs build 12; docs; review pack).
+- 00:40 IST checkpoint 15 (25 Oct): the review pack is brought current: every merge in section 1, and sections 3, 4, 5, 7 and 9 updated. No code. Next: D5 when RAM allows; Phase E's soak waits for build 12.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
