@@ -496,11 +496,11 @@ def test_a_kill_after_the_junction_is_removed_still_restores_later_writes(
     real_sync = relocate._sync_back
     calls = {"n": 0}
 
-    def die_once(target: str, moved: str) -> int:
+    def die_once(target: str, moved: str, record: object = None) -> int:
         calls["n"] += 1
         if calls["n"] == 2:  # the first copy-back runs before the junction is removed
             raise SimulatedCrash("after the junction was removed")
-        return real_sync(target, moved)
+        return real_sync(target, moved, record)  # type: ignore[arg-type]
 
     monkeypatch.setattr(relocate, "_sync_back", die_once)
     with pytest.raises(SimulatedCrash):
@@ -525,11 +525,11 @@ def test_a_kill_while_restoring_a_deleted_old_copy_resumes_from_the_restore(
     real_sync = relocate._sync_back
     calls = {"n": 0}
 
-    def die_once(target: str, moved: str) -> int:
+    def die_once(target: str, moved: str, record: object = None) -> int:
         calls["n"] += 1
         if calls["n"] == 2:  # the first copy-back runs before the junction is removed
             raise SimulatedCrash("after the junction was removed")
-        return real_sync(target, moved)
+        return real_sync(target, moved, record)  # type: ignore[arg-type]
 
     monkeypatch.setattr(relocate, "_sync_back", die_once)
     with pytest.raises(SimulatedCrash):
@@ -569,11 +569,11 @@ def test_a_failed_copy_back_after_the_junction_is_removed_puts_it_back(
     real_sync = relocate._sync_back
     calls = {"n": 0}
 
-    def fail_second(target: str, moved: str) -> int:
+    def fail_second(target: str, moved: str, record: object = None) -> int:
         calls["n"] += 1
         if calls["n"] == 2:
             raise RelocateError("a file vanished")
-        return real_sync(target, moved)
+        return real_sync(target, moved, record)  # type: ignore[arg-type]
 
     monkeypatch.setattr(relocate, "_sync_back", fail_second)
     with pytest.raises(RelocateError, match="vanished"):

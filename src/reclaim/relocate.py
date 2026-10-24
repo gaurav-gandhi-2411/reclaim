@@ -34,7 +34,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import structlog
 
@@ -642,10 +642,27 @@ def _folder_meta(path: str) -> tuple[int, str]:
     return attrs & _COPIED_ATTRS, digest.hexdigest()
 
 
+def _gone(path: str) -> bool:
+    """True only when `path` is definitely absent (not found). Any other error while
+    checking (access denied, a drive that is busy) refuses, so a transient fault is never
+    taken for a missing folder (fourth hostile review, B4 M1)."""
+    try:
+        os.stat(long_path(Path(path)), follow_symlinks=False)  # noqa: PTH116
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError as exc:
+        raise RelocateError(f"{path} could not be checked ({exc}); nothing changed, retry") from exc
+    return False
+
+
 def _folder_id(path: str) -> int:
     """The NTFS file ID of a real folder at `path`, 0 if there is none (absent, or a link)."""
     st = _lstat(path)
-    if st is None or st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+    if (
+        st is None
+        or st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT
+        or not stat.S_ISDIR(st.st_mode)
+    ):
         return 0
     return st.st_ino
 
@@ -1107,6 +1124,13 @@ def execute_move(
             _rename(plan.source, plan.moved)
         except OSError as exc:
             raise InUseError(f"{plan.source} came into use during the copy: retry later") from exc
+        if _folder_id(plan.moved) != journal.source_id:
+            # Replaced after the ID check, before the rename: put the other folder back where
+            # it was; the freeze, in effect, never happened.
+            _rename(plan.moved, plan.source)
+            journal.freeze_attempted = False
+            journal.save()
+            raise RelocateError(f"{plan.source} was replaced by another folder during the copy")  # noqa: TRY301
         journal.log(Stage.FROZEN, "", clock)
         hook("after_freeze")
         if policy.exclusion_match(Path(plan.moved)) is not None:
@@ -1378,7 +1402,7 @@ def rollback(journal_path: Path, *, clock: Callable[[], float] = time.time) -> O
         pointed = _junction_target(src)
         if pointed is None or _key(pointed) != _key(tgt):
             raise RelocateError(f"{src} is a link, but not to {tgt}; refusing to change it")
-        if not _exists(tgt) and old == moved:
+        if old == moved and _gone(tgt):
             # The moved folder is gone or its drive is not there, but the old copy is intact
             # (B3 M4): put it back. Nothing of the target is deleted (it cannot be reached).
             _remove_junction(src)
@@ -1391,26 +1415,31 @@ def rollback(journal_path: Path, *, clock: Callable[[], float] = time.time) -> O
                 _rebuild_restore(journal)
             _probe_target(tgt)
             # Copy back while the junction still stands: a failure leaves the move as it was.
-            copied_back = _sync_back(tgt, old)
+            copied_back = _sync_back(tgt, old, _record_for(journal, old))
             _remove_junction(src)
             journal.log(Stage.ROLLING_BACK, "junction removed", clock)
             try:
                 # Anything written in the moment between the probe and the removal.
-                copied_back += _sync_back(tgt, old)
+                copied_back += _sync_back(tgt, old, _record_for(journal, old))
             except Exception:
                 _create_junction(src, tgt)
                 _keep_root_flags(old, src)
                 journal.log(Stage.ROLLING_BACK, "copy-back failed; junction restored", clock)
                 raise
             journal.log(Stage.ROLLING_BACK, f"copied back {copied_back} changed files", clock)
-    elif journal.junction_attempted and not _exists(src) and _exists(tgt):
+    elif journal.junction_attempted and not _exists(src):
         # Only once a junction may have existed: before it, nothing but this code wrote to the
         # target, and copying it back would put a stale copy over a newer original.
         # The junction is gone (removed by us before a kill, or by something else): copying
         # back again is idempotent and catches writes made after the swap.
-        if old == restore:
-            _rebuild_restore(journal)
-        _sync_back(tgt, old)
+        if _gone(tgt):
+            note_extra = (
+                f"; {tgt} was not reachable, so anything written there after the move is only there"
+            )
+        else:
+            if old == restore:
+                _rebuild_restore(journal)
+            _sync_back(tgt, old, _record_for(journal, old))
     for _attempt in range(2):
         if not _exists(src) and _exists(old):
             # Something may recreate the folder in this very moment: it is settled below.
@@ -1498,6 +1527,11 @@ def _settle_source(journal: Journal) -> None:
     src = journal.source
     if not _exists(src) or _is_reparse(src) or _is_original(journal, src):
         return
+    if not stat.S_ISDIR(os.stat(long_path(Path(src)), follow_symlinks=False).st_mode):  # noqa: PTH116
+        raise RelocateError(
+            f"a file now sits at {src}; the original data is safe in {_where_original(journal)}. "
+            "Move that file elsewhere and roll back again."
+        )
     if _is_empty(src):
         assert_not_real_profile_under_pytest(src, operation="remove the empty folder")
         os.rmdir(long_path(Path(src)))  # noqa: PTH106 -- empty, no streams, not ours
@@ -1567,16 +1601,42 @@ def _probe_target(target: str) -> None:
     _rename(probe_path, target)
 
 
-def _sync_back(target: str, moved: str) -> int:
+def _record_for(journal: Journal, old: str) -> dict[str, Any] | None:
+    """The swap manifest, when `old` is the old copy it describes; None for a restore copy
+    (made by rollback itself from the target) or before the manifest exists. Unreadable when
+    it should exist: refuse, rather than copy back without knowing what the old copy was."""
+    if old != journal.moved or not journal.manifest:
+        return None
+    try:
+        with open(journal.manifest, encoding="utf-8") as fh:  # noqa: PTH123
+            record: dict[str, Any] = json.load(fh)
+        if not isinstance(record.get("files"), dict) or not isinstance(record.get("dirs"), dict):
+            raise TypeError("not a manifest")  # noqa: TRY301 -- one handler for every bad shape
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RelocateError(
+            f"the record of the old copy cannot be read ({exc}); nothing changed. Without it a "
+            "rollback cannot tell your later edits in the old copy from the move's own copy"
+        ) from exc
+    return record
+
+
+def _sync_back(target: str, moved: str, record: dict[str, Any] | None = None) -> int:
     """Copies into the old copy everything the target gained or changed after the swap: files
     whose size or mtime moved on (the copy carried the original's exactly), file attributes,
     and folders with their attributes and named streams (B3 M2). Each copied file is proved by
     SHA-256. A target file with the same size and mtime but other bytes was not edited, it is
     a bad copy: the old copy keeps its own version, and `_discard_copy` then keeps the target.
 
-    Deletes nothing in the old copy: a file removed after the swap comes back, and where a
-    program replaced a folder with a file (or the reverse), the old copy's entry is renamed
-    aside to `<name>.reclaim-conflict` rather than lost (B3 M3)."""
+    Never destroys what the old copy holds:
+    - a file removed after the swap comes back;
+    - where a program replaced a folder with a file (or the reverse), the old copy's entry is
+      renamed aside to `<name>.reclaim-conflict` (B3 M3);
+    - with `record` (the swap manifest), an old-copy file that no longer matches it was
+      written after the move: it is set aside the same way before the target's version is
+      copied in, so both survive (B4 H1);
+    - folder streams are only added or replaced, never removed, and a same-named stream is
+      replaced only when the old copy's folder still matches the record (B4 H2).
+    """
     tgt_files, tgt_dirs = _listing(target)
     old_files, old_dirs = _listing(moved)
     conflicts = sorted(
@@ -1585,9 +1645,7 @@ def _sync_back(target: str, moved: str) -> int:
         key=len,
     )
     for rel in conflicts:
-        here = _join(moved, rel)
-        if _exists(here):
-            _rename(here, _free_name(here + ".reclaim-conflict"))
+        _set_aside(moved, target, rel)
     if conflicts:
         old_files, old_dirs = _listing(moved)
     for rel in sorted(tgt_dirs):
@@ -1600,6 +1658,13 @@ def _sync_back(target: str, moved: str) -> int:
         or old_files[rel].st_size != st.st_size
         or old_files[rel].st_mtime_ns != st.st_mtime_ns
     ]
+    kept = 0
+    if record is not None:
+        recorded = record["files"]
+        for rel in changed:
+            if rel in old_files and not _matches_record(moved, rel, old_files[rel], recorded):
+                _set_aside(moved, target, rel)  # the old copy's own later edit: keep it
+                kept += 1
     for rel in changed:
         _copy_file(_join(target, rel), _join(moved, rel))
     bad = _differences(target, moved, changed)
@@ -1613,17 +1678,52 @@ def _sync_back(target: str, moved: str) -> int:
     for rel in ["", *sorted(tgt_dirs, key=len, reverse=True)]:
         there = _join(target, rel) if rel else long_path(Path(target))
         here = _join(moved, rel) if rel else long_path(Path(moved))
-        if _folder_meta(there) != _folder_meta(here):
-            _copy_folder_meta(there, here)
-    return len(changed) + len(conflicts)
+        unchanged = record is None or list(_folder_meta(here)) == record["dirs"].get(rel)
+        _merge_folder_meta(there, here, replace_same_name=unchanged)
+    return len(changed) + len(conflicts) + kept
 
 
-def _free_name(path: str) -> str:
-    candidate, n = path, 1
-    while _exists(candidate):
+def _matches_record(root: str, rel: str, st: os.stat_result, recorded: dict[str, Any]) -> bool:
+    want = recorded.get(rel)
+    return (
+        want is not None
+        and [st.st_size, st.st_mtime_ns] == want[:2]
+        and _sha256(_join(root, rel)) == want[2]
+    )
+
+
+def _set_aside(moved: str, target: str, rel: str) -> None:
+    """Renames the old copy's entry at `rel` to a free `<name>.reclaim-conflict[-n]`, free on
+    both sides so the copy-back cannot merge into a target entry of that name (B4 L1)."""
+    here = _join(moved, rel)
+    if not _exists(here):
+        return
+    aside = _free_name(here + ".reclaim-conflict", _join(target, rel) + ".reclaim-conflict")
+    _rename(here, aside)
+
+
+def _merge_folder_meta(src: str, dst: str, *, replace_same_name: bool) -> None:
+    """The target folder's attributes and named streams onto the old copy's folder: streams
+    the old copy lacks are added; one it has under the same name is replaced only when
+    `replace_same_name`; streams only the old copy has are kept."""
+    have = set(_named_streams(dst))
+    for name in _named_streams(src):
+        if name in have and not replace_same_name:
+            continue
+        with open(src + name, "rb") as fi:  # noqa: PTH123
+            _copy_stream(fi, dst + name)
+    _set_attributes(dst, os.stat(src, follow_symlinks=False).st_file_attributes)  # noqa: PTH116
+
+
+def _free_name(path: str, *also: str) -> str:
+    """`path`, or `path-2`, `path-3`, ...: the first name free at `path` and at every `also`
+    (the same suffix applied there)."""
+    n = 1
+    while True:
+        suffix = "" if n == 1 else f"-{n}"
+        if not _exists(path + suffix) and not any(_exists(a + suffix) for a in also):
+            return path + suffix
         n += 1
-        candidate = f"{path}-{n}"
-    return candidate
 
 
 def _discard_copy(journal: Journal) -> tuple[str, str] | None:
@@ -1635,7 +1735,7 @@ def _discard_copy(journal: Journal) -> tuple[str, str] | None:
     with the same attributes, and every folder has the same attributes and streams there.
     """
     tgt = journal.target
-    if not _exists(tgt):
+    if _gone(tgt):
         return None
     if _is_reparse(tgt):
         return (tgt, "it is a link now, not the copy this move made")
@@ -1722,7 +1822,8 @@ def delete_old_copy(
         recorded_dirs: dict[str, list[object]] = record["dirs"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise RelocateError(
-            f"the record of the old copy at the move cannot be read ({exc}); nothing deleted"
+            f"the record of the old copy at the move cannot be read ({exc}); nothing deleted. "
+            "Roll back to put the original back, or check the old copy yourself and remove it"
         ) from exc
     if not recorded:
         raise RelocateError(
@@ -1780,8 +1881,10 @@ def delete_old_copy(
 def _finish_delete(
     journal: Journal, clock: Callable[[], float], free_bytes: Callable[[str], int] = _free_bytes
 ) -> Outcome:
-    if _exists(journal.moved):
+    if not _gone(journal.moved):
         rmtree_reparse_point_safe(long_path(Path(journal.moved)))
+    if not _gone(journal.moved):
+        raise RelocateError(f"{journal.moved} is still there; nothing was reported deleted")
     journal.source_free_after = free_bytes(journal.source)
     freed = journal.source_free_after - journal.source_free_before
     journal.log(Stage.DELETED_OLD, f"volume free space changed by {freed} bytes", clock)

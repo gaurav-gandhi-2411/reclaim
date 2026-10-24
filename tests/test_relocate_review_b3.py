@@ -412,7 +412,7 @@ def test_a_copy_whose_folder_metadata_could_not_be_brought_back_is_kept(
     env.move()
     with open(_x(env.source / "sub") + ":meta", "wb") as fh:
         fh.write(b"written through the junction")
-    monkeypatch.setattr(relocate, "_copy_folder_meta", lambda _s, _d: None)
+    monkeypatch.setattr(relocate, "_merge_folder_meta", lambda _s, _d, **_k: None)
     outcome = rollback(env.journal_path())
     assert _exists(env.target)
     assert outcome.kept and "differ" in outcome.kept[1]

@@ -226,3 +226,41 @@ pass made rollback copy the target's stale file over the newer original. The exi
 
 **Mutation** (`D:\reclaim-build\tools\mutate_rl3.py`, 13 mutants of the new guards): all 13 killed, four
 after pins added for the first survivors (T8, T9, T12, T13).
+## Addendum 4 (2026-10-24): fourth hostile review (B4), FAIL, fixed
+
+A fourth independent review, of `463f6da`, passed every kill sweep, including new sweeps over
+`delete_old_copy` (inside its tree removal) and over the probe-failure paths, followed by recover
+or rollback. It found 9 problems (`tests/test_relocate_review_b4.py`, every probe fails on that
+head):
+
+- **H1, H2: rollback's copy-back still assumed the old copy was unchanged since the swap.**
+  - A write made into `.reclaim-moved` was overwritten by the target's stale version, and our
+    copy was then discarded, so the edit existed nowhere.
+  - A stream added to an old-copy folder was removed.
+  - The fix: copy-back now reads the swap manifest. An old-copy file that no longer matches it
+    is set aside as `<name>.reclaim-conflict` before the target's version is copied in, so both
+    survive. Folder streams are only added or replaced, never removed. A same-named stream is
+    replaced only while that folder still matches the record. A manifest that should exist but
+    cannot be read stops the rollback before anything changes.
+- **M1, L2: "missing" meant "could not be checked".** A transient access error on the target made
+  rollback treat it as gone and restore the stale old copy. A failed check also let the delete
+  report success while the old copy was still there. "Missing" is now only not-found; any
+  other error refuses and says to retry.
+- **M2:** the junction-was-removed branch now gives the same warning as the missing-target
+  branch: post-move writes are only on the unreachable target.
+- **M3:** the folder ID is checked again on the frozen name right after the rename. A folder
+  replaced in the moment between the check and the rename is put straight back, and the move
+  stops as if it had never frozen.
+- **Low findings:**
+  - a conflict name must be free on both sides, so a set-aside can never merge into a target
+    folder (L1);
+  - an unreadable manifest's message says what to do next (L3);
+  - a file left at the original path gets a clear message and is never taken for a folder
+    (L4).
+
+**Mutation** (`D:\reclaim-build\tools\mutate_rl4.py`, 11 mutants): 9 killed, 2 after new pins (V2, V6).
+Two are equivalent:
+- V5 (a conflict name checked on one side only): the manifest set-aside still preserves the old
+  content, because it no longer matches the record.
+- V10 (a file accepted as the original): NTFS file IDs are unique per volume, so no file can carry the
+  original folder's ID.

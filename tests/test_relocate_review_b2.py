@@ -122,8 +122,8 @@ def test_folder_recreated_inside_rollbacks_own_window_is_not_reported_restored(
     real = relocate._sync_back
     calls = {"n": 0}
 
-    def sync_back(target: str, moved: str) -> int:
-        n = real(target, moved)
+    def sync_back(target: str, moved: str, record: object = None) -> int:
+        n = real(target, moved, record)  # type: ignore[arg-type]
         calls["n"] += 1
         if calls["n"] == 2:  # after the junction is gone
             _write(env.source / "fresh.log", b"recreated by the program")
@@ -156,7 +156,7 @@ def test_rebuild_restore_never_wipes_a_complete_restore_when_the_target_is_gone(
     env.move()
     delete_old_copy(env.journal_path(), confirmed=True)
 
-    def die(target: str, moved: str) -> int:
+    def die(target: str, moved: str, record: object = None) -> int:
         raise SimulatedCrash("killed in the first copy-back")
 
     real = relocate._sync_back
