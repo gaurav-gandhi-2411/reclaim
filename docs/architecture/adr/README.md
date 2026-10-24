@@ -49,5 +49,6 @@ it. These numbers are used by more than one ADR: 0032.
 | 0040 | [Background, cancellable, low-priority dedup warm-up after a full scan](0040-background-dedup-warmup.md) |
 | 0041 | [`[storage] index_dir` -- the scan index may live on another volume](0041-index-dir-setting.md) |
 | 0042 | [dependency trees are opaque in the scan index (one aggregate row per root)](0042-opaque-dependency-trees.md) |
+| 0043 | [reversible cleanup of finished AI-agent worktrees, throwaway clones and idle scratch](0043-agent-artifacts-cleanup.md) |
 | 0044 | [Relocate a folder to another drive behind a junction](0044-relocate-behind-a-junction.md) |
 | 0045 | [keep `idx_files_path_lower` -- it is not a duplicate of the primary key](0045-keep-path-lower-index.md) |
