@@ -40,17 +40,17 @@ Relocate classifies both as GUIDED (`relocate.default_policy`). It listed them a
    - the distribution is stopped (`wsl --terminate <name>`, then `wsl --list --verbose` shows Stopped);
    - no `wsl.exe` or `vmmem` work is attributable to it;
    - the target is a local fixed NTFS drive;
-   - the target has free space of at least 2 x the VHDX size, for the export file plus the new disk;
+   - the target has free space of at least 2 x the VHDX size: the tar plus one imported disk. The temporary import in step 2 is unregistered before step 4, so the two imports never coexist (if a later design keeps both, this becomes 3 x);
    - the journal drive has room;
    - the name is not excluded.
 2. **Prefer `wsl --manage <name> --move <folder>`** where the installed WSL has it: one program-owned step.
 3. **Otherwise, a journaled sequence like relocate's.** WSL has no rename for a distribution, so the copy that is proven to start must be the one imported under the original name:
-   1. export to a tar on the target, and check the tar is readable and its size plausible;
-   2. import the tar under a temporary name into a scratch folder, prove it starts (`wsl -d <temp> -- true`), then unregister the temporary one. This proves the tar, not the final copy;
-   3. unregister the original. This is the one irreversible step, and the proven tar is on disk when it runs;
+   1. with the distribution Stopped (precondition above, re-checked here), export to a tar on the target; record the tar's size and SHA-256, and check it is readable;
+   2. import the tar under a temporary name into a scratch folder on the target, prove it starts (`wsl -d <temp> -- true`), terminate it, then unregister the temporary one. This proves the tar, not the final copy;
+   3. re-check the tar's size and SHA-256 against step 1, then unregister the original. This is the one irreversible step, and the proven tar is on disk when it runs;
    4. import the tar under the original name into the target folder;
    5. prove it starts, and that the default user from `/etc/wsl.conf` survives (BELIEVED: an import resets the default user otherwise; not tested here);
-   6. if step 4 or 5 fails, import the tar back to the old location under the original name and report;
+   6. if step 4 or 5 fails: when a distribution is registered under the original name (a failed step 5, or a step 4 that registered before failing), terminate and unregister that failed copy first, because `--import` refuses a name that is taken. Then import the tar back to the old location under the original name, prove it starts, and report. The proven tar is on disk throughout, so nothing is lost;
    7. keep the tar until the user confirms, with the same keep period and `delete-old` step as relocate's old copy.
 
    Every step is recorded in the journal so that `recover` can finish or undo it.

@@ -1,7 +1,7 @@
 # Plan: an automatic tier for agent artifacts (plan and eval design only -- NOT enabled)
 
 **Target user:** a developer who runs many AI-agent sessions and never reviews their leftovers, so the "Agent Leftovers" review list (ADR-0043) grows unread.
-**Pain point:** agent leftovers pile up (about 180 GB on 2026-10-16 for worktrees, clones and session scratch together, ADR-0043; `%TEMP%\claude` alone was 66 GB on 2026-10-09, RESUME census), and a Tier-B click per item is a chore nobody does. The growth rate per month has not been measured.
+**Pain point:** agent leftovers pile up (about 180 GB on 2026-10-16 for worktrees, clones and session scratch together, ADR-0043; `%TEMP%\claude` alone was 66 GB on 2026-10-09, RESUME census), and a Tier-B click per item is a chore nobody does. The growth rate per month has not been measured. The 180 GB was a peak: after the owner's own cleanup, a later agent-artifacts dry run (RESUME, "Dry-run list as of the pre-fix build") found only about 25 GiB of agent leftovers left, so the lever is the rate of accumulation, not today's pile.
 **Success metric:** GB returned per month by unattended runs, with **0 wrong automatic moves** in the gate (below) and in shadow mode.
 **Who pays:** the user, in disk space. No spend is involved.
 
@@ -53,7 +53,7 @@ Precision is the only hard gate. A wrong automatic move is a severity-1 failure;
 
   Plus positives that must be selected.
 - **Sample size from the target, not by feel.** With 0 failures in n independent negatives, the 95% upper bound on the wrong-move rate is about 3/n (rule of three). To claim below 1%, the gate needs at least **300 negatives with 0 selections**; below 0.5% needs 600. Recall is reported with a Wilson interval, but it is not gated.
-- **Mutation:** each rule in section 2 is removed in turn, and the gate must fail for each (as with ADR-0043's rule mutants: 26 killed in its first round, 55 killed and 0 surviving by the end, per RESUME).
+- **Mutation:** each rule in section 2 is removed in turn, and the gate must fail for each (as with ADR-0043's rule mutants: ADR-0043 records 26 killed; RESUME records 55 killed and 0 surviving after the later rounds).
 - **Shadow mode before enabling:** run the selection as a dry run on the weekly schedule for at least 4 weeks on the owner's machine. Log what it would have moved (path hash, size, ages, the rule trace). Then compare with what the owner later deleted, kept or restored by hand. Promotion requires 0 items the owner kept or needed back.
 - **Baselines reported beside it:** "everything older than 14 days" (naive) and "never" (status quo), with GB and wrong-move counts for each.
 
