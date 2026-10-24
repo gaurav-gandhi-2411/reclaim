@@ -105,6 +105,18 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     1. B: relocate (spec `docs/specs/relocate.md`), built and tested hermetically; real machine dry run only.
     2. C, then D.
     3. A5/A6 if GG restarts build 12.
+- 10:40 IST checkpoint 10 (24 Oct):
+  - **#200** (checkpoint 9 docs) merged as `708f023`.
+  - **Phase B, relocate:**
+    - built on `feat/relocate` (engine, CLI, eval gate) and `feat/relocate-ui` (dashboard page), not yet in a PR;
+    - reviews B1 and B2 FAILED and are fixed (head `603f189`; ADR-0044 addenda 1-2);
+    - a third review is running; 115 relocate tests pass;
+    - real machine: the read-only candidate list only (review pack section 5).
+  - **A5/A6:** still waiting for build 12 (section 8, item 8).
+  - **Next:**
+    1. Third relocate review, full verify, PR into `integration/run-2026-10`.
+    2. Phase C (MCP packaging and planner).
+    3. Phase D.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
