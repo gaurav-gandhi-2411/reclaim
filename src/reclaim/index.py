@@ -154,6 +154,17 @@ CREATE TABLE IF NOT EXISTS inaccessible_paths (
 );
 """
 
+# D1 (2026-10): every root a `scan_tree` walk finished WITHOUT cancellation. The summary's volume
+# reconciliation must know a drive root was walked in full; the in-memory `ScanStatus` only knew
+# that inside the process that ran the scan, so the field was null after every restart and after
+# every multi-drive scan (which has no single root).
+_COMPLETED_ROOTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS completed_scan_roots (
+    root TEXT PRIMARY KEY,
+    completed_at REAL NOT NULL
+);
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class StoredStat:
@@ -491,6 +502,7 @@ class ScanIndex:
         self._conn.execute("PRAGMA journal_size_limit=67108864")  # 64MB
         self._conn.execute(_SCHEMA)
         self._conn.execute(_INACCESSIBLE_SCHEMA)
+        self._conn.execute(_COMPLETED_ROOTS_SCHEMA)
         self._ensure_name_and_path_lower_columns()
         self._ensure_opaque_columns()
         for statement in _INDEXES:
@@ -894,6 +906,23 @@ class ScanIndex:
                 ],
             )
         self._conn.commit()
+
+    def record_completed_scan_root(self, root: Path, *, completed_at: float) -> None:
+        """Records that a `scan_tree` walk of `root` finished without cancellation. Callers must
+        never call this for a CANCELLED scan, for the same reason as
+        `replace_inaccessible_under_root`."""
+        assert_not_real_profile_under_pytest(self._db_path, operation="write to")
+        self._conn.execute(
+            "INSERT INTO completed_scan_roots (root, completed_at) VALUES (?, ?) "
+            "ON CONFLICT(root) DO UPDATE SET completed_at=excluded.completed_at",
+            (root.as_posix(), completed_at),
+        )
+        self._conn.commit()
+
+    def completed_scan_roots(self) -> list[Path]:
+        """Every root recorded by `record_completed_scan_root`, sorted by its POSIX form."""
+        rows = self._conn.execute("SELECT root FROM completed_scan_roots ORDER BY root")
+        return [Path(row["root"]) for row in rows]
 
     def inaccessible_summary(self, under: Path | None = None) -> InaccessibleSummary:
         """`(path_count, known_bytes, unknown_count)` over `inaccessible_paths`, optionally

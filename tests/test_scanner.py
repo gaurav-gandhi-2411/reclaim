@@ -1287,6 +1287,47 @@ def test_scan_tree_cancel_event_stops_the_walk_early(
     assert stats.files_pruned == 0
 
 
+def test_scan_tree_records_only_an_uncancelled_walk_as_a_completed_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D1: the summary's volume reconciliation trusts `completed_scan_roots` to mean "walked in
+    full", so a cancelled walk must never be recorded there."""
+    monkeypatch.setattr(scanner_module, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    root = tmp_path / "root"
+    _make_fanout_tree(root)
+    cancel_event = threading.Event()
+
+    def on_progress(processed: int, _total: int | None, _elapsed: float) -> None:
+        if processed >= 50:
+            cancel_event.set()
+
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        cancelled = scan_tree(root, index, on_progress=on_progress, cancel_event=cancel_event)
+        assert cancelled.cancelled is True
+        assert index.completed_scan_roots() == []
+
+        completed = scan_tree(root, index)
+        assert completed.cancelled is False
+        assert index.completed_scan_roots() == [Path(root.as_posix())]
+
+
+def test_scan_tree_never_records_a_root_it_could_not_list(tmp_path: Path) -> None:
+    """D1: an offline or unreadable root ends the walk uncancelled with nothing listed. It must
+    not be recorded as completed; a record from an earlier full walk of it stays."""
+    missing = tmp_path / "offline"
+    root = tmp_path / "root"
+    _make_fanout_tree(root)
+    with ScanIndex(tmp_path / "index.sqlite3") as index:
+        stats = scan_tree(missing, index)
+        assert stats.cancelled is False
+        assert index.completed_scan_roots() == []
+
+        scan_tree(root, index)
+        root.rename(tmp_path / "unplugged")
+        scan_tree(root, index)
+        assert index.completed_scan_roots() == [Path(root.as_posix())]
+
+
 def test_scan_tree_cancel_event_never_prunes_a_partial_walk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

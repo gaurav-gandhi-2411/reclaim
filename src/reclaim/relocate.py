@@ -293,7 +293,9 @@ class Outcome:
 def _norm(path: Path | str) -> str:
     """Absolute, backslashed, no `\\\\?\\` prefix, no trailing separator (except a drive root)."""
     text = str(path)
-    if text.startswith("\\\\?\\"):
+    if text[:8].upper() == "\\\\?\\UNC\\":
+        text = "\\\\" + text[8:]  # \\?\UNC\server\share -> \\server\share (B10 L3)
+    elif text.startswith("\\\\?\\"):
         text = text[4:]
     text = str(Path(text).absolute())
     if len(text) > 3:
@@ -407,6 +409,29 @@ def _long_name(path: str) -> str | None:
     if _kernel32.GetLongPathNameW(query, buf, size) == 0:
         return None
     return _norm(buf.value)
+
+
+def _as_spelled_on_disk(path: str) -> tuple[str, str | None]:
+    """`(path, reason)`. The nearest existing part of `path` (itself, or the closest existing
+    ancestor of a target that is still to be created) must be spelled as it is on disk, because
+    every journal, overlap and app-folder check compares path text: an 8.3 alias anywhere in it
+    passes them all (B9 M1 for the source, B10 M1 for the target's parent). A difference in case
+    only is not refused: the path is returned with the on-disk case, so the folder keeps its
+    own name on disk and every later check sees one spelling (B10 L2). `reason` is set when the
+    spelling is another one, or cannot be read."""
+    existing, rest = path, []
+    while not _exists(existing):
+        parent = _norm(Path(existing).parent)
+        if _key(parent) == _key(existing):
+            return path, None  # nothing of it exists (a drive that is gone): refused elsewhere
+        rest.append(Path(existing).name)
+        existing = parent
+    spelled = _long_name(existing)
+    if spelled is None:
+        return path, f"the full name of {existing} could not be read"
+    if _key(spelled) != _key(existing):
+        return path, f"{existing} is a short or alternate name: use its full name, {spelled}"
+    return _norm(Path(spelled, *reversed(rest))), None
 
 
 class _StreamData(ctypes.Structure):
@@ -1180,7 +1205,8 @@ def plan_move(
 
     A probe of its own that a kill left half-done (the folder at `<name>.reclaim-probe`, nothing
     at its own path) is put back first: only the probe ever makes that name."""
-    src, tgt = _norm(source), _norm(target)
+    src, src_spelling = _as_spelled_on_disk(_norm(source))
+    tgt, tgt_spelling = _as_spelled_on_disk(_norm(target))
     moved = src + MOVED_SUFFIX
     probe_path = src + PROBE_SUFFIX
     if (
@@ -1194,16 +1220,15 @@ def plan_move(
         logger.info("relocate_probe_restored", source=src)
     found = classify(src, policy)
     reasons = list(found.reasons) if found.verdict is not Verdict.MOVABLE else []
-    if _exists(src):
-        # Every journal check compares path text, and the freeze renames whatever name it is
-        # given: only the spelling on disk is accepted (case aside, B9 M1).
-        spelled = _long_name(src)
-        if spelled is None:
-            reasons.append(f"the full name of {src} could not be read")
-        elif _key(spelled) != _key(src):
-            reasons.append(f"{src} is a short or alternate name: use its full name, {spelled}")
     if found.verdict is Verdict.ALREADY_MOVED:
         reasons = list(found.reasons)
+    # The freeze renames whatever name it is given, and every journal check compares text.
+    reasons.extend(r for r in (src_spelling, tgt_spelling) if r is not None)
+    for label, path in (("source", src), ("target", tgt)):
+        if path.startswith("\\\\"):
+            # A network path, or a share that is another spelling of a local folder
+            # (`\\localhost\C$\...`): relocate works on local drive paths only (B10 L3).
+            reasons.append(f"the {label} {path} is a network path; use its local drive path")
     if found.verdict is Verdict.GUIDED:
         reasons.insert(0, "this folder is moved with its program's own steps")
     if _relation(src, tgt):
@@ -1782,6 +1807,16 @@ def _rollback_after_swap(
             note = "put back the copy from before the move" + extra
             journal.log(Stage.ROLLED_BACK, note, clock)
             return Outcome(journal, note)
+        if _gone(tgt):
+            # Our verified restore copy, put back because the target was unreachable: keep
+            # that run's warning about writes after the copy (B10 L1).
+            return _finish_rollback(
+                journal,
+                clock,
+                f"restored the folder from the verified copy of the moved folder; {tgt} was not "
+                "reachable, so anything a program wrote through the junction after that copy "
+                f"was verified is only there: reconnect {tgt} to get it",
+            )
         return _finish_rollback(journal, clock, "restored the folder")
     target_here = not _gone(tgt)
     if use_old_copy or not target_here:
@@ -1843,8 +1878,7 @@ def _rollback_after_swap(
         # Whatever failed after the junction went (a held file at the rename, a read error in
         # the repair), the original path must not be left empty (B6 M3).
         if not _exists(src):
-            _create_junction(src, tgt)
-            _keep_root_flags(tgt, src)
+            _put_junction_back(journal)
             journal.log(Stage.ROLLING_BACK, "copying back failed; junction restored", clock)
         if isinstance(exc, RelocateError):
             raise
@@ -1902,8 +1936,7 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
             if not _exists(src):
                 # An interrupted copy-back had removed the junction: put it back, so the
                 # original path is never left empty by a refusal.
-                _create_junction(src, tgt)
-                _keep_root_flags(tgt, src)
+                _put_junction_back(journal)
             raise NothingChangedError(
                 "there is no copy from before the move left (it was deleted); nothing changed. "
                 "Roll back without use_old_copy to restore the moved folder"
@@ -1970,12 +2003,27 @@ def _remove_our_restore(journal: Journal, restore: str) -> None:
         ) from exc
 
 
+def _put_junction_back(journal: Journal) -> None:
+    """Creates the junction src -> target again after a failed step. If that fails too (a
+    second fault), the path is empty and nothing more can be done safely here: the error says
+    so, where the data is, and that a rerun finishes the rollback (B10 M2)."""
+    src, tgt = journal.source, journal.target
+    try:
+        _create_junction(src, tgt)
+    except OSError as exc:
+        raise RelocateError(
+            f"move {journal.id}: putting the junction back at {src} failed too ({exc}), so {src} "
+            f"is empty right now. Nothing is lost: the data is in {tgt}. Run `reclaim relocate "
+            f"rollback {journal.id}` again; it finishes the rollback"
+        ) from exc
+    with contextlib.suppress(OSError):  # an unreachable target: the junction is what counts
+        _keep_root_flags(tgt, src)
+
+
 def _recreate_junction(journal: Journal, clock: Callable[[], float], why: str) -> None:
     """Puts the junction src -> target back and proves it points there (B7 M1)."""
     src, tgt = journal.source, journal.target
-    _create_junction(src, tgt)
-    with contextlib.suppress(OSError):  # an unreachable target: the junction is what counts
-        _keep_root_flags(tgt, src)
+    _put_junction_back(journal)
     pointed = _junction_target(src)
     if pointed is None or _key(pointed) != _key(tgt):
         raise RelocateError(f"the junction at {src} could not be restored to {tgt}; inspect it")
