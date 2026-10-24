@@ -119,17 +119,15 @@ def test_folder_recreated_inside_rollbacks_own_window_is_not_reported_restored(
     _make_tree(env.source)
     expected = _manifest(env.source)
     env.move()
-    real = relocate._sync_back
-    calls = {"n": 0}
+    real = relocate._delta_sync
 
-    def sync_back(target: str, moved: str, record: object = None) -> int:
-        n = real(target, moved, record)  # type: ignore[arg-type]
-        calls["n"] += 1
-        if calls["n"] == 2:  # after the junction is gone
-            _write(env.source / "fresh.log", b"recreated by the program")
-        return n
+    def delta(*a: object, **k: object) -> str:
+        note = real(*a, **k)  # type: ignore[arg-type]
+        # The junction is gone by now: a program recreates its folder in that moment.
+        _write(env.source / "fresh.log", b"recreated by the program")
+        return note
 
-    monkeypatch.setattr(relocate, "_sync_back", sync_back)
+    monkeypatch.setattr(relocate, "_delta_sync", delta)
     try:
         outcome = rollback(env.journal_path())
     except RelocateError:
@@ -156,26 +154,25 @@ def test_rebuild_restore_never_wipes_a_complete_restore_when_the_target_is_gone(
     env.move()
     delete_old_copy(env.journal_path(), confirmed=True)
 
-    def die(target: str, moved: str, record: object = None) -> int:
-        raise SimulatedCrash("killed in the first copy-back")
+    def die(*a: object, **k: object) -> None:
+        raise SimulatedCrash("killed before the junction is removed")
 
-    real = relocate._sync_back
-    monkeypatch.setattr(relocate, "_sync_back", die)
+    real = relocate._remove_junction
+    monkeypatch.setattr(relocate, "_remove_junction", die)
     with pytest.raises(SimulatedCrash):
         rollback(env.journal_path())
-    monkeypatch.setattr(relocate, "_sync_back", real)
+    monkeypatch.setattr(relocate, "_remove_junction", real)
     restore = Path(str(env.source) + RESTORE_SUFFIX)
     assert _manifest(restore) == expected  # the restore is complete at this point
 
     os.chmod(_x(env.target / "readonly.txt"), stat.S_IWRITE)
     shutil.rmtree(_x(env.target))  # external removal of the target folder
 
-    with pytest.raises((RelocateError, OSError)):
-        rollback(env.journal_path())
-    assert _exists(restore) and _manifest(restore) == expected, (
-        f"the complete restore copy was wiped; left: "
-        f"{_manifest(restore) if _exists(restore) else 'nothing'}"
-    )
+    # The complete restore copy is the one copy left: the rollback puts it back.
+    outcome = rollback(env.journal_path())
+    assert outcome.journal.stage == Stage.ROLLED_BACK
+    assert _manifest(env.source) == expected
+    assert not _exists(restore)
 
 
 def test_delete_old_copy_does_not_delete_writes_made_to_the_old_copy(env: Env) -> None:
@@ -593,6 +590,6 @@ def test_nothing_restorable_is_never_reported_as_rolled_back(env: Env) -> None:
     os.rmdir(_x(env.source))
     os.chmod(_x(env.target / "readonly.txt"), stat.S_IWRITE)
     shutil.rmtree(_x(env.target))
-    with pytest.raises(RelocateError, match="could not restore"):
+    with pytest.raises(RelocateError, match="nothing to put back"):
         rollback(env.journal_path())
     assert relocate.Journal.load(env.journal_path()).stage != Stage.ROLLED_BACK

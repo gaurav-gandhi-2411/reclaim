@@ -448,11 +448,12 @@ def test_a_bad_copy_back_stops_the_rollback_with_the_junction_in_place(
 
     def bad_copy(src: str, dst: str) -> None:
         real_copy(src, dst)
+        relocate._set_attributes(dst, 0)
         with open(dst, "r+b") as fh:
             fh.write(b"X")
 
     monkeypatch.setattr(relocate, "_copy_file", bad_copy)
-    with pytest.raises(RelocateError, match="could not be copied back"):
+    with pytest.raises(RelocateError, match="Nothing changed"):
         rollback(env.journal_path())
     assert _is_link(env.source)
     assert _manifest(env.target) == expected

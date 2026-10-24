@@ -407,12 +407,14 @@ def test_a_folder_stream_written_through_the_junction_is_copied_back_and_the_cop
 def test_a_copy_whose_folder_metadata_could_not_be_brought_back_is_kept(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Mutation T9: if folder metadata differs after copy-back, the target is kept."""
+    """Mutation T9: if the restored folder's metadata differs from the moved folder's
+    (here: the metadata steps of the copy-back are disabled), the target is kept."""
     _make_tree(env.source)
     env.move()
     with open(_x(env.source / "sub") + ":meta", "wb") as fh:
         fh.write(b"written through the junction")
-    monkeypatch.setattr(relocate, "_merge_folder_meta", lambda _s, _d, **_k: None)
+    monkeypatch.setattr(relocate, "_copy_folder_meta", lambda _s, _d: None)
+    monkeypatch.setattr(relocate, "_sync_metadata", lambda *_a: "skipped")
     outcome = rollback(env.journal_path())
     assert _exists(env.target)
     assert outcome.kept and "differ" in outcome.kept[1]

@@ -90,7 +90,10 @@ def test_rollback_never_overwrites_a_write_made_into_the_old_copy(env: Env) -> N
         delete_old_copy(env.journal_path(), confirmed=True)
     out = rollback(env.journal_path())
     assert out.journal.stage == Stage.ROLLED_BACK
-    survivors = _all_bytes(env.source) + (_all_bytes(env.target) if _exists(env.target) else [])
+    # Addendum 5: rollback never writes into the old copy; it is kept as it is.
+    survivors = _all_bytes(env.source) + _all_bytes(_moved(env))
+    if _exists(env.target):
+        survivors += _all_bytes(env.target)
     assert edit in survivors, (
         f"the edit made in the old copy is gone; source b.txt is now "
         f"{(env.source / 'sub' / 'b.txt').read_bytes()!r}; target exists: {_exists(env.target)}"
@@ -110,6 +113,7 @@ def test_rollback_never_removes_a_folder_stream_added_to_the_old_copy(env: Env) 
         delete_old_copy(env.journal_path(), confirmed=True)
     rollback(env.journal_path())
     streams = relocate._named_streams(_x(env.source / "sub"))
+    streams += relocate._named_streams(_x(_moved(env) / "sub"))
     left = [p for p in (env.target,) if _exists(p)]
     assert ":note:$DATA" in streams or left, (
         f"the folder stream written into the old copy is gone: {streams}"
@@ -221,7 +225,9 @@ def test_conflict_set_aside_never_merges_into_a_target_folder_of_the_same_name(
     _write(env.source / "d", b"a program replaced the folder with a file")
     _write(env.source / "d.reclaim-conflict" / "x.txt", b"other")
     rollback(env.journal_path())
-    survivors = _all_bytes(env.source) + (_all_bytes(env.target) if _exists(env.target) else [])
+    survivors = _all_bytes(env.source) + _all_bytes(_moved(env))
+    if _exists(env.target):
+        survivors += _all_bytes(env.target)
     assert b"ORIGINAL content kept in the old copy" in survivors, (
         "the set-aside folder's file was overwritten by the target's file of the same name"
     )
@@ -502,8 +508,8 @@ def test_a_file_where_the_folder_was_gives_a_relocate_error_not_a_raw_oserror(
 
 
 def test_a_folder_stream_edited_in_the_old_copy_is_not_replaced_by_the_targets(env: Env) -> None:
-    """Mutation V2: both sides changed the same folder stream after the move. The old copy's
-    folder no longer matches the record, so its version stays and the target is kept."""
+    """Both sides changed the same folder stream after the move. The folder comes back as
+    the programs left it (v2) and the old copy keeps its own version (v3): neither is lost."""
     _make_tree(env.source)
     with open(_x(env.source / "sub") + ":meta", "wb") as fh:
         fh.write(b"v1 at the move")
@@ -512,12 +518,11 @@ def test_a_folder_stream_edited_in_the_old_copy_is_not_replaced_by_the_targets(e
         fh.write(b"v2 through the junction")
     with open(_x(_moved(env) / "sub") + ":meta", "wb") as fh:
         fh.write(b"v3 in the old copy")
-    outcome = rollback(env.journal_path())
+    rollback(env.journal_path())
     with open(_x(env.source / "sub") + ":meta", "rb") as fh:
-        assert fh.read() == b"v3 in the old copy"
-    assert _exists(env.target) and outcome.kept
-    with open(_x(env.target / "sub") + ":meta", "rb") as fh:
         assert fh.read() == b"v2 through the junction"
+    with open(_x(_moved(env) / "sub") + ":meta", "rb") as fh:
+        assert fh.read() == b"v3 in the old copy"
 
 
 def test_a_tree_removal_that_leaves_the_old_copy_is_never_reported_as_deleted(

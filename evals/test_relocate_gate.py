@@ -211,6 +211,9 @@ def test_relocate_never_loses_a_byte(
         assert spec["reason"] in message, (spec["case"], message)
     if outcome in {Stage.ROLLED_BACK, "refused", "failed_rolled_back", "delete_refused"}:
         assert not relocate._is_reparse(str(layout.source)), "the original is still a junction"
+    if outcome in {"refused", "failed_rolled_back"}:
+        # Nothing swapped: no old copy is left behind. (A rollback after the swap keeps it
+        # unchanged on purpose, ADR-0044 addendum 5.)
         assert not os.path.lexists(_x(str(layout.source) + relocate.MOVED_SUFFIX))
     if outcome == Stage.DONE:
         assert relocate._is_reparse(str(layout.source))

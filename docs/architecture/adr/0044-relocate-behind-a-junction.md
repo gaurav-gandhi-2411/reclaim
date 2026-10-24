@@ -264,3 +264,54 @@ Two are equivalent:
   content, because it no longer matches the record.
 - V10 (a file accepted as the original): NTFS file IDs are unique per volume, so no file can carry the
   original folder's ID.
+## Addendum 5 (2026-10-24): fifth hostile review (B5), FAIL, and a redesign of rollback after the swap
+
+The fifth independent review, of `dfa7eb2`, again passed every kill sweep. It found a loss with
+no kill involved (H1): an edit made in `.reclaim-moved` was overwritten by rollback when a
+program had renamed the same file through the junction in a different case. It also found eleven
+more problems: unrecoverable states after a race at the freeze (M1), a link a program made in
+the moved folder blocking rollback for ever (M2), a resumed delete that skipped the old-copy check
+(M3), and eight low ones.
+
+**The pattern, not the instance.** Reviews B3, B4 and B5 each found a real loss in the same place:
+rollback's copy-back, which merged two trees that had both diverged since the swap (the moved
+folder, written by programs through the junction, and the old copy, written directly) into the
+old copy. Each patch closed one case and exposed the next (timestamps, then the manifest, then
+case). **Decision:** remove the merge instead of patching it a fourth time. Rollback after the swap
+now:
+
+1. Copies the moved folder, as the programs left it, to `<name>.reclaim-restore`: a fresh copy,
+   proved file by file and folder by folder. Disk space is checked first, and a refusal changes
+   nothing.
+2. Removes the junction. It then brings the restore copy level with anything written in the
+   meantime; the restore copy is ours, so only our own copies are changed. If that step fails,
+   the junction is put back.
+3. Renames the restore copy into place, recognised by its own file ID. Our moved copy is then
+   removed only if it is byte-identical to the restored folder, including attributes and
+   streams.
+4. Never writes into `.reclaim-moved`. It is kept exactly as it was, with the pre-move state
+   and anything written into it, and the message says where it is. `delete_old_copy` can delete
+   it later, comparing it with the restored folder under the same manifest checks as before.
+
+A file that has the recorded mtime in the moved folder but other bytes is a bad copy, not an edit.
+Its original is taken from the old copy, which is read, never written. With `use_old_copy`, or a
+moved folder that is gone or holds something a copy cannot keep (a link: M2), the old copy is
+renamed back instead, and the moved folder is left exactly as it is.
+
+Removed with the merge: `_sync_back`, the conflict set-aside, `_merge_folder_meta`, and the
+manifest-gated stream rules. H1, L1-L4 and the whole class behind them go with them. Also fixed:
+- the freeze race recovers through the pre-freeze path, putting a frozen foreign folder back
+  (M1);
+- `recover` at the delete stage goes through `delete_old_copy`, which re-checks what is left of
+  the old copy (M3);
+- messages: a touched old copy is never deleted by Reclaim and the message says so (L6), and
+  "nothing changed" appears only where true (L5).
+
+**Decided, not changed (L7):** a rollback the user asked for brings back everything the programs
+wrote, including a folder named like an excluded project. Refusing would strand that data on the
+other drive. The requirement is that it is never lost and lands at its original path.
+
+**Cost:** a rollback after the swap needs room for one copy of the folder on its original volume.
+`use_old_copy` needs none, but leaves post-move writes in the moved folder.
+
+**Mutation** (`D:\reclaim-build\tools\mutate_rl5.py`, 9 mutants of the new rollback): all 9 killed.

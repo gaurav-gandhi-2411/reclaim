@@ -61,6 +61,12 @@ def add_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) 
     ):
         cmd = sub.add_parser(name, help=text)
         cmd.add_argument("move_id")
+        if name == "rollback":
+            cmd.add_argument(
+                "--use-old-copy",
+                action="store_true",
+                help="Put back the copy from before the move instead of the moved folder as it is",
+            )
         if name == "delete-old":
             cmd.add_argument("--confirm", action="store_true", help="Before the 7 days are up")
             cmd.add_argument("--accept-missing", action="store_true")
@@ -144,7 +150,11 @@ def run(args: argparse.Namespace) -> int:
             "plan": lambda: _plan_or_move(args, policy, journal_dir, execute=False),
             "move": lambda: _plan_or_move(args, policy, journal_dir, execute=args.yes),
             "status": lambda: _status(journal_dir),
-            "rollback": lambda: _report(relocate.rollback(_journal(journal_dir, args.move_id))),
+            "rollback": lambda: _report(
+                relocate.rollback(
+                    _journal(journal_dir, args.move_id), use_old_copy=args.use_old_copy
+                )
+            ),
             "recover": lambda: _report(relocate.recover(_journal(journal_dir, args.move_id))),
             "delete-old": lambda: _report(
                 relocate.delete_old_copy(

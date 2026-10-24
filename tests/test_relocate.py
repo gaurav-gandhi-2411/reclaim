@@ -157,10 +157,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     return e
 
 
-def _assert_original(env: Env, expected: dict[str, str]) -> None:
+def _assert_original(env: Env, expected: dict[str, str], *, old_copy_kept: bool = False) -> None:
     assert not _is_link(env.source)
     assert _manifest(env.source) == expected
-    assert not _exists(str(env.source) + MOVED_SUFFIX)
+    # A rollback after the swap keeps the copy from before the move (ADR-0044 addendum 5).
+    assert _exists(str(env.source) + MOVED_SUFFIX) == old_copy_kept
     assert not _exists(str(env.source) + relocate.PROBE_SUFFIX)
     assert not _exists(env.target)
 
@@ -396,7 +397,7 @@ def test_long_paths_move_and_roll_back(env: Env) -> None:
     env.move()
     _assert_moved(env, expected)
     rollback(env.journal_path())
-    _assert_original(env, expected)
+    _assert_original(env, expected, old_copy_kept=True)
 
 
 def test_brackets_in_source_and_target_names(env: Env) -> None:
@@ -430,10 +431,9 @@ def test_an_unreadable_file_fails_the_copy_and_rolls_back(env: Env) -> None:
 # ------------------------------------------------------------------ rollback
 
 
-def test_rollback_after_the_move_brings_back_changes_made_through_the_junction(
-    env: Env,
-) -> None:
+def test_rollback_after_the_move_brings_back_the_folder_as_it_is_now(env: Env) -> None:
     _make_tree(env.source)
+    before = _manifest(env.source)
     env.move()
     _write(env.source / "sub" / "b.txt", b"written through the junction")
     _write(env.source / "brand-new.txt", b"created after the move")
@@ -443,10 +443,11 @@ def test_rollback_after_the_move_brings_back_changes_made_through_the_junction(
     outcome = rollback(env.journal_path())
 
     assert outcome.journal.stage == Stage.ROLLED_BACK
-    restored = _manifest(env.source)
-    # Nothing in the old copy is deleted by a rollback: a.bin comes back, the rest is current.
-    assert {k: v for k, v in restored.items() if k != "a.bin"} == after
-    assert "a.bin" in restored
+    # The folder comes back as the programs left it; the copy from before the move is kept
+    # exactly as it was, so nothing in either is lost (ADR-0044 addendum 5).
+    assert _manifest(env.source) == after
+    assert _manifest(str(env.source) + MOVED_SUFFIX) == before
+    assert "kept unchanged" in outcome.message
     assert not _is_link(env.source)
     assert not _exists(env.target)
 
@@ -493,24 +494,20 @@ def test_a_kill_after_the_junction_is_removed_still_restores_later_writes(
     env.move()
     _write(env.source / "sub" / "b.txt", b"written through the junction")
     expected = _manifest(env.source)
-    real_sync = relocate._sync_back
-    calls = {"n": 0}
+    real_delta = relocate._delta_sync
 
-    def die_once(target: str, moved: str, record: object = None) -> int:
-        calls["n"] += 1
-        if calls["n"] == 2:  # the first copy-back runs before the junction is removed
-            raise SimulatedCrash("after the junction was removed")
-        return real_sync(target, moved, record)  # type: ignore[arg-type]
+    def die(*a: object, **k: object) -> str:
+        raise SimulatedCrash("after the junction was removed")
 
-    monkeypatch.setattr(relocate, "_sync_back", die_once)
+    monkeypatch.setattr(relocate, "_delta_sync", die)
     with pytest.raises(SimulatedCrash):
         rollback(env.journal_path())
     assert not _exists(env.source)
+    monkeypatch.setattr(relocate, "_delta_sync", real_delta)
 
     rollback(env.journal_path())
 
-    restored = _manifest(env.source)
-    assert restored == expected
+    assert _manifest(env.source) == expected
     assert not _exists(env.target)
 
 
@@ -522,20 +519,17 @@ def test_a_kill_while_restoring_a_deleted_old_copy_resumes_from_the_restore(
     delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: BIG)
     _write(env.source / "late.txt", b"after delete")
     expected = _manifest(env.source)
-    real_sync = relocate._sync_back
-    calls = {"n": 0}
+    real_delta = relocate._delta_sync
 
-    def die_once(target: str, moved: str, record: object = None) -> int:
-        calls["n"] += 1
-        if calls["n"] == 2:  # the first copy-back runs before the junction is removed
-            raise SimulatedCrash("after the junction was removed")
-        return real_sync(target, moved, record)  # type: ignore[arg-type]
+    def die(*a: object, **k: object) -> str:
+        raise SimulatedCrash("after the junction was removed")
 
-    monkeypatch.setattr(relocate, "_sync_back", die_once)
+    monkeypatch.setattr(relocate, "_delta_sync", die)
     with pytest.raises(SimulatedCrash):
         rollback(env.journal_path())
     assert not _exists(env.source)
     assert _exists(str(env.source) + relocate.RESTORE_SUFFIX)
+    monkeypatch.setattr(relocate, "_delta_sync", real_delta)
 
     rollback(env.journal_path())
 
@@ -566,16 +560,11 @@ def test_a_failed_copy_back_after_the_junction_is_removed_puts_it_back(
     _make_tree(env.source)
     env.move()
     expected = _manifest(env.target)
-    real_sync = relocate._sync_back
-    calls = {"n": 0}
 
-    def fail_second(target: str, moved: str, record: object = None) -> int:
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise RelocateError("a file vanished")
-        return real_sync(target, moved, record)  # type: ignore[arg-type]
+    def fail(*a: object, **k: object) -> str:
+        raise RelocateError("a file vanished")
 
-    monkeypatch.setattr(relocate, "_sync_back", fail_second)
+    monkeypatch.setattr(relocate, "_delta_sync", fail)
     with pytest.raises(RelocateError, match="vanished"):
         rollback(env.journal_path())
     _assert_moved(env, expected)
@@ -635,7 +624,7 @@ def test_a_file_missing_from_the_target_needs_an_explicit_accept(env: Env) -> No
     _make_tree(env.source)
     env.move()
     os.remove(_x(env.target / "a.bin"))
-    with pytest.raises(RelocateError, match="no longer in the moved folder"):
+    with pytest.raises(RelocateError, match="no longer in"):
         delete_old_copy(env.journal_path(), confirmed=True)
     assert _exists(str(env.source) + MOVED_SUFFIX)
     delete_old_copy(env.journal_path(), confirmed=True, accept_missing=True)
@@ -654,15 +643,14 @@ def test_the_freed_figure_is_the_volume_free_space_delta(env: Env) -> None:
     assert outcome.journal.history[-1][2] == "volume free space changed by 3345 bytes"
 
 
-def test_delete_refuses_unless_the_move_is_done(env: Env) -> None:
+def test_after_a_rollback_the_kept_old_copy_can_be_deleted_after_its_checks(env: Env) -> None:
     _make_tree(env.source)
+    expected = _manifest(env.source)
     env.move()
     rollback(env.journal_path())
-    with pytest.raises(RelocateError, match="not done"):
-        delete_old_copy(env.journal_path(), confirmed=True)
-
-
-# ------------------------------------------------------------------ classification
+    delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: BIG)
+    assert not _exists(str(env.source) + MOVED_SUFFIX)
+    assert _manifest(env.source) == expected
 
 
 def _hardlinked(root: Path) -> None:
