@@ -436,21 +436,46 @@ def _final_name(path: str) -> str | None:
 
 
 _BAD_NAME_CHARS = frozenset('<>:"|?*') | {chr(c) for c in range(32)}
+_NTFS_NAME_UNITS = 255  # UTF-16 code units per name, not Python characters (B12 M1)
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL"}) | {
+    f"{kind}{n}" for kind in ("COM", "LPT") for n in "123456789¹²³"
+}
+
+
+def _units(name: str) -> int:
+    return len(name.encode("utf-16-le")) // 2
 
 
 def _bad_text(path: str) -> str | None:
-    """Why `path` is not a name NTFS can create, or None. A target that cannot be created made
-    the move fail after its journal existed, and the rollback could not even check the target
-    path, so the journal could never be finished (B11 M1)."""
+    """Why `path` is not a name this move can make and undo, or None. A target that cannot be
+    created made the move fail after its journal existed, and the rollback could not even
+    check the target path, so the journal could never be finished (B11 M1). The last part also
+    needs room for the longest working name the engine gives it (`<name>.reclaim-restore`):
+    without it the move succeeded and every rollback failed with a wrong reason (B12 M2)."""
     if path[1:3] != ":\\" or len(path) == 3:
         return None  # a network path or a drive root: refused with their own reasons
-    for part in path[3:].split("\\"):
+    parts = path[3:].split("\\")
+    for part in parts:
         if part in {"", ".", ".."}:
             return f"{path} has an empty, '.' or '..' part; give the folder's plain path"
         if _BAD_NAME_CHARS & set(part):
             return f"{path} has a character Windows does not allow in a name"
-        if len(part) > 255 or part[-1] in ". ":
-            return f"{path} has a part that is too long or ends in a dot or space"
+        if part[-1] in ". ":
+            return (
+                f"{path} has a name ending in a dot or space, which many programs cannot open; "
+                "rename the folder (or choose another target name) first"
+            )
+        if part.split(".")[0].rstrip(" ").upper() in _DEVICE_NAMES:
+            return f"{path} uses a name Windows reserves for a device ({part}); choose another"
+        if _units(part) > _NTFS_NAME_UNITS:
+            return f"{path} has a name longer than Windows allows"
+    room = max(len(s) for s in _WORKING_SUFFIXES)
+    if _units(parts[-1]) + room > _NTFS_NAME_UNITS:
+        return (
+            f"the name {parts[-1][:40]}... is too long to move safely: the move needs "
+            f"{room} more characters for its working copies, and a name may have at most "
+            f"{_NTFS_NAME_UNITS}. Rename the folder (or choose a shorter target name) first"
+        )
     return None
 
 
@@ -1128,14 +1153,32 @@ def probe(source: str) -> None:
             f"{source} is in use (a program has a file open under it): close it and retry"
         ) from exc
     try:
-        _rename(probe_path, source)
-    except OSError as exc:  # pragma: no cover -- only a racing writer can recreate `source`
+        _rename_back(probe_path, source)
+    except OSError as exc:
         raise RelocateError(
             f"the probe left the folder at {probe_path}: rename it back to {source}"
         ) from exc
 
 
 _WORKING_SUFFIXES = (MOVED_SUFFIX, PROBE_SUFFIX, RESTORE_SUFFIX)
+_RENAME_BACK_TRIES = 5
+_RENAME_BACK_WAIT_S = 0.2
+
+
+def _rename_back(src: str, dst: str) -> None:
+    """The second half of an in-use probe. A virus scanner or indexer opening the folder the
+    moment it was renamed is a real, short hold, not only a racing writer; a few short retries
+    keep it from leaving a dangling junction or a renamed folder (B12 M3). Still failing after
+    them, the caller's message names the way back."""
+    for attempt in range(_RENAME_BACK_TRIES):
+        try:
+            _rename(src, dst)
+        except OSError:
+            if attempt == _RENAME_BACK_TRIES - 1:
+                raise
+            time.sleep(_RENAME_BACK_WAIT_S)
+        else:
+            return
 
 
 def _os_errors_as_relocate_errors[**P, R](func: Callable[P, R]) -> Callable[P, R]:
@@ -1270,6 +1313,8 @@ def plan_move(
         not _exists(src)
         and _exists(probe_path)
         and not _is_reparse(probe_path)
+        # Never through a link: the plan refuses such a source anyway (B12 L2).
+        and not any(_is_reparse(str(ancestor)) for ancestor in Path(src).parents)
         # Path text only (src does not exist): never rename onto an excluded path (B2 M3).
         and policy.exclusion_match(Path(src)) is None
     ):
@@ -1535,9 +1580,11 @@ def _make_target(journal: Journal) -> None:
         current = current.parent
     for parent in reversed(parents):
         assert_not_real_profile_under_pytest(parent, operation="create")
-        os.mkdir(long_path(Path(parent)))  # noqa: PTH102
+        # Journaled before the mkdir: a failed save after it left a folder the rollback,
+        # reading the journal from disk, never knew to remove (B12 L3).
         journal.created_parents.append(parent)
         journal.save()
+        os.mkdir(long_path(Path(parent)))  # noqa: PTH102
     assert_not_real_profile_under_pytest(journal.target, operation="create")
     # Saved first: a kill between the mkdir and the next save leaves an empty folder rollback
     # can recognise as ours (B2 L7), instead of one that blocks every later plan.
@@ -2314,8 +2361,8 @@ def _probe_target(target: str) -> None:
             f"{target} is in use: close the program using it, then retry"
         ) from exc
     try:
-        _rename(probe_path, target)
-    except OSError as exc:  # pragma: no cover -- only a racing writer can recreate `target`
+        _rename_back(probe_path, target)
+    except OSError as exc:
         raise RelocateError(
             f"the probe left the moved folder at {probe_path} ({exc}): rename it back to "
             f"{target}, then roll back again"
@@ -2323,6 +2370,23 @@ def _probe_target(target: str) -> None:
 
 
 def _discard_copy(journal: Journal) -> tuple[str, str] | None:
+    """`_discard_target`, then the parent folders this move created for the target, whenever
+    nothing of ours is left at the target: also when it was never created or is already gone,
+    which used to return before the parents were looked at (B12 L3)."""
+    kept = _discard_target(journal)
+    if kept is None:
+        for parent in reversed(journal.created_parents):
+            if not _exists(parent):
+                continue  # journaled before its mkdir, which never ran
+            try:
+                assert_not_real_profile_under_pytest(parent, operation="remove")
+                os.rmdir(long_path(Path(parent)))  # noqa: PTH106 -- only if still empty
+            except OSError:
+                break  # not empty (something else is in it): it and its parents stay
+    return kept
+
+
+def _discard_target(journal: Journal) -> tuple[str, str] | None:
     """Removes our copy in the target when that is provably safe, else keeps it and says why.
     Called only once the original is back at its own path (by identity).
 
@@ -2368,12 +2432,6 @@ def _discard_copy(journal: Journal) -> tuple[str, str] | None:
             f"the original is back at {journal.source}, but {tgt} could not be removed ({exc}); "
             "close what holds it open and roll back again"
         ) from exc
-    for parent in reversed(journal.created_parents):
-        try:
-            assert_not_real_profile_under_pytest(parent, operation="remove")
-            os.rmdir(long_path(Path(parent)))  # noqa: PTH106 -- only if still empty
-        except OSError:
-            break
     return None
 
 
