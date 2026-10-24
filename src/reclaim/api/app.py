@@ -16,6 +16,7 @@ from reclaim.ai.category_explainer import DEFAULT_CACHE_DIR as DEFAULT_AI_EXPLAN
 from reclaim.anthropic_key_store import DEFAULT_KEY_PATH as DEFAULT_ANTHROPIC_KEY_PATH
 from reclaim.api import service
 from reclaim.api.approval_routes import router as approval_router
+from reclaim.api.relocate_routes import router as relocate_router
 from reclaim.api.routes import router
 from reclaim.api.security import LocalOriginPolicy, generate_csrf_token, local_origin_violation
 from reclaim.api.state import AppState
@@ -156,6 +157,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     app.include_router(router)
     app.include_router(approval_router)
+    app.include_router(relocate_router)
 
     policy = LocalOriginPolicy(host=host, port=port)
 
