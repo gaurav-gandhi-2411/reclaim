@@ -415,3 +415,44 @@ def test_delete_old_copy_after_a_target_file_was_replaced_by_an_older_version(en
 def test_policy_without_exclusions_still_runs(tmp_path: Path) -> None:
     # Sanity: the probes above use the fixture's policy.
     Policy(exclusion_match=lambda p: None, protected=lambda p: False)
+
+
+def test_a_stream_that_differs_in_the_copy_refuses_the_delete(env: Env) -> None:
+    """Mutation R7 (streams left out of the hash): a copy whose named stream differs, with its
+    main content and mtime intact, is a bad copy and must not let the old copy go."""
+    _make_tree(env.source)
+    with open(_x(env.source / "a.bin") + ":meta", "wb") as fh:
+        fh.write(b"original stream")
+    env.move()
+    victim = _x(env.target / "a.bin")
+    st = os.stat(victim)
+    relocate._set_attributes(victim, 0)
+    with open(victim + ":meta", "wb") as fh:
+        fh.write(b"altered stream!")
+    os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))
+    with pytest.raises(RelocateError, match="differ"):
+        delete_old_copy(env.journal_path(), confirmed=True)
+    assert _exists(str(env.source) + MOVED_SUFFIX)
+
+
+def test_a_bad_copy_back_stops_the_rollback_with_the_junction_in_place(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation R13 (copy-back unverified): if what rollback copies back is not byte-equal to
+    the target, the rollback must stop before the junction is removed."""
+    _make_tree(env.source)
+    env.move()
+    _write(env.source / "new-after-move.bin", b"written through the junction")
+    expected = _manifest(env.target)
+    real_copy = relocate._copy_file
+
+    def bad_copy(src: str, dst: str) -> None:
+        real_copy(src, dst)
+        with open(dst, "r+b") as fh:
+            fh.write(b"X")
+
+    monkeypatch.setattr(relocate, "_copy_file", bad_copy)
+    with pytest.raises(RelocateError, match="could not be copied back"):
+        rollback(env.journal_path())
+    assert _is_link(env.source)
+    assert _manifest(env.target) == expected
