@@ -384,3 +384,64 @@ def test_recover_finishes_an_interrupted_delete_after_a_rollback(
     out = recover(env.journal_path(), policy=env.policy)
     assert out.journal.stage == Stage.DELETED_OLD and not _exists(_moved(env))
     assert _manifest(env.source) == live and not _is_link(env.source)
+
+
+# ------------------------------------------------------------------ G1
+
+
+def _guided_policy(root: Path) -> relocate.Policy:
+    return relocate.Policy(
+        exclusion_match=lambda _p: None,
+        protected=lambda _p: False,
+        guided=((root, "move it with its own program"),),
+    )
+
+
+def test_a_guided_folder_is_sized_from_its_files_without_opening_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "Docker"
+    _write(root / "disk.vhdx", b"d" * 5000)
+    _write(root / "sub" / "a.bin", b"a" * 123)
+    _write(root / "sub" / "deep" / "b.bin", b"b" * 7)
+    # A junction to a big folder elsewhere: never followed, never counted.
+    other = tmp_path / "elsewhere"
+    _write(other / "big.bin", b"x" * 100_000)
+    relocate._create_junction(str(root / "link"), str(other))
+
+    def no_open(*_a: object, **_k: object) -> None:
+        raise AssertionError("sizing a guided folder must not open a file")
+
+    with monkeypatch.context() as m:
+        m.setattr("builtins.open", no_open)
+        found = relocate.classify(root, _guided_policy(root))
+    assert found.verdict == relocate.Verdict.GUIDED
+    assert found.bytes == 5000 + 123 + 7 and found.files == 3
+    # A path inside the guided root is guided and sized too.
+    inside = relocate.classify(root / "sub", _guided_policy(root))
+    assert inside.verdict == relocate.Verdict.GUIDED and inside.bytes == 123 + 7
+
+
+def test_a_missing_or_linked_guided_path_has_no_size_and_does_not_raise(tmp_path: Path) -> None:
+    root = tmp_path / "wsl"
+    assert relocate.classify(root, _guided_policy(root)).bytes == 0
+    other = tmp_path / "elsewhere"
+    _write(other / "big.bin", b"x" * 1000)
+    relocate._create_junction(str(root), str(other))
+    assert relocate.classify(root, _guided_policy(root)).bytes == 0
+
+
+def test_candidates_are_ordered_movable_then_guided_by_size(tmp_path: Path) -> None:
+    movable = tmp_path / "movable"
+    _write(movable / "m.bin", b"m" * 10)
+    big, small = tmp_path / "Docker", tmp_path / "wsl"
+    _write(big / "d.vhdx", b"d" * 9000)
+    _write(small / "w.vhdx", b"w" * 90)
+    policy = relocate.Policy(
+        exclusion_match=lambda _p: None,
+        protected=lambda _p: False,
+        guided=((big, "docker steps"), (small, "wsl steps")),
+    )
+    found = relocate.propose_candidates([small, movable, big], policy, None)
+    assert [c.path for c in found] == [str(movable), str(big), str(small)]
+    assert [c.classification.bytes for c in found] == [10, 9000, 90]

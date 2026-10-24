@@ -924,7 +924,7 @@ def classify(source: Path | str, policy: Policy) -> Classification:
     for root, steps in policy.guided:
         key, root_key = _key(path), _key(root)
         if key == root_key or key.startswith(root_key + "\\"):
-            return Classification(Verdict.GUIDED, (steps,))
+            return _guided(path, steps)
         if root_key.startswith(key + "\\"):
             reasons.append(f"it contains {root}, which is moved with its program's own steps")
     if policy.protected(path):
@@ -994,6 +994,27 @@ def classify(source: Path | str, policy: Policy) -> Classification:
     return Classification(
         verdict,
         tuple(reasons),
+        files=scan.files,
+        dirs=scan.dirs,
+        bytes=scan.bytes,
+        newest_mtime=scan.newest_mtime,
+    )
+
+
+def _guided(path: Path, steps: str) -> Classification:
+    """A folder that moves only through its program's own steps, with its size: the list and
+    the page show how much a Docker or WSL move would free (B8 G1). The size is `scan_tree`'s:
+    `lstat` sizes only, no file opened, no link followed. A path that is not a real folder
+    (missing, or a link a scan would follow) is reported with no size."""
+    st = _lstat(str(path))
+    if st is None or st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+        return Classification(Verdict.GUIDED, (steps,))
+    if not stat.S_ISDIR(st.st_mode):
+        return Classification(Verdict.GUIDED, (steps,), files=1, bytes=st.st_size)
+    scan = scan_tree(str(path))
+    return Classification(
+        Verdict.GUIDED,
+        (steps,),
         files=scan.files,
         dirs=scan.dirs,
         bytes=scan.bytes,
