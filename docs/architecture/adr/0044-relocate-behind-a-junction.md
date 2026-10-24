@@ -516,3 +516,50 @@ API's `old_copy_kept` held too. Fixes:
 Mutation `mutate_rl9`: one mutant per fix (accepting short names; the log outside the guard;
 `>=` on `created_at`; the rerun reported as a restore), 4 of 4 killed, the source restored
 byte-identical. The reviewer's API probe moved to the page branch.
+
+## Addendum 10 (2026-10-24): tenth, narrow review (B10) of addendum 9, FAIL, fixed
+
+The tenth review, of `55a81ab` and narrowed to addendum 9's four fixes, found those four held
+as written, with no lost byte. Its one-OSError sweep, 256 points across 6 scenarios, had 0
+failures. Its 25 probes (`tests/test_relocate_review_b10.py`): 7 failed. The spelling check
+covered the source only. Fixes:
+
+- **M1 (an alias in the target's parent):** a target typed through an 8.3 parent
+  (`D:\LONGTA~1\a\b`) passed every text check on the target: overlap with another move's live
+  target, the app-folder and hardlink-cache checks, and the leftover names. One sequence nested
+  move B inside move A's target; A's rollback then removed B's data together with A's target
+  copy. The bytes stayed in A's restored folder, but B's path became a dangling junction whose
+  rollback refused for good, naming the wrong place. `plan_move` now applies one rule to both
+  paths (`_as_spelled_on_disk`): the nearest existing part of the path (the source itself, or
+  the closest existing ancestor of a target still to be made) must be spelled as on disk.
+- **L2 (case):** a case-only difference is not refused. The path is taken with the on-disk
+  case, so the folder no longer gets the typed case on disk, and every later check sees one
+  spelling.
+- **L3 (UNC):** `_norm` turned `\\?\UNC\server\share` into a path under the current folder. It
+  now gives `\\server\share`. A network path, including a share that spells a local folder
+  (`\\localhost\C$\...`), is refused for source and target with "use its local drive path".
+  Relocate is local drives only.
+- **M2 (a double fault):** after the junction is removed, if the rename back fails and putting
+  the junction back fails too, the path is empty. Two faults on the same path leave nothing
+  that can safely be done there, so this is not prevented. **Decision:** the error says
+  exactly that: the path is empty right now, nothing is lost, where the data is, and that the
+  same command finishes the rollback (the probe asserts the rerun does). One helper,
+  `_put_junction_back`, now does this at all three places that put the junction back. The
+  reviewer's probe was changed to assert the message, and its docstring says so.
+- **L1:** the rerun of a rollback that put the verified restore back while the target was
+  unreachable said only "restored the folder". It now keeps that run's warning: writes made
+  through the junction after the copy was verified are only on the target. The first wording
+  began "put back the verified copy", and with the kept old copy noted after it, B7's sweep
+  read the message as claiming the copy from before the move had been put back (2 of 84 kill
+  points). It now begins "restored the folder from the verified copy".
+- **Not changed (BELIEVED, low):**
+  - `execute_move`'s check that the journal folder does not overlap the move is text-only, and
+    an aliased journal folder would pass it. The journal folder is Reclaim's own setting, not
+    user input to a move.
+  - Under `pytest -s`, a path with U+212A raised `UnicodeEncodeError` from an unconfigured
+    logger. In the product, logging goes through handlers that swallow emit errors, so this is
+    believed to be test-only.
+
+Mutation `mutate_rl10`: one mutant per fix (target spelling unchecked; case kept as typed;
+network paths accepted; a bare error after a failed junction re-creation; the rerun's warning
+dropped), 5 of 5 killed, the source restored byte-identical.
