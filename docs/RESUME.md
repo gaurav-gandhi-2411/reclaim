@@ -96,6 +96,15 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11 from it.
     3. A6.
     4. B.
+- 09:15 IST checkpoint 9 (24 Oct):
+  - **#198** (checkpoint 8 docs) merged as `f299ad0`; main CI green after it.
+  - **Agent artifacts:** the ninth and tenth narrow reviews PASSED (fixes `07dc814`, `b17904d`, `1c07e1d`; ADR addenda 9 and 10). No eleventh round. Full verify on `7b759ea`: 2579 passed, 22 skipped.
+  - **A4 done:** `integration/run-2026-10` = `129d982`, PR #199 open for GG's merge (size gate), CI 6/6 green. #182 closed in favour of #199.
+  - **A5 blocked:** build 12 was stopped by the low-memory reaper during the Nuitka compile (free RAM 3.8 GB, other sessions). Not restarted (section 8, item 8). Nothing installed; the installed build is still `c010a58`. A6 and #199's screenshots wait for it.
+  - **Next:**
+    1. B: relocate (spec `docs/specs/relocate.md`), built and tested hermetically; real machine dry run only.
+    2. C, then D.
+    3. A5/A6 if GG restarts build 12.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
