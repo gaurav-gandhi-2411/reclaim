@@ -1970,6 +1970,7 @@ function renderClusterTable(cluster) {
 }
 
 export {
+  loadAssistantSetup,
   renderClusterTable,
   renderAISuggestionCard,
   formatEtaSeconds,
@@ -2605,6 +2606,7 @@ async function loadSettingsView() {
   // -- fire-and-forget, same "non-fatal status refresh" posture as loadModeStatus elsewhere.
   loadAnthropicKeyStatus();
   loadNotificationsSettings();
+  loadAssistantSetup();
   loadAutoCleanSettings();
 }
 
@@ -3248,10 +3250,48 @@ function initSettings() {
   });
 }
 
+// --- Use Reclaim from your AI assistant (run spec Phase C) --------------------------------------
+//
+// Shows the setup text for each client with a copy button. Never writes any client's config.
+
+async function loadAssistantSetup() {
+  const box = document.getElementById("assistant-setup");
+  const status = document.getElementById("assistant-setup-status");
+  if (!box) return;
+  try {
+    const data = await api("/api/assistant/setup");
+    document.getElementById("assistant-claude-desktop").textContent = data.claude_desktop_json;
+    document.getElementById("assistant-claude-code").textContent = data.claude_code_command;
+    document.getElementById("assistant-codex").textContent = data.codex_toml;
+    status.textContent = data.installed
+      ? ""
+      : "This is a development copy of Reclaim: the commands below start it with this Python.";
+    box.hidden = false;
+  } catch (err) {
+    status.textContent = `Could not load the setup text: ${err.message}`;
+  }
+}
+
+function initAssistantSetup() {
+  for (const btn of document.querySelectorAll("[data-copy]")) {
+    btn.addEventListener("click", async () => {
+      const text = document.getElementById(btn.dataset.copy)?.textContent ?? "";
+      const status = document.getElementById("assistant-setup-status");
+      try {
+        await navigator.clipboard.writeText(text);
+        status.textContent = "Copied.";
+      } catch {
+        status.textContent = "Copy failed: select the text and copy it yourself.";
+      }
+    });
+  }
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
   initDialogKeyboardBehavior();
+  initAssistantSetup();
   initTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   initDashboardMode();

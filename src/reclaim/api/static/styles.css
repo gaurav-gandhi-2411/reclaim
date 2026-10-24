@@ -1016,6 +1016,19 @@ a:active {
   margin-top: var(--rc-space-2);
 }
 
+/* --- Assistant setup snippets ------------------------------------------------------------------- */
+
+.rc-snippet {
+  background: var(--rc-surface-alt);
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-sm);
+  padding: var(--rc-space-3);
+  overflow-x: auto;
+  font-family: var(--rc-font-mono);
+  font-size: var(--rc-text-sm);
+  margin: 0 0 var(--rc-space-2);
+}
+
 /* --- Toolbar / filters ----------------------------------------------------------------------------- */
 
 .rc-toolbar {

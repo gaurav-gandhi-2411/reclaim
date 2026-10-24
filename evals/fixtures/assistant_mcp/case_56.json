@@ -1,0 +1,103 @@
+{
+ "allowed_total_bytes": 94930969731,
+ "best_possible_bytes": null,
+ "case": "case_56",
+ "constraints": {},
+ "feasible": false,
+ "gold_planned_bytes": null,
+ "kind": "infeasible",
+ "machine": "machine4",
+ "selections": [
+  {
+   "group": "dev_artifacts",
+   "paths": [
+    "C:/Users/u/machine4/dl/A/dev_artifact_node_modules-0",
+    "C:/Users/u/machine4/cache/A/dev_artifact_node_modules-1",
+    "C:/Users/u/machine4/proj/A/dev_artifact_node_modules-2",
+    "C:/Users/u/machine4/proj/A/dev_artifact_node_modules-3",
+    "C:/Users/u/machine4/cache/A/dev_artifact_node_modules-4"
+   ],
+   "rule": "dev_artifact_node_modules",
+   "sizes": [
+    6562987287,
+    9261717837,
+    3865532039,
+    6924970773,
+    784012431
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "crash_dumps",
+   "paths": [
+    "C:/Users/u/machine4/dl/A/crash_dump-0",
+    "C:/Users/u/machine4/dl/A/crash_dump-1",
+    "C:/Users/u/machine4/dl/A/crash_dump-2",
+    "C:/Users/u/machine4/dl/A/crash_dump-3"
+   ],
+   "rule": "crash_dump",
+   "sizes": [
+    7956278435,
+    1067914511,
+    9286845355,
+    6161653175
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine4/cache/A/browser_cache-0"
+   ],
+   "rule": "browser_cache",
+   "sizes": [
+    2734184588
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "archive_pairs",
+   "paths": [
+    "C:/Users/u/machine4/cache/A/archive_pair-0"
+   ],
+   "rule": "archive_pair",
+   "sizes": [
+    4803967314
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "large_logs",
+   "paths": [
+    "C:/Users/u/machine4/keepme/A/large_log-0",
+    "C:/Users/u/machine4/keepme/A/large_log-1",
+    "C:/Users/u/machine4/proj/A/large_log-2"
+   ],
+   "rule": "large_log",
+   "sizes": [
+    8513552699,
+    6792055446,
+    2708625154
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine4/dl/A/windows_temp-0",
+    "C:/Users/u/machine4/cache/A/windows_temp-1",
+    "C:/Users/u/machine4/cache/A/windows_temp-2",
+    "C:/Users/u/machine4/cache/A/windows_temp-3"
+   ],
+   "rule": "windows_temp",
+   "sizes": [
+    7673763489,
+    947928796,
+    2183226134,
+    6701754268
+   ],
+   "tier": "A"
+  }
+ ],
+ "target_bytes": 148618060931
+}

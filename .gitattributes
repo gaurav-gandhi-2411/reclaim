@@ -10,3 +10,7 @@ src/reclaim/ai/models/*.onnx filter=lfs diff=lfs merge=lfs -text
 # unaffected -- `-text` here is the same fix `*.onnx` already has, extended to this one other
 # integrity-checked bundled model file.
 src/reclaim/ai/models/*.json -text
+# The planner eval's cases are written by evals/fixtures/assistant_mcp/build_planner_cases.py
+# with LF, and evals/test_assistant_planner_eval.py re-runs it to prove they are current: kept LF
+# on checkout too, so that check (and every run of it) leaves the working tree unchanged.
+evals/fixtures/assistant_mcp/*.json text eol=lf

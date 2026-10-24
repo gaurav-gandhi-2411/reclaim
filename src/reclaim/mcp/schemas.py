@@ -130,3 +130,117 @@ class DeleteResult(BaseModel):
     # paths, same no-enumeration posture as the rest of this model. `files_failed` includes them;
     # without this an agent cannot tell "skipped because it changed" from a real failure.
     skipped_by_reason: dict[str, int] = {}
+
+
+class PlannedSelection(BaseModel):
+    """One whole selection in a `plan_free_space` result: pass its `rule_id_or_category`,
+    `tier` and `selection_hash` to `delete` (which still asks the user)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id_or_category: str
+    category_group: str
+    tier: str
+    selection_hash: str
+    item_count: int
+    bytes_total: int
+    reversible: bool
+    risk_note: str
+
+
+class PlanFreeSpaceResult(BaseModel):
+    """`plan_free_space(...)`: a deterministic plan over the current scan. `reaches_target`
+    false means the constraints cannot reach the target: `shortfall_bytes` says by how much,
+    and no constraint was relaxed to hide it. `frees_now_bytes` is 0 by construction: every
+    assistant delete goes to the vault or the Recycle Bin (invariant I7), which frees the
+    space only when it is purged or emptied."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str
+    target_bytes: int
+    planned_bytes: int
+    reaches_target: bool
+    shortfall_bytes: int
+    frees_now_bytes: int
+    selections: list[PlannedSelection]
+    left_out: list[str]
+
+
+class DriveStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    drive: str
+    total_bytes: int
+    free_bytes: int
+
+
+class DiskStatusResult(BaseModel):
+    """`get_disk_status()`: every fixed drive's free and total space."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    drives: list[DriveStatus]
+
+
+class ExclusionsResult(BaseModel):
+    """`list_exclusions()`: what Reclaim never touches. No tool argument can widen these."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_names: list[str]
+    deny_patterns: list[str]
+
+
+class UsageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_bytes: int
+    is_dir: bool
+    reclaimable: bool
+
+
+class CategoryUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category_group: str
+    label: str
+    tier: str
+    file_count: int
+    bytes: int
+
+
+class DiskUsageResult(BaseModel):
+    """`explain_disk_usage(scan_id)`: the largest entries under the scanned root, and what
+    Reclaim can reclaim by category and tier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str
+    root: str | None
+    total_bytes: int
+    largest: list[UsageEntry]
+    reclaimable: list[CategoryUsage]
+
+
+class ModelEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_id: str
+    size_bytes: int
+    referenced_by: list[str]
+
+
+class UnusedModelsResult(BaseModel):
+    """`find_unused_models()`: cached Hugging Face models and the project files naming them.
+    An empty `referenced_by` means no readable project file names the model; excluded projects
+    are never read (`excluded_projects_not_read`), so they may still use it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cache_dir: str
+    models: list[ModelEntry]
+    files_read: int
+    stopped_at_limit: bool
+    excluded_projects_not_read: bool
