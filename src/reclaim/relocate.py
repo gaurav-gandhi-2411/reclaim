@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
 import hashlib
 import json
 import os
@@ -1013,6 +1014,32 @@ def probe(source: str) -> None:
 _WORKING_SUFFIXES = (MOVED_SUFFIX, PROBE_SUFFIX, RESTORE_SUFFIX)
 
 
+def _os_errors_as_relocate_errors[**P, R](func: Callable[P, R]) -> Callable[P, R]:
+    """For the public entry points that take a journal path (`rollback`, `recover`,
+    `delete_old_copy`): an `OSError` that no step turned into a message (a rename or a removal
+    that a scanner, an open window or a permission refused) becomes a `RelocateError` naming
+    the move, the path and the OS error, and saying to close what holds it and run the same
+    command again. One boundary instead of a handler per call site (B8 M-C, M-D). The journal
+    is left at the stage the step logged before it ran, which a rerun reads from the disk."""
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            return func(*args, **kwargs)
+        except OSError as exc:
+            journal_path = kwargs.get("journal_path", args[0] if args else "")
+            move_id = Path(str(journal_path)).stem.removeprefix("relocate-")
+            command = func.__name__.replace("_old_copy", "-old")
+            raise RelocateError(
+                f"move {move_id}: {command} stopped at {exc.filename or 'an unknown path'} "
+                f"({exc.strerror or exc}). The journal records how far it got and a rerun "
+                "continues from there. Close whatever holds it open (a program, a virus scan, "
+                f"an Explorer window) and run `reclaim relocate {command} {move_id}` again"
+            ) from exc
+
+    return wrapper
+
+
 def _is_inert(journal: Journal) -> bool:
     """A move that was undone: ROLLED_BACK, or DELETED_OLD after a rollback (`rolled_back`). It
     holds nothing and owns nothing, and acting on it again would touch whatever a later move of
@@ -1515,6 +1542,7 @@ def _post_swap_check(journal: Journal) -> None:
 # ------------------------------------------------------------------ recover and rollback
 
 
+@_os_errors_as_relocate_errors
 def recover(
     journal_path: Path, *, policy: Policy, clock: Callable[[], float] = time.time
 ) -> Outcome:
@@ -1571,6 +1599,7 @@ def _only_written_through_the_junction(journal: Journal) -> bool:
         return False
 
 
+@_os_errors_as_relocate_errors
 def rollback(
     journal_path: Path,
     *,
@@ -1787,6 +1816,12 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
             f"there is nothing to put back: the copy from before the move is gone and {tgt} "
             "is not reachable"
         )
+    if target_here and old != restore:
+        # Our own copy of the moved folder from a stopped copy-back; the moved folder it
+        # copied is still there, so it holds nothing unique (B6 L2). Removed BEFORE anything
+        # else changes, so a failure here leaves the junction and the journal as they were and
+        # a rerun starts clean (B8 M-D).
+        _remove_our_restore(journal, restore)
     junction_removed = False
     try:
         if _is_reparse(src):
@@ -1808,13 +1843,6 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
         )
     if target_here:
         extra = f"; the moved folder {tgt} is left as it is, with everything written there since"
-        ours = (journal.restore_id and _is_original(journal, restore)) or (
-            journal.restore_planned and journal.restore_id == 0
-        )
-        if old != restore and _exists(restore) and ours:
-            # Our own copy of the moved folder from a stopped copy-back; the moved folder it
-            # copied is still there, so it holds nothing unique (B6 L2).
-            rmtree_reparse_point_safe(long_path(Path(restore)))
     else:
         extra = f"; {tgt} was not reachable, so anything written there after the move is only there"
     if old == restore:
@@ -1826,6 +1854,22 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
         note = "put back the copy from before the move" + extra
     journal.log(Stage.ROLLED_BACK, note, clock)
     return Outcome(journal, note)
+
+
+def _remove_our_restore(journal: Journal, restore: str) -> None:
+    """Removes `<name>.reclaim-restore` when it is the folder this rollback made."""
+    ours = (journal.restore_id and _is_original(journal, restore)) or (
+        journal.restore_planned and journal.restore_id == 0
+    )
+    if not (ours and _exists(restore)):
+        return
+    try:
+        rmtree_reparse_point_safe(long_path(Path(restore)))
+    except OSError as exc:
+        raise RelocateError(
+            f"move {journal.id}: our unfinished copy {restore} could not be removed ({exc}); "
+            f"nothing else changed. Close whatever holds it open and run the same command again"
+        ) from exc
 
 
 def _recreate_junction(journal: Journal, clock: Callable[[], float], why: str) -> None:
@@ -2117,6 +2161,7 @@ def _discard_copy(journal: Journal) -> tuple[str, str] | None:
 # ------------------------------------------------------------------ delete the old copy
 
 
+@_os_errors_as_relocate_errors
 def delete_old_copy(
     journal_path: Path,
     *,

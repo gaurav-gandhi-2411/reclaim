@@ -12,13 +12,11 @@ from pathlib import Path
 
 import pytest
 from test_relocate import (  # type: ignore[import-not-found]
-    BIG,
     Env,
     _exists,
     _is_link,
     _make_tree,
     _manifest,
-    _write,
     _x,
     env,  # noqa: F401 -- the fixture
 )
@@ -168,5 +166,115 @@ def test_the_production_policy_checks_the_original_path_text_of_a_junction(
     assert _exists(_moved(env)) and os.path.isdir(_x(env.target))
 
 
-# keep the unused helper names honest for later groups
-_ = (BIG, _write, _restore)
+# ------------------------------------------------------------------ M-C, M-D
+
+
+class _Held:
+    """A rename that a scanner handle refuses until `release()` (the cause going away)."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, frm: str, to: str) -> None:
+        self.real = relocate._rename
+        self.frm, self.to = relocate._key(frm), relocate._key(to)
+        self.held = True
+        monkeypatch.setattr(relocate, "_rename", self._rename)
+
+    def _rename(self, a: str, b: str) -> None:
+        if self.held and relocate._key(a) == self.frm and relocate._key(b) == self.to:
+            raise PermissionError(5, "Access is denied (simulated scanner handle)", a)
+        self.real(a, b)
+
+    def release(self) -> None:
+        self.held = False
+
+
+def test_recover_with_the_cause_still_there_is_a_relocate_error_and_a_rerun_succeeds(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    expected = _manifest(env.source)
+    held = _Held(monkeypatch, str(_moved(env)), str(env.source))
+
+    def boom(*_a: object, **_k: object) -> str:
+        raise RelocateError("simulated: 1 files differ after copying them twice")
+
+    with monkeypatch.context() as m:
+        m.setattr(relocate, "_delta_sync", boom)
+        with pytest.raises(RelocateError):
+            env.move()
+    journal = Journal.load(env.journal_path())
+    with pytest.raises(RelocateError) as info:
+        recover(env.journal_path(), policy=env.policy)
+    text = str(info.value)
+    assert journal.id in text and "Access is denied" in text and "again" in text
+    assert not isinstance(info.value.__cause__, RelocateError)  # the wrapped OSError
+    assert _exists(_moved(env))  # nothing was lost or half-done
+    held.release()
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.ROLLED_BACK
+    assert _manifest(env.source) == expected and not _exists(_moved(env))
+    assert not _exists(env.target)
+
+
+def test_delete_old_with_an_os_error_is_a_relocate_error_and_a_rerun_succeeds(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    env.move()
+    real = relocate._sha256
+    state = {"fail": True}
+
+    def sha(path: str) -> str:
+        if state["fail"] and relocate._key(path).startswith(relocate._key(_moved(env))):
+            raise PermissionError(32, "The process cannot access the file", path)
+        return real(path)
+
+    monkeypatch.setattr(relocate, "_sha256", sha)
+    with pytest.raises(RelocateError) as info:
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
+    assert "delete-old" in str(info.value) and "again" in str(info.value)
+    assert _exists(_moved(env)) and _stage(env) == Stage.DONE
+    state["fail"] = False
+    out = delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
+    assert out.journal.stage == Stage.DELETED_OLD and not _exists(_moved(env))
+
+
+def test_a_failed_cleanup_of_our_restore_changes_nothing_and_a_rerun_succeeds(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup runs before the old copy goes back, so a failure leaves the junction up, the
+    old copy where it was and the journal at ROLLING_BACK; the rerun finishes the rollback."""
+    _make_tree(env.source)
+    before_move = _manifest(env.source)
+    env.move()
+    real = relocate._copy_file
+    n = {"i": 0}
+
+    def copy(src: str, dst: str) -> None:
+        if relocate._key(dst).startswith(relocate._key(_restore(env))):
+            n["i"] += 1
+            if n["i"] == 3:
+                raise OSError(5, "in the copy-back")
+        real(src, dst)
+
+    with monkeypatch.context() as m:
+        m.setattr(relocate, "_copy_file", copy)
+        with pytest.raises(RelocateError):
+            rollback(env.journal_path())
+    assert _exists(_restore(env)) and _is_link(env.source)
+    moved_before = _manifest(_moved(env))
+
+    def refuse(_path: str) -> None:
+        raise PermissionError(5, "Access is denied (simulated scanner handle)")
+
+    with monkeypatch.context() as m:
+        m.setattr(relocate, "rmtree_reparse_point_safe", refuse)
+        with pytest.raises(RelocateError, match="again"):
+            rollback(env.journal_path(), use_old_copy=True)
+    assert _is_link(env.source) and _exists(_restore(env))  # nothing else changed
+    assert _manifest(_moved(env)) == moved_before
+    assert _stage(env) == Stage.ROLLING_BACK
+    out = rollback(env.journal_path(), use_old_copy=True)
+    assert out.journal.stage == Stage.ROLLED_BACK
+    assert not _is_link(env.source) and _manifest(env.source) == before_move
+    assert not _exists(_restore(env))
+    assert _exists(env.target)  # use_old_copy leaves the moved folder as it is
