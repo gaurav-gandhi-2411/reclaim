@@ -411,7 +411,7 @@ real move to `D:\reclaim-build` was left out: tests here never leave their own t
 
 The eighth independent review, of `66c2df0`, found two medium findings (M-A, M-B), two more on
 raw errors (M-C, M-D) and two lows (`tests/test_relocate_review_b8.py`; 9 of the reviewer's 21 probes failed
-on `0f5dc41`, the engine head it reviewed). The owner added one finding of his own (G1). Fixes:
+on `0f5dc41`, the engine head it reviewed). The owner added one finding of their own (G1). Fixes:
 
 **`79f73f9` and `5cb862d`: M-A, M-B**
 - **M-A (a rollback of a dead journal undoes a later, live move):** a move was rolled back and
@@ -474,3 +474,45 @@ followed). Ordering is unchanged.
 reviewer's probes. **Probe changed by a decision:** the M-B helper builds its `Policy` with the
 lexical callable, as `default_policy` does. **API (`feat/relocate-ui`):** `delete_old_allowed_at`
 and `old_copy_kept` were two BELIEVED items; see that branch's commit.
+
+## Addendum 9 (2026-10-24): ninth hostile review (B9), FAIL on two mediums, fixed
+
+The ninth review, of `9263b2b` (engine `1e02a0d` plus the page), found two medium findings and
+three lows, and no lost byte (`tests/test_relocate_review_b9.py`; 4 of the reviewer's 21 probes
+failed on that head). Its one-OSError sweeps held: 268 fault points across rollback, a
+`use_old_copy` rollback, delete-old and recover, every error a `RelocateError` and every rerun
+correct, apart from the four points of M2. Supersession under a skewed clock, the lexical
+exclusion check on text variants, guided sizing (no file opened, no junction followed) and the
+API's `old_copy_kept` held too. Fixes:
+
+- **M1 (an 8.3 short name empties the real path):** a source typed by its short name passed the
+  plan, because only the exclusion check resolves a path and every other check compares text.
+  The freeze renamed the alias, which renames the real entry and gives it a new long name, and
+  the junction was created as a new entry literally named like the alias; rollback put the
+  folder back under that alias. The data was intact, but the folder's real path stayed empty.
+  `plan_move` (which `execute_move` re-runs) now reads the on-disk spelling of an existing
+  source with `GetLongPathNameW` and refuses any other spelling, case aside, naming the full
+  name; a name that cannot be read refuses too. This also closes the BELIEVED variants
+  (journal-text checks, overlap, supersession and `_key` comparisons that would not recognise
+  the same folder under its alias), since no journal can now hold an alias as its source.
+- **M2 (one journal write outside the guard):** in rollback after the swap, the "junction
+  removed" entry was written after the junction went but before the block that puts the
+  junction back on any failure, so a journal write failing there (a full journal drive, a held
+  `.tmp`) left the path empty. The removal stays outside the block (its own failure leaves the
+  junction in place), and the entry is now written inside it.
+- **L1 (a `created_at` tie):** two journals for the same source with one timestamp, such as a
+  hand-made copy under a new id, each counted as the other's "later, live move", so both
+  refused forever. Ties are now broken by id: exactly one of the two counts as later.
+- **L2 (the rerun of an interrupted `use_old_copy` rollback):** after the old copy was back but
+  before the journal recorded it, the rerun said "restored the folder" and went through
+  `_discard_copy`, which a first run never does. It now finishes as the first run would: it
+  names the copy from before the move, says where the moved folder (with what was written
+  since) is, and leaves it untouched.
+- **L3 (BELIEVED, not changed):** run from source, the CLI's default journal folder depends on
+  the current directory, and the overlap and supersession checks only read one journal folder.
+  The installed build uses its own data folder, so this is believed to affect development runs
+  only.
+
+Mutation `mutate_rl9`: one mutant per fix (accepting short names; the log outside the guard;
+`>=` on `created_at`; the rerun reported as a restore), 4 of 4 killed, the source restored
+byte-identical. The reviewer's API probe moved to the page branch.
