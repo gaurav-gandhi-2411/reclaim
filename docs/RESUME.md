@@ -154,6 +154,17 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     1. When the verify passes: merge #202 and #203 into `integration/run-2026-10`, regenerate the ADR index there (ADR-0043/0044), add `list_relocation_options`, and update #199.
     2. D5 (warm-up profile).
     3. Phase E.
+- 00:10 IST checkpoint 14 (25 Oct):
+  - **#199 is the one PR for GG's merge.** It now holds agent artifacts, relocate with its page, and the planner and read-only tools, plus the new `list_relocation_options`.
+    - Head `f8f51f5`: CI 6/6 green, CLEAN, contains main.
+    - The description is rewritten, with the handoff table.
+  - **Owed to GG** (review section 8):
+    - item 11, the full verify of `f8f51f5`, reaped while waiting for RAM;
+    - item 10, D: scratch I may not delete;
+    - item 9, three ACL-locked test folders;
+    - item 8, build 12.
+  - **Next:** D5 when RAM allows, then Phase E (soak needs build 12; docs; review pack).
+- 00:40 IST checkpoint 15 (25 Oct): the review pack is brought current: every merge in section 1, and sections 3, 4, 5, 7 and 9 updated. No code. Next: D5 when RAM allows; Phase E's soak waits for build 12.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
