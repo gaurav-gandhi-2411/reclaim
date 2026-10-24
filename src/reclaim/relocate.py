@@ -295,7 +295,9 @@ def _norm(path: Path | str) -> str:
     text = str(path)
     if text[:8].upper() == "\\\\?\\UNC\\":
         text = "\\\\" + text[8:]  # \\?\UNC\server\share -> \\server\share (B10 L3)
-    elif text.startswith("\\\\?\\"):
+    elif text.startswith("\\\\?\\") and text[5:7] == ":\\":
+        # Only in front of a drive letter: `\\?\Volume{...}\` and `\\?\GLOBALROOT\` stay device
+        # paths (refused by the plan), never a folder under the current one (B11 L4).
         text = text[4:]
     text = str(Path(text).absolute())
     if len(text) > 3:
@@ -393,32 +395,77 @@ _kernel32.DeviceIoControl.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
 _kernel32.SetFileAttributesW.restype = wintypes.BOOL
-_kernel32.GetLongPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
-_kernel32.GetLongPathNameW.restype = wintypes.DWORD
+_kernel32.GetFinalPathNameByHandleW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.LPWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+]
+_kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+_SHARE_ALL = 0x7  # read | write | delete: only the name is asked for
 
 
-def _long_name(path: str) -> str | None:
-    """`path` with every component spelled as it is on disk (8.3 aliases expanded), or None
-    when it cannot be read. Renaming an 8.3 alias renames the real entry, so a move given a
-    short name would leave the real path empty (B9 M1)."""
-    query = str(long_path(Path(path)))
-    size = _kernel32.GetLongPathNameW(query, None, 0)
-    if size == 0:
+def _final_name(path: str) -> str | None:
+    """The name Windows itself resolves `path` to, or None when it cannot be read: every
+    component in its on-disk case, 8.3 aliases expanded, a substituted drive letter and any
+    junction in a PARENT component resolved (the leaf is opened as itself, never followed).
+    Renaming an alias renames the real entry, so a move given one would leave the real path
+    empty (B9 M1, B10 M1); GetLongPathNameW expanded 8.3 names only, kept a long name's typed
+    case and did not see through `subst` (B11 L2, BELIEVED medium)."""
+    handle = _kernel32.CreateFileW(
+        str(long_path(Path(path))),
+        0,
+        _SHARE_ALL,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, _INVALID_HANDLE):
         return None
-    buf = ctypes.create_unicode_buffer(size)
-    if _kernel32.GetLongPathNameW(query, buf, size) == 0:
-        return None
+    try:
+        size = _kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
+        if size == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(size + 1)
+        if _kernel32.GetFinalPathNameByHandleW(handle, buf, size + 1, 0) == 0:
+            return None
+    finally:
+        _kernel32.CloseHandle(handle)
     return _norm(buf.value)
+
+
+_BAD_NAME_CHARS = frozenset('<>:"|?*') | {chr(c) for c in range(32)}
+
+
+def _bad_text(path: str) -> str | None:
+    """Why `path` is not a name NTFS can create, or None. A target that cannot be created made
+    the move fail after its journal existed, and the rollback could not even check the target
+    path, so the journal could never be finished (B11 M1)."""
+    if path[1:3] != ":\\" or len(path) == 3:
+        return None  # a network path or a drive root: refused with their own reasons
+    for part in path[3:].split("\\"):
+        if part in {"", ".", ".."}:
+            return f"{path} has an empty, '.' or '..' part; give the folder's plain path"
+        if _BAD_NAME_CHARS & set(part):
+            return f"{path} has a character Windows does not allow in a name"
+        if len(part) > 255 or part[-1] in ". ":
+            return f"{path} has a part that is too long or ends in a dot or space"
+    return None
 
 
 def _as_spelled_on_disk(path: str) -> tuple[str, str | None]:
     """`(path, reason)`. The nearest existing part of `path` (itself, or the closest existing
-    ancestor of a target that is still to be created) must be spelled as it is on disk, because
-    every journal, overlap and app-folder check compares path text: an 8.3 alias anywhere in it
-    passes them all (B9 M1 for the source, B10 M1 for the target's parent). A difference in case
-    only is not refused: the path is returned with the on-disk case, so the folder keeps its
-    own name on disk and every later check sees one spelling (B10 L2). `reason` is set when the
-    spelling is another one, or cannot be read."""
+    ancestor of a target that is still to be created) must be the name Windows resolves it to,
+    because every journal, overlap and app-folder check compares path text: an alias anywhere
+    in it passes them all (B9 M1 for the source, B10 M1 for the target's parent). A difference
+    in case only is not refused: the path is returned with the on-disk case, so the folder
+    keeps its own name and every later check sees one spelling (B10 L2, B11 L2). `reason` is
+    set when the text is not a creatable name, the spelling is another one, it cannot be
+    read, or an ancestor still to be created under is a file."""
+    bad = _bad_text(path)
+    if bad is not None:
+        return path, bad
     existing, rest = path, []
     while not _exists(existing):
         parent = _norm(Path(existing).parent)
@@ -426,11 +473,16 @@ def _as_spelled_on_disk(path: str) -> tuple[str, str | None]:
             return path, None  # nothing of it exists (a drive that is gone): refused elsewhere
         rest.append(Path(existing).name)
         existing = parent
-    spelled = _long_name(existing)
+    spelled = _final_name(existing)
     if spelled is None:
         return path, f"the full name of {existing} could not be read"
     if _key(spelled) != _key(existing):
-        return path, f"{existing} is a short or alternate name: use its full name, {spelled}"
+        return path, (
+            f"{existing} is a short or alternate name (an 8.3 name, a substituted drive or a "
+            f"link on the way): use its full name, {spelled}"
+        )
+    if rest and not os.path.isdir(long_path(Path(existing))):  # noqa: PTH112
+        return path, f"{existing} is a file, so no folder can be made under it"  # B11 L1
     return _norm(Path(spelled, *reversed(rest))), None
 
 
@@ -1207,6 +1259,11 @@ def plan_move(
     at its own path) is put back first: only the probe ever makes that name."""
     src, src_spelling = _as_spelled_on_disk(_norm(source))
     tgt, tgt_spelling = _as_spelled_on_disk(_norm(target))
+    if not _exists(src) and _exists(src + PROBE_SUFFIX):
+        # Only the probe's leftover exists: it carries the folder's own name (B11 L3).
+        spelled_probe, _ = _as_spelled_on_disk(src + PROBE_SUFFIX)
+        if _key(spelled_probe) == _key(src + PROBE_SUFFIX):
+            src = spelled_probe[: -len(PROBE_SUFFIX)]
     moved = src + MOVED_SUFFIX
     probe_path = src + PROBE_SUFFIX
     if (
@@ -1226,9 +1283,12 @@ def plan_move(
     reasons.extend(r for r in (src_spelling, tgt_spelling) if r is not None)
     for label, path in (("source", src), ("target", tgt)):
         if path.startswith("\\\\"):
-            # A network path, or a share that is another spelling of a local folder
-            # (`\\localhost\C$\...`): relocate works on local drive paths only (B10 L3).
-            reasons.append(f"the {label} {path} is a network path; use its local drive path")
+            # A network path, a share that is another spelling of a local folder
+            # (`\\localhost\C$\...`), or a device path (`\\?\Volume{...}\`): relocate works on
+            # local drive paths only (B10 L3, B11 L4).
+            reasons.append(
+                f"the {label} {path} is a network path or a device path; use its local drive path"
+            )
     if found.verdict is Verdict.GUIDED:
         reasons.insert(0, "this folder is moved with its program's own steps")
     if _relation(src, tgt):
@@ -1347,8 +1407,17 @@ def execute_move(
         source_dev=_folder_dev(plan.source),
     )
     journal.path = str(journal_dir / f"relocate-{journal.id}.json")
-    journal.log(Stage.PLANNED, f"{plan.files} files, {plan.bytes} bytes", clock)
-    journal.log(Stage.PROBING, "", clock)
+    try:
+        journal.log(Stage.PLANNED, f"{plan.files} files, {plan.bytes} bytes", clock)
+        journal.log(Stage.PROBING, "", clock)
+    except OSError as exc:
+        # Nothing on disk has changed yet; a journal that did get written is cleared by a
+        # rollback, which the next plan names (B11 L6).
+        raise RelocateError(
+            f"not moved: the move's journal could not be written in {journal_dir} ({exc}); "
+            f"nothing changed. If {journal.path} exists, run `reclaim relocate rollback "
+            f"{journal.id}` to clear it, then try again"
+        ) from exc
     try:
         probe(plan.source)
     except RelocateError as exc:
@@ -2011,10 +2080,12 @@ def _put_junction_back(journal: Journal) -> None:
     try:
         _create_junction(src, tgt)
     except OSError as exc:
+        # The command the user ran, so the rerun puts back the copy they chose (B11 L5).
+        again = f"rollback {journal.id}" + (" --use-old-copy" if journal.use_old_copy else "")
         raise RelocateError(
             f"move {journal.id}: putting the junction back at {src} failed too ({exc}), so {src} "
             f"is empty right now. Nothing is lost: the data is in {tgt}. Run `reclaim relocate "
-            f"rollback {journal.id}` again; it finishes the rollback"
+            f"{again}` again; it finishes the rollback"
         ) from exc
     with contextlib.suppress(OSError):  # an unreachable target: the junction is what counts
         _keep_root_flags(tgt, src)

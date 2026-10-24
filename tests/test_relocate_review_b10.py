@@ -189,7 +189,7 @@ def test_b10_a_loopback_unc_spelling_of_the_source_is_refused(env: Env) -> None:
     unc = f"\\\\localhost\\{drive}$" + rest
     if not os.path.isdir(unc):
         pytest.skip("the admin share is not reachable")
-    spelled = relocate._long_name(relocate._norm(unc))
+    spelled = relocate._final_name(relocate._norm(unc))
     plan = _plan(unc, env.target, env.policy)
     print("B10-UNC long_name:", spelled)
     print("B10-UNC plan", plan.ok, plan.reasons)
@@ -203,7 +203,7 @@ def test_b10_holds_already_moved_and_dangling_sources_plan_without_error(env: En
     print("B10-MOVED", found.reasons)
     assert not found.ok and any("already a link" in r for r in found.reasons)
     os.rename(_x(env.target), _x(Path(str(env.target) + "-away")))
-    print("B10-MOVED long_name dangling:", relocate._long_name(str(env.source)))
+    print("B10-MOVED long_name dangling:", relocate._final_name(str(env.source)))
     dangling = _plan(env.source, env.d / "again", env.policy)
     print("B10-DANGLING", dangling.reasons)
     assert not dangling.ok
@@ -304,7 +304,7 @@ def test_b10_long_name_of_a_unc_path_is_a_unc_path(env: Env) -> None:
     unc = f"\\\\localhost\\{drive}$" + rest
     if not os.path.isdir(unc):
         pytest.skip("the admin share is not reachable")
-    spelled = relocate._long_name(relocate._norm(unc))
+    spelled = relocate._final_name(relocate._norm(unc))
     typed_prefixed = relocate._norm("\\\\?\\UNC\\localhost\\" + drive + "$" + rest)
     print("B10-UNC2", spelled, "|", typed_prefixed)
     assert spelled is not None and spelled.startswith("\\\\"), spelled
