@@ -543,3 +543,46 @@ def test_pass2_the_root_alone_can_match_without_any_children(tmp_path: Path) -> 
     protected.mkdir()
     assert subtree_exclusion_match(protected, ["*intent-router*"]) == "*intent-router*"
     assert subtree_exclusion_match(protected, ["*zzz*"]) is None
+
+
+# --- SafetyValidator.exclusion_match(lexical=True) (B8 M-B) -------------------------------
+
+
+def _junction_pair(tmp_path: Path) -> tuple[Path, Path]:
+    import _winapi
+
+    target = tmp_path / "plain_target"
+    target.mkdir()
+    link = tmp_path / "zzexcljunc"
+    _winapi.CreateJunction(str(target), str(link))
+    return link, target
+
+
+def test_lexical_exclusion_match_sees_the_junction_name_not_its_target(tmp_path: Path) -> None:
+    from reclaim.config import Config, SafetyConfig
+    from reclaim.safety import SafetyValidator
+
+    link, _target = _junction_pair(tmp_path)
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=["*zzexcljunc*"])))
+    # Default: resolve() turns the junction into its target, whose path names nothing excluded.
+    assert validator.exclusion_match(link, is_dir=True) is None
+    assert validator.exclusion_match(link, is_dir=True, lexical=True) == "*zzexcljunc*"
+
+
+def test_lexical_exclusion_match_agrees_with_the_default_for_a_plain_path(tmp_path: Path) -> None:
+    from reclaim.config import Config, SafetyConfig
+    from reclaim.safety import SafetyValidator
+
+    plain = tmp_path / "zzexclplain"
+    plain.mkdir()
+    validator = SafetyValidator(Config(safety=SafetyConfig(deny=["*zzexclplain*"])))
+    assert validator.exclusion_match(plain, is_dir=True) == "*zzexclplain*"
+    assert validator.exclusion_match(plain, is_dir=True, lexical=True) == "*zzexclplain*"
+    assert validator.exclusion_match(tmp_path / "other", is_dir=True, lexical=True) is None
+
+
+def test_lexical_exclusion_match_with_no_patterns_is_none(tmp_path: Path) -> None:
+    from reclaim.config import Config
+    from reclaim.safety import SafetyValidator
+
+    assert SafetyValidator(Config()).exclusion_match(tmp_path, is_dir=True, lexical=True) is None
