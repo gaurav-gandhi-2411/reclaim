@@ -165,7 +165,7 @@ def test_a_kill_anywhere_in_the_freeze_race_path_then_recover_is_whole(
             continue
         paths = sorted(e.journals.glob("relocate-*.json"))
         try:
-            out = recover(paths[0])
+            out = recover(paths[0], policy=e.policy)
             for _ in range(2):
                 if out.journal.stage == Stage.ROLLED_BACK:
                     break
@@ -349,7 +349,7 @@ def test_a_touched_old_copy_refusal_names_a_step_that_works(env: Env) -> None:
     env.move()
     _write(_moved(env) / "notes.txt", b"pasted into the old copy")
     with pytest.raises(RelocateError) as first:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     message = str(first.value)
     assert "will not delete it" in message and "remove it if you no longer need it" in message
     assert (_moved(env) / "notes.txt").read_bytes() == b"pasted into the old copy"
@@ -372,12 +372,12 @@ def test_recover_at_deleting_old_rechecks_the_old_copy(
             lambda _p: (_ for _ in ()).throw(SimulatedCrash("rmtree")),
         )
         with pytest.raises(SimulatedCrash):
-            delete_old_copy(env.journal_path(), confirmed=True)
+            delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _stage(env) == Stage.DELETING_OLD
     written = b"written into the old copy after the interrupted delete"
     _write(_moved(env) / "late.txt", written)
     try:
-        recover(env.journal_path())
+        recover(env.journal_path(), policy=env.policy)
     except RelocateError:
         return
     assert written in _survivors(env), "recover deleted a write the delete check never saw"
@@ -434,7 +434,7 @@ def test_following_the_freeze_race_instruction_closes_the_move(
     steps = []
     for _ in range(3):
         try:
-            out = recover(env.journal_path())
+            out = recover(env.journal_path(), policy=env.policy)
         except RelocateError as exc:
             steps.append(str(exc))
             if "Move that folder's contents elsewhere" in str(exc):

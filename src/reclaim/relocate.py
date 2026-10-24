@@ -1393,13 +1393,17 @@ def _post_swap_check(journal: Journal) -> None:
 # ------------------------------------------------------------------ recover and rollback
 
 
-def recover(journal_path: Path, *, clock: Callable[[], float] = time.time) -> Outcome:
-    """After a crash: finish a move whose junction is in place and checks out, else roll back."""
+def recover(
+    journal_path: Path, *, policy: Policy, clock: Callable[[], float] = time.time
+) -> Outcome:
+    """After a crash: finish a move whose junction is in place and checks out, else roll back.
+    `policy` is needed because an interrupted delete of the old copy is finished here, and a
+    delete never goes ahead for an excluded project (B7 M3)."""
     journal = Journal.load(journal_path)
     if journal.stage in {Stage.DONE, Stage.DELETED_OLD, Stage.ROLLED_BACK}:
         return Outcome(journal, f"nothing to recover: the move is {journal.stage}")
     if journal.stage == Stage.DELETING_OLD:
-        return delete_old_copy(journal_path, clock=clock)
+        return delete_old_copy(journal_path, policy=policy, clock=clock)
     if journal.stage == Stage.SWAPPING and _junction_target(journal.source) is not None:
         try:
             _post_swap_check(journal)
@@ -1940,6 +1944,7 @@ def _discard_copy(journal: Journal) -> tuple[str, str] | None:
 def delete_old_copy(
     journal_path: Path,
     *,
+    policy: Policy,
     confirmed: bool = False,
     accept_missing: bool = False,
     clock: Callable[[], float] = time.time,
@@ -1958,8 +1963,14 @@ def delete_old_copy(
 
     Allowed after `KEEP_OLD_COPY_DAYS`, or earlier with `confirmed`. A delete interrupted
     half-way re-checks what is left of the old copy before carrying on (B5 M3).
+
+    `policy` is required, with no default, so no caller can skip it: the exclusions the user
+    has now are applied to the moved folder and to the old copy, and an excluded project's
+    original files are never deleted (B7 M3).
     """
     journal = Journal.load(journal_path)
+    if journal.stage in (Stage.DELETING_OLD, Stage.DONE, Stage.ROLLED_BACK):
+        _refuse_if_excluded(journal, policy)
     if journal.stage == Stage.DELETING_OLD:
         changed = _old_copy_changes(journal, allow_missing=True)
         if changed:
@@ -2025,6 +2036,17 @@ def delete_old_copy(
         clock,
     )
     return _finish_delete(journal, clock, free_bytes)
+
+
+def _refuse_if_excluded(journal: Journal, policy: Policy) -> None:
+    """The plan's own test (`Policy.exclusion_match`: the path text, then the names beneath
+    it), applied to the moved folder and to the old copy, as the exclusions are now."""
+    for path in (journal.source, journal.moved):
+        if _exists(path) and policy.exclusion_match(Path(path)) is not None:
+            raise RelocateError(
+                f"{path} is, or contains, an excluded project; nothing deleted. Take it off the "
+                "exclusion list first if the old copy may go"
+            )
 
 
 def _kept_since(journal: Journal) -> float:

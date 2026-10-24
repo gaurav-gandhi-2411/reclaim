@@ -71,7 +71,7 @@ def test_kill_inside_junction_creation_is_not_reported_as_restored(
     monkeypatch.setattr(relocate, "_create_junction", real_create)
 
     try:
-        outcome = recover(env.journal_path())
+        outcome = recover(env.journal_path(), policy=env.policy)
     except RelocateError:
         outcome = None  # a refusal would be acceptable; a false "restored" is not
     if outcome is not None and outcome.journal.stage == Stage.ROLLED_BACK:
@@ -120,7 +120,7 @@ def test_kill_during_rollbacks_target_probe_is_recoverable(
         rollback(env.journal_path())
     monkeypatch.setattr(relocate, "_probe_target", real_probe)
 
-    outcome = recover(env.journal_path())
+    outcome = recover(env.journal_path(), policy=env.policy)
     assert outcome.journal.stage == Stage.ROLLED_BACK
     assert not _is_link(env.source)
     assert _manifest(env.source) == expected
@@ -221,7 +221,7 @@ def test_a_recreated_folder_after_the_old_copy_was_deleted_is_not_called_restore
     _make_tree(env.source)
     expected = _manifest(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     os.rmdir(_x(env.source))  # the junction, removed by something else
     _write(env.source / "fresh.log", b"recreated")
     with pytest.raises(RelocateError, match="something else created"):
@@ -261,7 +261,7 @@ def test_rollback_of_a_move_whose_old_copy_holds_another_moves_target(env: Env) 
     if not plan.ok:
         return  # refused up front: the claim holds
     _move(env, b_src, b_tgt)
-    delete_old_copy(_journal_for(env, b_src), confirmed=True)
+    delete_old_copy(_journal_for(env, b_src), policy=env.policy, confirmed=True)
     rollback(_journal_for(env, env.source))
     assert _manifest(b_src) == expected_b
 
@@ -276,7 +276,7 @@ def test_alternate_data_streams_survive_the_move_and_delete(env: Env) -> None:
     with open(_x(env.source / "a.bin") + ":meta", "wb") as fh:
         fh.write(b"data that lives in a named stream")
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     with open(_x(env.source / "a.bin") + ":meta", "rb") as fh:
         assert fh.read() == b"data that lives in a named stream"
 
@@ -407,7 +407,7 @@ def test_delete_old_copy_after_a_target_file_was_replaced_by_an_older_version(en
     p = env.target / "sub" / "b.txt"
     st = os.stat(_x(p))
     os.utime(_x(p), ns=(st.st_atime_ns, st.st_mtime_ns + 1))  # mtime moved, bytes same
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     with open(_x(env.source / "sub" / "b.txt"), "rb") as fh:
         assert fh.read() == b"hello"
 
@@ -431,7 +431,7 @@ def test_a_stream_that_differs_in_the_copy_refuses_the_delete(env: Env) -> None:
         fh.write(b"altered stream!")
     os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))
     with pytest.raises(RelocateError, match="differ"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _exists(str(env.source) + MOVED_SUFFIX)
 
 

@@ -155,10 +155,13 @@ def run(args: argparse.Namespace) -> int:
                     _journal(journal_dir, args.move_id), use_old_copy=args.use_old_copy
                 )
             ),
-            "recover": lambda: _report(relocate.recover(_journal(journal_dir, args.move_id))),
+            "recover": lambda: _report(
+                relocate.recover(_journal(journal_dir, args.move_id), policy=policy)
+            ),
             "delete-old": lambda: _report(
                 relocate.delete_old_copy(
                     _journal(journal_dir, args.move_id),
+                    policy=policy,
                     confirmed=args.confirm,
                     accept_missing=args.accept_missing,
                 )

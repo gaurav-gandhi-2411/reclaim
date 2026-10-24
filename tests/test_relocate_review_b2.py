@@ -78,7 +78,7 @@ def test_kill_after_freeze_then_recreated_folder_is_not_reported_restored(
     _write(env.source / "fresh.log", b"recreated by the program")
 
     try:
-        outcome = recover(env.journal_path())
+        outcome = recover(env.journal_path(), policy=env.policy)
     except RelocateError:
         return
     assert _manifest(env.source) == expected, (
@@ -103,7 +103,7 @@ def test_kill_during_delta_then_empty_recreated_folder_is_not_reported_restored(
     os.mkdir(_x(env.source))
 
     try:
-        outcome = recover(env.journal_path())
+        outcome = recover(env.journal_path(), policy=env.policy)
     except RelocateError:
         return
     assert _manifest(env.source) == expected, (
@@ -152,7 +152,7 @@ def test_rebuild_restore_never_wipes_a_complete_restore_when_the_target_is_gone(
     _make_tree(env.source)
     expected = _manifest(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
 
     def die(*a: object, **k: object) -> None:
         raise SimulatedCrash("killed before the junction is removed")
@@ -183,7 +183,7 @@ def test_delete_old_copy_does_not_delete_writes_made_to_the_old_copy(env: Env) -
     _write(_moved(env) / "sub" / "b.txt", b"written into the old copy after the move")
 
     try:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     except RelocateError:
         return
     with open(_x(env.target / "sub" / "b.txt"), "rb") as fh:
@@ -230,7 +230,7 @@ def test_a_writer_holding_a_share_delete_handle_does_not_lose_its_writes(env: En
     finally:
         _k32.CloseHandle(handle)
     try:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     except RelocateError:
         return
     with open(_x(env.target / "sub" / "b.txt"), "rb") as fh:
@@ -262,7 +262,7 @@ def test_a_folder_stream_added_after_the_plan_survives_delete_old_copy(env: Env)
                 fh.write(b"folder metadata")
 
     env.move(checkpoint=during)
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert relocate._named_streams(_x(env.target / "sub")), "the folder's stream is lost"
 
 
@@ -415,7 +415,7 @@ def test_a_kill_anywhere_in_rollback_then_recover_restores_everything(
         _make_tree(e.source)
         e.move()
         if delete_first:
-            delete_old_copy(e.journal_path(), confirmed=True)
+            delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
         _write(e.source / "sub" / "b.txt", b"edited through the junction")
         _write(e.source / "new.txt", b"added through the junction")
         expected = _manifest(e.target)
@@ -487,7 +487,7 @@ def test_a_kill_anywhere_in_the_move_then_recover_is_whole(
         try:
             paths = sorted(e.journals.glob("relocate-*.json"))
             if paths:
-                out = recover(paths[0])
+                out = recover(paths[0], policy=e.policy)
                 if out.journal.stage == Stage.DONE:
                     ok = _is_link(e.source) and _manifest(e.target) == expected
                 else:
@@ -522,7 +522,7 @@ def test_a_file_written_into_the_old_copy_is_never_accepted_as_removed(env: Env)
     env.move()
     _write(_moved(env) / "written-later.txt", b"only copy")
     with pytest.raises(RelocateError, match="changed since the move"):
-        delete_old_copy(env.journal_path(), confirmed=True, accept_missing=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True, accept_missing=True)
     assert (_moved(env) / "written-later.txt").read_bytes() == b"only copy"
 
 
@@ -533,7 +533,7 @@ def test_a_folder_stream_only_in_the_old_copy_refuses_the_delete(env: Env) -> No
     with open(_x(_moved(env) / "sub") + ":meta", "wb") as fh:
         fh.write(b"folder metadata that only the old copy has")
     with pytest.raises(RelocateError, match="changed since the move"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _exists(_moved(env))
 
 
@@ -560,7 +560,7 @@ def test_a_folder_that_replaced_our_target_is_kept(env: Env) -> None:
     os.chmod(_x(env.target / "readonly.txt"), stat.S_IWRITE)
     shutil.rmtree(_x(env.target))
     _write(env.target / "someone-elses.txt", b"not ours")
-    outcome = recover(env.journal_path())
+    outcome = recover(env.journal_path(), policy=env.policy)
     assert outcome.journal.stage == Stage.ROLLED_BACK
     assert _manifest(env.source) == expected
     assert (env.target / "someone-elses.txt").read_bytes() == b"not ours"
@@ -574,7 +574,7 @@ def test_a_foreign_folder_at_the_old_copys_name_is_never_used(env: Env) -> None:
     os.rename(_x(_moved(env)), _x(env.c / "kept-aside"))
     _write(_moved(env) / "impostor.txt", b"x")
     with pytest.raises(RelocateError, match="not the folder this move kept"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     with pytest.raises(RelocateError, match="not the folder this move renamed"):
         rollback(env.journal_path())
     assert _is_link(env.source)
@@ -586,7 +586,7 @@ def test_nothing_restorable_is_never_reported_as_rolled_back(env: Env) -> None:
     something else. There is nothing to restore, and the rollback must say so."""
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     os.rmdir(_x(env.source))
     os.chmod(_x(env.target / "readonly.txt"), stat.S_IWRITE)
     shutil.rmtree(_x(env.target))

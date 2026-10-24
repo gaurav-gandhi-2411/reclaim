@@ -21,6 +21,7 @@ from test_relocate import (  # type: ignore[import-not-found]
     env,  # noqa: F401 -- the fixture
 )
 from test_relocate_review_b4 import (  # type: ignore[import-not-found]
+    _arm_deletes,
     _moved,
     _stage,
     _vol,
@@ -31,9 +32,11 @@ import reclaim.relocate as relocate
 from reclaim.cli import main
 from reclaim.relocate import (
     Journal,
+    Policy,
     RelocateError,
     Stage,
     delete_old_copy,
+    execute_move,
     plan_move,
     recover,
     rollback,
@@ -50,7 +53,7 @@ def test_b7_a_partial_restore_is_never_put_back_as_the_folder(
     it into place and reports ROLLED_BACK, 'put back the copy from before the move'."""
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     full = _manifest(env.target)
     unplugged = env.d / "unplugged"
     real = relocate._copy_file
@@ -153,8 +156,34 @@ def test_b7_a_full_journal_drive_after_the_freeze_gives_a_relocate_error(
     assert isinstance(info.value, RelocateError), f"raw {type(info.value).__name__}: {info.value}"
 
 
-def _journal_paths(e: Env) -> list[Path]:
-    return sorted(e.journals.glob("relocate-*.json"))
+def test_b7_delete_old_never_deletes_an_excluded_projects_old_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """delete_old_copy takes no policy, and the CLI computes one but does not pass it: a
+    project the user excluded after the move has its original files (the old copy) deleted."""
+    d = tmp_path / "D"
+    d.mkdir()
+    d_key = relocate._key(d)
+    monkeypatch.setattr(
+        relocate, "_volume_serial", lambda p: 2 if relocate._key(p).startswith(d_key) else 1
+    )
+    src = tmp_path / "C" / "models"
+    _write(src / "a.bin", b"a" * 10)
+    _write(src / "zzexclproj" / "main.py", b"the excluded project's source")
+    config = tmp_path / "config.toml"
+    journals = tmp_path / "journals"
+
+    def cli(*args: str) -> int:
+        return main(["relocate", "--config", str(config), "--journal-dir", str(journals), *args])
+
+    assert cli("move", str(src), "--target", str(d / "models"), "--yes") == 0
+    (journal,) = relocate.journals(journals)
+    config.write_text('[exclusions]\nproject_names = ["zzexclproj"]\n', encoding="utf-8")
+    assert cli("plan", str(d / "models"), "--target", str(tmp_path / "C" / "x")) == 1
+    assert "excluded" in capsys.readouterr().out  # the exclusion is live for the plan
+    cli("delete-old", journal.id, "--confirm")
+    moved = Path(str(src) + relocate.MOVED_SUFFIX)
+    assert _exists(moved / "zzexclproj" / "main.py"), "the excluded project's old copy was deleted"
 
 
 @pytest.mark.parametrize("delete_first", [False, True])
@@ -175,7 +204,7 @@ def test_b7_sweep_a_kill_in_the_copy_back_then_the_target_drive_goes_away(
         pre_move = _manifest(e.source)
         e.move()
         if delete_first:
-            delete_old_copy(e.journal_path(), confirmed=True)
+            delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
         _write(e.source / "new.txt", b"TARGET-SIDE addition")
         full_target = _manifest(e.target)
         with monkeypatch.context() as m:
@@ -220,7 +249,7 @@ def test_b7_h1_a_verified_restore_is_put_back_and_named_for_what_it_is(
     the message must not call it the copy from before the move (which was deleted)."""
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     full = _manifest(env.target)
 
     def die(_link: str) -> None:
@@ -244,7 +273,7 @@ def test_b7_h1_a_partial_restore_is_refused_with_the_way_forward_and_keeps_every
 ) -> None:
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     full = _manifest(env.target)
     unplugged = env.d / "unplugged"
     real = relocate._copy_file
@@ -302,7 +331,7 @@ def test_b7_m2_a_blocked_rollback_names_the_move_and_recover_finishes_it(
     assert journal.id in str(info.value)
     assert f"reclaim relocate recover {journal.id}" in str(info.value)
     assert _exists(_moved(env)) and not _exists(env.source)  # parked, and the message says so
-    out = recover(env.journal_path())  # the cause is gone
+    out = recover(env.journal_path(), policy=env.policy)  # the cause is gone
     assert out.journal.stage == Stage.ROLLED_BACK
     assert _manifest(env.source) == expected
 
@@ -432,7 +461,72 @@ def test_b7_m2_a_failed_removal_of_the_old_copy_is_a_relocate_error_naming_delet
     with monkeypatch.context() as m:
         m.setattr(relocate, "rmtree_reparse_point_safe", refuse)
         with pytest.raises(RelocateError, match=f"delete-old {jid}"):
-            delete_old_copy(env.journal_path(), confirmed=True)
+            delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _stage(env) == Stage.DELETING_OLD
-    out = delete_old_copy(env.journal_path(), confirmed=True)
+    out = delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert out.journal.stage == Stage.DELETED_OLD
+
+
+def _excluding(*, marker: str) -> Policy:
+    """A policy that excludes any path whose text ends with `marker` (casefolded)."""
+    return Policy(
+        exclusion_match=lambda p: "excluded" if relocate._key(p).endswith(marker) else None,
+        protected=lambda _p: False,
+    )
+
+
+def test_b7_m3_delete_old_copy_and_recover_cannot_be_called_without_a_policy(env: Env) -> None:
+    _make_tree(env.source)
+    env.move()
+    with pytest.raises(TypeError):
+        delete_old_copy(env.journal_path(), confirmed=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        recover(env.journal_path())  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("marker", [relocate.MOVED_SUFFIX, "data"])
+def test_b7_m3_an_excluded_moved_folder_or_old_copy_is_never_deleted(env: Env, marker: str) -> None:
+    """The old copy's own path (`...reclaim-moved`), or the folder's path, is excluded now."""
+    _make_tree(env.source)
+    env.move()
+    before = _manifest(_moved(env))
+    with pytest.raises(RelocateError, match="excluded"):
+        delete_old_copy(env.journal_path(), policy=_excluding(marker=marker), confirmed=True)
+    assert _manifest(_moved(env)) == before
+    assert _stage(env) == Stage.DONE
+    out = delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)  # control
+    assert out.journal.stage == Stage.DELETED_OLD
+
+
+def test_b7_m3_an_excluded_project_inside_the_old_copy_is_never_deleted(env: Env) -> None:
+    """The exclusion is by project name beneath the folder, as the plan applies it. The name is
+    only in the old copy's tree at the move, and the manifest still matches."""
+    _make_tree(env.source)
+    _write(env.source / "zzexclproj" / "main.py", b"the excluded project's source")
+    # The move itself refuses it (the plan's test), so move with a policy that does not see it.
+    execute_move(
+        env.source,
+        env.target,
+        Policy(exclusion_match=lambda _p: None, protected=lambda _p: False),
+        env.journals,
+        free_bytes=lambda _p: BIG,
+    )
+    with pytest.raises(RelocateError, match="excluded"):
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
+    assert _exists(_moved(env) / "zzexclproj" / "main.py")
+
+
+def test_b7_m3_recover_does_not_finish_a_delete_for_an_excluded_folder(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    env.move()
+    with monkeypatch.context() as m:
+        _arm_deletes(m, 3, relocate._key(_moved(env)))
+        with pytest.raises(SimulatedCrash):
+            delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
+    assert _stage(env) == Stage.DELETING_OLD
+    left = _manifest(_moved(env))
+    with pytest.raises(RelocateError, match="excluded"):
+        recover(env.journal_path(), policy=_excluding(marker=relocate.MOVED_SUFFIX))
+    assert _manifest(_moved(env)) == left

@@ -158,14 +158,16 @@ def _run(layout: Layout, spec: dict[str, Any]) -> tuple[str, str]:
 
             with pytest.raises(Crash):
                 move(checkpoint=die)
-            return relocate.recover(journal()).journal.stage, ""
+            return relocate.recover(journal(), policy=layout.policy).journal.stage, ""
         outcome = move()
         if action == "move":
             return outcome.journal.stage, ""
         if action == "move_then_rollback":
             return relocate.rollback(journal()).journal.stage, ""
         if action == "delete_then_rollback":
-            relocate.delete_old_copy(journal(), confirmed=True, free_bytes=lambda _p: free)
+            relocate.delete_old_copy(
+                journal(), policy=layout.policy, confirmed=True, free_bytes=lambda _p: free
+            )
             return relocate.rollback(journal()).journal.stage, ""
         if action == "corrupt_then_delete":
             victim = layout.target / spec["files"][0]["path"]
@@ -175,7 +177,7 @@ def _run(layout: Layout, spec: dict[str, Any]) -> tuple[str, str]:
             victim.write_bytes(bytes(data))
             os.utime(_x(victim), ns=(st.st_atime_ns, st.st_mtime_ns))
             try:
-                relocate.delete_old_copy(journal(), confirmed=True)
+                relocate.delete_old_copy(journal(), policy=layout.policy, confirmed=True)
             except RelocateError as exc:
                 # The corrupted copy is what the junction serves: restore the old copy so the
                 # invariant below checks that nothing was lost, which is the point of refusing.
@@ -258,7 +260,7 @@ def test_a_real_kill_mid_copy_recovers_the_original(tmp_path: Path) -> None:
     assert relocate.Journal.load(journal).stage == Stage.COPYING
     assert os.path.lexists(_x(layout.target)), "the kill landed before the copy began"
 
-    outcome = relocate.recover(journal)
+    outcome = relocate.recover(journal, policy=layout.policy)
 
     assert outcome.journal.stage == Stage.ROLLED_BACK
     assert _manifest(layout.source) == before

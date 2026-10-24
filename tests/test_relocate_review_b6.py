@@ -93,7 +93,7 @@ def test_delete_old_copy_reports_the_space_the_source_volume_gained(
         calls.append(_is_link(path))
         return 0
 
-    delete_old_copy(env.journal_path(), confirmed=True, free_bytes=spy)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True, free_bytes=spy)
     assert calls and not calls[-1], "the gain was measured through the junction (target volume)"
 
 
@@ -140,7 +140,7 @@ def test_a_half_deleted_old_copy_is_never_put_back_as_the_copy_from_before_the_m
     with monkeypatch.context() as m:
         _arm_deletes(m, 3, relocate._key(_moved(env)))
         with pytest.raises(SimulatedCrash):
-            delete_old_copy(env.journal_path(), confirmed=True)
+            delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _stage(env) == Stage.DELETING_OLD
     if how == "target_unreachable":
         os.rename(_x(env.target), _x(env.d / "unplugged"))  # stands in for D: being offline
@@ -175,7 +175,7 @@ def test_rolling_back_an_unfinished_swap_keeps_the_old_copy_for_the_keep_period(
     rollback(env.journal_path())
     assert _exists(_moved(env))
     with pytest.raises(RelocateError, match="kept for"):
-        delete_old_copy(env.journal_path())  # not confirmed
+        delete_old_copy(env.journal_path(), policy=env.policy)  # not confirmed
 
 
 # ------------------------------------------------------------------ after the junction removal
@@ -220,7 +220,7 @@ def test_use_old_copy_with_the_old_copy_deleted_does_not_say_the_target_is_unrea
 ) -> None:
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     with pytest.raises(RelocateError) as info:
         rollback(env.journal_path(), use_old_copy=True)
     assert "not reachable" not in str(info.value), str(info.value)
@@ -269,7 +269,7 @@ def test_delete_old_copy_never_deletes_a_folder_stream_the_live_folder_lacks(
     if rolled_back:
         rollback(env.journal_path())
     try:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     except RelocateError:
         return
     pytest.fail("deleted a folder stream that no other copy holds, without accept_missing")
@@ -345,7 +345,7 @@ def test_a_kill_anywhere_in_the_new_rollback_loses_nothing(
         _rich_tree(e.source)
         e.move()
         if delete_first:
-            delete_old_copy(e.journal_path(), confirmed=True)
+            delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
         else:
             _write(_moved(e) / "sub" / "deeper" / "c [1].txt", b"OLD-SIDE edit, only here")
         _write(e.source / "sub" / "b.txt", b"TARGET-SIDE edit through the junction")

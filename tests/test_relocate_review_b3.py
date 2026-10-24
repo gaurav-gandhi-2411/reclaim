@@ -105,7 +105,7 @@ def test_a_racing_writer_during_the_moves_probe_is_not_journalled_rolled_back(
     monkeypatch.setattr(relocate, "_rename", real)
     stage = _stage(env)
     if stage == Stage.ROLLED_BACK:
-        out = recover(env.journal_path())
+        out = recover(env.journal_path(), policy=env.policy)
         assert _manifest(env.source) == expected, (
             f"journal says {stage} ({out.message!r}) but the original is at "
             f"{env.source}{PROBE_SUFFIX}: {_exists(str(env.source) + PROBE_SUFFIX)}"
@@ -179,7 +179,7 @@ def test_older_bytes_written_into_the_old_copy_refuse_the_delete(env: Env) -> No
     _write(path, b"only copy of these bytes")
     os.utime(_x(path), ns=(OLD_NS, OLD_NS))
     try:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     except RelocateError:
         return
     pytest.fail("the old copy's only version of sub\\b.txt was deleted")
@@ -195,7 +195,7 @@ def test_a_pasted_file_with_an_old_mtime_is_never_accepted_as_removed(env: Env) 
     _write(path, b"only copy")
     os.utime(_x(path), ns=(OLD_NS, OLD_NS))
     try:
-        delete_old_copy(env.journal_path(), confirmed=True, accept_missing=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True, accept_missing=True)
     except RelocateError:
         return
     pytest.fail("a file added to the old copy after the move was deleted as 'removed'")
@@ -207,7 +207,7 @@ def test_a_folder_attribute_set_in_the_old_copy_is_compared(env: Env) -> None:
     env.move()
     relocate._set_attributes(_x(_moved(env) / "sub"), stat.FILE_ATTRIBUTE_HIDDEN)
     try:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     except RelocateError:
         return
     hidden = os.stat(_x(env.target / "sub"), follow_symlinks=False).st_file_attributes
@@ -237,7 +237,7 @@ def test_rollback_from_a_half_deleted_old_copy_keeps_folder_streams(
 
     monkeypatch.setattr(relocate, "rmtree_reparse_point_safe", partial)
     with pytest.raises(SimulatedCrash):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     monkeypatch.setattr(relocate, "rmtree_reparse_point_safe", real)
     out = rollback(env.journal_path())
     assert out.journal.stage == Stage.ROLLED_BACK
@@ -343,7 +343,7 @@ def test_recover_after_a_kill_before_keep_root_flags_keeps_the_hidden_bit(
     with pytest.raises(SimulatedCrash):
         env.move()
     monkeypatch.undo()
-    out = recover(env.journal_path())
+    out = recover(env.journal_path(), policy=env.policy)
     assert out.journal.stage == Stage.DONE
     attrs = os.stat(_x(env.source), follow_symlinks=False).st_file_attributes
     assert attrs & stat.FILE_ATTRIBUTE_HIDDEN, "recover finished the move without the hidden bit"
@@ -427,7 +427,7 @@ def test_a_foreign_folder_at_the_restore_name_after_a_planned_restore_is_not_use
     name is not ours and must not be removed."""
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     journal = relocate.Journal.load(env.journal_path())
     journal.restore_planned = True
     journal.restore_id = 0

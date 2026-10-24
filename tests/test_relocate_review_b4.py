@@ -87,7 +87,7 @@ def test_rollback_never_overwrites_a_write_made_into_the_old_copy(env: Env) -> N
     _write(_moved(env) / "sub" / "b.txt", edit)
     # delete_old_copy agrees this is data: it refuses.
     with pytest.raises(RelocateError):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     out = rollback(env.journal_path())
     assert out.journal.stage == Stage.ROLLED_BACK
     # Addendum 5: rollback never writes into the old copy; it is kept as it is.
@@ -110,7 +110,7 @@ def test_rollback_never_removes_a_folder_stream_added_to_the_old_copy(env: Env) 
     with open(sub + ":note", "wb") as fh:
         fh.write(b"stream written into the old copy")
     with pytest.raises(RelocateError):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     rollback(env.journal_path())
     streams = relocate._named_streams(_x(env.source / "sub"))
     streams += relocate._named_streams(_x(_moved(env) / "sub"))
@@ -248,7 +248,7 @@ def test_delete_old_copy_never_reports_deleted_when_the_old_copy_is_still_there(
     with monkeypatch.context() as m:
         _patch_stat_failing(m, relocate._key(_moved(env)), PermissionError)
         try:
-            out = delete_old_copy(env.journal_path(), confirmed=True)
+            out = delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
         except (RelocateError, OSError):
             return
     assert not (out.journal.stage == Stage.DELETED_OLD and _exists(_moved(env))), (
@@ -305,7 +305,7 @@ def test_a_kill_anywhere_in_delete_old_copy_is_whole(
             else:
                 _arm_deletes(m, at, relocate._key(_moved(e)))
             try:
-                delete_old_copy(e.journal_path(), confirmed=True)
+                delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
                 crashed = False
             except SimulatedCrash as crash:
                 where = str(crash)
@@ -317,9 +317,9 @@ def test_a_kill_anywhere_in_delete_old_copy_is_whole(
             break
         try:
             if after == "recover":
-                out = recover(e.journal_path())
+                out = recover(e.journal_path(), policy=e.policy)
                 if out.journal.stage == Stage.DONE:
-                    out = delete_old_copy(e.journal_path(), confirmed=True)
+                    out = delete_old_copy(e.journal_path(), policy=e.policy, confirmed=True)
                 ok = (
                     out.journal.stage == Stage.DELETED_OLD
                     and _is_link(e.source)
@@ -386,7 +386,7 @@ def test_a_kill_anywhere_in_the_probe_failure_path_then_recover_is_whole(
                 crashed = False
         paths = sorted(e.journals.glob("relocate-*.json"))
         try:
-            out = recover(paths[0]) if paths else None
+            out = recover(paths[0], policy=e.policy) if paths else None
             ok = (
                 (out is None or out.journal.stage == Stage.ROLLED_BACK)
                 and not _is_link(e.source)
@@ -436,9 +436,9 @@ def test_a_kill_anywhere_in_the_move_with_a_post_move_old_copy_check(
         paths = sorted(e.journals.glob("relocate-*.json"))
         try:
             if paths:
-                out = recover(paths[0])
+                out = recover(paths[0], policy=e.policy)
                 if out.journal.stage == Stage.DONE:
-                    out = delete_old_copy(paths[0], confirmed=True)
+                    out = delete_old_copy(paths[0], policy=e.policy, confirmed=True)
                     ok = (
                         out.journal.stage == Stage.DELETED_OLD
                         and _manifest(e.target) == expected
@@ -474,7 +474,7 @@ def test_an_unreadable_manifest_says_what_to_do(env: Env) -> None:
     with open(manifest, "w", encoding="utf-8") as fh:
         fh.write("{not json")
     with pytest.raises(RelocateError) as info:
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     msg = str(info.value)
     assert any(w in msg.lower() for w in ("roll back", "rollback", "yourself", "retry")), (
         f"no next step in: {msg!r}"
@@ -533,5 +533,5 @@ def test_a_tree_removal_that_leaves_the_old_copy_is_never_reported_as_deleted(
     env.move()
     monkeypatch.setattr(relocate, "rmtree_reparse_point_safe", lambda _p: None)
     with pytest.raises(RelocateError, match="still there"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert relocate.Journal.load(env.journal_path()).stage != Stage.DELETED_OLD

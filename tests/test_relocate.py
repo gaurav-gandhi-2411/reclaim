@@ -281,7 +281,7 @@ def test_a_kill_at_any_step_recovers_to_the_original_or_a_finished_move(
     moved = Path(str(env.source) + MOVED_SUFFIX)
     expected = _manifest(moved if _exists(moved) else (snapshot_dir or env.source))
 
-    outcome = recover(env.journal_path())
+    outcome = recover(env.journal_path(), policy=env.policy)
 
     if outcome.journal.stage == Stage.DONE:
         assert point == "after_junction"
@@ -455,7 +455,9 @@ def test_rollback_after_the_move_brings_back_the_folder_as_it_is_now(env: Env) -
 def test_rollback_after_the_old_copy_was_deleted_copies_the_data_back(env: Env) -> None:
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: BIG)
+    delete_old_copy(
+        env.journal_path(), policy=env.policy, confirmed=True, free_bytes=lambda _p: BIG
+    )
     _write(env.source / "late.txt", b"after delete")
     expected = _manifest(env.source)
 
@@ -516,7 +518,9 @@ def test_a_kill_while_restoring_a_deleted_old_copy_resumes_from_the_restore(
 ) -> None:
     _make_tree(env.source)
     env.move()
-    delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: BIG)
+    delete_old_copy(
+        env.journal_path(), policy=env.policy, confirmed=True, free_bytes=lambda _p: BIG
+    )
     _write(env.source / "late.txt", b"after delete")
     expected = _manifest(env.source)
     real_delta = relocate._delta_sync
@@ -589,9 +593,11 @@ def test_the_old_copy_is_kept_for_seven_days_unless_confirmed(env: Env) -> None:
     now = [1_000_000.0]
     env.move(clock=lambda: now[0])
     with pytest.raises(RelocateError, match="kept for"):
-        delete_old_copy(env.journal_path(), clock=lambda: now[0] + DAY)
+        delete_old_copy(env.journal_path(), policy=env.policy, clock=lambda: now[0] + DAY)
     now[0] += KEEP_OLD_COPY_DAYS * DAY + 1
-    outcome = delete_old_copy(env.journal_path(), clock=lambda: now[0], free_bytes=lambda _p: BIG)
+    outcome = delete_old_copy(
+        env.journal_path(), policy=env.policy, clock=lambda: now[0], free_bytes=lambda _p: BIG
+    )
     assert outcome.journal.stage == Stage.DELETED_OLD
     assert not _exists(str(env.source) + MOVED_SUFFIX)
 
@@ -604,7 +610,7 @@ def test_a_same_size_corrupted_target_refuses_the_delete(env: Env) -> None:
     _write(victim, b"HELLO")  # same size, different bytes
     os.utime(_x(victim), ns=(before.st_atime_ns, before.st_mtime_ns))
     with pytest.raises(RelocateError, match="differ"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _exists(str(env.source) + MOVED_SUFFIX)
 
 
@@ -616,7 +622,9 @@ def test_a_file_changed_through_the_junction_after_the_move_does_not_block_the_d
     _write(env.source / "sub" / "b.txt", b"updated by its program")
     later = time.time() + 100  # a program's write is newer than the copied original
     os.utime(_x(env.source / "sub" / "b.txt"), (later, later))
-    delete_old_copy(env.journal_path(), confirmed=True, clock=lambda: 1_000_200.0)
+    delete_old_copy(
+        env.journal_path(), policy=env.policy, confirmed=True, clock=lambda: 1_000_200.0
+    )
     assert not _exists(str(env.source) + MOVED_SUFFIX)
 
 
@@ -625,9 +633,9 @@ def test_a_file_missing_from_the_target_needs_an_explicit_accept(env: Env) -> No
     env.move()
     os.remove(_x(env.target / "a.bin"))
     with pytest.raises(RelocateError, match="no longer in"):
-        delete_old_copy(env.journal_path(), confirmed=True)
+        delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True)
     assert _exists(str(env.source) + MOVED_SUFFIX)
-    delete_old_copy(env.journal_path(), confirmed=True, accept_missing=True)
+    delete_old_copy(env.journal_path(), policy=env.policy, confirmed=True, accept_missing=True)
     assert not _exists(str(env.source) + MOVED_SUFFIX)
 
 
@@ -637,7 +645,9 @@ def test_the_freed_figure_is_the_volume_free_space_delta(env: Env) -> None:
     execute_move(
         env.source, env.target, env.policy, env.journals, free_bytes=lambda _p: next(readings)
     )
-    outcome = delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: 12_345)
+    outcome = delete_old_copy(
+        env.journal_path(), policy=env.policy, confirmed=True, free_bytes=lambda _p: 12_345
+    )
     assert outcome.journal.source_free_after == 12_345
     assert outcome.journal.source_free_before == 9_000
     assert outcome.journal.history[-1][2] == "volume free space changed by 3345 bytes"
@@ -648,7 +658,9 @@ def test_after_a_rollback_the_kept_old_copy_can_be_deleted_after_its_checks(env:
     expected = _manifest(env.source)
     env.move()
     rollback(env.journal_path())
-    delete_old_copy(env.journal_path(), confirmed=True, free_bytes=lambda _p: BIG)
+    delete_old_copy(
+        env.journal_path(), policy=env.policy, confirmed=True, free_bytes=lambda _p: BIG
+    )
     assert not _exists(str(env.source) + MOVED_SUFFIX)
     assert _manifest(env.source) == expected
 
