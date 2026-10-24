@@ -165,6 +165,7 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     - item 8, build 12.
   - **Next:** D5 when RAM allows, then Phase E (soak needs build 12; docs; review pack).
 - 00:40 IST checkpoint 15 (25 Oct): the review pack is brought current: every merge in section 1, and sections 3, 4, 5, 7 and 9 updated. No code. Next: D5 when RAM allows; Phase E's soak waits for build 12.
+- 05:10 IST checkpoint 16 (25 Oct): #199 is current with main (`8a1febc`, CI 6/6, CLEAN), and HOWTO sections 9 and 10 are on it. Three run-log entries that had been glued onto the end of the previous line were split back onto their own lines; no words changed. D5's first try gave up waiting for RAM (free stayed 7.9-8.3 GB for 4 h, under its 8.5 GB gate; it never started) and is re-queued. Next: D5 when RAM allows, then the 25 Oct daily summary.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
