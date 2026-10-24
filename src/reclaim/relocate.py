@@ -137,6 +137,11 @@ class Policy:
 
     exclusion_match: Callable[[Path], str | None]
     protected: Callable[[Path], bool]
+    # The same check on the path text as journaled, without following a junction: after a move
+    # the original path is a junction, which `exclusion_match` canonicalises to the target's
+    # path, so a path pattern naming the original folder would no longer hit (B8 M-B). Hits
+    # from either check refuse. None: only `exclusion_match` is applied.
+    exclusion_match_text: Callable[[Path], str | None] | None = None
     hardlink_caches: tuple[Path, ...] = ()
     guided: tuple[tuple[Path, str], ...] = ()
     app_dirs: tuple[Path, ...] = ()
@@ -817,6 +822,9 @@ def default_policy(
         pass
     return Policy(
         exclusion_match=lambda path: validator.exclusion_match(path, is_dir=True),
+        exclusion_match_text=lambda path: validator.exclusion_match(
+            path, is_dir=True, lexical=True
+        ),
         protected=validator.path_is_protected_root,
         hardlink_caches=hardlink,
         guided=tuple(guided),
@@ -1005,6 +1013,42 @@ def probe(source: str) -> None:
 _WORKING_SUFFIXES = (MOVED_SUFFIX, PROBE_SUFFIX, RESTORE_SUFFIX)
 
 
+def _is_inert(journal: Journal) -> bool:
+    """A move that was undone: ROLLED_BACK, or DELETED_OLD after a rollback (`rolled_back`). It
+    holds nothing and owns nothing, and acting on it again would touch whatever a later move of
+    the same folder put at the same paths (B8 M-A). A DELETED_OLD without the flag is a
+    finished move, not inert."""
+    return journal.stage == Stage.ROLLED_BACK or (
+        journal.stage == Stage.DELETED_OLD and journal.rolled_back
+    )
+
+
+def _refuse_if_superseded(journal: Journal, journal_path: Path) -> None:
+    """Refuses (changing nothing) while a later move of the same folder is not inert: every
+    identity check of an older journal can pass against the later move's folders, so its
+    rollback would undo the live one (B8 M-A). A journal folder that cannot be read refuses
+    too: not knowing is not a pass."""
+    try:
+        others = journals(journal_path.parent)
+    except (OSError, RelocateError) as exc:
+        raise RelocateError(
+            f"the move journals next to {journal_path} could not be read ({exc}); nothing "
+            "changed. Fix that, then run the same command again"
+        ) from exc
+    for other in others:
+        if (
+            other.id != journal.id
+            and _key(other.source) == _key(journal.source)
+            and not _is_inert(other)
+            and other.created_at >= journal.created_at
+        ):
+            raise RelocateError(
+                f"move {other.id} ({other.stage}) is a later, live move of {journal.source}; "
+                f"acting on the older move {journal.id} would undo it. Nothing changed. Deal "
+                f"with move {other.id} instead"
+            )
+
+
 def _kept_by(moved: str, journal_dir: Path | None) -> str | None:
     """The id of the newest journal whose old copy is `moved`, if the journals can be read."""
     if journal_dir is None:
@@ -1034,9 +1078,7 @@ def _overlap_reasons(src: str, tgt: str, journal_dir: Path | None) -> list[str]:
     except (OSError, ValueError, TypeError, RelocateError) as exc:
         return [*reasons, f"a move journal in {journal_dir} could not be read ({exc})"]
     for other in others:
-        if other.stage == Stage.ROLLED_BACK or (
-            other.stage == Stage.DELETED_OLD and other.rolled_back
-        ):
+        if _is_inert(other):
             # Undone moves hold nothing. A DELETED_OLD without the flag is a finished move: its
             # path is a live junction, so it must keep blocking (B7 L3).
             continue
@@ -1556,8 +1598,9 @@ def rollback(
       and leaves the moved folder untouched.
     """
     journal = Journal.load(journal_path)
-    if journal.stage == Stage.ROLLED_BACK:
-        return Outcome(journal, "already rolled back")
+    if _is_inert(journal):
+        return Outcome(journal, "already rolled back; nothing to do")
+    _refuse_if_superseded(journal, journal_path)
     if journal.stage == Stage.DELETING_OLD:
         journal.old_copy_partial = True  # Reclaim's own interrupted delete (B7 L2)
     # Saved with the first entry: a kill and `recover` must do what the user chose (B7 L1).
@@ -2102,7 +2145,10 @@ def delete_old_copy(
     original files are never deleted (B7 M3).
     """
     journal = Journal.load(journal_path)
+    if _is_inert(journal) and journal.stage == Stage.DELETED_OLD:
+        return Outcome(journal, "already rolled back and its old copy deleted; nothing to do")
     if journal.stage in (Stage.DELETING_OLD, Stage.DONE, Stage.ROLLED_BACK):
+        _refuse_if_superseded(journal, journal_path)
         _refuse_if_excluded(journal, policy)
     if journal.stage == Stage.DELETING_OLD:
         changed = _old_copy_changes(journal, allow_missing=True)
@@ -2174,9 +2220,24 @@ def delete_old_copy(
 
 def _refuse_if_excluded(journal: Journal, policy: Policy) -> None:
     """The plan's own test (`Policy.exclusion_match`: the path text, then the names beneath
-    it), applied to the moved folder and to the old copy, as the exclusions are now."""
+    it), applied to the moved folder and to the old copy, as the exclusions are now.
+
+    The original path is a junction by now, and `exclusion_match` resolves it to the target's
+    path; so the journaled path text is checked as well, without following the junction, and
+    so is the old copy's path with its `.reclaim-moved` suffix mapped back to it (B8 M-B)."""
     for path in (journal.source, journal.moved):
         if _exists(path) and policy.exclusion_match(Path(path)) is not None:
+            raise RelocateError(
+                f"{path} is, or contains, an excluded project; nothing deleted. Take it off the "
+                "exclusion list first if the old copy may go"
+            )
+    if policy.exclusion_match_text is None:
+        return
+    mapped_back = journal.moved
+    if _key(mapped_back).endswith(MOVED_SUFFIX):
+        mapped_back = mapped_back[: -len(MOVED_SUFFIX)]
+    for path in dict.fromkeys((journal.source, mapped_back, journal.moved)):
+        if policy.exclusion_match_text(Path(path)) is not None:
             raise RelocateError(
                 f"{path} is, or contains, an excluded project; nothing deleted. Take it off the "
                 "exclusion list first if the old copy may go"
