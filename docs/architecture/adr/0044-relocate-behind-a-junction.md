@@ -406,3 +406,71 @@ copy-back; it is a `RelocateError` by design, and the probe now expects that. Th
 asserts the junction is back. The second-move sweep no longer calls `rollback` on the deleted
 journal (L3 makes that unnecessary) and expects it to stay DELETED_OLD. The probe that ran a
 real move to `D:\reclaim-build` was left out: tests here never leave their own temp folder.
+
+## Addendum 8 (2026-10-24): eighth hostile review (B8), FAIL on two mediums, fixed
+
+The eighth independent review, of `66c2df0`, found two medium findings (M-A, M-B), two more on
+raw errors (M-C, M-D) and two lows (`tests/test_relocate_review_b8.py`; 9 of the reviewer's 21 probes failed
+on `0f5dc41`, the engine head it reviewed). The owner added one finding of his own (G1). Fixes:
+
+**`79f73f9` and `5cb862d`: M-A, M-B**
+- **M-A (a rollback of a dead journal undoes a later, live move):** a move was rolled back and
+  its old copy deleted, the folder was moved again to the same target, and `rollback` of the
+  FIRST journal passed every identity check against the second move's folders (its restored
+  folder was now the second move's old copy, its target path the second move's target): it
+  copied the second move's data back and removed its junction while the second journal still
+  said DONE. Two layers: (1) a ROLLED_BACK journal, and a DELETED_OLD one with `rolled_back`,
+  is inert: `rollback`, `recover` and `delete-old` return "nothing to do" and touch nothing;
+  (2) before anything changes, `rollback` and `delete-old` scan the journal folder and refuse,
+  naming the move id, when a later journal for the same source (case-insensitive) is not inert
+  (an unreadable journal folder refuses too). **Deviation:** `delete-old` on a ROLLED_BACK
+  journal is not inert, because deleting the kept old copy after a rollback is the documented
+  flow; it gets layer 2 and its existing identity checks (the restored folder must be the one at
+  the path, which a later move's junction is not).
+- **M-B (a path-pattern exclusion did not stop delete-old or recover):** after a move the
+  journaled source is a junction, and `SafetyValidator.exclusion_match` resolves it to the
+  target's path, which a pattern naming the original folder does not hit; the old copy's path
+  ends in `.reclaim-moved`, which it does not hit either. `exclusion_match` gained an opt-in
+  `lexical=True` (the path text as given, no `resolve()`; the default is unchanged for every
+  other caller, with unit tests in `tests/test_safety_exclusion_matching.py`), `Policy` an
+  optional `exclusion_match_text`, and `default_policy` wires the two together. `delete-old` and
+  `recover` refuse on a hit of either check on the journaled source, the old copy's path with
+  the suffix mapped back, or the old copy's own path. **Limit:** a path pattern naming a file
+  that exists only in the old copy (deleted from the target since) is matched by name
+  patterns, not by path text; the folder-level texts are matched. A `Policy` built without the
+  new field (a test, a future caller) keeps the old behaviour.
+
+**`d04564a`: M-C, M-D**
+- **M-C:** `recover` while the cause of the first failure was still there (a scanner handle on
+  the parked folder) let a raw `PermissionError` out; the CLI printed a traceback. `rollback`,
+  `recover` and `delete_old_copy` now share one boundary (`_os_errors_as_relocate_errors`): an
+  `OSError` no step turned into a message becomes a `RelocateError` naming the move, the path
+  and the OS error, saying to close what holds it and run the same command again. More specific
+  messages are untouched. The journal keeps the stage logged before the step; tests rerun after
+  the cause is gone.
+- **M-D:** a `use_old_copy` rollback removed our own restore copy AFTER putting the old copy
+  back, and a failure there left a raw error, the journal at ROLLING_BACK and, on the retry
+  ("an earlier run did it"), the restore folder behind. The cleanup now runs before anything
+  else changes and raises a specific `RelocateError`.
+
+**`113c844`: L-1, L-2, BELIEVED 1**
+- **L-1:** `recover` finished an interrupted delete of the old copy without checking the moved
+  folder was still there. It now requires the junction to resolve to a folder whose ID is
+  `target_id` (after a rollback: the folder at the source is the restored one), else it refuses,
+  keeps what remains and says to reconnect the drive at the same path.
+- **L-2:** a verified restore put back because the target is unreachable says that writes made
+  through the junction after that copy was verified are only on the target.
+- **BELIEVED 1 (probed first; it failed):** a rollback refused before it changed anything (no
+  space, moved folder in use, nothing to put back) left a DONE move at ROLLING_BACK. Those
+  refusals now raise `NothingChangedError` (a `RelocateError`) and `rollback` restores the stage,
+  `use_old_copy` and `old_copy_partial` and drops its history entry: a DONE move stays DONE and
+  its `delete-old` works.
+
+**`eba2f55`: G1.** `classify` returned GUIDED before sizing, so the list showed Docker and WSL
+at 0 bytes. Guided folders are now sized with `scan_tree` (`lstat` only, no file opened, no link
+followed). Ordering is unchanged.
+
+**Other commits.** `f2de975` sorts the imports of the b6 probes (lint); `b6d3563` adds the
+reviewer's probes. **Probe changed by a decision:** the M-B helper builds its `Policy` with the
+lexical callable, as `default_policy` does. **API (`feat/relocate-ui`):** `delete_old_allowed_at`
+and `old_copy_kept` were two BELIEVED items; see that branch's commit.
