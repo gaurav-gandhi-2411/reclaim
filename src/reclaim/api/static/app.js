@@ -249,6 +249,7 @@ const VIEW_LOADERS = {
   review: loadReviewQueue,
   "ai-suggestions": loadAISuggestions,
   quarantine: loadQuarantineView,
+  relocate: loadRelocateView,
   settings: loadSettingsView,
 };
 
@@ -1567,6 +1568,8 @@ const DIALOG_ESCAPE_CLOSE_BUTTON_IDS = {
   "how-it-works-dialog": "how-it-works-close",
   "power-mode-dialog": "power-mode-cancel",
   "full-drive-confirm-dialog": "full-drive-confirm-cancel",
+  "relocate-dialog": "relocate-dialog-cancel",
+  "relocate-delete-dialog": "relocate-delete-cancel",
 };
 
 function initDialogKeyboardBehavior() {
@@ -1970,6 +1973,10 @@ function renderClusterTable(cluster) {
 }
 
 export {
+  renderRelocateCandidates,
+  renderRelocateMoves,
+  openRelocateDialog,
+  confirmRelocate,
   renderClusterTable,
   renderAISuggestionCard,
   formatEtaSeconds,
@@ -3248,10 +3255,279 @@ function initSettings() {
   });
 }
 
+// --- Move to another drive (relocate; docs/specs/relocate.md, ADR-0044) ------------------------
+//
+// Review tier: the user picks a folder, reads the dry run's figures and confirms. The confirm
+// token the plan returns is bound to those figures server-side, so a move only starts for the
+// plan shown. Every value from the server is rendered with textContent, never innerHTML.
+
+function relocateFileCount(n) {
+  return n === 1 ? "1 file" : `${n} files`;
+}
+
+const RELOCATE_VERDICT_LABELS = {
+  movable: "Can move",
+  guided: "Move with its own steps",
+  already_moved: "Already moved",
+  must_stay: "Must stay",
+};
+
+async function loadRelocateView() {
+  const stateEl = document.getElementById("relocate-state");
+  const contentEl = document.getElementById("relocate-content");
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", {
+    title: "Checking folders that could move…",
+    message: "This reads folder sizes only; nothing is changed.",
+  });
+  try {
+    const [data, moves] = await Promise.all([
+      api("/api/relocate/candidates"),
+      api("/api/relocate/moves"),
+    ]);
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    renderRelocateDrive(data);
+    renderRelocateCandidates(data.candidates);
+    renderRelocateMoves(moves.moves);
+  } catch (err) {
+    renderState(stateEl, "error", {
+      title: "Could not check the folders",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadRelocateView,
+    });
+  }
+}
+
+function renderRelocateDrive(data) {
+  const el = document.getElementById("relocate-drive");
+  el.textContent = data.target_drive
+    ? `Folders move to ${data.target_drive} (${formatFromBytes(data.target_drive_free)} free).`
+    : "There is no second fixed drive on this computer, so nothing can be moved.";
+}
+
+function renderRelocateCandidates(candidates) {
+  const list = document.getElementById("relocate-candidates");
+  list.innerHTML = "";
+  if (candidates.length === 0) {
+    renderState(list, "empty", {
+      title: "No large folders found in the usual places",
+      message: "None of the known model, package or browser caches exist on this computer.",
+    });
+    return;
+  }
+  for (const c of candidates) {
+    const card = document.createElement("article");
+    card.className = "rc-relocate-card";
+    card.dataset.verdict = c.verdict;
+
+    const head = document.createElement("div");
+    head.className = "rc-relocate-head";
+    const badge = document.createElement("span");
+    badge.className = "rc-relocate-badge";
+    badge.textContent = RELOCATE_VERDICT_LABELS[c.verdict] ?? c.verdict;
+    const path = document.createElement("code");
+    path.className = "rc-relocate-path";
+    path.textContent = c.path;
+    const size = document.createElement("span");
+    size.className = "rc-relocate-size";
+    size.textContent = c.verdict === "movable" ? `${formatFromBytes(c.bytes)}, ${relocateFileCount(c.files)}` : "";
+    head.append(badge, path, size);
+    card.appendChild(head);
+
+    for (const reason of c.reasons) {
+      const p = document.createElement("p");
+      p.className = "rc-relocate-reason";
+      p.textContent = reason;
+      card.appendChild(p);
+    }
+    if (c.verdict === "movable") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rc-btn rc-btn-secondary";
+      btn.textContent = "Check this move";
+      btn.addEventListener("click", () => planRelocate(c.path, btn));
+      card.appendChild(btn);
+    }
+    list.appendChild(card);
+  }
+}
+
+let relocatePendingPlan = null;
+
+async function planRelocate(source, button) {
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "Checking…";
+  try {
+    const plan = await api("/api/relocate/plan", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    });
+    openRelocateDialog(plan);
+  } catch (err) {
+    showRelocateResult("error", "Could not check this move", err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function openRelocateDialog(plan) {
+  relocatePendingPlan = plan;
+  const dialog = document.getElementById("relocate-dialog");
+  document.getElementById("relocate-dialog-source").textContent = plan.source;
+  document.getElementById("relocate-dialog-target").textContent = plan.target;
+  document.getElementById("relocate-dialog-size").textContent =
+    `${formatFromBytes(plan.bytes)} in ${relocateFileCount(plan.files)}; ${formatFromBytes(plan.target_free)} free there.`;
+  document.getElementById("relocate-dialog-kept").textContent =
+    `The original stays at ${plan.moved} until you delete it (after 7 days, or sooner if you choose).`;
+  const reasons = document.getElementById("relocate-dialog-reasons");
+  reasons.innerHTML = "";
+  for (const reason of plan.reasons) {
+    const li = document.createElement("li");
+    li.textContent = reason;
+    reasons.appendChild(li);
+  }
+  reasons.hidden = plan.reasons.length === 0;
+  document.getElementById("relocate-dialog-confirm").disabled = !plan.ok;
+  dialog.hidden = false;
+  document.getElementById("relocate-dialog-cancel").focus();
+}
+
+function closeRelocateDialog() {
+  document.getElementById("relocate-dialog").hidden = true;
+  relocatePendingPlan = null;
+}
+
+async function confirmRelocate() {
+  const plan = relocatePendingPlan;
+  closeRelocateDialog();
+  if (!plan || !plan.ok) return;
+  await runRelocateJob("Moving the folder…", "/api/relocate/move", {
+    source: plan.source,
+    target: plan.target,
+    confirm_token: plan.confirm_token,
+  });
+}
+
+async function runRelocateJob(title, path, body) {
+  const stateEl = document.getElementById("relocate-state");
+  const contentEl = document.getElementById("relocate-content");
+  try {
+    await api(path, { method: "POST", body: JSON.stringify(body ?? {}) });
+    contentEl.hidden = true;
+    renderState(stateEl, "loading", {
+      title,
+      message: "Every file is copied and checked before anything at the old place changes.",
+    });
+    let job;
+    for (;;) {
+      job = await api("/api/relocate/status");
+      if (job.status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, BATCH_POLL_INTERVAL_MS));
+    }
+    await loadRelocateView();
+    if (job.status === "failed") {
+      showRelocateResult("error", "It did not complete", job.error);
+    } else {
+      showRelocateResult("done", "Done", [job.message, ...job.kept].filter(Boolean).join(" "));
+    }
+  } catch (err) {
+    await loadRelocateView();
+    showRelocateResult("error", "It did not start", err.message);
+  }
+}
+
+function showRelocateResult(kind, title, message) {
+  const el = document.getElementById("relocate-result");
+  renderState(el, kind === "error" ? "error" : "empty", { title, message });
+}
+
+function renderRelocateMoves(moves) {
+  const section = document.getElementById("relocate-moves-section");
+  const list = document.getElementById("relocate-moves");
+  list.innerHTML = "";
+  section.hidden = moves.length === 0;
+  for (const m of moves) {
+    const card = document.createElement("article");
+    card.className = "rc-relocate-card";
+    const head = document.createElement("div");
+    head.className = "rc-relocate-head";
+    const stage = document.createElement("span");
+    stage.className = "rc-relocate-badge";
+    stage.textContent = m.stage.replace("_", " ");
+    const path = document.createElement("code");
+    path.className = "rc-relocate-path";
+    path.textContent = `${m.source} → ${m.target}`;
+    const size = document.createElement("span");
+    size.className = "rc-relocate-size";
+    size.textContent = formatFromBytes(m.bytes);
+    head.append(stage, path, size);
+    card.appendChild(head);
+
+    if (m.stage === "done" || m.stage === "deleted_old") {
+      const undo = document.createElement("button");
+      undo.type = "button";
+      undo.className = "rc-btn rc-btn-secondary";
+      undo.textContent = "Move it back";
+      undo.addEventListener("click", () =>
+        runRelocateJob("Moving the folder back…", `/api/relocate/${encodeURIComponent(m.id)}/rollback`)
+      );
+      card.appendChild(undo);
+    }
+    if (m.stage === "done") {
+      const early = Date.now() / 1000 < (m.delete_old_allowed_at ?? 0);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "rc-btn rc-btn-secondary";
+      del.textContent = "Delete the original copy";
+      del.addEventListener("click", () => openRelocateDeleteDialog(m, early));
+      card.appendChild(del);
+    }
+    list.appendChild(card);
+  }
+}
+
+let relocatePendingDelete = null;
+
+function openRelocateDeleteDialog(move, early) {
+  relocatePendingDelete = { move, early };
+  document.getElementById("relocate-delete-path").textContent = move.moved;
+  document.getElementById("relocate-delete-early").hidden = !early;
+  document.getElementById("relocate-delete-dialog").hidden = false;
+  document.getElementById("relocate-delete-cancel").focus();
+}
+
+function closeRelocateDeleteDialog() {
+  document.getElementById("relocate-delete-dialog").hidden = true;
+  relocatePendingDelete = null;
+}
+
+async function confirmRelocateDelete() {
+  const pending = relocatePendingDelete;
+  closeRelocateDeleteDialog();
+  if (!pending) return;
+  await runRelocateJob(
+    "Checking and deleting the original copy…",
+    `/api/relocate/${encodeURIComponent(pending.move.id)}/delete-old`,
+    { confirm: pending.early }
+  );
+}
+
+function initRelocate() {
+  document.getElementById("relocate-dialog-cancel").addEventListener("click", closeRelocateDialog);
+  document.getElementById("relocate-dialog-confirm").addEventListener("click", confirmRelocate);
+  document.getElementById("relocate-delete-cancel").addEventListener("click", closeRelocateDeleteDialog);
+  document.getElementById("relocate-delete-confirm").addEventListener("click", confirmRelocateDelete);
+}
+
 // --- Boot ------------------------------------------------------------------------------------
 
 function init() {
   initDialogKeyboardBehavior();
+  initRelocate();
   initTheme();
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
   initDashboardMode();
