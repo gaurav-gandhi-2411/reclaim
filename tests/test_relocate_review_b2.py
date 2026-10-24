@@ -524,7 +524,7 @@ def test_a_file_written_into_the_old_copy_is_never_accepted_as_removed(env: Env)
     _make_tree(env.source)
     env.move()
     _write(_moved(env) / "written-later.txt", b"only copy")
-    with pytest.raises(RelocateError, match="newer than the moved folder"):
+    with pytest.raises(RelocateError, match="changed since the move"):
         delete_old_copy(env.journal_path(), confirmed=True, accept_missing=True)
     assert (_moved(env) / "written-later.txt").read_bytes() == b"only copy"
 
@@ -535,7 +535,7 @@ def test_a_folder_stream_only_in_the_old_copy_refuses_the_delete(env: Env) -> No
     env.move()
     with open(_x(_moved(env) / "sub") + ":meta", "wb") as fh:
         fh.write(b"folder metadata that only the old copy has")
-    with pytest.raises(RelocateError, match="differ"):
+    with pytest.raises(RelocateError, match="changed since the move"):
         delete_old_copy(env.journal_path(), confirmed=True)
     assert _exists(_moved(env))
 

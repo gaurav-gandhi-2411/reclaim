@@ -186,3 +186,43 @@ Also fixed:
 **Mutation** (`D:\reclaim-build\tools\mutate_rl2.py`, 22 targeted mutants): 21 killed, after
 six new pins for the first survivors. S4 (reuse a restore copy that already matches) is
 equivalent: rebuilding it gives the same result.
+## Addendum 3 (2026-10-24): third hostile review (B3), FAIL, fixed
+
+A third independent review, of `603f189`, found no lost bytes in any kill sweep and no foreign
+folder accepted as the original. It found 14 gaps around the identity design
+(`tests/test_relocate_review_b3.py`, every probe fails on that head). Fixes:
+
+- **The old copy is checked against a record, not judged by timestamps (H3, M1, L3).** The full
+  SHA-256 compare after the freeze already hashes every file, so the move now writes the old
+  copy's exact state at the swap to `relocate-<id>.manifest`: each file's size, mtime and hash,
+  and each folder's attributes and streams. `delete_old_copy` deletes only if the old copy still
+  matches that record, so a file pasted into the old copy (Explorer keeps mtimes) or an older
+  version written into it refuses the delete.
+- **Before the freeze, rollback never claims anything (H1, H2).** The freeze checks that the
+  folder still has the recorded file ID; one a program replaced during the copy is not frozen.
+  Rollback knows whether the freeze was ever attempted. If not, this code never moved the
+  original: it only puts back a probe a kill or a racing writer left, removes our copy if the
+  original is in place, and otherwise keeps the copy. The move's own probe failure goes through
+  that rollback instead of being journalled "nothing changed".
+- **Copy-back carries folder metadata (M2).** Copy-back now brings folder attributes and
+  streams and file attributes, and our copy is discarded only if those match too.
+- **Type conflicts are set aside, not stuck (M3).** Where a program replaced a folder with a
+  file (or the reverse), the old copy's entry is renamed to `<name>.reclaim-conflict`.
+- **A missing target with an intact old copy restores the old copy (M4).** The message says
+  that anything written to the unreachable target is only there.
+- **Path-based deny patterns are re-checked at the live path before the freeze (M5).**
+- **Messages name where the original really is (M6):** the probe folder, the old copy, the
+  restore copy, or the target.
+- **Low findings:**
+  - a folder carrying a named stream is not "empty" (L1);
+  - `recover` keeps the root's hidden and system bits (L2);
+  - a half-made restore folder counts as ours only while empty (L4).
+- **Journals without IDs (L5) do not exist:** the feature has never shipped.
+
+**One regression of my own, caught before commit:** rewriting rollback dropped the condition
+that copy-back runs only once a junction may have existed. With it gone, a kill during the delta
+pass made rollback copy the target's stale file over the newer original. The existing kill test
+(`delta_file`) failed, and the condition is back with a comment. A mutant (T3) now pins it.
+
+**Mutation** (`D:\reclaim-build\tools\mutate_rl3.py`, 13 mutants of the new guards): all 13 killed, four
+after pins added for the first survivors (T8, T9, T12, T13).
