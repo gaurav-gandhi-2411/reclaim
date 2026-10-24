@@ -1,0 +1,1 @@
+{"case": "corrupt_target", "why": "A same-size corrupted copy refuses the delete of the old copy.", "files": [{"path": "a.bin", "size": 4000}], "action": "corrupt_then_delete", "expect": "delete_refused", "reason": "differ"}

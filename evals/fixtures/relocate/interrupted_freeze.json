@@ -1,0 +1,1 @@
+{"case": "interrupted_freeze", "why": "Killed after the freeze, before the junction: recovery restores the original.", "files": [{"path": "a.bin", "size": 1000}], "action": "crash:after_freeze", "expect": "rolled_back"}
