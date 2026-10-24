@@ -125,6 +125,23 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     1. Review 7 result; full verify.
     2. Merge #202 and #203 into `integration/run-2026-10`.
     3. Phase D.
+- 19:45 IST checkpoint 12 (24 Oct):
+  - **Merged, main CI green after each:**
+    - #206 logging fix (`e9058c6`);
+    - #207 load-robust budgets, D4 (`c07b1cf`);
+    - #205 reconciliation survives restarts, D1 (`1a42294`; DECISIONS 16);
+    - #208 ADR-0045, D2 (`18e40d2`);
+    - #209 D7/D8 plans (after a fix to the WSL fallback order).
+  - **Open for self-merge:** #210 ADR index (D6), waiting for its verifier pass.
+  - **Relocate (#202):**
+    - mutation round 7: 3 real test gaps found and closed;
+    - review B9 FAILED, with 2 medium and 3 low and no lost byte. The worst: an 8.3 short name left the real path empty. All fixed (addendum 9), mutation 4/4, 388 relocate tests pass;
+    - the narrow review B10 is running;
+    - CI 6/6 green on `9263b2b`, after main's logging fix was merged into both branches.
+  - **Next:**
+    1. B10 result. Then the full verify (RAM), and #202/#203 into `integration/run-2026-10`, regenerating the ADR index there.
+    2. D5 (warm-up profile) and the rest of D6 (HOWTO, README screenshots).
+    3. Phase E.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
