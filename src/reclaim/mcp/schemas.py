@@ -244,3 +244,31 @@ class UnusedModelsResult(BaseModel):
     files_read: int
     stopped_at_limit: bool
     excluded_projects_not_read: bool
+
+
+class RelocationOption(BaseModel):
+    """One folder the "Move to Another Drive" feature knows about. `verdict` is `movable`,
+    `guided` (moved with its program's own steps), `already_moved` or `must_stay`; `reasons`
+    says why for anything not movable. An output only: no tool takes a path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    verdict: str
+    size_bytes: int
+    files: int
+    reasons: list[str]
+    suggested_target: str | None
+
+
+class RelocationOptionsResult(BaseModel):
+    """`list_relocation_options()`: large folders that could move to another drive, movable
+    first, then by size. Nothing is moved by this tool or by any other: the user moves a folder
+    on the dashboard's "Move to Another Drive" page or with `reclaim relocate`, after a dry
+    run they confirm."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_drive: str | None
+    target_drive_free_bytes: int | None
+    options: list[RelocationOption]

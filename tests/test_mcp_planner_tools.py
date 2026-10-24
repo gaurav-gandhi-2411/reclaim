@@ -8,6 +8,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from mcp_gates import auto_approve
 from test_mcp import _build_power_mode_state, _poll_scan_status_until_completed, _write
 
+from reclaim.api.relocate_routes import relocation_candidates
 from reclaim.config import CategoriesConfig, Config, DevArtifactsConfig, ExclusionsConfig
 from reclaim.mcp.server import build_mcp_server
 
@@ -158,3 +159,29 @@ async def test_find_unused_models_never_reads_an_excluded_project(
     assert found["org/unused"]["referenced_by"] == []  # its only user is excluded, never read
     assert report["excluded_projects_not_read"] is True
     assert not any("zzexclproj" in p.casefold() for p in opened)
+
+
+def _snapshot(root: Path) -> list[tuple[str, int]]:
+    return sorted((str(p), p.stat().st_size if p.is_file() else -1) for p in root.rglob("*"))
+
+
+async def test_list_relocation_options_is_the_pages_listing_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    home = Path(os.environ["USERPROFILE"])  # redirected under tmp by the root conftest
+    hub = home / ".cache" / "huggingface" / "hub"
+    _write(hub / "models--org--big" / "blobs" / "b", b"w" * 4_096)
+    state = _build_power_mode_state(tmp_path, config=_config())
+    before = _snapshot(home)
+    server = build_mcp_server(state, approval_gate=auto_approve())
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        tools = {t.name: t for t in (await session.list_tools()).tools}
+        assert tools["list_relocation_options"].inputSchema.get("properties", {}) == {}
+        result = (await session.call_tool("list_relocation_options", {})).structuredContent
+    assert _snapshot(home) == before  # read-only: nothing renamed, written or journaled
+    options = {o["path"]: o for o in result["options"]}
+    assert options[str(hub)]["verdict"] == "movable"
+    assert options[str(hub)]["size_bytes"] >= 4_096
+    page = relocation_candidates(state)  # exactly what the dashboard page lists
+    assert [o["path"] for o in result["options"]] == [c.path for c in page.candidates]
+    assert [o["verdict"] for o in result["options"]] == [c.verdict for c in page.candidates]

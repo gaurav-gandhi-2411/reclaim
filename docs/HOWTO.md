@@ -126,6 +126,8 @@ for this.
 What the assistant can do:
 - scan a folder in your profile and list what Reclaim found;
 - plan how to free a given amount (`plan_free_space`), using Reclaim's own categories only;
+- list the large folders that could move to another drive, with their size and why one cannot
+  (`list_relocation_options`, the same list as the **Move to Another Drive** page);
 - ask to clean a selection.
 
 What it cannot do:

@@ -195,7 +195,13 @@ def _job_out(job: RelocateJob) -> JobOut:
 @router.get("/candidates", response_model=CandidatesOut)
 def candidates(request: Request) -> CandidatesOut:
     """Read-only: classifies and sizes the usual folders. No probe (it renames), no write."""
-    state = _state(request)
+    return relocation_candidates(_state(request))
+
+
+def relocation_candidates(state: AppState) -> CandidatesOut:
+    """The read-only listing behind the page and the MCP tool `list_relocation_options`: one
+    function, so the assistant sees exactly what the page shows, and the MCP package never
+    imports the relocate engine (which can move and delete) to get it."""
     home = Path.home()
     drive = _best_drive(home)
     found = relocate.propose_candidates(relocate.known_locations(os.environ), _policy(state), drive)
