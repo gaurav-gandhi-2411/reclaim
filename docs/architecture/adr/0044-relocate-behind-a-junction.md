@@ -146,3 +146,43 @@ reported as success) and one lost data:
 11. The misleading messages of 1, 2 and 6 are gone with their fixes.
 
 All 14 probe tests and three changed engine tests fail on `3a39526` and pass on the fix.
+## Addendum 2 (2026-10-24): second hostile review (B2), FAIL, fixed
+
+A second independent review, of `50ffcdf`, found 14 problems, each shown by a probe that fails
+on that head (`tests/test_relocate_review_b2.py`, which also sweeps a kill over every killable
+call in a move and in a rollback, with and without the old copy deleted).
+
+The high ones shared one cause: rollback decided what sat at the original path was "the
+original" by looking at it, and after a kill at the wrong moment, or a program recreating its
+folder inside rollback's own window, it reported a folder that was not the original as
+restored (H1, H2), once after removing our target. **The fix is identity, not inspection:** the
+journal records the source folder's NTFS file ID before anything happens (a rename keeps it),
+and the restore copy's ID when rollback makes one. Only a folder with one of those IDs is ever
+accepted at the original path. Anything else there is removed if empty and otherwise left alone
+with nothing changed, saying where the data is. The old copy and our target are recognised the
+same way, so a folder of the same name that is not ours is never used or removed. Because the
+design rests on file IDs, streams and junctions, both volumes must be NTFS.
+
+Also fixed:
+- **H3:** a complete restore copy was wiped before checking the target still existed. It is now
+  never removed unless the target is present, and is reused when it already matches.
+- **H4:** a write into the old copy itself was deleted with it. An old-copy file newer than the
+  target's, or added after the swap, now refuses the delete, even with `accept_missing`.
+- **M1:** a kill at rollback's last journal save left a message telling the user to empty the
+  original folder. With identity it simply finishes.
+- **M2:** an excluded project appearing during the copy was moved. Exclusions are re-checked on
+  the frozen tree.
+- **M3:** a dry run could rename its own interrupted probe onto an excluded path. It no longer
+  does.
+- **L1-L7:**
+  - an attribute-only change before the freeze is now synced;
+  - folder streams are now copied and compared, no longer refused;
+  - the root folder's hidden and system bits are kept on the junction;
+  - folder case renames are aligned;
+  - read-only folders can be removed from the copy;
+  - a journal with wrong field types fails the plan cleanly;
+  - a kill between the target's creation and the next save no longer blocks later plans.
+
+**Mutation** (`D:\reclaim-build\tools\mutate_rl2.py`, 22 targeted mutants): 21 killed, after
+six new pins for the first survivors. S4 (reuse a restore copy that already matches) is
+equivalent: rebuilding it gives the same result.

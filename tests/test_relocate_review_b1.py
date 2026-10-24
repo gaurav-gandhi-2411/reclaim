@@ -224,7 +224,7 @@ def test_a_recreated_folder_after_the_old_copy_was_deleted_is_not_called_restore
     delete_old_copy(env.journal_path(), confirmed=True)
     os.rmdir(_x(env.source))  # the junction, removed by something else
     _write(env.source / "fresh.log", b"recreated")
-    with pytest.raises(RelocateError, match="not the original"):
+    with pytest.raises(RelocateError, match="something else created"):
         rollback(env.journal_path())
     assert _manifest(env.target) == expected  # the data is safe where it was
     os.remove(_x(env.source / "fresh.log"))

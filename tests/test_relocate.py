@@ -7,6 +7,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -624,7 +625,8 @@ def test_a_file_changed_through_the_junction_after_the_move_does_not_block_the_d
     _make_tree(env.source)
     env.move(clock=lambda: 1_000_000.0)
     _write(env.source / "sub" / "b.txt", b"updated by its program")
-    os.utime(_x(env.source / "sub" / "b.txt"), (1_000_100.0, 1_000_100.0))
+    later = time.time() + 100  # a program's write is newer than the copied original
+    os.utime(_x(env.source / "sub" / "b.txt"), (later, later))
     delete_old_copy(env.journal_path(), confirmed=True, clock=lambda: 1_000_200.0)
     assert not _exists(str(env.source) + MOVED_SUFFIX)
 
