@@ -104,3 +104,45 @@ PR on top of this module.
   runner is refused under pytest, so the move could not be tested.
 - **A symlink instead of a junction.** Rejected: directory symlinks need Developer Mode or admin,
   and some programs treat them differently; a junction needs neither.
+
+## Addendum 1 (2026-10-24): first hostile review (B1), FAIL, fixed
+
+An independent data-safety review of `3a39526` found 11 problems, each shown by a probe test that
+fails on that head (`tests/test_relocate_review_b1.py`). No case deleted an old copy whose data
+was not in the target, but four left the original path missing, empty or dangling (two of them
+reported as success) and one lost data:
+
+1. **A kill inside the junction's creation** (after its `mkdir`, before the reparse data) left an
+   empty folder at the original path, which rollback took as "restored". **2. A folder a program
+   recreated** after the junction was removed was taken the same way. Rollback now treats any
+   plain folder at the original path after the swap as suspect: an empty one is removed and the
+   old copy put back; one with content counts as restored only if every file of the target is in
+   it byte for byte (our own interrupted rollback); otherwise it refuses and says where the data
+   is. The same applies when the old copy was already deleted (the data is copied back first).
+3. **Moves that nest** (a target inside another move's target or `.reclaim-moved`) let one move's
+   rollback reach the other's data. The plan now refuses any overlap with an open move's source,
+   target, old copy or restore folder (read from the journals; an unreadable journal fails the
+   plan), any path through one of Reclaim's working folders, and any path reached through a link.
+4. **Named data streams** (`Zone.Identifier`, app metadata) were not copied, so deleting the old
+   copy lost them. Every copy now carries them, every hash covers them, and a folder that carries
+   streams (folders are created, not copied) must stay.
+5. **A journal folder inside the source** was renamed away at the freeze. It is refused, and the
+   CLI's journal folder joins the must-stay list.
+6. **A kill inside rollback's probe of the target** left the target at `.reclaim-probe`; rollback
+   now puts it back, and a missing target is reported as missing, not "in use".
+7. **A kill inside the plan's probe** left the source at `.reclaim-probe` with no journal. The
+   move's probe runs after its journal exists again, and a dry run puts back its own interrupted
+   probe (only the probe makes that name).
+8. **A writer that restores the mtime** between the copy and the freeze was missed (stale bytes
+   served behind the junction until a later delete check caught it). The full SHA-256 compare now
+   runs after the freeze, on the frozen source, for every file; a file still different is copied
+   once more and a second difference fails the move. The pre-freeze compare is gone, so the data
+   is still read twice in all.
+9. **The shared exclusion walk follows junctions** (`safety.subtree_exclusion_match`). Accepted,
+   not changed here: it descends junctions on purpose (content reached through a junction counts,
+   the pnpm case), PR #190 bounds junction cycles, and the verdict for such a folder is must-stay.
+10. **A case-only rename** during the copy failed the move (closed, nothing lost). The re-sync now
+    renames the copy to the new spelling.
+11. The misleading messages of 1, 2 and 6 are gone with their fixes.
+
+All 14 probe tests and three changed engine tests fail on `3a39526` and pass on the fix.

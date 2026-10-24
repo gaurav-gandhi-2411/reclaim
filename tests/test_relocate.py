@@ -190,6 +190,7 @@ def test_move_keeps_every_file_and_leaves_a_junction(env: Env) -> None:
     stages = [step[1] for step in Journal.load(env.journal_path()).history]
     assert stages == [
         "planned",
+        "probing",
         "copying",
         "copied",
         "freezing",
@@ -288,9 +289,8 @@ def test_a_kill_at_any_step_recovers_to_the_original_or_a_finished_move(
         _assert_original(env, expected)
 
 
-def test_a_bad_copy_is_caught_by_the_hash_check_and_rolled_back(env: Env) -> None:
+def test_a_bad_copy_is_found_by_the_full_hash_and_copied_again(env: Env) -> None:
     _make_tree(env.source)
-    expected = _manifest(env.source)
 
     def corrupt(name: str) -> None:
         if name == "after_copy":
@@ -304,8 +304,30 @@ def test_a_bad_copy_is_caught_by_the_hash_check_and_rolled_back(env: Env) -> Non
     old = os.stat(_x(env.source / "a.bin")).st_mtime_ns - 10 * relocate._DELTA_WINDOW_NS
     os.utime(_x(env.source / "a.bin"), ns=(old, old))  # older than the copy window
     expected = _manifest(env.source)
-    with pytest.raises(RelocateError, match="differ from their source"):
-        env.move(checkpoint=corrupt)
+    outcome = env.move(checkpoint=corrupt)
+    _assert_moved(env, expected)
+    assert any("1 fixed by a second copy" in str(step[2]) for step in outcome.journal.history)
+
+
+def test_a_copy_that_stays_bad_fails_the_move_and_rolls_back(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_tree(env.source)
+    expected = _manifest(env.source)
+    real_copy = relocate._copy_file
+
+    def bad_copy(src: str, dst: str) -> None:
+        real_copy(src, dst)
+        if dst.endswith("a.bin"):
+            st = os.stat(dst)
+            relocate._set_attributes(dst, 0)
+            with open(dst, "r+b") as fh:
+                fh.write(b"X")
+            os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+    monkeypatch.setattr(relocate, "_copy_file", bad_copy)
+    with pytest.raises(RelocateError, match="differ after copying them twice"):
+        env.move()
     _assert_original(env, expected)
 
 

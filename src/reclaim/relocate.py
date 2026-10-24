@@ -33,6 +33,7 @@ from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import BinaryIO
 
 import structlog
 
@@ -81,6 +82,7 @@ class Verdict(StrEnum):
 
 class Stage(StrEnum):
     PLANNED = "planned"
+    PROBING = "probing"
     COPYING = "copying"
     COPIED = "copied"
     FREEZING = "freezing"
@@ -142,6 +144,7 @@ class TreeScan:
     multi_linked: list[str] = field(default_factory=list)
     venv_markers: list[str] = field(default_factory=list)
     cloud_files: list[str] = field(default_factory=list)
+    folder_streams: list[str] = field(default_factory=list)
     unreadable: list[str] = field(default_factory=list)
 
 
@@ -310,6 +313,25 @@ _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
 _kernel32.SetFileAttributesW.restype = wintypes.BOOL
 
+
+class _StreamData(ctypes.Structure):
+    # WIN32_FIND_STREAM_DATA: MAX_PATH + 36 characters for the stream name.
+    _fields_ = [("StreamSize", ctypes.c_longlong), ("cStreamName", ctypes.c_wchar * 296)]
+
+
+_kernel32.FindFirstStreamW.argtypes = [
+    wintypes.LPCWSTR,
+    ctypes.c_int,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+]
+_kernel32.FindFirstStreamW.restype = wintypes.HANDLE
+_kernel32.FindNextStreamW.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+_kernel32.FindNextStreamW.restype = wintypes.BOOL
+_kernel32.FindClose.argtypes = [wintypes.HANDLE]
+_ERROR_HANDLE_EOF = 38
+_UNNAMED_STREAM = "::$DATA"
+
 _GENERIC_WRITE = 0x40000000
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -383,6 +405,35 @@ def _set_attributes(path: str, attributes: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _named_streams(path: str) -> list[str]:
+    """The named data streams of a file or folder (`:name:$DATA`), not the unnamed one.
+
+    NTFS files can carry more than their main content: the "downloaded from the internet" mark
+    (`Zone.Identifier`), app metadata, a whole second payload. A plain read-and-write copies
+    only the main stream, so these would be lost once the old copy is deleted (found by the
+    first hostile review, B1 finding 4); every copy and every hash here covers them."""
+    data = _StreamData()
+    handle = _kernel32.FindFirstStreamW(path, 0, ctypes.byref(data), 0)
+    if handle in (None, _INVALID_HANDLE):
+        error = ctypes.get_last_error()
+        if error == _ERROR_HANDLE_EOF:
+            return []
+        raise ctypes.WinError(error)
+    names: list[str] = []
+    try:
+        while True:
+            if data.cStreamName != _UNNAMED_STREAM:
+                names.append(data.cStreamName)
+            if not _kernel32.FindNextStreamW(handle, ctypes.byref(data)):
+                error = ctypes.get_last_error()
+                if error == _ERROR_HANDLE_EOF:
+                    break
+                raise ctypes.WinError(error)
+    finally:
+        _kernel32.FindClose(handle)
+    return sorted(names)
+
+
 def _rename(src: str, dst: str) -> None:
     assert_not_real_profile_under_pytest(src, operation="rename")
     assert_not_real_profile_under_pytest(dst, operation="rename onto")
@@ -417,6 +468,11 @@ def _walk(root: str) -> Iterable[tuple[str, os.DirEntry[str], bool]]:
 def scan_tree(root: str) -> TreeScan:
     """One read-only pass: counts, bytes, and everything that makes a tree unsafe to move."""
     out = TreeScan()
+    try:
+        if _named_streams(long_path(Path(root))):
+            out.folder_streams.append(".")
+    except OSError:
+        out.unreadable.append(".")
     base = long_path(Path(root))
     stack = [("", base)]
     while stack:
@@ -444,6 +500,12 @@ def scan_tree(root: str) -> TreeScan:
                 if stat.S_ISDIR(st.st_mode):
                     out.dirs += 1
                     stack.append((rel, entry.path))
+                    try:
+                        if _named_streams(entry.path):
+                            # Folders are created, not copied, so their streams would be lost.
+                            out.folder_streams.append(rel)
+                    except OSError:
+                        out.unreadable.append(rel)
                     continue
                 out.files += 1
                 out.bytes += st.st_size
@@ -466,11 +528,21 @@ def _listing(root: str) -> tuple[dict[str, os.stat_result], set[str]]:
     return files, dirs
 
 
-def _sha256(path: str) -> str:
+def _stream_sha256(path: str) -> bytes:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:  # noqa: PTH123
         while chunk := fh.read(_CHUNK):
             digest.update(chunk)
+    return digest.digest()
+
+
+def _sha256(path: str) -> str:
+    """The file's content identity: the SHA-256 of its main stream, then the name and SHA-256
+    of each named stream, so a dropped or altered stream is a difference like any other."""
+    digest = hashlib.sha256(_stream_sha256(path))
+    for name in _named_streams(path):
+        digest.update(name.encode("utf-8"))
+        digest.update(_stream_sha256(path + name))
     return digest.hexdigest()
 
 
@@ -486,14 +558,26 @@ def _copy_file(src: str, dst: str) -> None:
         # A re-copy: CREATE_ALWAYS refuses a read-only file, and also a hidden or system one
         # unless the same attributes are passed, so reset them first.
         _set_attributes(dst, 0)
-    with open(src, "rb") as fi, open(dst, "wb") as fo:  # noqa: PTH123
+    with open(src, "rb") as fi:  # noqa: PTH123
         st = os.fstat(fi.fileno())
+        _copy_stream(fi, dst)
+    streams = _named_streams(src)
+    for stale in set(_named_streams(dst)) - set(streams):
+        os.remove(dst + stale)  # noqa: PTH107 -- a stream of our own earlier copy, not a file
+    for name in streams:
+        with open(src + name, "rb") as fi:  # noqa: PTH123
+            _copy_stream(fi, dst + name)
+    # Last: writing a stream moves the file's mtime, and a read-only file takes no utime.
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    _set_attributes(dst, st.st_file_attributes)
+
+
+def _copy_stream(fi: BinaryIO, dst: str) -> None:
+    with open(dst, "wb") as fo:  # noqa: PTH123
         while chunk := fi.read(_CHUNK):
             fo.write(chunk)
         fo.flush()
         os.fsync(fo.fileno())
-    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
-    _set_attributes(dst, st.st_file_attributes)
 
 
 def _join(root: str, rel: str) -> str:
@@ -716,6 +800,11 @@ def classify(source: Path | str, policy: Policy) -> Classification:
         reasons.append(
             f"it contains hardlinked files, which a copy would split ({_sample(scan.multi_linked)})"
         )
+    if scan.folder_streams:
+        reasons.append(
+            "it has folders carrying named data streams, which a copy would not keep "
+            f"({_sample(scan.folder_streams)})"
+        )
     if scan.cloud_files:
         reasons.append(
             "it contains cloud placeholders that reading would download "
@@ -756,6 +845,38 @@ def probe(source: str) -> None:
         ) from exc
 
 
+_WORKING_SUFFIXES = (MOVED_SUFFIX, PROBE_SUFFIX, RESTORE_SUFFIX)
+
+
+def _overlap_reasons(src: str, tgt: str, journal_dir: Path | None) -> list[str]:
+    """What ties this move to Reclaim's own working folders or to another move: any of those
+    would let one move's rollback or delete reach into another's data (B1 finding 3)."""
+    reasons = []
+    for label, path in (("source", src), ("target", tgt)):
+        if any(part.casefold().endswith(s) for part in Path(path).parts for s in _WORKING_SUFFIXES):
+            reasons.append(f"the {label} is inside a folder Reclaim uses while moving another")
+        for ancestor in Path(path).parents:
+            if _is_reparse(str(ancestor)):
+                reasons.append(f"the {label} is reached through a link ({ancestor})")
+                break
+    if journal_dir is None:
+        return reasons
+    try:
+        others = journals(journal_dir)
+    except (OSError, ValueError, TypeError) as exc:
+        return [*reasons, f"a move journal in {journal_dir} could not be read ({exc})"]
+    for other in others:
+        if other.stage == Stage.ROLLED_BACK:
+            continue
+        busy = (other.source, other.target, other.moved, other.source + RESTORE_SUFFIX)
+        if any(_relation(mine, theirs) for mine in (src, tgt) for theirs in busy):
+            reasons.append(
+                f"it overlaps move {other.id} ({other.source} -> {other.target}, {other.stage}); "
+                "finish or roll that one back first"
+            )
+    return reasons
+
+
 def plan_move(
     source: Path | str,
     target: Path | str,
@@ -763,10 +884,18 @@ def plan_move(
     *,
     free_bytes: Callable[[str], int] = _free_bytes,
     run_probe: bool = True,
+    journal_dir: Path | None = None,
 ) -> Plan:
-    """The dry run. Changes nothing (the probe renames and renames back)."""
+    """The dry run. Changes nothing (the probe renames and renames back).
+
+    A probe of its own that a kill left half-done (the folder at `<name>.reclaim-probe`, nothing
+    at its own path) is put back first: only the probe ever makes that name."""
     src, tgt = _norm(source), _norm(target)
     moved = src + MOVED_SUFFIX
+    probe_path = src + PROBE_SUFFIX
+    if not _exists(src) and _exists(probe_path) and not _is_reparse(probe_path):
+        _rename(probe_path, src)
+        logger.info("relocate_probe_restored", source=src)
     found = classify(src, policy)
     reasons = list(found.reasons) if found.verdict is not Verdict.MOVABLE else []
     if found.verdict is Verdict.ALREADY_MOVED:
@@ -786,9 +915,10 @@ def plan_move(
         reasons.append(f"the target {tgt} already exists; choose a new folder")
     if _exists(moved):
         reasons.append(f"{moved} already exists (left by an earlier move?): inspect it first")
-    for leftover in (src + PROBE_SUFFIX, src + RESTORE_SUFFIX):
+    for leftover in (probe_path, src + RESTORE_SUFFIX, tgt + PROBE_SUFFIX):
         if _exists(leftover):
             reasons.append(f"{leftover} already exists (left by an earlier run?): inspect it first")
+    reasons.extend(_overlap_reasons(src, tgt, journal_dir))
     src_vol, tgt_vol = _volume_serial(src), _volume_serial(tgt)
     if src_vol is None or tgt_vol is None:
         reasons.append("the volume of the source or target could not be read")
@@ -834,10 +964,17 @@ def execute_move(
 ) -> Outcome:
     """Moves `source` behind a junction. Re-runs the whole dry run first (the state may have
     changed since the user saw it). Any ordinary failure rolls back before returning; a process
-    killed mid-way leaves its journal for `recover`."""
-    plan = plan_move(source, target, policy, free_bytes=free_bytes, run_probe=True)
-    if not plan.ok:
-        raise RelocateError("not moved: " + "; ".join(plan.reasons))
+    killed mid-way leaves its journal for `recover`. The in-use probe runs after the journal
+    exists, so a kill between its two renames is recoverable too."""
+    plan = plan_move(
+        source, target, policy, free_bytes=free_bytes, run_probe=False, journal_dir=journal_dir
+    )
+    reasons = list(plan.reasons)
+    if any(_relation(journal_dir, p) for p in (plan.source, plan.target, plan.moved)):
+        # The journal would be renamed away with the source at the freeze (B1 finding 5).
+        reasons.append(f"the journal folder {journal_dir} overlaps the move")
+    if reasons:
+        raise RelocateError("not moved: " + "; ".join(reasons))
     journal_dir.mkdir(parents=True, exist_ok=True)
     journal = Journal(
         id=uuid.uuid4().hex[:12],
@@ -852,6 +989,12 @@ def execute_move(
     )
     journal.path = str(journal_dir / f"relocate-{journal.id}.json")
     journal.log(Stage.PLANNED, f"{plan.files} files, {plan.bytes} bytes", clock)
+    journal.log(Stage.PROBING, "", clock)
+    try:
+        probe(plan.source)
+    except RelocateError as exc:
+        journal.log(Stage.ROLLED_BACK, f"not moved, nothing changed: {exc}", clock)
+        raise RelocateError(f"not moved: {exc}") from exc
     hook = checkpoint or (lambda _name: None)
     try:
         _make_target(journal)
@@ -859,7 +1002,7 @@ def execute_move(
         journal.log(Stage.COPYING, "", clock)
         _copy_tree(plan.source, plan.target, checkpoint=hook)
         hook("after_copy")
-        note = _verify_copy(plan.source, plan.target, journal.copy_started_ns)
+        note = _verify_copy(plan.source, plan.target)
         journal.log(Stage.COPIED, note, clock)
         hook("after_verify")
         journal.log(Stage.FREEZING, "", clock)
@@ -904,35 +1047,14 @@ def _make_target(journal: Journal) -> None:
     journal.save()
 
 
-def _verify_copy(src: str, dst: str, copy_started_ns: int) -> str:
-    """Compares the copy with the still-live source, by SHA-256 of every file.
-
-    A file the source changed, added or removed since the copy started is not a failure: the
-    delta pass re-copies and re-hashes it once the source is frozen. Any other difference (the
-    same size and an older timestamp, but other bytes) is a bad copy and stops the move."""
+def _verify_copy(src: str, dst: str) -> str:
+    """After the copy, before the freeze: only the listing is summarised here. The proof is
+    the full SHA-256 compare in `_delta_sync`, which runs on the frozen source: a compare
+    against the live source can be fooled by a writer that restores its mtime between this
+    point and the freeze (first hostile review, B1 finding 8), and it reads everything twice."""
     src_files, _ = _listing(src)
     dst_files, _ = _listing(dst)
-    window = copy_started_ns - _DELTA_WINDOW_NS
-    deferred, checked = [], []
-    for rel, st in src_files.items():
-        copy = dst_files.get(rel)
-        if (
-            copy is None
-            or st.st_mtime_ns >= window
-            or copy.st_size != st.st_size
-            or copy.st_mtime_ns != st.st_mtime_ns
-        ):
-            deferred.append(rel)
-        else:
-            checked.append(rel)
-    bad = _differences(src, dst, checked)
-    if bad:
-        raise RelocateError(f"{len(bad)} copied files differ from their source: {_sample(bad)}")
-    extra = len(set(dst_files) - set(src_files))
-    return (
-        f"SHA-256 equal for {len(checked)} files; {len(deferred)} changed during the copy and "
-        f"{extra} were removed, left to the re-sync"
-    )
+    return f"copied {len(dst_files)} of {len(src_files)} files; verified after the freeze"
 
 
 def _delta_sync(
@@ -942,11 +1064,24 @@ def _delta_sync(
     *,
     checkpoint: Callable[[str], None] | None = None,
 ) -> str:
-    """Brings the target to the frozen source exactly: what was created, changed or deleted
-    during the copy window. Removes from the target only files the source no longer has (our
-    own copies of them). Every file written since the copy started is copied and re-hashed."""
+    """Brings the target to the frozen source exactly, then proves it: the SHA-256 of every
+    file (with its named streams) must be equal on both sides.
+
+    First the cheap pass: what was created, changed (by size, mtime, or a write inside the copy
+    window) or deleted during the copy. Removes from the target only files the source no longer
+    has (our own copies of them). A case-only rename gives the copy the new spelling instead of
+    copying it again and deleting the old name (NTFS treats both names as one file). Then the
+    full compare; a file that still differs is copied once more, and a second difference fails
+    the move (it rolls back)."""
     src_files, src_dirs = _listing(moved)
     dst_files, dst_dirs = _listing(target)
+    by_key = {rel.casefold(): rel for rel in dst_files}
+    for rel in src_files:
+        spelled = by_key.get(rel.casefold())
+        if spelled is not None and spelled != rel:
+            _rename(_join(target, spelled), _join(target, rel))
+            dst_files[rel] = dst_files.pop(spelled)
+            by_key[rel.casefold()] = rel
     window = copy_started_ns - _DELTA_WINDOW_NS
     recopy = [
         rel
@@ -956,26 +1091,37 @@ def _delta_sync(
         or dst_files[rel].st_mtime_ns != st.st_mtime_ns
         or st.st_mtime_ns >= window
     ]
-    for rel in sorted(src_dirs - dst_dirs):
-        os.makedirs(_join(target, rel), exist_ok=True)  # noqa: PTH103
+    dst_dir_keys = {rel.casefold() for rel in dst_dirs}
+    for rel in sorted(src_dirs):
+        if rel.casefold() not in dst_dir_keys:
+            os.makedirs(_join(target, rel), exist_ok=True)  # noqa: PTH103
     for rel in recopy:
         _copy_file(_join(moved, rel), _join(target, rel))
         if checkpoint is not None:
             checkpoint("delta_file")
-    gone = sorted(set(dst_files) - set(src_files))
+    src_keys = {rel.casefold() for rel in src_files}
+    gone = sorted(rel for rel in dst_files if rel.casefold() not in src_keys)
     for rel in gone:
         path = _join(target, rel)
         assert_not_real_profile_under_pytest(path, operation="delete the copy")
         os.chmod(path, stat.S_IWRITE)  # noqa: PTH101
         os.unlink(path)  # noqa: PTH108
-    for rel in sorted(dst_dirs - src_dirs, key=len, reverse=True):
-        assert_not_real_profile_under_pytest(_join(target, rel), operation="remove")
-        os.rmdir(_join(target, rel))  # noqa: PTH106
+    src_dir_keys = {rel.casefold() for rel in src_dirs}
+    for rel in sorted(dst_dirs, key=len, reverse=True):
+        if rel.casefold() not in src_dir_keys:
+            assert_not_real_profile_under_pytest(_join(target, rel), operation="remove")
+            os.rmdir(_join(target, rel))  # noqa: PTH106
     _verify_listing(moved, target)
-    bad = _differences(moved, target, recopy)
-    if bad:
-        raise RelocateError(f"{len(bad)} files differ after the re-sync: {_sample(bad)}")
-    return f"re-copied {len(recopy)}, removed {len(gone)} from the copy"
+    bad = _differences(moved, target, src_files)
+    for rel in bad:
+        _copy_file(_join(moved, rel), _join(target, rel))
+    still = _differences(moved, target, bad)
+    if still:
+        raise RelocateError(f"{len(still)} files differ after copying them twice: {_sample(still)}")
+    return (
+        f"re-copied {len(recopy)}, removed {len(gone)} from the copy; SHA-256 equal for all "
+        f"{len(src_files)} files ({len(bad)} fixed by a second copy)"
+    )
 
 
 def _verify_listing(a: str, b: str) -> None:
@@ -983,7 +1129,11 @@ def _verify_listing(a: str, b: str) -> None:
     b_files, b_dirs = _listing(b)
     a_bytes = sum(s.st_size for s in a_files.values())
     b_bytes = sum(s.st_size for s in b_files.values())
-    if set(a_files) != set(b_files) or a_dirs != b_dirs or a_bytes != b_bytes:
+    # Folder names are compared without case: a folder renamed only in case keeps its old
+    # spelling in the copy, which NTFS treats as the same folder.
+    a_dir_keys = {d.casefold() for d in a_dirs}
+    b_dir_keys = {d.casefold() for d in b_dirs}
+    if set(a_files) != set(b_files) or a_dir_keys != b_dir_keys or a_bytes != b_bytes:
         raise RelocateError(
             f"{b} does not match {a} ({len(b_files)} vs {len(a_files)} files, "
             f"{b_bytes} vs {a_bytes} bytes)"
@@ -1021,35 +1171,35 @@ def recover(journal_path: Path, *, clock: Callable[[], float] = time.time) -> Ou
 
 def rollback(journal_path: Path, *, clock: Callable[[], float] = time.time) -> Outcome:
     """Restores the original folder at its own path, from any stage. Reads the disk, not just
-    the journal's stage, because a crash can land between a step and its journal entry."""
+    the journal's stage, because a crash can land between a step and its journal entry.
+
+    After the junction was (or may have been) made, a plain folder at the original path is not
+    taken on trust (B1 findings 1 and 2): an empty one (a kill inside the junction's creation,
+    or a program recreating its cache folder) is removed and the old copy put back; one with
+    content counts as restored only if it is our own renamed-back copy, else nothing changes
+    and the message says what to do."""
     journal = Journal.load(journal_path)
     if journal.stage == Stage.ROLLED_BACK:
         return Outcome(journal, "already rolled back")
     journal.log(Stage.ROLLING_BACK, f"from {journal.stage}", clock)
     src, tgt = journal.source, journal.target
     probe_path, restore = src + PROBE_SUFFIX, src + RESTORE_SUFFIX
+    target_probe = tgt + PROBE_SUFFIX
     if not _exists(src) and _exists(probe_path) and not _is_reparse(probe_path):
         _rename(probe_path, src)
+    if not _exists(tgt) and _exists(target_probe) and not _is_reparse(target_probe):
+        _rename(target_probe, tgt)  # a kill inside our own probe of the target (B1 finding 6)
     # The old copy: `<name>.reclaim-moved`, or, once that was deleted, the copy a rollback
     # makes back from the target.
     old = journal.moved if _exists(journal.moved) else restore
+    if journal.junction_attempted and _exists(src) and not _is_reparse(src):
+        _settle_plain_source(journal, old)
     if _is_reparse(src):
         pointed = _junction_target(src)
         if pointed is None or _key(pointed) != _key(tgt):
             raise RelocateError(f"{src} is a link, but not to {tgt}; refusing to change it")
         if old == restore:
-            # The old copy was deleted: copy the data back first (from scratch: a restore left
-            # by an interrupted rollback is our own partial copy).
-            if _exists(restore):
-                rmtree_reparse_point_safe(long_path(Path(restore)))
-            assert_not_real_profile_under_pytest(restore, operation="create")
-            os.mkdir(long_path(Path(restore)))  # noqa: PTH102
-            _copy_tree(tgt, restore)
-            _verify_listing(tgt, restore)
-            files, _ = _listing(tgt)
-            bad = _differences(tgt, restore, files)
-            if bad:
-                raise RelocateError(f"{len(bad)} files did not copy back: {_sample(bad)}")
+            _rebuild_restore(tgt, restore)
         _probe_target(tgt)
         # Copy back while the junction still stands: a failure here leaves the move as it was.
         copied_back = _sync_back(tgt, old)
@@ -1063,9 +1213,12 @@ def rollback(journal_path: Path, *, clock: Callable[[], float] = time.time) -> O
             journal.log(Stage.ROLLING_BACK, "copy-back failed; junction restored", clock)
             raise
         journal.log(Stage.ROLLING_BACK, f"copied back {copied_back} files changed after the swap")
-    elif journal.junction_attempted and not _exists(src) and _exists(old) and _exists(tgt):
-        # Interrupted between removing the junction and renaming back (or before the junction
-        # was made): copying back again is idempotent and catches writes made after the swap.
+    elif journal.junction_attempted and not _exists(src) and _exists(tgt):
+        # The junction is gone (removed by us before a kill, or by something else): copying
+        # back again is idempotent and catches writes made after the swap.
+        if not _exists(old):
+            _rebuild_restore(tgt, restore)
+            old = restore
         _sync_back(tgt, old)
     if not _exists(src) and _exists(old):
         _rename(old, src)
@@ -1079,8 +1232,49 @@ def rollback(journal_path: Path, *, clock: Callable[[], float] = time.time) -> O
     return Outcome(journal, note, kept or ())
 
 
+def _settle_plain_source(journal: Journal, old: str) -> None:
+    """A plain folder sits at the original path after the junction was (maybe) made."""
+    src, tgt = journal.source, journal.target
+    with os.scandir(long_path(Path(src))) as it:
+        empty = next(it, None) is None
+    if empty:
+        assert_not_real_profile_under_pytest(src, operation="remove the empty folder")
+        os.rmdir(long_path(Path(src)))  # noqa: PTH106 -- empty: nothing of anyone's is lost
+        return
+    if not _exists(old) and _exists(tgt):
+        # Our own earlier rollback renamed the old copy back and stopped before the end: then
+        # every file of the target is in it, byte for byte.
+        files, _ = _listing(tgt)
+        if not _differences(tgt, src, files):
+            return
+    raise RelocateError(
+        f"{src} is a folder that is not the original: something created it after the move. "
+        f"The original data is safe in {old if _exists(old) else tgt}. Move the new folder's "
+        "contents somewhere else, delete the folder, and roll back again."
+    )
+
+
+def _rebuild_restore(tgt: str, restore: str) -> None:
+    """The old copy was deleted: copy the target back into `<name>.reclaim-restore`, from
+    scratch (one left by an interrupted rollback is our own partial copy), and prove it."""
+    if _exists(restore):
+        rmtree_reparse_point_safe(long_path(Path(restore)))
+    assert_not_real_profile_under_pytest(restore, operation="create")
+    os.mkdir(long_path(Path(restore)))  # noqa: PTH102
+    _copy_tree(tgt, restore)
+    _verify_listing(tgt, restore)
+    files, _ = _listing(tgt)
+    bad = _differences(tgt, restore, files)
+    if bad:
+        raise RelocateError(f"{len(bad)} files did not copy back: {_sample(bad)}")
+
+
 def _probe_target(target: str) -> None:
     probe_path = target + PROBE_SUFFIX
+    if not _exists(target):
+        raise RelocateError(f"{target} is missing, so the moved data cannot be copied back")
+    if _exists(probe_path):
+        raise RelocateError(f"{probe_path} already exists; inspect it before rolling back")
     try:
         _rename(target, probe_path)
     except OSError as exc:

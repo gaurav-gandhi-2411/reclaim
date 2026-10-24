@@ -79,8 +79,8 @@ def _gib(n: int) -> str:
     return f"{n / 2**30:.2f} GiB"
 
 
-def _policy(config: Config, config_path: Path) -> relocate.Policy:
-    app_dirs = [data_root() / "data"]
+def _policy(config: Config, config_path: Path, journal_dir: Path) -> relocate.Policy:
+    app_dirs = [data_root() / "data", journal_dir]
     try:
         app_dirs.append(resolve_index_db(None, config_path).parent)
     except (OSError, ValueError) as exc:
@@ -133,7 +133,7 @@ def run(args: argparse.Namespace) -> int:
     except (ValueError, OSError) as exc:
         return _err(f"config.toml is invalid ({config_path}): {exc}")
     try:
-        policy = _policy(config, config_path)
+        policy = _policy(config, config_path, args.journal_dir)
     except relocate.RelocateError as exc:
         return _err(str(exc))
     journal_dir: Path = args.journal_dir
@@ -202,7 +202,7 @@ def _plan_or_move(
         if drive is None:
             return _err("no other fixed drive to move to; pass --target")
         target = Path(relocate.suggested_target(source, drive))
-    plan = relocate.plan_move(source, target, policy)
+    plan = relocate.plan_move(source, target, policy, journal_dir=journal_dir)
     _print_plan(plan)
     if not plan.ok:
         return 1
