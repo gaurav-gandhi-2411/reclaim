@@ -64,7 +64,7 @@ per-stratum counts against `DEFAULT_TARGET_TOTAL = 300` and
 `DEFAULT_TARGET_PER_STRATUM_MINIMUM = 40`. Rendered at the top of the review page on every
 load, with an explicit "targets not yet met" / "✅ targets met" state and the reasoning spelled
 out in the UI itself ("a gold set of mostly confirmed positives can't locate a decision
-threshold"). Not enforced — GG can stop whenever he judges the session sufficient — but no
+threshold"). Not enforced — GG can stop whenever they judge the session sufficient — but no
 longer invisible.
 
 **Every decision is commit-keyed and schema-versioned.** `LabelDecision.commit_sha` is stamped
