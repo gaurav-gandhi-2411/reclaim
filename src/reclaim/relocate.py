@@ -391,6 +391,22 @@ _kernel32.DeviceIoControl.restype = wintypes.BOOL
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
 _kernel32.SetFileAttributesW.restype = wintypes.BOOL
+_kernel32.GetLongPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+_kernel32.GetLongPathNameW.restype = wintypes.DWORD
+
+
+def _long_name(path: str) -> str | None:
+    """`path` with every component spelled as it is on disk (8.3 aliases expanded), or None
+    when it cannot be read. Renaming an 8.3 alias renames the real entry, so a move given a
+    short name would leave the real path empty (B9 M1)."""
+    query = str(long_path(Path(path)))
+    size = _kernel32.GetLongPathNameW(query, None, 0)
+    if size == 0:
+        return None
+    buf = ctypes.create_unicode_buffer(size)
+    if _kernel32.GetLongPathNameW(query, buf, size) == 0:
+        return None
+    return _norm(buf.value)
 
 
 class _StreamData(ctypes.Structure):
@@ -1098,7 +1114,9 @@ def _refuse_if_superseded(journal: Journal, journal_path: Path) -> None:
             other.id != journal.id
             and _key(other.source) == _key(journal.source)
             and not _is_inert(other)
-            and other.created_at >= journal.created_at
+            # Ties broken by id, so two journals with one timestamp (a hand-made copy) never
+            # each block the other (B9 L1).
+            and (other.created_at, other.id) > (journal.created_at, journal.id)
         ):
             raise RelocateError(
                 f"move {other.id} ({other.stage}) is a later, live move of {journal.source}; "
@@ -1176,6 +1194,14 @@ def plan_move(
         logger.info("relocate_probe_restored", source=src)
     found = classify(src, policy)
     reasons = list(found.reasons) if found.verdict is not Verdict.MOVABLE else []
+    if _exists(src):
+        # Every journal check compares path text, and the freeze renames whatever name it is
+        # given: only the spelling on disk is accepted (case aside, B9 M1).
+        spelled = _long_name(src)
+        if spelled is None:
+            reasons.append(f"the full name of {src} could not be read")
+        elif _key(spelled) != _key(src):
+            reasons.append(f"{src} is a short or alternate name: use its full name, {spelled}")
     if found.verdict is Verdict.ALREADY_MOVED:
         reasons = list(found.reasons)
     if found.verdict is Verdict.GUIDED:
@@ -1743,8 +1769,20 @@ def _rollback_after_swap(
         if pointed is None or _key(pointed) != _key(tgt):
             raise NothingChangedError(f"{src} is a link, but not to {tgt}; refusing to change it")
     _settle_source(journal)
-    if _is_original(journal, src):
-        return _finish_rollback(journal, clock, "restored the folder")  # an earlier run did it
+    if _is_original(journal, src):  # an earlier run put a folder back
+        if journal.source_id and _folder_id(src) == journal.source_id:
+            # It was the copy from before the move (use_old_copy): finish as that run would
+            # have, leaving the moved folder untouched and saying so (B9 L2).
+            if _gone(tgt):
+                extra = f"; {tgt} was not reachable, so anything written there after the move is "
+                extra += "only there"
+            else:
+                extra = f"; the moved folder {tgt} is left as it is, with everything written "
+                extra += "there since"
+            note = "put back the copy from before the move" + extra
+            journal.log(Stage.ROLLED_BACK, note, clock)
+            return Outcome(journal, note)
+        return _finish_rollback(journal, clock, "restored the folder")
     target_here = not _gone(tgt)
     if use_old_copy or not target_here:
         return _put_back_old_copy(journal, clock, target_here)
@@ -1780,10 +1818,15 @@ def _rollback_after_swap(
             f"copying {tgt} back was interrupted ({exc}); nothing changed at {src}. The moved "
             f"data is on {tgt}: reconnect it and roll back again"
         ) from exc
+    removed = False
     if _is_reparse(src):
-        _remove_junction(src)
-        journal.log(Stage.ROLLING_BACK, "junction removed", clock)
+        _remove_junction(src)  # a failure here leaves the junction: the path is not empty
+        removed = True
     try:
+        if removed:
+            # Inside the guard: a journal write failing now must not leave the path empty
+            # (B9 M2).
+            journal.log(Stage.ROLLING_BACK, "junction removed", clock)
         # Anything written to the moved folder between the copy and the removal; the restore
         # folder is ours, so bringing it to the target exactly removes only our own copies.
         # It changes the restore folder, so until the sync has proved it again it is not a
