@@ -165,3 +165,82 @@ class PlanFreeSpaceResult(BaseModel):
     frees_now_bytes: int
     selections: list[PlannedSelection]
     left_out: list[str]
+
+
+class DriveStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    drive: str
+    total_bytes: int
+    free_bytes: int
+
+
+class DiskStatusResult(BaseModel):
+    """`get_disk_status()`: every fixed drive's free and total space."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    drives: list[DriveStatus]
+
+
+class ExclusionsResult(BaseModel):
+    """`list_exclusions()`: what Reclaim never touches. No tool argument can widen these."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_names: list[str]
+    deny_patterns: list[str]
+
+
+class UsageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size_bytes: int
+    is_dir: bool
+    reclaimable: bool
+
+
+class CategoryUsage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category_group: str
+    label: str
+    tier: str
+    file_count: int
+    bytes: int
+
+
+class DiskUsageResult(BaseModel):
+    """`explain_disk_usage(scan_id)`: the largest entries under the scanned root, and what
+    Reclaim can reclaim by category and tier."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str
+    root: str | None
+    total_bytes: int
+    largest: list[UsageEntry]
+    reclaimable: list[CategoryUsage]
+
+
+class ModelEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_id: str
+    size_bytes: int
+    referenced_by: list[str]
+
+
+class UnusedModelsResult(BaseModel):
+    """`find_unused_models()`: cached Hugging Face models and the project files naming them.
+    An empty `referenced_by` means no readable project file names the model; excluded projects
+    are never read (`excluded_projects_not_read`), so they may still use it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cache_dir: str
+    models: list[ModelEntry]
+    files_read: int
+    stopped_at_limit: bool
+    excluded_projects_not_read: bool
