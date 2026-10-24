@@ -164,3 +164,43 @@ Reclaim never edits these files for you.
 Things to ask: "free 20 GB, keep my projects, rebuildable things only", "what is using my disk?", "plan 50 GB but no
 duplicates". A plan says when the number cannot be reached under what you asked (`reaches_target: false` with the
 shortfall), rather than quietly including more.
+
+## 9. Move a big folder to another drive (tab: **Move to Another Drive**)
+For folders programs still need, so deleting is not an option: model caches, browser builds for tests and the like.
+Reclaim copies the folder to your other fixed drive, checks every file (SHA-256), and leaves a link (a junction) at the
+old place, so every program still finds it there. Available once #199 is merged and a build with it is installed.
+
+1. The tab lists the usual large folders and sorts them: those it can move first, then the rest, each with the reason.
+   - **Moved with their own steps:** Docker's disk image and WSL. Reclaim shows their size and the steps (Docker's
+     settings, `wsl --export`/`--import`), and never moves them itself.
+   - **Refused:**
+     - a folder holding one of your protected project names;
+     - a folder with hardlinks inside (a copy would split them);
+     - a folder reached through a link;
+     - a name too long to move safely (over 239 characters), a short "8.3" name, and a network path.
+2. **Check this move** runs a dry run and shows where it goes, the folder's size and file count, the free space on
+   the target, and anything in the way. Nothing changes yet.
+3. **Move it** does the move. The original stays next to the link as `<name>.reclaim-moved`, unchanged, so nothing is
+   lost if you change your mind.
+4. Each move is listed under **Moves**:
+   - **Move it back** copies the folder, as it is now, back to its own place and removes the link;
+   - **Delete the original copy** frees the space on the first drive. It checks every file of the kept copy against the
+     moved one first and deletes nothing if any differs. Before 7 days have passed it warns you first.
+
+From a terminal: `reclaim relocate list`, `plan`, `move`, `status`, `rollback <id>`, `delete-old <id>`. If a move was
+interrupted (a crash, a power cut), `reclaim relocate recover <id>` finishes it or puts it back.
+`rollback <id> --use-old-copy` puts back the copy from before the move instead of the moved folder; the page does not
+offer that.
+
+## 10. Finished AI-agent leftovers (category: **Agent Leftovers**)
+Coding agents leave git worktrees, throwaway clones and scratch folders behind. Reclaim can offer the finished ones for
+cleanup. Available once #199 is merged and a build with it is installed.
+- **Off until you turn it on,** and always off in safe mode: switch to power mode, then turn **Agent Leftovers** on in
+  **Settings**.
+- **What is offered:** an item is offered only if it is proven finished. All its work is pushed. Nothing is left
+  hidden (untracked files, stashes, git filters that change what a commit stores). No program is using it. It is not one of your
+  protected projects. Anything that cannot be proven is kept, and the report says why.
+- **You choose each one.** It goes to the vault (**Quarantine & Restore**), never straight to deletion, and comes back
+  with **Restore**. For a worktree, git's link to it comes back too.
+- **To look without changing anything:** `reclaim agent-artifacts` prints what would be offered and why the rest is
+  kept.
