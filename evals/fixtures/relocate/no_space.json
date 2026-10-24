@@ -1,0 +1,1 @@
+{"case": "no_space", "why": "The target volume needs 1.2x the folder free.", "files": [{"path": "a.bin", "size": 5000}], "free": 5500, "action": "move", "expect": "refused", "reason": "GiB free"}

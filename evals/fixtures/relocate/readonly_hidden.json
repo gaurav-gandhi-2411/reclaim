@@ -1,0 +1,1 @@
+{"case": "readonly_hidden", "why": "Read-only and hidden files are copied with their attributes and survive a rollback.", "files": [{"path": "ro.txt", "size": 10, "attrs": ["readonly"]}, {"path": "h.txt", "size": 10, "attrs": ["hidden", "system"]}], "action": "move_then_rollback", "expect": "rolled_back"}
