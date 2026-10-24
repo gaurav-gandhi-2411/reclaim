@@ -563,3 +563,49 @@ covered the source only. Fixes:
 Mutation `mutate_rl10`: one mutant per fix (target spelling unchecked; case kept as typed;
 network paths accepted; a bare error after a failed junction re-creation; the rerun's warning
 dropped), 5 of 5 killed, the source restored byte-identical.
+
+## Addendum 11 (2026-10-24): eleventh, narrow review (B11) of addendum 10, FAIL, fixed
+
+The eleventh review, of `6139589` and narrowed to addendum 10, found that its fixes held:
+the 8.3 target parent, UNC, the double-fault message, and the rerun warning. No byte was lost.
+Its one-OSError sweep over plan and move had 186 points, 0 empty paths and 0 changes to the
+folder's content. 12 of its 32 probes failed (`tests/test_relocate_review_b11.py`), on one
+medium finding that predates addendum 10 and on several lows. Fixes:
+
+- **M1 (a target NTFS cannot create):** `..`, `?`, `|` or a component over 255 characters
+  passed the plan, because `_norm` does not collapse `..` and nothing checked the text. The
+  move failed in `_make_target`. Its rollback could not check the target path, so the journal
+  stayed at ROLLING_BACK and every later plan of the folder was refused for good.
+  `_as_spelled_on_disk` now refuses any text NTFS cannot create: an empty, `.` or `..` part, a
+  character Windows does not allow in a name, a part over 255 characters, or a part ending in
+  a dot or space. **L1:** a target whose nearest existing ancestor is a file is refused too.
+- **L2 and the `subst` alias (BELIEVED medium):** GetLongPathNameW only rewrites components it
+  looks up, so a long name kept its typed case, and the folder was renamed into that case for
+  good. It does not see through a substituted drive letter either, so a `subst` alias of a
+  live target could bring back B10's nesting sequence. `_final_name` replaces it: it opens
+  the existing part itself (a reparse point at the leaf is not followed) and asks
+  GetFinalPathNameByHandleW for the name Windows resolves it to. That name has every
+  component in its on-disk case, 8.3 names expanded, and a substituted drive or a junction in
+  a parent resolved. Any other spelling is refused, naming the full name. **The `subst` case
+  is BELIEVED only:** `subst` changes machine state, so neither the reviewer nor I ran it.
+- **L3:** a probe leftover is now put back under its own on-disk name, not the typed case.
+- **L4:** `_norm` turned `\\?\Volume{GUID}\...` and `\\?\GLOBALROOT\...` into a folder under
+  the current directory. It now strips `\\?\` only in front of a drive letter. These paths
+  stay device paths and are refused with the network-path reason, which now names device
+  paths too.
+- **L5:** the double-fault message of a `use_old_copy` rollback now names `--use-old-copy`.
+  Rerunning without it would have copied the moved folder back instead of the copy the user
+  chose.
+- **L6 (predates addendum 10):** a failure writing the move's first journal entries escaped
+  `execute_move` as a raw `PermissionError`. It is now a `RelocateError` saying nothing
+  changed and naming the journal to clear, if one was written.
+- **Not changed:**
+  - A mapped network drive as a source is not refused by drive type. BELIEVED, not tested:
+    `_final_name` resolves it to a UNC name, which is refused; failing that, the post-swap
+    check fails and the move rolls back.
+  - The `pytest -s` logging issue from addendum 10 also leaves empty paths under `-s` (4
+    points). The product configures logging, so it is BELIEVED test-only, as before.
+- **Test hygiene:** the reviewer's sweep wrote a report next to its test file when a folder
+  existed there. That code was removed, since a test writes only under `tmp_path`.
+
+Mutation `mutate_rl11`: one mutant per fix, 7 of 7 killed, the source restored byte-identical.
