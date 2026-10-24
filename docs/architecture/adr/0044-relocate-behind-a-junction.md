@@ -1,0 +1,106 @@
+# ADR-0044: Relocate a folder to another drive behind a junction
+
+Status: accepted (2026-10-24, autonomous run Phase B). Spec: `docs/specs/relocate.md`.
+ADR-0043 is agent-artifact cleanup, on `integration/run-2026-10`.
+
+## Context
+
+The first real run (2026-10-09, `scripts/relocate_dir.ps1`) moved 185 GiB of model caches from C:
+to D: and lifted C: free space from 15 to 208 GiB, with no file differences. Deletion can't do
+that: the data is in use and is not junk. The prototype is a PowerShell script run by hand. The
+product needs the same stages in the app, as a review-tier action (the user clicks), with the
+data-safety bar of the rest of Reclaim. That means a dry run first, a rollback at every stage,
+and nothing deleted that has no other proven copy.
+
+## Decision
+
+`src/reclaim/relocate.py` carries the prototype's stages over to Python and adds a journal:
+
+1. **Classify, exclusion first.** The user's exclusions (`SafetyValidator.exclusion_match`, path
+   text and then the names beneath it) are checked before anything else. A hit ends the
+   inspection, so an excluded tree is never sized or probed. Next come the built-in protected
+   roots, the profile roots (too broad), Reclaim's own data and index, and the hardlink caches
+   (uv, pnpm, conda `pkgs`). Docker and WSL are classified as guided moves, using their own
+   steps. Then one read-only walk refuses trees that a plain copy would damage: links,
+   hardlinked files, Python environments, cloud placeholders, unreadable entries, no files.
+2. **Plan (the dry run).** The plan checks that:
+   - the target is on a different volume (by volume serial);
+   - the target is absent, and not inside the source or an excluded or protected path;
+   - the target volume has 1.2x the folder's size free;
+   - no `.reclaim-moved`, `.reclaim-probe` or `.reclaim-restore` is left from earlier;
+   - a rename round-trip succeeds. Windows refuses to rename a folder while a file under it is
+     open, so the round-trip proves there are no live holders; it never kills a holder.
+
+   The plan changes nothing; unlike the prototype, it does not even create the target's parent.
+3. **Move.** The move runs on a fresh plan:
+   1. Copy, keeping data, timestamps and the A/H/S/R attributes.
+   2. Compare the SHA-256 of every file whose source has not changed since the copy started.
+   3. Freeze: rename the source to `<name>.reclaim-moved`.
+   4. Delta re-sync. Files created, changed or deleted during the copy are brought across. Every
+      re-copied file is hashed against the frozen source, and the full listings and byte totals
+      must match.
+   5. Make the junction, then check it: it must point to the target, and the listing through it
+      must equal the old copy's.
+
+   Junctions are written with `FSCTL_SET_REPARSE_POINT` directly. On a machine with
+   `LongPathsEnabled=0`, `_winapi.CreateJunction` fails for targets over 260 characters, and a
+   prefixed target makes it write a broken name (measured 2026-10-24). Every filesystem call
+   uses `\\?\` paths, so paths over 260 characters work.
+4. **Journal.** The journal is a JSON file per move, written atomically before each step; its
+   history is the audit log. Any ordinary error rolls back before returning. A killed process
+   leaves the journal, and `recover` either finishes the move (the junction exists and checks
+   out) or rolls it back.
+5. **Rollback works at any stage, from the disk's state, not only the journal's.**
+   - Before the junction exists, our copy is removed; nothing else wrote to it.
+   - After the junction exists, rollback first probes the target for open handles, then copies
+     back into the old copy every file a program added or rewrote through the junction. A
+     rewrite is detected by size or mtime: the copy carries the original's mtime exactly. This
+     happens while the junction still stands, and a final pass runs after the junction is
+     removed; if that final pass fails, the junction is put back. Rollback deletes nothing in
+     the old copy.
+   - Once the old copy is deleted, rollback copies the target back into a verified
+     `.reclaim-restore` first.
+   - Our copy in the target is removed only when every file in it is byte-equal to the
+     restored folder. Otherwise it is kept and the outcome says why.
+6. **Deleting the old copy is a separate call.** It is allowed after 7 days, or earlier with a
+   confirmation. Every file of the old copy must either have the same SHA-256 in the target or
+   a different mtime there (rewritten through the junction). A same-size, same-mtime difference
+   is a bad copy and refuses the delete. A file missing from the target refuses the delete
+   unless the user accepts it. The freed figure is the volume's free-space delta.
+
+CLI: `reclaim relocate list | plan | move --yes | status | rollback | recover | delete-old`
+(`src/reclaim/relocate_cli.py`). The dashboard page and the MCP approval card are a follow-up
+PR on top of this module.
+
+## Consequences
+
+- **Zero data loss is a CI gate:** `evals/test_relocate_gate.py`, with one fixture per case in
+  `evals/fixtures/relocate/` and one real process kill. Every case checks that each original
+  file is still byte-identical at its original path, whatever the outcome.
+- **What the tests found in this module before review:**
+  - A copy-time hash check against the live source aborted every move of a folder that was
+    written during the copy. Changed files are now left to the delta, which runs on the frozen
+    source.
+  - Rollback over a corrupted target copy removed the junction and then failed, leaving the
+    original path missing. Copy-back now happens before the junction is removed, the old
+    copy's bytes win over a same-mtime difference, and the target is kept.
+  - A clock-window rule let a corrupted file pass the delete check. It was replaced by the
+    exact-mtime rule.
+- **Not supported yet:**
+  - Trees containing links (they must stay).
+  - ACLs and owners: the copy inherits the target's permissions, as robocopy `/COPY:DAT` did.
+  - A case-only rename during the copy fails the move closed, with nothing lost.
+- **The junction's target is whatever the user chose.** Moving to removable or network drives
+  is not blocked here. The CLI suggests only fixed drives; the UI will offer only those.
+- **Real machine, this run:** dry run only (`reclaim relocate list`), per the run spec.
+
+## Alternatives
+
+- **Keep the PowerShell script and shell out to it.** Rejected: it can't be tested hermetically,
+  it has no journal (a kill between freeze and swap needs manual repair), and it can't handle
+  paths over 260 characters.
+- **robocopy for the copy.** Rejected for the app: the per-file hash is the verification anyway,
+  robocopy's exit codes are a second failure surface, and it needs a real process runner. That
+  runner is refused under pytest, so the move could not be tested.
+- **A symlink instead of a junction.** Rejected: directory symlinks need Developer Mode or admin,
+  and some programs treat them differently; a junction needs neither.
