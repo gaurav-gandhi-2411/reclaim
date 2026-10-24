@@ -156,6 +156,26 @@ def test_b7_a_full_journal_drive_after_the_freeze_gives_a_relocate_error(
     assert isinstance(info.value, RelocateError), f"raw {type(info.value).__name__}: {info.value}"
 
 
+def test_b7_recover_finishes_a_swap_that_programs_already_use(env: Env) -> None:
+    """Killed after the junction was made (stage SWAPPING). After the restart a program writes
+    into its folder (through the junction) before the user runs recover. _post_swap_check
+    compares the old copy's listing with the live folder, sees one more file, and recover
+    rolls the finished move back: a full copy back onto the drive the user was freeing (or, if
+    it lacks room, a refusal telling them to free space or use the old copy)."""
+    _make_tree(env.source)
+
+    def hook(name: str) -> None:
+        if name == "after_junction":
+            raise SimulatedCrash(name)
+
+    with pytest.raises(SimulatedCrash):
+        env.move(checkpoint=hook)
+    assert _stage(env) == Stage.SWAPPING
+    _write(env.source / "written-after-restart.log", b"the program ran before recover")
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.DONE, f"{out.journal.stage}: {out.message}"
+
+
 def test_b7_delete_old_never_deletes_an_excluded_projects_old_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -530,3 +550,38 @@ def test_b7_m3_recover_does_not_finish_a_delete_for_an_excluded_folder(
     with pytest.raises(RelocateError, match="excluded"):
         recover(env.journal_path(), policy=_excluding(marker=relocate.MOVED_SUFFIX))
     assert _manifest(_moved(env)) == left
+
+
+def test_b7_m4_recover_still_rolls_back_when_the_old_copy_itself_changed(env: Env) -> None:
+    """The conservative path stays: if the old copy differs from its manifest, the listings
+    differing is no proof that only programs wrote through the junction."""
+    _make_tree(env.source)
+
+    def hook(name: str) -> None:
+        if name == "after_junction":
+            raise SimulatedCrash(name)
+
+    with pytest.raises(SimulatedCrash):
+        env.move(checkpoint=hook)
+    assert _stage(env) == Stage.SWAPPING
+    _write(_moved(env) / "written-into-the-old-copy.log", b"something wrote here")
+    _write(env.source / "also-new.log", b"and through the junction")
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.ROLLED_BACK, out.message
+    assert not _is_link(env.source)
+
+
+def test_b7_m4_a_finished_swap_keeps_what_the_program_wrote(env: Env) -> None:
+    _make_tree(env.source)
+
+    def hook(name: str) -> None:
+        if name == "after_junction":
+            raise SimulatedCrash(name)
+
+    with pytest.raises(SimulatedCrash):
+        env.move(checkpoint=hook)
+    _write(env.source / "written-after-restart.log", b"kept")
+    out = recover(env.journal_path(), policy=env.policy)
+    assert out.journal.stage == Stage.DONE
+    assert _is_link(env.source)
+    assert (env.target / "written-after-restart.log").read_bytes() == b"kept"

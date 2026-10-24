@@ -1410,11 +1410,43 @@ def recover(
             _keep_root_flags(journal.moved, journal.source)  # a kill may have landed before it
         except (RelocateError, OSError) as exc:
             logger.warning("relocate_recover_check_failed", id=journal.id, error=str(exc))
+            if _only_written_through_the_junction(journal):
+                # The listings differ because a program already works in its folder, through
+                # the junction (B7 M4): the move is finished, rolling it back would undo it.
+                with contextlib.suppress(OSError):
+                    _keep_root_flags(journal.moved, journal.source)
+                journal.swapped_at = clock()
+                journal.log(
+                    Stage.DONE,
+                    "finished after an interruption; programs had already written through the "
+                    "junction",
+                    clock,
+                )
+                return Outcome(journal, f"finished the move; {journal.source} points to the copy")
         else:
             journal.swapped_at = clock()
             journal.log(Stage.DONE, "finished after an interruption", clock)
             return Outcome(journal, f"finished the move; {journal.source} points to the copy")
     return rollback(journal_path, clock=clock)
+
+
+def _only_written_through_the_junction(journal: Journal) -> bool:
+    """True when the junction is ours (it points to the journaled target, which is the folder
+    this move made) and the old copy is exactly as the swap manifest recorded it: the only
+    way the live folder can differ from it then is a program writing through the junction.
+    Any doubt (no manifest, an unreadable listing, an old copy that changed) is False, and
+    the caller takes the conservative path."""
+    pointed = _junction_target(journal.source)
+    if pointed is None or _key(pointed) != _key(journal.target):
+        return False
+    if journal.target_id == 0 or _folder_id(journal.target) != journal.target_id:
+        return False
+    if not journal.manifest or not _is_original(journal, journal.moved):
+        return False
+    try:
+        return not _old_copy_changes(journal, allow_missing=False)
+    except (RelocateError, OSError):
+        return False
 
 
 def rollback(
