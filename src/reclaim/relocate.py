@@ -243,6 +243,7 @@ class Journal:
         data = asdict(self)
         data.pop("path")
         tmp = self.path + ".tmp"
+        assert_not_real_profile_under_pytest(tmp, operation="write the journal")
         with open(tmp, "w", encoding="utf-8") as fh:  # noqa: PTH123 -- str path, see module note
             json.dump(data, fh, indent=1)
             fh.flush()
@@ -641,6 +642,7 @@ def _copy_file(src: str, dst: str) -> None:
 
 
 def _copy_stream(fi: BinaryIO, dst: str) -> None:
+    assert_not_real_profile_under_pytest(dst, operation="write")
     with open(dst, "wb") as fo:  # noqa: PTH123
         while chunk := fi.read(_CHUNK):
             fo.write(chunk)
@@ -671,6 +673,7 @@ def _copy_folder_meta(src: str, dst: str) -> None:
     """A folder's own named streams and attributes (folders are created, not copied, so these
     would otherwise be lost: B2 L2, L3). Stale streams of our own earlier copy are removed."""
     streams = _named_streams(src)
+    assert_not_real_profile_under_pytest(dst, operation="remove streams of")
     for stale in set(_named_streams(dst)) - set(streams):
         os.remove(dst + stale)  # noqa: PTH107 -- a stream of our own copy of the folder
     for name in streams:
@@ -1177,6 +1180,7 @@ def execute_move(
         reasons.append(f"the journal folder {journal_dir} overlaps the move")
     if reasons:
         raise RelocateError("not moved: " + "; ".join(reasons))
+    assert_not_real_profile_under_pytest(journal_dir, operation="create")
     journal_dir.mkdir(parents=True, exist_ok=True)
     journal = Journal(
         id=uuid.uuid4().hex[:12],
@@ -1294,6 +1298,7 @@ def _write_manifest(journal: Journal, digests: Mapping[str, str]) -> str:
     # Not "*.json": `journals()` and every caller glob "relocate-*.json" for journals.
     path = journal.path[: -len(".json")] + ".manifest"
     tmp = path + ".tmp"
+    assert_not_real_profile_under_pytest(tmp, operation="write the swap manifest")
     with open(tmp, "w", encoding="utf-8") as fh:  # noqa: PTH123
         json.dump(record, fh)
         fh.flush()
