@@ -189,6 +189,8 @@ class Journal:
     restore_planned: bool = False
     target_id: int = 0
     target_planned: bool = False
+    # Saved before the old copy's removal starts: from then on it may be partial (B6 M2).
+    old_copy_partial: bool = False
     # Saved before the freeze rename: until then the original was never moved (B3 H1).
     freeze_attempted: bool = False
     # The old copy as it was at the swap; delete_old_copy compares against it (B3 H3).
@@ -295,11 +297,18 @@ def _volume_serial(path: str) -> int | None:
         current = current.parent
 
 
-def _free_bytes(path: str) -> int:
+def _volume_anchor(path: str) -> str:
+    """The nearest existing real folder at or above `path`: a junction (the moved folder's
+    old path) is not followed, so what is measured is the volume `path` itself is on."""
     current = Path(_norm(path))
-    while not _exists(str(current)) and current.parent != current:
+    while (not _exists(str(current)) or _is_reparse(str(current))) and current.parent != current:
         current = current.parent
-    return shutil.disk_usage(long_path(current)).free
+    return str(current)
+
+
+def _free_bytes(path: str) -> int:
+    """Free space of the volume `path` itself is on, never through a junction (B6 M1)."""
+    return shutil.disk_usage(long_path(Path(_volume_anchor(path)))).free
 
 
 # ------------------------------------------------------------------ Win32
@@ -1460,32 +1469,7 @@ def _rollback_after_swap(
         return _finish_rollback(journal, clock, "restored the folder")  # an earlier run did it
     target_here = not _gone(tgt)
     if use_old_copy or not target_here:
-        old = moved if _is_original(journal, moved) else None
-        if old is None and journal.restore_id and _is_original(journal, restore):
-            old = restore  # a complete copy an interrupted rollback made from the target
-        if old is None:
-            raise RelocateError(
-                f"there is nothing to put back: the copy from before the move is gone and {tgt} "
-                "is not reachable"
-            )
-        if _is_reparse(src):
-            _remove_junction(src)
-        if not _exists(src):
-            _rename(old, src)
-        if target_here:
-            extra = (
-                f"; the moved folder {tgt} is left as it is, with everything written there since"
-            )
-        else:
-            extra = (
-                f"; {tgt} was not reachable, so anything written there after the move is only there"
-            )
-        if not _is_original(journal, src):
-            raise RelocateError(
-                f"could not restore {src}; the original is in {_where_original(journal)}"
-            )
-        journal.log(Stage.ROLLED_BACK, "put back the copy from before the move" + extra, clock)
-        return Outcome(journal, "put back the copy from before the move" + extra)
+        return _put_back_old_copy(journal, clock, target_here)
     _probe_target(tgt)
     try:
         files, _ = _listing(tgt)
@@ -1495,7 +1479,10 @@ def _rollback_after_swap(
             "before the move instead, and leaves the moved folder as it is"
         ) from exc
     need = int(sum(st.st_size for st in files.values()) * 1.1)
-    if not (_is_original(journal, restore) or free_bytes(src) >= need):
+    # A partial restore of ours is removed before the copy starts again, so its space counts as
+    # free (B6 L1); the free space is the source volume's, never measured through the junction.
+    partial = sum(st.st_size for st in _listing(restore)[0].values()) if _exists(restore) else 0
+    if free_bytes(_volume_anchor(src)) + partial < need:
         raise RelocateError(
             f"copying {tgt} back needs {need / 2**30:.1f} GiB free where it came from; nothing "
             "changed. Free that much, or roll back with use_old_copy (puts back the copy from "
@@ -1516,15 +1503,22 @@ def _rollback_after_swap(
         # Anything written to the moved folder between the copy and the removal; the restore
         # folder is ours, so bringing it to the target exactly removes only our own copies.
         _delta_sync(tgt, restore, started)
-    except Exception:
+        repaired = _repair_from_old_copy(journal, restore)
+        if not _exists(src):
+            _rename(restore, src)
+    except Exception as exc:
+        # Whatever failed after the junction went (a held file at the rename, a read error in
+        # the repair), the original path must not be left empty (B6 M3).
         if not _exists(src):
             _create_junction(src, tgt)
             _keep_root_flags(tgt, src)
             journal.log(Stage.ROLLING_BACK, "copying back failed; junction restored", clock)
-        raise
-    repaired = _repair_from_old_copy(journal, restore)
-    if not _exists(src):
-        _rename(restore, src)
+        if isinstance(exc, RelocateError):
+            raise
+        raise RelocateError(
+            f"copying the folder back failed ({exc}); {src} points to {tgt} again and nothing is "
+            "lost. Roll back again when the cause is gone"
+        ) from exc
     note = "restored the folder as it is now"
     if repaired:
         note += (
@@ -1532,6 +1526,65 @@ def _rollback_after_swap(
             f"changed since the move (a bad copy), so their original was used: {_sample(repaired)}"
         )
     return _finish_rollback(journal, clock, note)
+
+
+def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here: bool) -> Outcome:
+    """`use_old_copy`, or a moved folder that is gone: the copy from before the move goes back
+    to its path, and the moved folder (if reachable) is left exactly as it is."""
+    src, tgt, moved = journal.source, journal.target, journal.moved
+    restore = src + RESTORE_SUFFIX
+    old = moved if _is_original(journal, moved) else None
+    if old is not None and journal.old_copy_partial:
+        # A delete of the old copy was interrupted: what is left is not the copy from before
+        # the move (B6 M2).
+        if target_here:
+            raise RelocateError(
+                f"{moved} was partly deleted, so it is not the copy from before the move any "
+                "more; nothing changed. Roll back without use_old_copy to restore the moved folder"
+            )
+        raise RelocateError(
+            f"{tgt} is not reachable and {moved} was partly deleted; nothing changed. Reconnect "
+            f"the drive of {tgt} and roll back again"
+        )
+    if old is None and not target_here and journal.restore_id and _is_original(journal, restore):
+        old = restore  # a complete copy an interrupted rollback made from the target
+    if old is None:
+        if target_here:
+            if not _exists(src):
+                # An interrupted copy-back had removed the junction: put it back, so the
+                # original path is never left empty by a refusal.
+                _create_junction(src, tgt)
+                _keep_root_flags(tgt, src)
+            raise RelocateError(
+                "there is no copy from before the move left (it was deleted); nothing changed. "
+                "Roll back without use_old_copy to restore the moved folder"
+            )
+        raise RelocateError(
+            f"there is nothing to put back: the copy from before the move is gone and {tgt} "
+            "is not reachable"
+        )
+    if _is_reparse(src):
+        _remove_junction(src)
+    if not _exists(src):
+        _rename(old, src)
+    if not _is_original(journal, src):
+        raise RelocateError(
+            f"could not restore {src}; the original is in {_where_original(journal)}"
+        )
+    if target_here:
+        extra = f"; the moved folder {tgt} is left as it is, with everything written there since"
+        ours = (journal.restore_id and _is_original(journal, restore)) or (
+            journal.restore_planned and journal.restore_id == 0
+        )
+        if old != restore and _exists(restore) and ours:
+            # Our own copy of the moved folder from a stopped copy-back; the moved folder it
+            # copied is still there, so it holds nothing unique (B6 L2).
+            rmtree_reparse_point_safe(long_path(Path(restore)))
+    else:
+        extra = f"; {tgt} was not reachable, so anything written there after the move is only there"
+    note = "put back the copy from before the move" + extra
+    journal.log(Stage.ROLLED_BACK, note, clock)
+    return Outcome(journal, note)
 
 
 def _repair_from_old_copy(journal: Journal, restore: str) -> list[str]:
@@ -1632,6 +1685,11 @@ def _where_original(journal: Journal) -> str:
     src = journal.source
     for path in (journal.moved, src + PROBE_SUFFIX, src + RESTORE_SUFFIX):
         if _is_original(journal, path):
+            if journal.junction_attempted and path == journal.moved and _exists(journal.target):
+                return (
+                    f"{path} (as it was before the move) and {journal.target} (with everything "
+                    "written since)"
+                )
             return path
     if _exists(journal.target):
         return journal.target
@@ -1801,7 +1859,7 @@ def delete_old_copy(
         return _finish_delete(journal, clock, free_bytes)
     if journal.stage not in (Stage.DONE, Stage.ROLLED_BACK):
         raise RelocateError(f"the move is {journal.stage}; nothing to delete")
-    age_days = (clock() - journal.swapped_at) / 86400
+    age_days = (clock() - _kept_since(journal)) / 86400
     if not confirmed and age_days < KEEP_OLD_COPY_DAYS:
         raise RelocateError(
             f"the old copy is kept for {KEEP_OLD_COPY_DAYS} days after the move "
@@ -1834,6 +1892,14 @@ def delete_old_copy(
             # The copy carries the source's mtime exactly, so an unchanged mtime means nothing
             # rewrote the file: different bytes are a bad copy, not an edit.
             differ.append(rel)
+    empty_streams = hashlib.sha256().hexdigest()
+    live_dirs = _listing(live)[1] | {""}
+    for rel, (_attrs, streams) in record["dirs"].items():
+        if streams == empty_streams:
+            continue
+        here = _join(live, rel) if rel else long_path(Path(live))
+        if rel not in live_dirs or _folder_meta(here)[1] != streams:
+            missing.append(f"{rel or '.'} (its named streams)")
     if differ:
         raise RelocateError(
             f"{len(differ)} files in {live} differ from the old copy without having been changed "
@@ -1844,12 +1910,22 @@ def delete_old_copy(
             f"{len(missing)} files of the old copy are no longer in {live} "
             f"({_sample(missing)}); nothing deleted. Accept that to delete anyway."
         )
+    journal.old_copy_partial = True
     journal.log(
         Stage.DELETING_OLD,
         f"verified {len(recorded) - len(missing)} files; {len(missing)} accepted as removed",
         clock,
     )
     return _finish_delete(journal, clock, free_bytes)
+
+
+def _kept_since(journal: Journal) -> float:
+    """When the old copy started being kept: the swap, or, for a swap a kill interrupted
+    before DONE, the moment it was journalled."""
+    if journal.swapped_at:
+        return journal.swapped_at
+    times = [float(s[0]) for s in journal.history if s[1] == Stage.SWAPPING.value]  # type: ignore[arg-type]
+    return max(times) if times else journal.created_at
 
 
 def _read_manifest(journal: Journal) -> dict[str, Any]:
@@ -1914,7 +1990,7 @@ def _finish_delete(
         rmtree_reparse_point_safe(long_path(Path(journal.moved)))
     if not _gone(journal.moved):
         raise RelocateError(f"{journal.moved} is still there; nothing was reported deleted")
-    journal.source_free_after = free_bytes(journal.source)
+    journal.source_free_after = free_bytes(_volume_anchor(journal.source))  # not the junction
     freed = journal.source_free_after - journal.source_free_before
     journal.log(Stage.DELETED_OLD, f"volume free space changed by {freed} bytes", clock)
     return Outcome(journal, f"deleted the old copy; the volume gained {freed / 2**30:.2f} GiB")

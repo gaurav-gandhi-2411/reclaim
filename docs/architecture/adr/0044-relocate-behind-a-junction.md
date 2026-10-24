@@ -315,3 +315,33 @@ other drive. The requirement is that it is never lost and lands at its original 
 `use_old_copy` needs none, but leaves post-move writes in the moved folder.
 
 **Mutation** (`D:\reclaim-build\tools\mutate_rl5.py`, 9 mutants of the new rollback): all 9 killed.
+## Addendum 6 (2026-10-24): sixth hostile review (B6), FAIL on edges, fixed
+
+The sixth independent review, of `4eb7b06` (the redesigned rollback), found no high findings.
+Its new sweep killed the new rollback at 99 points in 4 variants (old copy kept or deleted, then a
+plain rollback or `use_old_copy`). The cases included edits on both sides, a case rename, a long
+path, streams, read-only files, and writes and deletes during the copy-back. Not one byte of any
+file was lost, and the old copy was never written.
+
+It found ten problems (`tests/test_relocate_review_b6.py`):
+- **M1, L5:** the space check, and the "volume gained" figure, measured the target volume. The
+  check was handed the junction, and `shutil.disk_usage` follows it. Free space is now taken at
+  the nearest real folder of the original path, so a rollback can no longer fill the drive it was
+  meant to relieve.
+- **M2:** a partly deleted old copy was put back as "the copy from before the move". An
+  interrupted delete is now remembered before removal starts, and such a copy is never put back;
+  the message says what to do.
+- **M3:** a failure after the junction was removed (a held file at the final rename, a read error
+  in the repair) left the original path empty. Every step after the removal is now inside the
+  guard that puts the junction back.
+- **M4:** `delete_old_copy` deleted folder streams the live folder no longer had. A recorded folder
+  stream missing from the live folder now counts as missing, and needs `accept_missing`.
+- **M5:** rolling back a swap that never reached DONE skipped the 7-day keep period. It now
+  counts from the moment the swap was journalled.
+- **Low findings:**
+  - a partial restore no longer skips the space check (L1);
+  - `use_old_copy` removes our own restore copy when the moved folder is still there (L2);
+  - a refusal never leaves the original path empty: the junction is put back first;
+  - messages name both places the data is (L3, L4).
+
+**Mutation** (`D:\reclaim-build\tools\mutate_rl6.py`, 8 mutants): all 8 killed.
