@@ -84,6 +84,24 @@ _audit_configured_for_path: Path | None = None
 AUDIT_LOGGER_NAME = "reclaim.audit"
 
 
+class _CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """Console handler that writes to whatever `sys.stderr` is when a record is emitted.
+
+    A plain `StreamHandler(sys.stderr)` keeps the object of configure time. When that stream is
+    replaced and closed (pytest's capture of the test that called `cli.main`), every later line
+    fails in `emit()`, and `Handler.handleError` prints a traceback in its place (D4).
+    """
+
+    @property
+    def stream(self) -> object:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value: object) -> None:
+        # `StreamHandler.__init__`/`setStream` assign here; the stream is always looked up.
+        pass
+
+
 def get_audit_logger() -> structlog.stdlib.BoundLogger:
     """The logger for rare, security-relevant events that must survive regardless of how much
     routine debug volume happens around them (BE2) -- currently just api.scan_initiated (AN4).
@@ -145,7 +163,7 @@ def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO
         cache_logger_on_first_use=True,
     )
 
-    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler = _CurrentStderrHandler()
     console_handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             processor=structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty()),

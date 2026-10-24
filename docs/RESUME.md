@@ -96,6 +96,64 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     2. A5: build 11 from it.
     3. A6.
     4. B.
+- 09:15 IST checkpoint 9 (24 Oct):
+  - **#198** (checkpoint 8 docs) merged as `f299ad0`; main CI green after it.
+  - **Agent artifacts:** the ninth and tenth narrow reviews PASSED (fixes `07dc814`, `b17904d`, `1c07e1d`; ADR addenda 9 and 10). No eleventh round. Full verify on `7b759ea`: 2579 passed, 22 skipped.
+  - **A4 done:** `integration/run-2026-10` = `129d982`, PR #199 open for GG's merge (size gate), CI 6/6 green. #182 closed in favour of #199.
+  - **A5 blocked:** build 12 was stopped by the low-memory reaper during the Nuitka compile (free RAM 3.8 GB, other sessions). Not restarted (section 8, item 8). Nothing installed; the installed build is still `c010a58`. A6 and #199's screenshots wait for it.
+  - **Next:**
+    1. B: relocate (spec `docs/specs/relocate.md`), built and tested hermetically; real machine dry run only.
+    2. C, then D.
+    3. A5/A6 if GG restarts build 12.
+- 10:40 IST checkpoint 10 (24 Oct):
+  - **#200** (checkpoint 9 docs) merged as `708f023`.
+  - **Phase B, relocate:**
+    - built on `feat/relocate` (engine, CLI, eval gate) and `feat/relocate-ui` (dashboard page), not yet in a PR;
+    - reviews B1 and B2 FAILED and are fixed (head `603f189`; ADR-0044 addenda 1-2);
+    - a third review is running; 115 relocate tests pass;
+    - real machine: the read-only candidate list only (review pack section 5).
+  - **A5/A6:** still waiting for build 12 (section 8, item 8).
+  - **Next:**
+    1. Third relocate review, full verify, PR into `integration/run-2026-10`.
+    2. Phase C (MCP packaging and planner).
+    3. Phase D.
+- 14:20 IST checkpoint 11 (24 Oct):
+  - **Relocate:** six hostile reviews; rollback after the swap redesigned without a merge (DECISIONS 12). Head `9474aa8`, 187 tests pass, mutation 87 mutants (all killed but 5 equivalent). Review 7 running. Draft **#202** (with the page).
+  - **Phase C:** planner, read-only tools, settings panel, HOWTO section 8, end-to-end smoke with Claude Code. Draft **#203**.
+  - **Owed:** the full verify of both (queued on an export; free RAM has been 6-7.7 GB all day). A5/A6 still wait for build 12.
+  - **Next:**
+    1. Review 7 result; full verify.
+    2. Merge #202 and #203 into `integration/run-2026-10`.
+    3. Phase D.
+- 19:45 IST checkpoint 12 (24 Oct):
+  - **Merged, main CI green after each:**
+    - #206 logging fix (`e9058c6`);
+    - #207 load-robust budgets, D4 (`c07b1cf`);
+    - #205 reconciliation survives restarts, D1 (`1a42294`; DECISIONS 16);
+    - #208 ADR-0045, D2 (`18e40d2`);
+    - #209 D7/D8 plans (after a fix to the WSL fallback order).
+  - **Open for self-merge:** #210 ADR index (D6), waiting for its verifier pass.
+  - **Relocate (#202):**
+    - mutation round 7: 3 real test gaps found and closed;
+    - review B9 FAILED, with 2 medium and 3 low and no lost byte. The worst: an 8.3 short name left the real path empty. All fixed (addendum 9), mutation 4/4, 388 relocate tests pass;
+    - the narrow review B10 is running;
+    - CI 6/6 green on `9263b2b`, after main's logging fix was merged into both branches.
+  - **Next:**
+    1. B10 result. Then the full verify (RAM), and #202/#203 into `integration/run-2026-10`, regenerating the ADR index there.
+    2. D5 (warm-up profile) and the rest of D6 (HOWTO, README screenshots).
+    3. Phase E.
+- 22:45 IST checkpoint 13 (24 Oct):
+  - **Merged:** #210, the ADR index (D6, `9a88e3c`), and checkpoint 12 (#211).
+  - **Relocate (#202):**
+    - reviews B10, B11 and B12 FAILED on narrower path and name edges, with no lost byte;
+    - all fixed (addenda 10-12), mutation 19 of 19;
+    - the series stops at twelve (DECISIONS 17);
+    - `feat/relocate-ui` = `82fa6b2`; 496 relocate, eval-gate and guard tests pass.
+  - **Full verify of `82fa6b2`:** waiting on its RAM gate.
+  - **Next:**
+    1. When the verify passes: merge #202 and #203 into `integration/run-2026-10`, regenerate the ADR index there (ADR-0043/0044), add `list_relocation_options`, and update #199.
+    2. D5 (warm-up profile).
+    3. Phase E.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above

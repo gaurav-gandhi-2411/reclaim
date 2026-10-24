@@ -1226,27 +1226,30 @@ def _reconciliation_fields(
     index: ScanIndex, state: AppState
 ) -> tuple[str | None, int | None, float | None]:
     """`(volume, delta_bytes, delta_pct)` for `SummaryResponse`'s volume-level reconciliation
-    (P0-5) -- `(None, None, None)` whenever the most recently completed scan wasn't a genuine
-    whole-single-drive scan, since `compute_disk_reconciliation` has no way to distinguish a
-    real inaccessible-directory undercount from "this index just never covered the whole
-    volume", and this function never guesses. `OSError` (a real `shutil.disk_usage` failure --
-    e.g. the volume was unmounted since the scan) is likewise treated as "not available" rather
-    than surfaced as a 500 on an otherwise-working summary endpoint.
+    (P0-5), against the first drive root (in sorted order, so `C:` before `D:`) that a scan has
+    ever walked in full, as recorded in the index (`ScanIndex.completed_scan_roots`, D1) -- so it
+    survives a restart and covers each drive of a multi-drive scan. `(None, None, None)` while a
+    scan is running (the index is mid-update) or when no drive root was ever walked in full:
+    `compute_disk_reconciliation` has no way to distinguish a real inaccessible-directory
+    undercount from "this index just never covered the whole volume", and this function never
+    guesses. `OSError` (a real `shutil.disk_usage` failure -- e.g. the volume was unmounted since
+    the scan) skips that root rather than surfacing a 500 on an otherwise-working endpoint.
     """
     with state.lock:
-        root = state.scan_status.root
-        drives_total = state.scan_status.drives_total
-        status = state.scan_status.status
-    if status != "completed" or root is None or drives_total != 1 or not is_volume_root(root):
-        return None, None, None
-    try:
-        report = compute_disk_reconciliation(
-            index, root, indexed_bytes=cached_physical_size_bytes(index, state, under=root)
-        )
-    except (NotAVolumeRootError, OSError) as exc:
-        logger.warning("api.reconciliation_unavailable", volume=str(root), error=str(exc))
-        return None, None, None
-    return report.volume, report.delta_bytes, report.delta_pct
+        if state.scan_status.status == "running":
+            return None, None, None
+    for root in index.completed_scan_roots():
+        if not is_volume_root(root):
+            continue
+        try:
+            report = compute_disk_reconciliation(
+                index, root, indexed_bytes=cached_physical_size_bytes(index, state, under=root)
+            )
+        except (NotAVolumeRootError, OSError) as exc:
+            logger.warning("api.reconciliation_unavailable", volume=str(root), error=str(exc))
+            continue
+        return report.volume, report.delta_bytes, report.delta_pct
+    return None, None, None
 
 
 def build_summary(state: AppState, *, require_warm: bool = True) -> SummaryResponse:
