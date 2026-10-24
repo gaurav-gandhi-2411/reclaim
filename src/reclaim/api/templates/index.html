@@ -300,6 +300,28 @@
       <!-- BH5 (2026-08-26 audit): R5's disk-space toast notification shipped with no way to turn
            it on -- no config.default.toml section, no toggle here. This closes the second half
            (the config.default.toml section is packaging/config.default.toml's own fix). -->
+      <!-- Run spec Phase C: connect an AI assistant. Text with copy buttons only: Reclaim never
+           edits a client's config file. -->
+      <section class="rc-settings-panel" aria-labelledby="assistant-heading">
+        <h2 id="assistant-heading">Use Reclaim from your AI assistant</h2>
+        <p>Claude Desktop, Claude Code and Codex CLI can use Reclaim on this computer: scan, see what is using space, and plan what to clean. Every clean still shows a card here that you approve, and everything it cleans can be restored. Paste the text for your assistant into its settings; Reclaim never changes them for you. Keep this window open while you use it.</p>
+        <p id="assistant-setup-status" class="rc-meta" role="status" aria-live="polite"></p>
+        <div id="assistant-setup" hidden>
+          <h3>Claude Desktop</h3>
+          <p class="rc-meta">Add to <code>%APPDATA%\Claude\claude_desktop_config.json</code>, then restart Claude Desktop.</p>
+          <pre class="rc-snippet"><code id="assistant-claude-desktop"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-claude-desktop">Copy</button>
+          <h3>Claude Code</h3>
+          <p class="rc-meta">Run once in a terminal.</p>
+          <pre class="rc-snippet"><code id="assistant-claude-code"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-claude-code">Copy</button>
+          <h3>Codex CLI</h3>
+          <p class="rc-meta">Add to <code>%USERPROFILE%\.codex\config.toml</code>.</p>
+          <pre class="rc-snippet"><code id="assistant-codex"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-codex">Copy</button>
+        </div>
+      </section>
+
       <section class="rc-settings-panel" aria-labelledby="notifications-heading">
         <h2 id="notifications-heading">Low disk space alert</h2>
         <p>A native Windows notification when your system drive crosses a usage threshold — checked a few times a day by a background task. Off by default; nothing is sent anywhere, and no scan or file access is involved.</p>
