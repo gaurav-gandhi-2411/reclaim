@@ -19,6 +19,7 @@ restored source) and the old copy (after every file of it is proved present in t
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -58,6 +59,11 @@ KEEP_OLD_COPY_DAYS = 7
 # size and mtime look unchanged (the prototype's 2 s window: NTFS mtime is precise, but a
 # writer can finish inside the same tick the copy read the file).
 _DELTA_WINDOW_NS = 2_000_000_000
+# Room the journal's drive needs for the move's journal and manifest (a few hundred bytes per
+# file) and for the rollback's own writes if the move fails: the journal usually lives on the
+# drive being freed, which is often the full one (B7 M2). A failed save after the freeze would
+# leave the folder parked at `<name>.reclaim-moved` with no way to roll back.
+JOURNAL_RESERVE_BYTES = 64 * 2**20
 _CHUNK = 1 << 20
 _MAX_LISTED = 5
 
@@ -195,6 +201,10 @@ class Journal:
     freeze_attempted: bool = False
     # The old copy as it was at the swap; delete_old_copy compares against it (B3 H3).
     manifest: str = ""
+    # Set only once the restore folder is a complete, hash-verified copy of the moved folder, and
+    # cleared as soon as anything starts changing it again. A restore folder without it may be
+    # partial and is never put back as the folder (B7 H1).
+    restore_verified: bool = False
     history: list[list[object]] = field(default_factory=list)
     path: str = ""
 
@@ -1036,6 +1046,14 @@ def plan_move(
         reasons.append("the target is on the same volume, so nothing would be freed")
     target_free = free_bytes(tgt)
     source_free = free_bytes(src) if _exists(src) else 0
+    if journal_dir is not None and found.verdict is Verdict.MOVABLE:
+        journal_free = free_bytes(str(journal_dir))
+        if journal_free < JOURNAL_RESERVE_BYTES:
+            reasons.append(
+                f"the drive of the journal folder {journal_dir} has {journal_free / 2**20:.0f} MiB "
+                f"free; the move needs {JOURNAL_RESERVE_BYTES // 2**20} MiB there for its record, "
+                "or it could not be undone if it failed"
+            )
     if found.verdict is Verdict.MOVABLE and target_free < SPACE_MARGIN * found.bytes:
         reasons.append(
             f"the target volume has {target_free / 2**30:.1f} GiB free; the move needs "
@@ -1106,7 +1124,7 @@ def execute_move(
     except RelocateError as exc:
         # Usually nothing changed (the first rename failed). But a program can recreate the
         # folder between the probe's two renames (B3 H2): the rollback decides from the disk.
-        rollback(Path(journal.path), clock=clock)
+        _rollback_or_explain(journal, exc, clock)
         raise RelocateError(f"not moved: {exc}") from exc
     hook = checkpoint or (lambda _name: None)
     try:
@@ -1161,9 +1179,24 @@ def execute_move(
         journal.log(Stage.DONE, f"old copy kept at {plan.moved}", clock)
     except Exception as exc:
         logger.warning("relocate_failed", id=journal.id, stage=journal.stage, error=str(exc))
-        outcome = rollback(Path(journal.path), clock=clock)
+        outcome = _rollback_or_explain(journal, exc, clock)
         raise RelocateError(f"move failed and was rolled back ({exc}). {outcome.message}") from exc
     return Outcome(journal, f"moved; {plan.source} now points to {plan.target}")
+
+
+def _rollback_or_explain(
+    journal: Journal, cause: BaseException, clock: Callable[[], float]
+) -> Outcome:
+    """The failed move's own rollback. If that fails too (a held file at the rename, the
+    journal's drive full), say which move it is and what to run, never a raw error (B7 M2)."""
+    try:
+        return rollback(Path(journal.path), clock=clock)
+    except (OSError, RelocateError) as exc:
+        raise RelocateError(
+            f"move {journal.id} failed ({cause}) and could not be rolled back ({exc}). Nothing "
+            f"was deleted; the folder may be parked at {journal.moved}. Run "
+            f"`reclaim relocate recover {journal.id}` once the cause is gone"
+        ) from exc
 
 
 def _write_manifest(journal: Journal, digests: Mapping[str, str]) -> str:
@@ -1496,14 +1529,26 @@ def _rollback_after_swap(
             f"{exc}. Nothing changed. Rolling back with use_old_copy puts back the copy from "
             "before the move instead"
         ) from exc
+    except OSError as exc:
+        # The target going away mid-copy is an OSError, not a RelocateError (B7 H1).
+        raise RelocateError(
+            f"copying {tgt} back was interrupted ({exc}); nothing changed at {src}. The moved "
+            f"data is on {tgt}: reconnect it and roll back again"
+        ) from exc
     if _is_reparse(src):
         _remove_junction(src)
         journal.log(Stage.ROLLING_BACK, "junction removed", clock)
     try:
         # Anything written to the moved folder between the copy and the removal; the restore
         # folder is ours, so bringing it to the target exactly removes only our own copies.
+        # It changes the restore folder, so until the sync has proved it again it is not a
+        # copy anything may be put back from (B7 H1).
+        journal.restore_verified = False
+        journal.save()
         _delta_sync(tgt, restore, started)
         repaired = _repair_from_old_copy(journal, restore)
+        journal.restore_verified = True
+        journal.save()
         if not _exists(src):
             _rename(restore, src)
     except Exception as exc:
@@ -1534,20 +1579,36 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
     src, tgt, moved = journal.source, journal.target, journal.moved
     restore = src + RESTORE_SUFFIX
     old = moved if _is_original(journal, moved) else None
+    restore_ok = (
+        not target_here
+        and journal.restore_verified
+        and journal.restore_id != 0
+        and _is_original(journal, restore)
+    )
     if old is not None and journal.old_copy_partial:
         # A delete of the old copy was interrupted: what is left is not the copy from before
-        # the move (B6 M2).
+        # the move (B6 M2). A verified restore copy of the moved folder is still whole, though.
         if target_here:
             raise RelocateError(
                 f"{moved} was partly deleted, so it is not the copy from before the move any "
                 "more; nothing changed. Roll back without use_old_copy to restore the moved folder"
             )
+        if not restore_ok:
+            raise RelocateError(
+                f"{tgt} is not reachable and {moved} was partly deleted; nothing changed. "
+                f"Reconnect the drive of {tgt} and roll back again"
+            )
+        old = None
+    if old is None and restore_ok:
+        old = restore  # a complete, verified copy an interrupted rollback made from the target
+    if old is None and not target_here and _exists(restore) and _is_original(journal, restore):
+        # The restore copy exists but was never proved complete (a copy-back cut short): the
+        # target holds the only whole copy of the moved folder (B7 H1).
         raise RelocateError(
-            f"{tgt} is not reachable and {moved} was partly deleted; nothing changed. Reconnect "
-            f"the drive of {tgt} and roll back again"
+            f"{restore} is only part of the moved folder (the copy back was interrupted), so it "
+            f"is not put back; nothing changed. The moved data is on {tgt}: reconnect that "
+            "drive and roll back again"
         )
-    if old is None and not target_here and journal.restore_id and _is_original(journal, restore):
-        old = restore  # a complete copy an interrupted rollback made from the target
     if old is None:
         if target_here:
             if not _exists(src):
@@ -1563,10 +1624,21 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
             f"there is nothing to put back: the copy from before the move is gone and {tgt} "
             "is not reachable"
         )
-    if _is_reparse(src):
-        _remove_junction(src)
-    if not _exists(src):
-        _rename(old, src)
+    junction_removed = False
+    try:
+        if _is_reparse(src):
+            _remove_junction(src)
+            junction_removed = True
+        if not _exists(src):
+            _rename(old, src)
+    except OSError as exc:
+        # Same guard as the copy-back's (B6 M3): never leave the original path empty (B7 M1).
+        if junction_removed and not _exists(src):
+            _recreate_junction(journal, clock, "putting the old copy back failed")
+        raise RelocateError(
+            f"could not put {old} back at {src} ({exc}); {src} is as it was and nothing is "
+            "lost. Close whatever holds files open there and roll back again"
+        ) from exc
     if not _is_original(journal, src):
         raise RelocateError(
             f"could not restore {src}; the original is in {_where_original(journal)}"
@@ -1582,9 +1654,27 @@ def _put_back_old_copy(journal: Journal, clock: Callable[[], float], target_here
             rmtree_reparse_point_safe(long_path(Path(restore)))
     else:
         extra = f"; {tgt} was not reachable, so anything written there after the move is only there"
-    note = "put back the copy from before the move" + extra
+    if old == restore:
+        note = (
+            f"put back the verified copy of the moved folder that an interrupted rollback made "
+            f"from {tgt}; the old copy of the folder had been deleted"
+        )
+    else:
+        note = "put back the copy from before the move" + extra
     journal.log(Stage.ROLLED_BACK, note, clock)
     return Outcome(journal, note)
+
+
+def _recreate_junction(journal: Journal, clock: Callable[[], float], why: str) -> None:
+    """Puts the junction src -> target back and proves it points there (B7 M1)."""
+    src, tgt = journal.source, journal.target
+    _create_junction(src, tgt)
+    with contextlib.suppress(OSError):  # an unreachable target: the junction is what counts
+        _keep_root_flags(tgt, src)
+    pointed = _junction_target(src)
+    if pointed is None or _key(pointed) != _key(tgt):
+        raise RelocateError(f"the junction at {src} could not be restored to {tgt}; inspect it")
+    journal.log(Stage.ROLLING_BACK, f"{why}; junction restored", clock)
 
 
 def _repair_from_old_copy(journal: Journal, restore: str) -> list[str]:
@@ -1726,6 +1816,9 @@ def _rebuild_restore(journal: Journal) -> None:
     a restore folder of our own that already matches the target is reused; only one that does
     not match (a partial copy from an interrupted rollback) is removed and made again."""
     tgt, restore = journal.target, journal.source + RESTORE_SUFFIX
+    if journal.restore_verified:
+        journal.restore_verified = False
+        journal.save()
     if not _exists(tgt) or _is_reparse(tgt):
         kept = f"; {restore} is kept" if _exists(restore) else ""
         raise RelocateError(
@@ -1743,6 +1836,7 @@ def _rebuild_restore(journal: Journal) -> None:
             files, _ = _listing(tgt)
             if not _differences(tgt, restore, files):
                 journal.restore_id = _folder_id(restore)
+                journal.restore_verified = True
                 journal.save()
                 return
         except (RelocateError, OSError):
@@ -1762,6 +1856,8 @@ def _rebuild_restore(journal: Journal) -> None:
     bad = _differences(tgt, restore, files)
     if bad:
         raise RelocateError(f"{len(bad)} files did not copy back: {_sample(bad)}")
+    journal.restore_verified = True
+    journal.save()
 
 
 def _probe_target(target: str) -> None:
@@ -1774,7 +1870,13 @@ def _probe_target(target: str) -> None:
         _rename(target, probe_path)
     except OSError as exc:
         raise InUseError(f"{target} is in use: close the program using it, then retry") from exc
-    _rename(probe_path, target)
+    try:
+        _rename(probe_path, target)
+    except OSError as exc:  # pragma: no cover -- only a racing writer can recreate `target`
+        raise RelocateError(
+            f"the probe left the moved folder at {probe_path} ({exc}): rename it back to "
+            f"{target}, then roll back again"
+        ) from exc
 
 
 def _discard_copy(journal: Journal) -> tuple[str, str] | None:
@@ -1816,7 +1918,13 @@ def _discard_copy(journal: Journal) -> tuple[str, str] | None:
             return (tgt, f"it could not be compared with the restored folder: {exc}")
         if bad:
             return (tgt, f"{len(bad)} of its files or folders differ from the restored folder")
-    rmtree_reparse_point_safe(long_path(Path(tgt)))
+    try:
+        rmtree_reparse_point_safe(long_path(Path(tgt)))
+    except OSError as exc:
+        raise RelocateError(
+            f"the original is back at {journal.source}, but {tgt} could not be removed ({exc}); "
+            "close what holds it open and roll back again"
+        ) from exc
     for parent in reversed(journal.created_parents):
         try:
             assert_not_real_profile_under_pytest(parent, operation="remove")
@@ -1987,7 +2095,14 @@ def _finish_delete(
     journal: Journal, clock: Callable[[], float], free_bytes: Callable[[str], int] = _free_bytes
 ) -> Outcome:
     if not _gone(journal.moved):
-        rmtree_reparse_point_safe(long_path(Path(journal.moved)))
+        try:
+            rmtree_reparse_point_safe(long_path(Path(journal.moved)))
+        except OSError as exc:
+            raise RelocateError(
+                f"{journal.moved} could not be fully deleted ({exc}); what is left is still the "
+                f"old copy minus what went. Close what holds it open and run `reclaim relocate "
+                f"delete-old {journal.id}` again"
+            ) from exc
     if not _gone(journal.moved):
         raise RelocateError(f"{journal.moved} is still there; nothing was reported deleted")
     journal.source_free_after = free_bytes(_volume_anchor(journal.source))  # not the junction

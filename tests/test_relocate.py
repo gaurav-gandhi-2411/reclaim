@@ -633,7 +633,7 @@ def test_a_file_missing_from_the_target_needs_an_explicit_accept(env: Env) -> No
 
 def test_the_freed_figure_is_the_volume_free_space_delta(env: Env) -> None:
     _make_tree(env.source)
-    readings = iter([BIG, 9_000])  # the target volume, then the source volume
+    readings = iter([BIG, 9_000, BIG])  # the target volume, the source volume, the journal drive
     execute_move(
         env.source, env.target, env.policy, env.journals, free_bytes=lambda _p: next(readings)
     )
