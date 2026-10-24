@@ -169,3 +169,26 @@ def test_one_job_at_a_time_and_unknown_ids(setup: tuple[TestClient, Path, Path])
     assert client.post("/api/relocate/nope/rollback").status_code == 404
     assert client.post("/api/relocate/..%2F..%2Fx/rollback").status_code in {400, 404}
     assert client.get("/api/relocate/status").json()["status"] == "idle"
+
+
+def test_rollback_with_the_old_copy_and_the_kept_flag(setup: tuple[TestClient, Path, Path]) -> None:
+    client, source, _d = setup
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    (source / "w.bin").write_bytes(b"edited through the junction")
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    assert move["old_copy_kept"] is True
+    assert client.post(f"/api/relocate/{move['id']}/rollback?use_old_copy=true").status_code == 202
+    assert _wait(client)["status"] == "done"
+    assert (source / "w.bin").read_bytes() == b"w" * 1000  # the copy from before the move
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    assert move["stage"] == "rolled_back" and move["old_copy_kept"] is False
+    assert Path(plan["target"], "w.bin").read_bytes() == b"edited through the junction"

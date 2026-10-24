@@ -22,7 +22,7 @@ const calls = [];
 globalThis.fetch = async (path, options = {}) => {
   calls.push({ path, options });
   const body = path === "/api/relocate/status" ? { status: "done", message: "moved", kept: [] } : { candidates: [], moves: [] };
-  return new dom.window.Response(JSON.stringify(body), {
+  return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" },
   });

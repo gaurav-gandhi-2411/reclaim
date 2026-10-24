@@ -3477,7 +3477,7 @@ function renderRelocateMoves(moves) {
       );
       card.appendChild(undo);
     }
-    if (m.stage === "done") {
+    if (m.stage === "done" || (m.stage === "rolled_back" && m.old_copy_kept)) {
       const early = Date.now() / 1000 < (m.delete_old_allowed_at ?? 0);
       const del = document.createElement("button");
       del.type = "button";

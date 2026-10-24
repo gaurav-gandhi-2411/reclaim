@@ -168,6 +168,7 @@ class MoveOut(BaseModel):
     bytes: int
     swapped_at: float
     delete_old_allowed_at: float | None
+    old_copy_kept: bool
     history: list[list[object]]
 
 
@@ -326,9 +327,19 @@ def _journal_path(state: AppState, move_id: str) -> Path:
 
 
 @router.post("/{move_id}/rollback", response_model=JobOut, status_code=202)
-def rollback(move_id: str, background: BackgroundTasks, request: Request) -> JobOut:
+def rollback(
+    move_id: str, background: BackgroundTasks, request: Request, use_old_copy: bool = False
+) -> JobOut:
+    """Puts the folder back as the programs left it (default), or with `use_old_copy` the copy
+    from before the move (ADR-0044 addendum 5)."""
     path = _journal_path(_state(request), move_id)
-    return _start(request, background, "rollback", move_id, lambda: relocate.rollback(path))
+    return _start(
+        request,
+        background,
+        "rollback",
+        move_id,
+        lambda: relocate.rollback(path, use_old_copy=use_old_copy),
+    )
 
 
 @router.post("/{move_id}/delete-old", response_model=JobOut, status_code=202)
@@ -368,6 +379,7 @@ def moves(request: Request) -> MovesOut:
                 bytes=j.bytes,
                 swapped_at=j.swapped_at,
                 delete_old_allowed_at=j.swapped_at + keep if j.swapped_at else None,
+                old_copy_kept=relocate._is_original(j, j.moved),
                 history=j.history,
             )
             for j in reversed(rows)
