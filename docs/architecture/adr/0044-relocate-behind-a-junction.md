@@ -345,3 +345,64 @@ It found ten problems (`tests/test_relocate_review_b6.py`):
   - messages name both places the data is (L3, L4).
 
 **Mutation** (`D:\reclaim-build\tools\mutate_rl6.py`, 8 mutants): all 8 killed.
+
+## Addendum 7 (2026-10-24): seventh hostile review (B7), FAIL on one high finding, fixed
+
+The seventh independent review, of `9474aa8`, ran four more kill sweeps (a
+`use_old_copy` rollback at every point, `delete-old` after a rollback, a second move after a
+rollback, and a copy-back cut short and then the target drive going away). It found one high
+finding and a set of medium and low ones (`tests/test_relocate_review_b7.py`; 12 of the
+reviewer's 20 probes failed on `9474aa8`). Fixes, in four commits:
+
+**`1ddfe71`: H1, M1, M2**
+- **H1 (false success):** after the old copy was deleted, a copy-back cut short by the target
+  drive going away left a partial `<name>.reclaim-restore`. A retry took it for "the copy from
+  before the move" on its folder ID alone, renamed it into place, and journaled ROLLED_BACK. The
+  journal now records `restore_verified`, set only after the copy-back passed its SHA-256
+  compare and cleared whenever the restore folder starts changing again (including the final
+  sync). An unverified restore is refused, with the place the moved data is on and what to do. A
+  verified one is put back and described as the verified copy of the moved folder, never as "the
+  copy from before the move". A raw `OSError` from the copy-back is now a `RelocateError`.
+- **M1:** the `use_old_copy` put-back removed the junction and then failed on a held rename,
+  leaving the path empty and a raw `PermissionError`. It now puts the junction back (checked) and
+  raises a `RelocateError`, as the copy-back branch already did (B6 M3).
+- **M2:** a failed move whose own rollback also failed (a blocked rename, the journal's drive
+  full) escaped raw with the folder parked at `<name>.reclaim-moved`. It is now a `RelocateError`
+  naming the move and `reclaim relocate recover <id>`. The plan also refuses when the journal's
+  drive has under 64 MiB free (`JOURNAL_RESERVE_BYTES`). The second rename of `_probe_target`,
+  the `rmtree` in `_discard_copy` and the one in `_finish_delete` are wrapped the same way.
+
+**`1687597`: M3.** `delete_old_copy` never consulted the exclusions, and the CLI did not pass its
+policy. It now takes a REQUIRED keyword-only `policy` (no default) and refuses when the moved
+folder or the old copy is excluded, by the plan's own test (the path text, then the names
+beneath it). `recover` finishes an interrupted delete, so it takes the policy as well. The API
+route on `feat/relocate-ui` still has to pass it: in `src/reclaim/api/relocate_routes.py` the
+`delete_old` handler's `relocate.delete_old_copy(...)` call needs `policy=_policy(_state(request))`
+(the `_policy(state)` helper is already there). That file has no `recover` call. Its `moves()`
+handler calls `relocate.journals(...)`, which now raises `RelocateError` for a journal that
+cannot be read (L5), so it needs the same error mapping as the other routes.
+
+**`e09b6aa`: M4.** A kill after the junction was made, then a program writing into its folder
+before `recover` ran, made `recover` roll a finished move back. When the junction points to the
+journaled target, the target is the folder this move made, and the old copy still matches its
+swap manifest, recover now finishes forward to DONE. Any doubt keeps the conservative rollback.
+
+**`81aab11`: L1 to L5**
+- **L1:** `use_old_copy` is saved in the journal when a rollback starts, and `recover` honours
+  it. A later plain rollback replaces the saved choice.
+- **L2:** a rollback from DELETING_OLD says the old copy was partly deleted. `delete-old` after
+  it compares only what is left: a subset of the manifest with matching content may be finished,
+  anything else is refused with a message that does not blame a writer.
+- **L3:** a journal that ended DELETED_OLD after a rollback (the new `rolled_back` flag) no
+  longer blocks the folder. A DELETED_OLD after a completed move still blocks, and so does a
+  journal without the flag (fail closed).
+- **L4:** the refusal for a kept old copy names `reclaim relocate delete-old <id>`.
+- **L5:** `_is_original` also compares the volume (`source_dev`); a corrupt journal is a
+  `RelocateError` in `journals()`, so `status` prints a message; the plan refuses EFS-encrypted
+  files, and a target that is not a local fixed drive (`GetDriveTypeW`), before any copy.
+
+**Probes changed by a decision.** The reviewer's H1 probe expected a raw `OSError` from the cut
+copy-back; it is a `RelocateError` by design, and the probe now expects that. The M1 probe also
+asserts the junction is back. The second-move sweep no longer calls `rollback` on the deleted
+journal (L3 makes that unnecessary) and expects it to stay DELETED_OLD. The probe that ran a
+real move to `D:\reclaim-build` was left out: tests here never leave their own temp folder.
