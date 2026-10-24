@@ -1683,6 +1683,7 @@ def scan_tree(
                     ],
                     scanned_at=scanned_at,
                 )
+                index.record_completed_scan_root(root, completed_at=scanned_at)
         except (OSError, sqlite3.OperationalError) as exc:
             if _is_disk_full(exc):
                 raise ScanDiskFullError("disk is full — free up space and try again") from exc
