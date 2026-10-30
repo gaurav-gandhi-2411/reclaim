@@ -30,6 +30,23 @@ def _load() -> ModuleType:
 dj = _load()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may register a real scheduled task or write to the real jobs dir, even when the
+    guard under test is broken: a mutant that dropped the 8 GB check once let the launch-refusal
+    test register and run a real ReclaimJob-x from the real D:\\reclaim-build\\jobs."""
+    monkeypatch.setattr(dj, "JOBS_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr(dj, "CLEANUP_ROOT", tmp_path)
+    real_run = dj.subprocess.run
+
+    def guarded(cmd: list[str], *a: object, **k: object) -> object:
+        if cmd and cmd[0] == dj.SCHTASKS:
+            pytest.fail(f"a test reached the real schtasks: {cmd}")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(dj.subprocess, "run", guarded)
+
+
 def test_parse_disk_floors() -> None:
     assert dj.parse_disk_floors(["c:=20", "D:=50.5"]) == {"C:": 20.0, "D:": 50.5}
 
