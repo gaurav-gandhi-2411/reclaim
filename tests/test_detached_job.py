@@ -205,6 +205,9 @@ def test_cleanup_dir_may_not_be_the_root_or_hold_the_jobs_dir(tmp_path: Path) ->
     assert dj.cleanup_dir_problems(jobs, jobs, tmp_path)
     assert dj.cleanup_dir_problems(jobs / "other_job", jobs, tmp_path)
     assert dj.cleanup_dir_problems(tmp_path / "build", jobs, tmp_path) == []
+    # With the jobs dir outside the root, only the root-equality check refuses the root itself.
+    root = tmp_path / "root"
+    assert "strictly inside" in " ".join(dj.cleanup_dir_problems(root, jobs, root))
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
