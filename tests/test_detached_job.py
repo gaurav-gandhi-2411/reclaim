@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -579,3 +580,55 @@ def test_status_reports_a_runner_that_stopped_sampling(
     quiet = (dj._now() - dt.timedelta(seconds=90)).isoformat()
     (job / "status.json").write_text(json.dumps({"state": "running", "heartbeat": quiet}))
     assert dj.main(["status", "t"]) == 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+def test_abort_never_cleans_through_an_ancestor_the_job_made_a_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Data-safety pass 3: the cleanup dir a\b is new at start; the job then turns a into a
+    # junction to victim, so a\b resolves to victim\b, which holds files the job never made.
+    victim = tmp_path / "victim"
+    (victim / "b").mkdir(parents=True)
+    (victim / "b" / "precious.txt").write_text("data")
+    flag = tmp_path / "linked"
+    ancestor = tmp_path / "a"
+    job = (
+        "import pathlib, subprocess, time\n"
+        f"subprocess.run(['cmd', '/c', 'mklink', '/J', r'{ancestor}', r'{victim}'], check=True)\n"
+        f"pathlib.Path(r'{flag}').write_text('1')\n"
+        "time.sleep(60)\n"
+    )
+    ram = [9.0, 9.0, 9.0]
+
+    def fake_ram() -> float:
+        if ram:
+            return ram.pop(0)
+        _wait_for(flag)
+        return 1.0
+
+    monkeypatch.setattr(dj, "free_ram_gb", fake_ram)
+    monkeypatch.setattr(dj, "disk_free_gb", lambda _drive: 100.0)
+    r = _runner(tmp_path, command=[sys.executable, "-c", job], cleanup=[str(tmp_path / "a" / "b")])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert (victim / "b" / "precious.txt").read_text() == "data"
+    assert "REFUSED cleanup" in _log(tmp_path)
+
+
+def test_save_never_writes_through_a_link_left_at_the_tmp_name(tmp_path: Path) -> None:
+    r = _runner(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("DATA")
+    os.link(victim, tmp_path / "jobs" / "t" / "status.json.tmp")
+    r.save(state="waiting")  # type: ignore[attr-defined]
+    assert victim.read_text() == "DATA"
+    assert _status(tmp_path)["state"] == "waiting"
+
+
+@pytest.mark.parametrize("cmd", ["status", "forget"])
+def test_status_and_forget_refuse_a_name_that_is_a_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cmd: str
+) -> None:
+    monkeypatch.setattr(dj, "JOBS_ROOT", tmp_path / "jobs")
+    monkeypatch.setattr(dj.subprocess, "run", lambda *_a, **_k: pytest.fail("ran schtasks"))
+    assert dj.main([cmd, "..\outside"]) == 2

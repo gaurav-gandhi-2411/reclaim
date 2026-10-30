@@ -46,12 +46,25 @@ in each `--cleanup` dir are deleted:
   and not a junction, checked at launch and again at abort (after resolving links);
 - an entry that is, or holds, a junction or symlink, or cannot be read, is **not** deleted; it is
   logged as `REFUSED` and left for a person;
+- its resolved path must be its written path, so a junction the job made on a parent folder
+  at runtime cannot point the delete at another folder's files;
 - if the kill is not confirmed, the cleanup is skipped and logged;
 - every listing and deletion is written to `runner.log`.
 
 The job never starts without its Job Object. If the runner dies (the time limit, logoff, a
 reboot), the Job Object ends the command with it; there is then no cleanup and no `END` line,
 and `status` reports the job as stale. A task re-run on the same job dir is refused.
+
+**Limits** (data-safety pass 3; the job runs as you, so these guard against mistakes, not a
+hostile command):
+- give each job its **own** cleanup dir, never one shared with or nested in another running
+  job's: launch refuses a dir that exists, but two jobs launched before either creates its dir
+  are not checked against each other, and an abort would delete the other job's output there;
+- the kill is confirmed on the command itself; the Job Object ends its descendants, but a
+  process the command starts *outside* the Job Object (through Task Scheduler, a service or
+  WMI) is not tracked;
+- the runner's own files (`status.json`, the logs) live in the job dir; the status temp file
+  is unlinked before each write, but the job could still redirect the logs with links.
 
 ## Use
 

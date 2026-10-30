@@ -291,6 +291,10 @@ def cleanup_dir_problems(d: Path, jobs_root: Path, cleanup_root: Path) -> list[s
     if not d.is_absolute():
         return [f"cleanup dir {d} must be an absolute path"]
     real = _real(d)
+    # A junction on any ancestor (one the job can make at runtime) would point the abort's
+    # delete at another dir's files, so the resolved path must be the written path.
+    if os.path.normcase(real) != os.path.normcase(os.path.normpath(d)):
+        return [f"cleanup dir {d} is reached through a junction/symlink ({real})"]
     if not is_under(d, cleanup_root) or real == _real(cleanup_root):
         return [f"cleanup dir {d} must be strictly inside {cleanup_root}"]
     if _real(jobs_root).is_relative_to(real) or real.is_relative_to(_real(jobs_root)):
@@ -334,6 +338,8 @@ class Runner:
         tmp = self.dir / "status.json.tmp"
         for attempt in range(10):
             try:
+                # Unlink first: writing through a link left at this name would overwrite its target.
+                tmp.unlink(missing_ok=True)
                 tmp.write_text(json.dumps(self.status, indent=1), encoding="utf-8")
                 tmp.replace(self.dir / "status.json")
             except OSError as e:
@@ -537,12 +543,19 @@ def task_xml(name: str, python: str, script: str, job_dir: Path, limit_hours: in
 """
 
 
+def valid_name(name: str) -> bool:
+    """A job name is one path segment: letters, digits, - and _ (no '..', no separators)."""
+    if name.replace("-", "").replace("_", "").isalnum():
+        return True
+    _say("error: --name may hold only letters, digits, - and _", err=True)
+    return False
+
+
 def launch(a: argparse.Namespace) -> int:
     if not a.command:
         _say("error: give the command after --", err=True)
         return 2
-    if not a.name.replace("-", "").replace("_", "").isalnum():
-        _say("error: --name may hold only letters, digits, - and _", err=True)
+    if not valid_name(a.name):
         return 2
     spec = {
         "name": a.name,
@@ -595,6 +608,8 @@ def launch(a: argparse.Namespace) -> int:
 
 
 def status(a: argparse.Namespace) -> int:
+    if not valid_name(a.name):
+        return 2
     path = JOBS_ROOT / a.name / "status.json"
     if not path.exists():
         spec_path = JOBS_ROOT / a.name / "spec.json"
@@ -625,6 +640,8 @@ def stale_after_s(name: str) -> float:
 
 
 def forget(a: argparse.Namespace) -> int:
+    if not valid_name(a.name):
+        return 2
     path = JOBS_ROOT / a.name / "status.json"
     st = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if st.get("state") not in TERMINAL:
