@@ -83,7 +83,7 @@ A session polls `status` or the log files; it never waits on the job from a back
 ## Proof (2026-10-30, on GG's machine)
 
 The run log (`docs/run-log-2026-10.md`, 30 Oct) has the commands and output. On `4f9bed6`
-unless noted, with a dummy job (`D:\reclaim-build\tmp\jobtest\dummy_job.py`) that prints a numbered
+unless noted (the abort proofs were rerun on `b3e13a0`, where a cleanup dir must be new), with a dummy job (`D:\reclaim-build\tmp\jobtest\dummy_job.py`) that prints a numbered
 line every 2 s and, for the abort runs, writes partial output and starts a grandchild:
 
 | proof | what was done | result |
@@ -91,8 +91,9 @@ line every 2 s and, for the abort runs, writes partial output and starts a grand
 | ancestry | `Win32_Process` parent chain of the runner | `pythonw.exe` -> `svchost.exe` (Task Scheduler) -> `services.exe`; no Claude Code process |
 | 1b (pre-`4f9bed6`, same launch path) | launching shell stopped while the job waited on the RAM gate (free RAM 5.4-6.3 GB) | waited 10.5 min, then ran; 60/60 lines, `DUMMY DONE`, `END state=done rc=0` |
 | 2 | launching shell stopped 5 s after the child started | ran on; 90/90 lines, `DUMMY DONE`, `END state=done rc=0`; `status` exit 0 |
-| 3 | disk floor 1 GB under D:'s free space, the job writes 2 GB into a cleanup dir holding an older file | abort at 1,088 MB written; child, job and grandchild gone; only the job's `partial_*` dir removed, the older file kept; D: back to its starting free space |
-| 4b | as 3, with a junction to a canary folder inside the partial dir | the partial dir `REFUSED` and kept; the canary behind the junction intact; the tree ended |
+| 3 (`b3e13a0`) | disk floor 1 GB under D:'s free space; the job creates its cleanup dir and writes 2 GB into it, and starts a grandchild | abort at 1,088 MB written; child, runner and grandchild gone; the job's `partial_*` dir removed, the cleanup dir left empty; D: back to its starting free space (1,345.57 GB) |
+| 4b (`b3e13a0`) | as 3, with a junction to a canary folder inside the partial dir | the partial dir `REFUSED` and kept; the canary behind the junction intact; the tree ended |
+| 5 (`b3e13a0`) | `launch` with a cleanup dir that already exists (holding an older file) | refused before any task was registered: `cleanup dir ... already exists`, exit 2; the older file untouched |
 
 What is not proven on the machine: the RAM abort. Free RAM cannot be driven down on purpose
 without harming other sessions, so that path is covered by `tests/test_detached_job.py` (a real
