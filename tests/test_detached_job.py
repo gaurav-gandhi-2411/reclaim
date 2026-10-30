@@ -152,16 +152,145 @@ def test_holds_reparse_point_false_for_plain_tree(tmp_path: Path) -> None:
     assert dj.holds_reparse_point(tmp_path / "missing") is True
 
 
+_OK = ["--expect-line", "ok"]
+
+
 def test_launch_refuses_a_start_floor_below_8_gb(capsys: pytest.CaptureFixture[str]) -> None:
-    rc = dj.main(["launch", "--name", "x", "--start-ram-gb", "7.9", "--", "cmd", "/c", "exit"])
+    rc = dj.main(
+        ["launch", "--name", "x", *_OK, "--start-ram-gb", "7.9", "--", "cmd", "/c", "exit"]
+    )
     assert rc == 2
     assert "8 GB build floor" in capsys.readouterr().err
 
 
 def test_launch_refuses_cleanup_outside_the_build_root(capsys: pytest.CaptureFixture[str]) -> None:
-    rc = dj.main(["launch", "--name", "x", "--cleanup", r"C:\Users", "--", "cmd", "/c", "exit"])
+    rc = dj.main(
+        ["launch", "--name", "x", *_OK, "--cleanup", r"C:\Users", "--", "cmd", "/c", "exit"]
+    )
     assert rc == 2
     assert "must be strictly inside" in capsys.readouterr().err
+
+
+def test_launch_refuses_a_job_with_no_success_check(capsys: pytest.CaptureFixture[str]) -> None:
+    assert dj.main(["launch", "--name", "x", "--", "cmd", "/c", "exit"]) == 2
+    assert "declare a success check" in capsys.readouterr().err
+    assert not (dj.JOBS_ROOT / "x").exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["cmd.exe", "C:/", "build.cmd"],  # /c
+        ["python", "C:/Users/me/AppData/Local/Temp/x.py"],  # /tmp/x.py
+        ["tool", "--out=D:/out"],  # --out=/d/out
+    ],
+)
+def test_launch_refuses_a_command_git_bash_rewrote(
+    args: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert dj.main(["launch", "--name", "x", *_OK, "--", *args]) == 2
+    assert "Git Bash path conversion" in capsys.readouterr().err
+    assert not (dj.JOBS_ROOT / "x").exists()
+
+
+def test_mangled_args_leaves_windows_paths_and_switches_alone() -> None:
+    ok = ["cmd.exe", "/c", r"D:\b\x.cmd", "/VERYSILENT", r"/LOG=D:\l.log", "http://h/x", "a:b"]
+    assert dj.mangled_args(ok) == []
+
+
+# Arguments that each break a naive command-line round trip: spaces, quotes, a trailing
+# backslash, cmd metacharacters, %VAR%, a switch that Git Bash would rewrite, non-ASCII.
+_TRICKY = ["/c", r"D:\a b\c.cmd", 'say "hi"', "trail\\", "a&b|c<d>e^f", "%PATH%", "", "ünï"]
+
+
+def _fake_schtasks(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake(cmd: list[str], *_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(dj.subprocess, "run", fake)
+    return calls
+
+
+def test_the_stored_command_round_trips_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """launch stores the argv it was given, byte for byte, and the runner hands that argv to
+    the child unchanged: the child prints its own argv and it must equal what was launched."""
+    calls = _fake_schtasks(monkeypatch)
+    echo = "import json, sys; print('ARGV=' + json.dumps(sys.argv[1:]))"
+    cmd = [sys.executable, "-c", echo, *_TRICKY]
+    assert dj.main(["launch", "--name", "rt", "--cwd", str(tmp_path), *_OK, "--", *cmd]) == 0
+    assert [c[1] for c in calls] == ["/Create", "/Run"]
+    job_dir = dj.JOBS_ROOT / "rt"
+    assert json.loads((job_dir / "spec.json").read_text(encoding="utf-8"))["command"] == cmd
+    _readings(monkeypatch, [9.0])
+    spec = json.loads((job_dir / "spec.json").read_text(encoding="utf-8"))
+    spec["gate_seconds"], spec["expect_lines"] = 0.05, ["ARGV="]
+    (job_dir / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    assert dj.Runner(job_dir, cleanup_root=tmp_path).run() == 0
+    out = (job_dir / "output.log").read_text(encoding="utf-8")
+    line = next(x for x in out.splitlines() if x.startswith("ARGV="))
+    assert json.loads(line[len("ARGV=") :]) == _TRICKY
+
+
+def _git_bash() -> Path | None:
+    """Git for Windows' bash (not WSL's System32\\bash.exe, which is a different program)."""
+    import shutil
+
+    git = shutil.which("git")
+    if not git:
+        return None
+    # git.exe sits in Git\cmd, Git\bin or Git\mingw64\bin; bash.exe in Git\bin or Git\usr\bin.
+    for root in Path(git).resolve().parents[:3]:
+        for cand in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
+            if cand.exists() and "system32" not in str(cand).lower():
+                return cand
+    return None
+
+
+_DRIVER = """
+import json, subprocess, sys, types
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import detached_job as dj
+root = Path(sys.argv[2])
+dj.JOBS_ROOT, dj.CLEANUP_ROOT, dj.SCHTASKS = root / "jobs", root, str(root / "no-schtasks.exe")
+dj.subprocess = types.SimpleNamespace(
+    run=lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, "", ""))
+raise SystemExit(dj.main(["launch", "--name", "gb", "--expect-line", "x", "--"] + sys.argv[3:]))
+"""
+
+
+@pytest.mark.skipif(_git_bash() is None, reason="needs Git for Windows' bash")
+@pytest.mark.parametrize("no_conv", [True, False])
+def test_a_launch_from_git_bash_round_trips_or_is_refused(tmp_path: Path, no_conv: bool) -> None:
+    """Through a real Git Bash: with MSYS_NO_PATHCONV=1 the stored command is exactly what was
+    typed; without it, bash turns /c into C:/ and launch refuses instead of storing that."""
+    bash = _git_bash()
+    assert bash is not None
+    driver = tmp_path / "driver.py"
+    driver.write_text(_DRIVER, encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL")
+    }
+    if no_conv:
+        env["MSYS_NO_PATHCONV"] = "1"
+    py, script_dir = sys.executable.replace("\\", "/"), str(_SCRIPT.parent)
+    line = f"'{py}' '{driver}' '{script_dir}' '{tmp_path}' cmd.exe /c 'D:\\b\\x.cmd' /tmp/y"
+    r = subprocess.run(  # noqa: S603 -- Git's own bash, a script the test wrote
+        [str(bash), "-c", line], capture_output=True, text=True, env=env, check=False
+    )
+    spec_path = tmp_path / "jobs" / "gb" / "spec.json"
+    if no_conv:
+        assert r.returncode == 0, r.stderr
+        stored = json.loads(spec_path.read_text(encoding="utf-8"))["command"]
+        assert stored == ["cmd.exe", "/c", r"D:\b\x.cmd", "/tmp/y"]
+    else:
+        assert r.returncode == 2 and "Git Bash path conversion" in r.stderr
+        assert not spec_path.exists()
 
 
 # ---- spec validation ----------------------------------------------------------------------------
@@ -290,11 +419,111 @@ def _log(tmp_path: Path) -> str:
 
 def test_runner_done_and_output_captured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _readings(monkeypatch, [9.0])
-    r = _runner(tmp_path, command=[sys.executable, "-c", "print('hello from job')"])
+    r = _runner(
+        tmp_path,
+        command=[sys.executable, "-c", "print('hello from job')"],
+        expect_lines=["hello from job"],
+    )
     assert r.run() == 0  # type: ignore[attr-defined]
     assert _status(tmp_path)["state"] == "done"
     assert "hello from job" in (tmp_path / "jobs" / "t" / "output.log").read_text()
     assert _log(tmp_path).rstrip().splitlines()[-1].endswith("END state=done rc=0 reason=-")
+
+
+def test_rc_0_with_no_success_check_is_suspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The build-12 try-1 shape: `cmd C:/` exited 0 having built nothing (a spec written before
+    success checks existed, or hand-edited to drop them)."""
+    _readings(monkeypatch, [9.0])
+    r = _runner(tmp_path, command=[sys.executable, "-c", "pass"])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    st = _status(tmp_path)
+    assert (st["state"], st["rc"], st["reason"]) == ("suspect", 0, "no success check declared")
+    assert "END state=suspect rc=0" in _log(tmp_path)
+    assert dj.main(["status", "t"]) == 1
+    assert '"suspect"' in capsys.readouterr().out
+
+
+def test_rc_0_without_the_expected_line_is_suspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0])
+    r = _runner(
+        tmp_path, command=[sys.executable, "-c", "print('half done')"], expect_lines=["==> DONE."]
+    )
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert _status(tmp_path)["state"] == "suspect"
+    assert "expected line not in output: '==> DONE.'" in _log(tmp_path)
+
+
+def test_an_expected_file_older_than_the_job_is_suspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale installer from an earlier build must not pass for this build's output."""
+    _readings(monkeypatch, [9.0])
+    old = tmp_path / "reclaim-setup.exe"
+    old.write_bytes(b"old build")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    missing = tmp_path / "never-written.exe"
+    r = _runner(
+        tmp_path, command=[sys.executable, "-c", "pass"], expect_files=[str(old), str(missing)]
+    )
+    assert r.run() == 1  # type: ignore[attr-defined]
+    st = _status(tmp_path)
+    assert st["state"] == "suspect" and st["artifacts"] == []
+    assert "mtime before start" in str(st["reason"]) and "missing" in str(st["reason"])
+
+
+def test_a_fresh_expected_file_is_done_and_its_sha_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    _readings(monkeypatch, [9.0])
+    out = tmp_path / "dist" / "reclaim-setup.exe"
+    out.parent.mkdir()
+    job = f"open(r'{out}', 'wb').write(b'new build'); print('==> DONE.')"
+    r = _runner(
+        tmp_path,
+        command=[sys.executable, "-c", job],
+        expect_files=[str(out)],
+        expect_lines=["==> DONE."],
+    )
+    assert r.run() == 0  # type: ignore[attr-defined]
+    st = _status(tmp_path)
+    assert st["state"] == "done"
+    [art] = st["artifacts"]  # type: ignore[misc]
+    assert art["sha256"] == hashlib.sha256(b"new build").hexdigest() and art["bytes"] == 9
+    assert f"artifact {out} bytes=9" in _log(tmp_path)
+
+
+def test_a_failed_rc_is_failed_even_when_the_checks_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0])
+    job = "print('==> DONE.'); raise SystemExit(4)"
+    r = _runner(tmp_path, command=[sys.executable, "-c", job], expect_lines=["==> DONE."])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert (_status(tmp_path)["state"], _status(tmp_path)["rc"]) == ("failed", 4)
+
+
+@pytest.mark.parametrize(
+    ("over", "needle"),
+    [
+        ({"expect_files": "x"}, "expect_files must be"),
+        ({"expect_lines": [""]}, "expect_lines must be"),
+        ({"expect_files": ["relative.exe"]}, "absolute"),
+        ({"command": ["cmd.exe", "C:/", "x"]}, "Git Bash"),
+        ({"cwd": "C:/Users/me"}, "Git Bash"),
+        ({"expect_files": ["C:/Users/me/AppData/Local/Temp/x.exe"]}, "Git Bash"),  # /tmp/x.exe
+    ],
+)
+def test_validate_spec_rejects_bad_checks_and_mangled_paths(
+    tmp_path: Path, over: dict[str, object], needle: str
+) -> None:
+    errs = dj.validate_spec(_spec(tmp_path, **over), tmp_path / "jobs", tmp_path)
+    assert any(needle in e for e in errs), errs
 
 
 def test_runner_failed_keeps_rc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,7 +657,11 @@ def test_ram_exactly_at_the_abort_floor_does_not_abort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _readings(monkeypatch, [9.0, 9.0, 9.0, 2.0])
-    r = _runner(tmp_path, command=[sys.executable, "-c", "import time; time.sleep(0.6)"])
+    r = _runner(
+        tmp_path,
+        command=[sys.executable, "-c", "import time; time.sleep(0.6); print('slept')"],
+        expect_lines=["slept"],
+    )
     assert r.run() == 0  # type: ignore[attr-defined]
 
 
@@ -548,7 +781,11 @@ def test_a_rerun_of_the_task_does_not_repeat_the_job(
 ) -> None:
     _readings(monkeypatch, [9.0])
     count = tmp_path / "count"
-    r = _runner(tmp_path, command=[sys.executable, "-c", f"open(r'{count}', 'a').write('x')"])
+    r = _runner(
+        tmp_path,
+        command=[sys.executable, "-c", f"open(r'{count}', 'a').write('x')"],
+        expect_files=[str(count)],
+    )
     assert r.run() == 0  # type: ignore[attr-defined]
     again = dj.Runner(tmp_path / "jobs" / "t", cleanup_root=tmp_path)
     assert again.run() == 1
@@ -648,4 +885,4 @@ def test_status_and_forget_refuse_a_name_that_is_a_path(
 ) -> None:
     monkeypatch.setattr(dj, "JOBS_ROOT", tmp_path / "jobs")
     monkeypatch.setattr(dj.subprocess, "run", lambda *_a, **_k: pytest.fail("ran schtasks"))
-    assert dj.main([cmd, "..\outside"]) == 2
+    assert dj.main([cmd, r"..\outside"]) == 2
