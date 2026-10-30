@@ -70,13 +70,17 @@ hostile command):
 
 A job declares what success looks like, and `launch` refuses a job that declares nothing:
 
-- `--expect-file PATH` (absolute, repeatable): the file must exist when the command ends, with
-  an mtime no more than 2 s before the command started (a stale installer from an earlier
-  build does not count). Its size, mtime and SHA-256 are recorded in `status.json`
-  (`artifacts`) and `runner.log`.
-- `--expect-line TEXT` (repeatable): some line of `output.log` must contain the text, e.g. the
-  `==> DONE.` the installer build prints last, or `OK: all checks passed` from
-  `scripts/verify.py`.
+- `--expect-file PATH` (absolute, repeatable): when the command ends, the file must exist,
+  differ (mtime or size) from what was there just before the command started, and have an
+  mtime inside the run (2 s of filesystem slack each side). So a file that merely already
+  existed does not count, however recent or future-dated, and neither does an old installer
+  copied into place with its old mtime. Its size, mtime and SHA-256 are recorded in
+  `status.json` (`artifacts`) and `runner.log`.
+- `--expect-line TEXT` (repeatable): some line of `output.log` (the command's own stdout and
+  stderr, read as UTF-8) must contain the text. Pick a line only the success path prints, and
+  one the command does not echo back: `cmd` with echo on prints `if ... echo ALLGOOD` before
+  it runs it. Good choices: the `==> DONE.` the installer build prints last, or
+  `OK: all checks passed` from `scripts/verify.py`.
 
 rc 0 with every check met ends `state=done`; rc 0 with any check unmet ends **`state=suspect`**
 with the unmet checks as the reason (and `status` exits 1); a nonzero rc is `failed` whatever
@@ -88,13 +92,16 @@ nothing. Only reading `output.log` caught it.
 
 Git Bash rewrites POSIX-looking arguments before Python sees them: `/c` becomes `C:/`,
 `/tmp/x` becomes `C:/Users/<you>/AppData/Local/Temp/x`, `--out=/d/x` becomes `--out=D:/x`.
-Either launch from PowerShell, or prefix the launch with `MSYS_NO_PATHCONV=1` (or
-`MSYS2_ARG_CONV_EXCL='*'`); both were checked to keep `/c` intact. As a backstop, `launch` (and
-the runner, for a hand-edited spec) refuses any command argument, `--cwd`, `--cleanup` or
-`--expect-file` with a drive letter followed by `/`, the shape that conversion produces; write
-Windows paths with backslashes. `tests/test_detached_job.py` runs a real Git Bash both ways:
-with `MSYS_NO_PATHCONV=1` the stored command equals what was typed, and without it the launch
-is refused and nothing is written. A second test checks that the argv a child receives from the
+`-I/c/x` becomes `-IC:/x`, and a path list `/c/a:/c/b` becomes `C:\a;C:\b`. That last shape
+cannot be told from a real Windows value, so `launch` decides from the environment, not the
+argv: started from Git Bash (`MSYSTEM` set) it refuses unless `MSYS_NO_PATHCONV=1` or
+`MSYS2_ARG_CONV_EXCL='*'` is set (both were checked to keep `/c` intact), or you launch from
+PowerShell. As a backstop for a hand-edited spec, `launch` and the runner also refuse any
+command argument, `--cwd`, `--cleanup` or `--expect-file` holding a drive letter followed by a
+single `/` (a URL's `://` is fine). That refuses legitimate forward-slash paths too
+(`python C:/x/y.py`): write Windows paths with backslashes. `tests/test_detached_job.py` runs a
+real Git Bash both ways: with `MSYS_NO_PATHCONV=1` the stored command equals what was typed,
+and without it the launch is refused and nothing is written. A second test checks that the argv a child receives from the
 runner equals the launched argv exactly (spaces, quotes, a trailing backslash, `&|<>^`, `%VAR%`,
 an empty argument, non-ASCII).
 

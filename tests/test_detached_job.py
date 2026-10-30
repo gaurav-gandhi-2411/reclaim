@@ -45,6 +45,9 @@ def _no_real_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         return real_run(cmd, *a, **k)
 
     monkeypatch.setattr(dj.subprocess, "run", guarded)
+    # A test run started from Git Bash must not trip launch's Git Bash refusal by accident.
+    for var in ("MSYSTEM", "MSYS_NO_PATHCONV", "MSYS2_ARG_CONV_EXCL"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def test_parse_disk_floors() -> None:
@@ -183,6 +186,7 @@ def test_launch_refuses_a_job_with_no_success_check(capsys: pytest.CaptureFixtur
         ["cmd.exe", "C:/", "build.cmd"],  # /c
         ["python", "C:/Users/me/AppData/Local/Temp/x.py"],  # /tmp/x.py
         ["tool", "--out=D:/out"],  # --out=/d/out
+        ["gcc", "-IC:/x"],  # -I/c/x
     ],
 )
 def test_launch_refuses_a_command_git_bash_rewrote(
@@ -289,7 +293,7 @@ def test_a_launch_from_git_bash_round_trips_or_is_refused(tmp_path: Path, no_con
         stored = json.loads(spec_path.read_text(encoding="utf-8"))["command"]
         assert stored == ["cmd.exe", "/c", r"D:\b\x.cmd", "/tmp/y"]
     else:
-        assert r.returncode == 2 and "Git Bash path conversion" in r.stderr
+        assert r.returncode == 2 and "Git Bash with path conversion on" in r.stderr
         assert not spec_path.exists()
 
 
@@ -472,7 +476,65 @@ def test_an_expected_file_older_than_the_job_is_suspect(
     assert r.run() == 1  # type: ignore[attr-defined]
     st = _status(tmp_path)
     assert st["state"] == "suspect" and st["artifacts"] == []
-    assert "mtime before start" in str(st["reason"]) and "missing" in str(st["reason"])
+    assert "unchanged since the job started" in str(st["reason"])
+    assert "missing" in str(st["reason"])
+
+
+@pytest.mark.parametrize("age_s", [0.0, 1.5, -3600.0])  # just written, inside the slack, future
+def test_a_recent_file_the_job_did_not_touch_is_suspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_s: float
+) -> None:
+    """Freshness alone is not proof (verifier finding on #223): a file written a moment before
+    the job, or future-dated, passed a bare `mtime >= start - 2 s` check."""
+    import time
+
+    _readings(monkeypatch, [9.0])
+    f = tmp_path / "reclaim-setup.exe"
+    f.write_bytes(b"not this job's")
+    os.utime(f, (time.time() - age_s, time.time() - age_s))
+    r = _runner(tmp_path, command=[sys.executable, "-c", "pass"], expect_files=[str(f)])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert _status(tmp_path)["state"] == "suspect"
+
+
+def test_a_copied_in_file_keeping_an_old_mtime_is_suspect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job that only copies an old installer into place (copy2 keeps its mtime) built nothing."""
+    _readings(monkeypatch, [9.0])
+    old, dest = tmp_path / "old.exe", tmp_path / "out" / "reclaim-setup.exe"
+    old.write_bytes(b"old build")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    dest.parent.mkdir()
+    job = f"import shutil; shutil.copy2(r'{old}', r'{dest}')"
+    r = _runner(tmp_path, command=[sys.executable, "-c", job], expect_files=[str(dest)])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert "mtime is outside the job's run" in str(_status(tmp_path)["reason"])
+
+
+@pytest.mark.parametrize(
+    ("env", "on"),
+    [
+        ({}, False),
+        ({"MSYSTEM": "MINGW64"}, True),
+        ({"MSYSTEM": "MINGW64", "MSYS_NO_PATHCONV": "1"}, False),
+        ({"MSYSTEM": "MINGW64", "MSYS2_ARG_CONV_EXCL": "*"}, False),
+        ({"MSYSTEM": "MINGW64", "MSYS2_ARG_CONV_EXCL": "--foo"}, True),
+    ],
+)
+def test_git_bash_conversion_on(env: dict[str, str], on: bool) -> None:
+    assert dj.git_bash_conversion_on(env) is on
+
+
+def test_launch_from_git_bash_with_conversion_on_is_refused(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Conversion also makes shapes no pattern can tell from real Windows values
+    (/c/a:/c/b -> C:\\a;C:\\b), so the environment, not the argv, decides."""
+    monkeypatch.setenv("MSYSTEM", "MINGW64")
+    assert dj.main(["launch", "--name", "x", *_OK, "--", "tool", r"C:\a;C:\b"]) == 2
+    assert "Git Bash with path conversion on" in capsys.readouterr().err
+    assert not (dj.JOBS_ROOT / "x").exists()
 
 
 def test_a_fresh_expected_file_is_done_and_its_sha_recorded(
