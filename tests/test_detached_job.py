@@ -177,8 +177,15 @@ def _spec(tmp_path: Path, **over: object) -> dict[str, object]:
         ({"sample_seconds": 0}, "above 0"),
         ({"limit_hours": 0}, "limit_hours"),
         ({"limit_hours": 1.5}, "limit_hours"),
+        ({"limit_hours": True}, "finite"),
+        ({"abort_ram_gb": 0.4}, "abort_ram_gb"),
+        ({"sample_seconds": 61}, "at most 60"),
+        ({"gate_seconds": 1e6}, "at most 60"),
+        ({"disk_floors": {"C:": "20"}}, "disk_floors"),
+        ({"cwd": None}, "cwd"),
         ({"wait_max_min": 60}, "wait_max_min"),
         ({"command": []}, "command"),
+        ({"command": "cmd /c x"}, "command"),
         ({"cleanup": ["relative\\out"]}, "absolute"),
     ],
 )
@@ -212,7 +219,8 @@ def test_plan_cleanup_before_set_is_case_insensitive(tmp_path: Path) -> None:
     out = tmp_path / "build"
     out.mkdir()
     (out / "Keep.txt").write_text("k")
-    assert dj.plan_cleanup(out, {"keep.txt"}, tmp_path)[0] == []
+    (out / "other.TXT").write_text("o")
+    assert dj.plan_cleanup(out, {"keep.txt", "OTHER.txt"}, tmp_path)[0] == []
 
 
 def test_task_xml_is_well_formed_and_escapes(tmp_path: Path) -> None:
@@ -288,37 +296,53 @@ def test_runner_gate_waits_then_gives_up(tmp_path: Path, monkeypatch: pytest.Mon
     assert not marker.exists()
 
 
-_SLOW_JOB = "import pathlib, sys, time; pathlib.Path(sys.argv[1]).mkdir(); time.sleep(60)"
+# The job creates its cleanup dir (a cleanup dir may not exist before the job starts), writes
+# partial output there, and starts a grandchild whose PID it records outside the cleanup dir.
+_SLOW_JOB = (
+    "import pathlib, subprocess, sys, time\n"
+    "p = pathlib.Path(sys.argv[1]); p.mkdir(parents=True)\n"
+    "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "pathlib.Path(sys.argv[2]).write_text(str(g.pid))\n"
+    "time.sleep(60)\n"
+)
 
 
 def _abort_case(tmp_path: Path) -> tuple[Path, Path, Path, list[str]]:
     out = tmp_path / "build"
-    out.mkdir()
-    old = out / "old_output"
-    old.write_text("from an earlier build")
     new = out / "partial"
-    return out, old, new, [sys.executable, "-c", _SLOW_JOB, str(new)]
+    gpid = tmp_path / "grandchild.pid"
+    return out, new, gpid, [sys.executable, "-c", _SLOW_JOB, str(new), str(gpid)]
 
 
 def _wait_for(path: Path) -> None:
     import time
 
-    for _ in range(100):
-        if path.exists():
+    for _ in range(200):
+        if path.exists() and path.stat().st_size:
             return
         time.sleep(0.05)
 
 
-def test_runner_aborts_on_low_ram_and_cleans_only_new_output(
+def _alive(pid: int) -> bool:
+    out = subprocess.run(  # noqa: S603 -- fixed system binary, a PID the test recorded
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    return str(pid) in out
+
+
+def test_runner_aborts_on_low_ram_ends_the_tree_and_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    out, old, new, cmd = _abort_case(tmp_path)
+    out, new, gpid, cmd = _abort_case(tmp_path)
     ram = [9.0, 9.0, 9.0]
 
     def fake_ram() -> float:
         if ram:
             return ram.pop(0)
-        _wait_for(new)  # abort only once the job has written partial output
+        _wait_for(gpid)  # abort only once the job has written output and started a grandchild
         return 1.0
 
     monkeypatch.setattr(dj, "free_ram_gb", fake_ram)
@@ -327,12 +351,13 @@ def test_runner_aborts_on_low_ram_and_cleans_only_new_output(
     assert r.run() == 1  # type: ignore[attr-defined]
     st = _status(tmp_path)
     assert st["state"] == "aborted" and "free RAM" in str(st["reason"])
-    assert old.exists() and not new.exists()
+    assert out.is_dir() and not new.exists()
+    assert not _alive(int(gpid.read_text()))
     assert "child tree ended" in _log(tmp_path)
 
 
 def test_runner_aborts_on_a_disk_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    out, old, new, cmd = _abort_case(tmp_path)
+    out, new, gpid, cmd = _abort_case(tmp_path)
     monkeypatch.setattr(dj, "free_ram_gb", lambda: 9.0)
     calls = [0]
 
@@ -340,24 +365,24 @@ def test_runner_aborts_on_a_disk_floor(tmp_path: Path, monkeypatch: pytest.Monke
         calls[0] += 1
         if calls[0] <= 3:
             return 100.0
-        _wait_for(new)
+        _wait_for(gpid)
         return 0.5
 
     monkeypatch.setattr(dj, "disk_free_gb", fake_disk)
     r = _runner(tmp_path, command=cmd, cleanup=[str(out)])
     assert r.run() == 1  # type: ignore[attr-defined]
     assert "disk floor" in str(_status(tmp_path)["reason"])
-    assert old.exists() and not new.exists()
+    assert not new.exists()
 
 
 def test_watchdog_crash_still_kills_and_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    out, old, new, cmd = _abort_case(tmp_path)
+    out, new, gpid, cmd = _abort_case(tmp_path)
     _readings(monkeypatch, [9.0])
 
     def broken(*_a: object) -> int:
-        _wait_for(new)
+        _wait_for(gpid)
         raise RuntimeError("sampler broke")
 
     monkeypatch.setattr(dj, "low_ram_step", broken)
@@ -365,8 +390,160 @@ def test_watchdog_crash_still_kills_and_cleans(
     assert r.run() == 1  # type: ignore[attr-defined]
     st = _status(tmp_path)
     assert st["state"] == "aborted" and "watchdog failed" in str(st["reason"])
-    assert old.exists() and not new.exists()
+    assert not new.exists()
     assert "END state=aborted" in _log(tmp_path)
+
+
+def test_two_low_samples_abort_even_if_ram_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0, 9.0, 9.0, 1.0, 1.0, 9.0])
+    r = _runner(tmp_path, command=[sys.executable, "-c", "import time; time.sleep(5)"])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert _status(tmp_path)["state"] == "aborted"
+
+
+def test_ram_exactly_at_the_abort_floor_does_not_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0, 9.0, 9.0, 2.0])
+    r = _runner(tmp_path, command=[sys.executable, "-c", "import time; time.sleep(0.6)"])
+    assert r.run() == 0  # type: ignore[attr-defined]
+
+
+def test_cleanup_is_skipped_when_the_kill_is_not_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out, new, gpid, cmd = _abort_case(tmp_path)
+    ram = [9.0, 9.0, 9.0]
+
+    def fake_ram() -> float:
+        if ram:
+            return ram.pop(0)
+        _wait_for(gpid)
+        return 1.0
+
+    monkeypatch.setattr(dj, "free_ram_gb", fake_ram)
+    monkeypatch.setattr(dj, "disk_free_gb", lambda _drive: 100.0)
+    real_kill = dj.Runner.kill
+
+    def unconfirmed(self: object, child: object, job: object) -> bool:
+        real_kill(self, child, job)  # really end it, but report it as unconfirmed
+        return False
+
+    monkeypatch.setattr(dj.Runner, "kill", unconfirmed)
+    r = _runner(tmp_path, command=cmd, cleanup=[str(out)])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert new.exists()
+    assert "cleanup SKIPPED" in _log(tmp_path)
+
+
+def test_no_job_object_means_no_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _readings(monkeypatch, [9.0])
+    monkeypatch.setattr(dj, "_job_for", lambda _handle: None)
+    r = _runner(tmp_path, command=[sys.executable, "-c", "import time; time.sleep(30)"])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    st = _status(tmp_path)
+    assert st["state"] == "aborted" and "Job Object" in str(st["reason"])
+
+
+def test_kill_reports_an_unconfirmed_kill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class Stubborn:
+        pid = 0
+        returncode = None
+
+        def wait(self, timeout: float) -> int:
+            raise subprocess.TimeoutExpired("x", timeout)
+
+    monkeypatch.setattr(dj.subprocess, "run", lambda *_a, **_k: None)  # no real taskkill
+    r = _runner(tmp_path)
+    assert r.kill(Stubborn(), None) is False  # type: ignore[attr-defined]
+    assert "still alive" in _log(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are Windows-only")
+def test_abort_never_cleans_a_cleanup_dir_the_job_made_a_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    precious = tmp_path / "precious"  # inside the cleanup root, so only the re-check guards it
+    precious.mkdir()
+    (precious / "only_copy.txt").write_text("data")
+    out = tmp_path / "build"
+    flag = tmp_path / "linked"
+    job = (
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.run(['cmd', '/c', 'mklink', '/J', r'{out}', r'{precious}'], check=True)\n"
+        f"pathlib.Path(r'{flag}').write_text('1')\n"
+        "time.sleep(60)\n"
+    )
+    ram = [9.0, 9.0, 9.0]
+
+    def fake_ram() -> float:
+        if ram:
+            return ram.pop(0)
+        _wait_for(flag)
+        return 1.0
+
+    monkeypatch.setattr(dj, "free_ram_gb", fake_ram)
+    monkeypatch.setattr(dj, "disk_free_gb", lambda _drive: 100.0)
+    r = _runner(tmp_path, command=[sys.executable, "-c", job], cleanup=[str(out)])
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert (precious / "only_copy.txt").read_text() == "data"
+    assert "REFUSED cleanup" in _log(tmp_path)
+
+
+def test_a_cleanup_dir_that_already_exists_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0])
+    out = tmp_path / "shared"
+    out.mkdir()
+    marker = tmp_path / "ran"
+    r = _runner(
+        tmp_path,
+        cleanup=[str(out)],
+        command=[sys.executable, "-c", f"open(r'{marker}', 'w')"],
+    )
+    assert r.run() == 1  # type: ignore[attr-defined]
+    assert "already exists" in str(_status(tmp_path)["reason"]) and not marker.exists()
+
+
+@pytest.mark.parametrize("spec_text", ["[]", "{}", '{"cleanup": null}', "not json"])
+def test_a_malformed_spec_ends_with_an_end_line(tmp_path: Path, spec_text: str) -> None:
+    job_dir = tmp_path / "jobs" / "t"
+    job_dir.mkdir(parents=True)
+    (job_dir / "spec.json").write_text(spec_text, encoding="utf-8")
+    assert dj.Runner(job_dir, cleanup_root=tmp_path).run() == 1
+    assert "END state=error" in _log(tmp_path)
+
+
+def test_a_malformed_cleanup_entry_is_an_error(tmp_path: Path) -> None:
+    errs = dj.validate_spec(_spec(tmp_path, cleanup=[5]), tmp_path / "jobs", tmp_path)
+    assert any("cleanup must be a list of strings" in e for e in errs)
+
+
+def test_a_rerun_of_the_task_does_not_repeat_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _readings(monkeypatch, [9.0])
+    count = tmp_path / "count"
+    r = _runner(tmp_path, command=[sys.executable, "-c", f"open(r'{count}', 'a').write('x')"])
+    assert r.run() == 0  # type: ignore[attr-defined]
+    again = dj.Runner(tmp_path / "jobs" / "t", cleanup_root=tmp_path)
+    assert again.run() == 1
+    assert count.read_text() == "x" and _status(tmp_path)["state"] == "done"
+
+
+def test_save_outlasts_a_reader_holding_status_open(tmp_path: Path) -> None:
+    import threading
+
+    r = _runner(tmp_path)
+    status = tmp_path / "jobs" / "t" / "status.json"
+    status.write_text("{}")
+    f = status.open()  # Windows denies replacing a file another handle has open
+    threading.Timer(0.6, f.close).start()
+    r.save(state="waiting")  # type: ignore[attr-defined]
+    assert json.loads(status.read_text())["state"] == "waiting"
 
 
 def test_runner_refuses_a_hand_edited_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -393,4 +570,9 @@ def test_status_reports_a_runner_that_stopped_sampling(
     assert '"stale"' in capsys.readouterr().out
     fresh = dj._now().isoformat()
     (job / "status.json").write_text(json.dumps({"state": "running", "heartbeat": fresh}))
+    assert dj.main(["status", "t"]) == 2
+    # gate_seconds 20: a runner may be silent up to 3 x 20 + 60 = 120 s before it is stale.
+    (job / "spec.json").write_text(json.dumps(_spec(tmp_path, gate_seconds=20)), encoding="utf-8")
+    quiet = (dj._now() - dt.timedelta(seconds=90)).isoformat()
+    (job / "status.json").write_text(json.dumps({"state": "running", "heartbeat": quiet}))
     assert dj.main(["status", "t"]) == 2

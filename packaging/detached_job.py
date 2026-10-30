@@ -46,6 +46,8 @@ JOBS_ROOT = Path(r"D:\reclaim-build\jobs")
 CLEANUP_ROOT = Path(r"D:\reclaim-build")
 TASK_PREFIX = "ReclaimJob-"
 TERMINAL = ("done", "failed", "aborted", "gave_up", "error")
+ABORT_RAM_MIN_GB = 0.5  # below this the abort would fire only after the machine is starved
+MAX_PERIOD_S = 60  # longest gap between two watchdog samples
 # Absolute paths: a job must never run whatever "schtasks" happens to be first on PATH.
 _SYSTEM32 = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32"
 SCHTASKS = str(_SYSTEM32 / "schtasks.exe")
@@ -235,29 +237,49 @@ def _job_for(process_handle: int) -> int | None:
 # ---- spec validation (launch and run both check; a hand-edited spec cannot lower a floor) ------
 
 
-def validate_spec(spec: dict[str, Any], jobs_root: Path, cleanup_root: Path) -> list[str]:
-    """Problems with a job spec; empty means it may run."""
-    errs: list[str] = []
+def _finite(v: object) -> bool:
+    return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def validate_spec(spec: object, jobs_root: Path, cleanup_root: Path) -> list[str]:
+    """Problems with a job spec; empty means it may run. Types are checked before values, so a
+    hand-edited spec.json fails closed instead of crashing the runner."""
+    if not isinstance(spec, dict):
+        return ["spec must be a JSON object"]
     nums = ("start_ram_gb", "abort_ram_gb", "wait_max_min", "gate_seconds", "sample_seconds")
-    for key in (*nums, "limit_hours"):
-        v = spec.get(key)
-        if not isinstance(v, int | float) or isinstance(v, bool) or not math.isfinite(v):
-            errs.append(f"{key} must be a finite number, got {v!r}")
+    errs = [
+        f"{key} must be a finite number, got {spec.get(key)!r}"
+        for key in (*nums, "limit_hours")
+        if not _finite(spec.get(key))
+    ]
+    cmd, cleanup, floors = spec.get("command"), spec.get("cleanup"), spec.get("disk_floors")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) for c in cmd):
+        errs.append("command must be a non-empty list of strings")
+    if not isinstance(spec.get("cwd"), str):
+        errs.append("cwd must be a string")
+    if not isinstance(floors, dict) or not all(
+        isinstance(k, str) and _finite(v) for k, v in floors.items()
+    ):
+        errs.append("disk_floors must map drives to finite numbers")
+    if not isinstance(cleanup, list) or not all(isinstance(d, str) for d in cleanup):
+        errs.append("cleanup must be a list of strings")
     if errs:
         return errs
     if spec["start_ram_gb"] < 8:
         errs.append("start_ram_gb may not be below the 8 GB build floor")
-    if not 0 < spec["abort_ram_gb"] < spec["start_ram_gb"]:
-        errs.append("abort_ram_gb must be above 0 and below start_ram_gb")
-    if spec["gate_seconds"] <= 0 or spec["sample_seconds"] <= 0:
-        errs.append("gate_seconds and sample_seconds must be above 0")
+    if not ABORT_RAM_MIN_GB <= spec["abort_ram_gb"] < spec["start_ram_gb"]:
+        errs.append(f"abort_ram_gb must be at least {ABORT_RAM_MIN_GB} and below start_ram_gb")
+    # A longer period would leave the job effectively unwatched between samples.
+    if (
+        not 0 < spec["gate_seconds"] <= MAX_PERIOD_S
+        or not 0 < spec["sample_seconds"] <= MAX_PERIOD_S
+    ):
+        errs.append(f"gate_seconds and sample_seconds must be above 0 and at most {MAX_PERIOD_S}")
     if not isinstance(spec["limit_hours"], int) or spec["limit_hours"] < 1:
         errs.append("limit_hours must be a whole number >= 1")
     elif not 0 < spec["wait_max_min"] < spec["limit_hours"] * 60:
         errs.append("wait_max_min must be above 0 and below limit_hours, or the task limit ends it")
-    if not spec.get("command"):
-        errs.append("command is empty")
-    for d in spec.get("cleanup", []):
+    for d in spec["cleanup"]:  # a list of str, checked above
         errs.extend(cleanup_dir_problems(Path(d), jobs_root, cleanup_root))
     return errs
 
@@ -276,6 +298,16 @@ def cleanup_dir_problems(d: Path, jobs_root: Path, cleanup_root: Path) -> list[s
     if d.exists() and d.lstat().st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
         return [f"cleanup dir {d} is a junction/symlink"]
     return []
+
+
+def cleanup_dirs_already_there(dirs: list[str]) -> list[str]:
+    """A cleanup dir must not exist before the job starts: the job creates it, so it is private
+    to the job and an abort deleting what is new in it deletes only what this job made."""
+    return [
+        f"cleanup dir {d} already exists; use a new dir the job creates"
+        for d in dirs
+        if Path(d).exists()
+    ]
 
 
 # ---- runner (what the scheduled task executes) ---------------------------------------------------
@@ -320,11 +352,14 @@ class Runner:
 
     def run(self) -> int:
         """Every path ends in finish(): an END line and a terminal state."""
+        if (self.dir / "status.json").exists():  # a task re-run must not repeat the job
+            self.log("REFUSED: this job already ran (status.json exists)")
+            return 1
         try:
             self.spec = json.loads((self.dir / "spec.json").read_text(encoding="utf-8"))
             errs = validate_spec(self.spec, self.dir.parent, self.cleanup_root)
-        except (OSError, ValueError) as e:
-            errs = [f"spec.json unreadable: {e}"]
+        except Exception as e:  # a bad spec ends in an END line, never a crash
+            errs = [f"spec.json unusable: {type(e).__name__}: {e}"]
         if errs:
             return self.finish("error", None, "; ".join(errs))
         try:
@@ -350,11 +385,11 @@ class Runner:
                 return self.finish("gave_up", None, "start gate never met")
             time.sleep(s["gate_seconds"])
 
-        before = {
-            d: sorted(p.name for p in Path(d).iterdir()) if Path(d).is_dir() else []
-            for d in s["cleanup"]
-        }
-        self.save(state="running", cleanup_before=before)
+        there = cleanup_dirs_already_there(s["cleanup"])
+        if there:
+            return self.finish("error", None, "; ".join(there))
+        before: dict[str, list[str]] = {d: [] for d in s["cleanup"]}
+        self.save(state="running")
         with (self.dir / "output.log").open("ab") as out:
             child = subprocess.Popen(  # noqa: S603 -- the command the launching session wrote
                 s["command"],
@@ -383,7 +418,10 @@ class Runner:
         if not reason:
             return self.finish("done" if rc == 0 else "failed", rc, "")
         if dead:
-            self.cleanup({k: set(v) for k, v in before.items()})
+            try:
+                self.cleanup({k: set(v) for k, v in before.items()})
+            except Exception as e:  # still an abort: say so, with what failed
+                self.log(f"cleanup FAILED: {type(e).__name__}: {e}")
         else:
             self.log("cleanup SKIPPED: the job is not confirmed dead, so its output may change")
         return self.finish("aborted", None, reason)
@@ -408,12 +446,13 @@ class Runner:
         """End the child tree; True once the child is confirmed gone."""
         if job:
             ctypes.windll.kernel32.TerminateJobObject(ctypes.c_void_p(job), 1)
-        subprocess.run(  # noqa: S603 -- fixed system binary, our own child's PID
-            [TASKKILL, "/PID", str(child.pid), "/T", "/F"],
-            capture_output=True,
-            creationflags=_CREATE_NO_WINDOW,
-            check=False,
-        )
+        with contextlib.suppress(OSError):  # the wait below decides whether the kill worked
+            subprocess.run(  # noqa: S603 -- fixed system binary, our own child's PID
+                [TASKKILL, "/PID", str(child.pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=_CREATE_NO_WINDOW,
+                check=False,
+            )
         try:
             child.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -523,7 +562,7 @@ def launch(a: argparse.Namespace) -> int:
     except ValueError as e:
         _say(f"error: {e}", err=True)
         return 2
-    errs = validate_spec(spec, JOBS_ROOT, CLEANUP_ROOT)
+    errs = validate_spec(spec, JOBS_ROOT, CLEANUP_ROOT) + cleanup_dirs_already_there(a.cleanup)
     if errs:
         for err in errs:
             _say(f"error: {err}", err=True)

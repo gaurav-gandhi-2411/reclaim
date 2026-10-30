@@ -21,10 +21,14 @@ with `forget`.
 
 | check | default | what happens |
 |---|---|---|
-| start gate | free RAM >= 8 GB (`--start-ram-gb`; refused below 8, the build floor) and every disk floor met, 3 samples in a row, `--gate-seconds` 20 apart | waits; gives up after `--wait-max-min` (720) with state `gave_up` |
+| start gate | free RAM >= 8 GB (`--start-ram-gb`; refused below 8, the build floor) and every disk floor met, 3 samples in a row, `--gate-seconds` 20 apart | waits; gives up after `--wait-max-min` (600, must be under the time limit) with state `gave_up` |
 | disk floors | `--disk C:=20 --disk D:=50` (repeatable) | crossing one while running aborts; an unreadable drive counts as crossed |
-| RAM while running | free RAM < `--abort-ram-gb` (2) for 2 samples in a row, `--sample-seconds` 15 apart | aborts |
-| time limit | `--limit-hours` (12) | Task Scheduler ends the task |
+| RAM while running | free RAM < `--abort-ram-gb` (2; at least 0.5) for 2 samples in a row, `--sample-seconds` 15 apart | aborts |
+| time limit | `--limit-hours` (12) | Task Scheduler ends the task: the runner dies and the Job Object ends the command, but there is no cleanup and no `END` line, so `status` shows it as stale |
+
+Both periods are capped at 60 s: a longer one would leave the job unwatched between samples. The
+launcher and the runner run the same validation, so a hand-edited `spec.json` cannot lower a
+floor; a malformed one ends the job with `state=error` and an `END` line.
 
 **Why the running floor is 2 GB, not 8.** The 8 GB floor is the bar for *starting* heavy work,
 and it is unchanged. A build or verify then uses several GB itself, so a running floor of 8
@@ -33,16 +37,21 @@ machine from running out (the reaper fired at 3.6-4.3 GB free last run, with oth
 jobs holding the rest). The value is a flag; raise it for a job that must yield sooner.
 
 **Abort.** The command runs in a Windows Job Object with kill-on-close, so the whole tree ends
-together (`taskkill /T` is the fallback). Then, for each `--cleanup` dir, only the top-level
-entries that did not exist when the job started are deleted:
-- a cleanup dir must be strictly inside `D:\reclaim-build` (checked at launch and again at abort,
-  after resolving links);
+together (`taskkill /T` is the fallback). Only once the child is confirmed gone, the entries
+in each `--cleanup` dir are deleted:
+- a cleanup dir must **not exist** when the job starts (checked at launch and again by the
+  runner): the job creates it, so nothing else writes there and everything in it is the job's.
+  Point a build's output at a fresh dir if you want its partial output removed on abort;
+- it must be absolute, strictly inside `D:\reclaim-build`, not the jobs dir or a parent of it,
+  and not a junction, checked at launch and again at abort (after resolving links);
 - an entry that is, or holds, a junction or symlink, or cannot be read, is **not** deleted; it is
   logged as `REFUSED` and left for a person;
+- if the kill is not confirmed, the cleanup is skipped and logged;
 - every listing and deletion is written to `runner.log`.
 
-If the runner itself dies, the Job Object ends the command with it, so a job never runs on
-unwatched.
+The job never starts without its Job Object. If the runner dies (the time limit, logoff, a
+reboot), the Job Object ends the command with it; there is then no cleanup and no `END` line,
+and `status` reports the job as stale. A task re-run on the same job dir is refused.
 
 ## Use
 
@@ -57,7 +66,8 @@ From the repo root, with the venv's Python (the runner itself uses only the stan
 ```
 
 `status` exits 0 for `done`, 1 for `failed`/`aborted`/`gave_up`/`error`, 2 while waiting or
-running; its `heartbeat_age_s` shows whether the runner is still sampling. Everything is under
+running, and 3 for `stale` (the runner stopped sampling: no heartbeat for 3 periods plus a
+minute, or no status at all that long after launch). Everything is under
 `D:\reclaim-build\jobs\<name>\`:
 
 | file | content |
