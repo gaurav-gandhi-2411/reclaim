@@ -19,7 +19,7 @@ The job keeps its own watchdog instead:
 
 Usage (venv python; see packaging/DETACHED_JOBS.md):
   detached_job.py launch --name NAME [options] -- COMMAND [ARGS...]
-  detached_job.py status NAME   # prints status.json; exit 0 done, 1 failed/aborted, 2 running
+  detached_job.py status NAME   # exit 0 done, 1 failed/aborted, 2 waiting/running, 3 stale
   detached_job.py forget NAME   # deletes the finished job's scheduled task (not its logs)
 Each job writes to JOBS_ROOT\\NAME\\: spec.json, status.json (state + heartbeat), runner.log
 (gate, samples, abort, END line), output.log (the command's stdout and stderr).
@@ -32,6 +32,7 @@ import contextlib
 import ctypes
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -167,8 +168,9 @@ def plan_cleanup(cleanup_dir: Path, before: set[str], root: Path) -> tuple[list[
         return [], [f"nothing to clean: {cleanup_dir} does not exist"]
     notes: list[str] = []
     delete: list[Path] = []
+    seen = {n.lower() for n in before}  # NTFS names are case-insensitive
     for entry in sorted(cleanup_dir.iterdir()):
-        if entry.name in before:
+        if entry.name.lower() in seen:
             continue
         if holds_reparse_point(entry):
             notes.append(f"REFUSED {entry}: holds a junction/symlink or is unreadable; kept")
@@ -230,24 +232,84 @@ def _job_for(process_handle: int) -> int | None:
     return int(job)
 
 
+# ---- spec validation (launch and run both check; a hand-edited spec cannot lower a floor) ------
+
+
+def validate_spec(spec: dict[str, Any], jobs_root: Path, cleanup_root: Path) -> list[str]:
+    """Problems with a job spec; empty means it may run."""
+    errs: list[str] = []
+    nums = ("start_ram_gb", "abort_ram_gb", "wait_max_min", "gate_seconds", "sample_seconds")
+    for key in (*nums, "limit_hours"):
+        v = spec.get(key)
+        if not isinstance(v, int | float) or isinstance(v, bool) or not math.isfinite(v):
+            errs.append(f"{key} must be a finite number, got {v!r}")
+    if errs:
+        return errs
+    if spec["start_ram_gb"] < 8:
+        errs.append("start_ram_gb may not be below the 8 GB build floor")
+    if not 0 < spec["abort_ram_gb"] < spec["start_ram_gb"]:
+        errs.append("abort_ram_gb must be above 0 and below start_ram_gb")
+    if spec["gate_seconds"] <= 0 or spec["sample_seconds"] <= 0:
+        errs.append("gate_seconds and sample_seconds must be above 0")
+    if not isinstance(spec["limit_hours"], int) or spec["limit_hours"] < 1:
+        errs.append("limit_hours must be a whole number >= 1")
+    elif not 0 < spec["wait_max_min"] < spec["limit_hours"] * 60:
+        errs.append("wait_max_min must be above 0 and below limit_hours, or the task limit ends it")
+    if not spec.get("command"):
+        errs.append("command is empty")
+    for d in spec.get("cleanup", []):
+        errs.extend(cleanup_dir_problems(Path(d), jobs_root, cleanup_root))
+    return errs
+
+
+def cleanup_dir_problems(d: Path, jobs_root: Path, cleanup_root: Path) -> list[str]:
+    """A cleanup dir must be absolute, strictly inside cleanup_root, not a link, and not the root,
+    the jobs dir or an ancestor of either: an abort deletes whatever is new in it, so it must be
+    a dir only this job writes to."""
+    if not d.is_absolute():
+        return [f"cleanup dir {d} must be an absolute path"]
+    real = _real(d)
+    if not is_under(d, cleanup_root) or real == _real(cleanup_root):
+        return [f"cleanup dir {d} must be strictly inside {cleanup_root}"]
+    if _real(jobs_root).is_relative_to(real) or real.is_relative_to(_real(jobs_root)):
+        return [f"cleanup dir {d} may not contain or be inside {jobs_root}"]
+    if d.exists() and d.lstat().st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        return [f"cleanup dir {d} is a junction/symlink"]
+    return []
+
+
 # ---- runner (what the scheduled task executes) ---------------------------------------------------
 
 
 class Runner:
-    def __init__(self, job_dir: Path) -> None:
+    def __init__(self, job_dir: Path, cleanup_root: Path = CLEANUP_ROOT) -> None:
         self.dir = job_dir
-        self.spec: dict[str, Any] = json.loads((job_dir / "spec.json").read_text(encoding="utf-8"))
-        self.status: dict[str, Any] = {"name": self.spec["name"], "state": "starting"}
+        self.cleanup_root = cleanup_root
+        self.spec: dict[str, Any] = {}
+        self.status: dict[str, Any] = {"name": job_dir.name, "state": "starting"}
 
     def log(self, msg: str) -> None:
-        with (self.dir / "runner.log").open("a", encoding="utf-8") as f:
+        with (
+            contextlib.suppress(OSError),
+            (self.dir / "runner.log").open("a", encoding="utf-8") as f,
+        ):
             f.write(f"{_now().isoformat()} {msg}\n")
 
     def save(self, **fields: Any) -> None:
+        """Never raises: a reader holding status.json open (Windows denies the replace) must not
+        stop the watchdog. Retries, then logs and carries on; the heartbeat shows the gap."""
         self.status.update(fields, heartbeat=_now().isoformat())
         tmp = self.dir / "status.json.tmp"
-        tmp.write_text(json.dumps(self.status, indent=1), encoding="utf-8")
-        tmp.replace(self.dir / "status.json")
+        for attempt in range(10):
+            try:
+                tmp.write_text(json.dumps(self.status, indent=1), encoding="utf-8")
+                tmp.replace(self.dir / "status.json")
+            except OSError as e:
+                if attempt == 9:
+                    self.log(f"WARNING: status.json not written: {e}")
+                time.sleep(0.2)
+            else:
+                return
 
     def sample(self) -> tuple[float, dict[str, float]]:
         free: dict[str, float] = {}
@@ -257,6 +319,20 @@ class Runner:
         return free_ram_gb(), free
 
     def run(self) -> int:
+        """Every path ends in finish(): an END line and a terminal state."""
+        try:
+            self.spec = json.loads((self.dir / "spec.json").read_text(encoding="utf-8"))
+            errs = validate_spec(self.spec, self.dir.parent, self.cleanup_root)
+        except (OSError, ValueError) as e:
+            errs = [f"spec.json unreadable: {e}"]
+        if errs:
+            return self.finish("error", None, "; ".join(errs))
+        try:
+            return self._run()
+        except Exception as e:  # the END line and status must exist whatever happens
+            return self.finish("error", None, f"{type(e).__name__}: {e}")
+
+    def _run(self) -> int:
         s = self.spec
         floors: dict[str, float] = s["disk_floors"]
         self.log(f"runner pid={os.getpid()} spec={json.dumps(s)}")
@@ -290,17 +366,27 @@ class Runner:
                 # from any other console can reach the job.
                 creationflags=_CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP,
             )
-            job = _job_for(int(child._handle))  # type: ignore[attr-defined]
-            self.log(f"started child pid={child.pid} job_object={'yes' if job else 'NO'}")
-            self.save(child_pid=child.pid, job_object=bool(job))
-            rc, reason = self._watch(child, floors)
+            job, rc, reason = None, -1, ""
+            try:
+                job = _job_for(int(child._handle))  # type: ignore[attr-defined]
+                self.log(f"started child pid={child.pid} job_object={'yes' if job else 'NO'}")
+                self.save(child_pid=child.pid, job_object=bool(job))
+                if job is None:  # without it a dying runner would leave the job running unwatched
+                    reason = "could not put the job in a Job Object"
+                else:
+                    rc, reason = self._watch(child, floors)
+            except BaseException as e:
+                reason = f"watchdog failed: {type(e).__name__}: {e}"
             if reason:
                 self.log(f"ABORT: {reason}")
-                self.kill(child, job)
-        if reason:
+                dead = self.kill(child, job)
+        if not reason:
+            return self.finish("done" if rc == 0 else "failed", rc, "")
+        if dead:
             self.cleanup({k: set(v) for k, v in before.items()})
-            return self.finish("aborted", None, reason)
-        return self.finish("done" if rc == 0 else "failed", rc, "")
+        else:
+            self.log("cleanup SKIPPED: the job is not confirmed dead, so its output may change")
+        return self.finish("aborted", None, reason)
 
     def _watch(self, child: subprocess.Popen[bytes], floors: dict[str, float]) -> tuple[int, str]:
         """Sample until the child exits (its rc, "") or a floor is crossed (-1, the reason)."""
@@ -318,7 +404,8 @@ class Runner:
             if breaches:
                 return -1, f"disk floor crossed on {breaches} ({_fmt(free)})"
 
-    def kill(self, child: subprocess.Popen[bytes], job: int | None) -> None:
+    def kill(self, child: subprocess.Popen[bytes], job: int | None) -> bool:
+        """End the child tree; True once the child is confirmed gone."""
         if job:
             ctypes.windll.kernel32.TerminateJobObject(ctypes.c_void_p(job), 1)
         subprocess.run(  # noqa: S603 -- fixed system binary, our own child's PID
@@ -329,13 +416,19 @@ class Runner:
         )
         try:
             child.wait(timeout=60)
-            self.log(f"child tree ended (rc={child.returncode})")
         except subprocess.TimeoutExpired:
             self.log("WARNING: child still alive 60 s after the kill")
+            return False
+        self.log(f"child tree ended (rc={child.returncode})")
+        return True
 
     def cleanup(self, before: dict[str, set[str]]) -> None:
         for d, names in before.items():
-            delete, notes = plan_cleanup(Path(d), names, CLEANUP_ROOT)
+            problems = cleanup_dir_problems(Path(d), self.dir.parent, self.cleanup_root)
+            if problems:
+                self.log(f"REFUSED cleanup of {d}: {problems}")
+                continue
+            delete, notes = plan_cleanup(Path(d), names, self.cleanup_root)
             for n in notes:
                 self.log(n)
             self.log(f"partial output in {d}: {[p.name for p in delete]}")
@@ -412,32 +505,34 @@ def launch(a: argparse.Namespace) -> int:
     if not a.name.replace("-", "").replace("_", "").isalnum():
         _say("error: --name may hold only letters, digits, - and _", err=True)
         return 2
-    if a.start_ram_gb < 8:
-        _say("error: --start-ram-gb may not be below the 8 GB build floor", err=True)
-        return 2
-    floors = parse_disk_floors(a.disk)
-    for d in a.cleanup:
-        if not is_under(Path(d), CLEANUP_ROOT):
-            _say(f"error: --cleanup {d} is not inside {CLEANUP_ROOT}", err=True)
-            return 2
-    job_dir = JOBS_ROOT / a.name
-    if job_dir.exists():
-        _say(f"error: {job_dir} exists; pick a new --name", err=True)
-        return 2
-    job_dir.mkdir(parents=True)
     spec = {
         "name": a.name,
         "command": a.command,
         "cwd": a.cwd,
         "start_ram_gb": a.start_ram_gb,
         "abort_ram_gb": a.abort_ram_gb,
-        "disk_floors": floors,
+        "disk_floors": {},
         "cleanup": a.cleanup,
         "wait_max_min": a.wait_max_min,
         "gate_seconds": a.gate_seconds,
         "sample_seconds": a.sample_seconds,
         "limit_hours": a.limit_hours,
     }
+    try:
+        spec["disk_floors"] = parse_disk_floors(a.disk)
+    except ValueError as e:
+        _say(f"error: {e}", err=True)
+        return 2
+    errs = validate_spec(spec, JOBS_ROOT, CLEANUP_ROOT)
+    if errs:
+        for err in errs:
+            _say(f"error: {err}", err=True)
+        return 2
+    job_dir = JOBS_ROOT / a.name
+    if job_dir.exists():
+        _say(f"error: {job_dir} exists; pick a new --name", err=True)
+        return 2
+    job_dir.mkdir(parents=True)
     (job_dir / "spec.json").write_text(json.dumps(spec, indent=1), encoding="utf-8")
     # The base interpreter's pythonw.exe, not the venv's: the venv launcher starts a console
     # python.exe, and a console lets a Ctrl-C/close event end the runner (0xC000013A, seen in
@@ -463,16 +558,31 @@ def launch(a: argparse.Namespace) -> int:
 def status(a: argparse.Namespace) -> int:
     path = JOBS_ROOT / a.name / "status.json"
     if not path.exists():
+        spec_path = JOBS_ROOT / a.name / "spec.json"
+        if not spec_path.exists():
+            _say(f"no job named {a.name}")
+            return 1
+        age = time.time() - spec_path.stat().st_mtime
+        if age > stale_after_s(a.name):
+            _say(f"never started: no status.json {round(age)} s after launch")
+            return 3
         _say(f"no status yet ({path}); the task may not have started")
         return 2
     st = json.loads(path.read_text(encoding="utf-8"))
-    st["heartbeat_age_s"] = round(
-        (_now() - dt.datetime.fromisoformat(st["heartbeat"])).total_seconds()
-    )
+    age = (_now() - dt.datetime.fromisoformat(st["heartbeat"])).total_seconds()
+    st["heartbeat_age_s"] = round(age)
+    if st["state"] not in TERMINAL and age > stale_after_s(a.name):
+        st["state"] = "stale"  # the runner stopped sampling: killed, logged off, rebooted
     _say(json.dumps(st, indent=1))
     if st["state"] in TERMINAL:
         return 0 if st["state"] == "done" else 1
-    return 2
+    return 3 if st["state"] == "stale" else 2
+
+
+def stale_after_s(name: str) -> float:
+    """A live runner saves at least once per gate/sample period; allow 3 periods plus a minute."""
+    spec = json.loads((JOBS_ROOT / name / "spec.json").read_text(encoding="utf-8"))
+    return 3 * float(max(spec["gate_seconds"], spec["sample_seconds"])) + 60
 
 
 def forget(a: argparse.Namespace) -> int:
@@ -501,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     la.add_argument("--abort-ram-gb", type=float, default=2.0)
     la.add_argument("--disk", action="append", default=None, help="DRIVE=GB, repeatable")
     la.add_argument("--cleanup", action="append", default=[], help="dir under D:\\reclaim-build")
-    la.add_argument("--wait-max-min", type=float, default=720)
+    la.add_argument("--wait-max-min", type=float, default=600)
     la.add_argument("--gate-seconds", type=float, default=20)
     la.add_argument("--sample-seconds", type=float, default=15)
     la.add_argument("--limit-hours", type=int, default=12)
@@ -520,12 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         return status(a)
     if a.cmd == "forget":
         return forget(a)
-    runner = Runner(Path(a.job_dir))
-    try:
-        return runner.run()
-    except Exception as e:  # the END line and status must exist whatever happens
-        runner.log(f"RUNNER ERROR {type(e).__name__}: {e}")
-        return runner.finish("error", None, f"{type(e).__name__}: {e}")
+    return Runner(Path(a.job_dir)).run()
 
 
 if __name__ == "__main__":
