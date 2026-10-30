@@ -72,11 +72,25 @@ A session polls `status` or the log files; it never waits on the job from a back
 
 ## Proof (2026-10-30, on GG's machine)
 
-The run log (`docs/run-log-2026-10.md`, 30 Oct) has the commands and output. Proven so far:
-the runner's parents are `svchost.exe` (Task Scheduler) -> `services.exe`, with no Claude Code
-process, and a runner waiting on the RAM gate kept running after its launching shell was stopped.
-The remaining proofs (survival while running, a complete log, the abort and cleanup paths) are
-added here as they pass.
+The run log (`docs/run-log-2026-10.md`, 30 Oct) has the commands and output. On `4f9bed6`
+unless noted, with a dummy job (`D:\reclaim-build\tmp\jobtest\dummy_job.py`) that prints a numbered
+line every 2 s and, for the abort runs, writes partial output and starts a grandchild:
+
+| proof | what was done | result |
+|---|---|---|
+| ancestry | `Win32_Process` parent chain of the runner | `pythonw.exe` -> `svchost.exe` (Task Scheduler) -> `services.exe`; no Claude Code process |
+| 1b (pre-`4f9bed6`, same launch path) | launching shell stopped while the job waited on the RAM gate (free RAM 5.4-6.3 GB) | waited 10.5 min, then ran; 60/60 lines, `DUMMY DONE`, `END state=done rc=0` |
+| 2 | launching shell stopped 5 s after the child started | ran on; 90/90 lines, `DUMMY DONE`, `END state=done rc=0`; `status` exit 0 |
+| 3 | disk floor 1 GB under D:'s free space, the job writes 2 GB into a cleanup dir holding an older file | abort at 1,088 MB written; child, job and grandchild gone; only the job's `partial_*` dir removed, the older file kept; D: back to its starting free space |
+| 4b | as 3, with a junction to a canary folder inside the partial dir | the partial dir `REFUSED` and kept; the canary behind the junction intact; the tree ended |
+
+What is not proven on the machine: the RAM abort. Free RAM cannot be driven down on purpose
+without harming other sessions, so that path is covered by `tests/test_detached_job.py` (a real
+child process, faked RAM readings, the real kill and cleanup). Survival of a *real* reaper event
+is BELIEVED, not observed: the reaper stops the process trees of a session's background shells,
+the same as stopping the launching shell in proofs 1b and 2, and the ancestry shows no such
+shell above the job. (A real reaper event in this session stopped a shell that was only
+waiting on a job's log file; it could not have touched the job.)
 
 The first proof run failed and is part of the record: the task then started the venv's
 `pythonw.exe`, which launches a *console* `python.exe`, and the runner ended with `0xC000013A`
