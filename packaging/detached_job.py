@@ -16,10 +16,14 @@ The job keeps its own watchdog instead:
   deleted. A cleanup dir outside CLEANUP_ROOT, or any new entry holding a reparse point
   (junction/symlink), is refused and left in place, so an abort can never delete through a link
   or touch anything the job did not create.
+- success check: rc 0 proves only that the command exited 0 (a mangled `cmd C:/` once exited 0
+  having built nothing). Every job declares --expect-file (must exist afterwards with an mtime
+  after the child started; its SHA-256 is recorded) and/or --expect-line (text a line of
+  output.log must contain). rc 0 with every check met is `done`; rc 0 otherwise is `suspect`.
 
 Usage (venv python; see packaging/DETACHED_JOBS.md):
-  detached_job.py launch --name NAME [options] -- COMMAND [ARGS...]
-  detached_job.py status NAME   # exit 0 done, 1 failed/aborted, 2 waiting/running, 3 stale
+  detached_job.py launch --name NAME --expect-file PATH|--expect-line TEXT [options] -- COMMAND...
+  detached_job.py status NAME   # exit 0 done, 1 failed/aborted/suspect, 2 waiting/running, 3 stale
   detached_job.py forget NAME   # deletes the finished job's scheduled task (not its logs)
 Each job writes to JOBS_ROOT\\NAME\\: spec.json, status.json (state + heartbeat), runner.log
 (gate, samples, abort, END line), output.log (the command's stdout and stderr).
@@ -31,9 +35,11 @@ import argparse
 import contextlib
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,9 +51,17 @@ from typing import Any
 JOBS_ROOT = Path(r"D:\reclaim-build\jobs")
 CLEANUP_ROOT = Path(r"D:\reclaim-build")
 TASK_PREFIX = "ReclaimJob-"
-TERMINAL = ("done", "failed", "aborted", "gave_up", "error")
+TERMINAL = ("done", "failed", "aborted", "gave_up", "error", "suspect")
 ABORT_RAM_MIN_GB = 0.5  # below this the abort would fire only after the machine is starved
 MAX_PERIOD_S = 60  # longest gap between two watchdog samples
+MTIME_SLACK_S = 2.0  # filesystem timestamp granularity; the before/after snapshot is the real test
+# What Git Bash makes of a POSIX-looking argument: /c -> C:/, /tmp/x -> C:/Users/.../Temp/x,
+# --out=/d/x -> --out=D:/x, -I/c/x -> -IC:/x. Nothing in a hand-written Windows command needs a
+# forward slash straight after a drive letter, so such an argument is refused rather than run.
+# This is only a backstop for a spec written by hand: conversion also yields shapes it cannot
+# tell from a real Windows value (/c/a:/c/b -> C:\a;C:\b), so launch refuses to run from a Git
+# Bash environment at all unless conversion is off (git_bash_conversion_on).
+_MANGLED = re.compile(r"[A-Za-z]:/(?!/)")  # anywhere (-IC:/x); `://` of a URL excepted
 # Absolute paths: a job must never run whatever "schtasks" happens to be first on PATH.
 _SYSTEM32 = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32"
 SCHTASKS = str(_SYSTEM32 / "schtasks.exe")
@@ -131,6 +145,80 @@ def start_gate_step(ok_count: int, ram_gb: float, start_ram_gb: float, disks_ok:
 def low_ram_step(low_count: int, ram_gb: float, abort_ram_gb: float) -> int:
     """Consecutive low-RAM samples while running; the job aborts at 2."""
     return low_count + 1 if ram_gb < abort_ram_gb else 0
+
+
+def mangled_args(args: list[str]) -> list[str]:
+    """Arguments Git Bash path conversion has rewritten (see _MANGLED)."""
+    return [a for a in args if _MANGLED.search(a)]
+
+
+def git_bash_conversion_on(env: dict[str, str]) -> bool:
+    """True when this process was started from Git Bash (MSYSTEM set) with path conversion on,
+    so its argv may already have been rewritten in ways no pattern can undo."""
+    if not env.get("MSYSTEM"):
+        return False
+    return env.get("MSYS_NO_PATHCONV") != "1" and env.get("MSYS2_ARG_CONV_EXCL") != "*"
+
+
+def file_state(path: str) -> tuple[int, int] | None:
+    """(mtime_ns, size), or None when the path cannot be stat'ed."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def check_outputs(
+    expect_files: list[str],
+    expect_lines: list[str],
+    output: str,
+    started: float,
+    before: dict[str, tuple[int, int] | None],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Artifacts found (path, bytes, mtime, sha256) and the unmet checks. No check declared at
+    all is itself unmet: rc 0 alone is not success. An expected file must have changed since
+    just before the child started (`before`) and carry an mtime inside the job's run, so a file
+    that merely already existed, however recent or future-dated its mtime, does not count."""
+    found: list[dict[str, Any]] = []
+    unmet: list[str] = []
+    if not expect_files and not expect_lines:
+        unmet.append("no success check declared")
+    for f in expect_files:
+        p = Path(f)
+        try:
+            st = p.stat()
+        except OSError:
+            unmet.append(f"expected file missing: {f}")
+            continue
+        if not p.is_file():
+            unmet.append(f"expected file is not a file: {f}")
+            continue
+        if before.get(f) == (st.st_mtime_ns, st.st_size):
+            unmet.append(f"expected file unchanged since the job started: {f}")
+            continue
+        if not started - MTIME_SLACK_S <= st.st_mtime <= time.time() + MTIME_SLACK_S:
+            unmet.append(f"expected file mtime is outside the job's run: {f}")
+            continue
+        digest = hashlib.sha256()
+        with p.open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(block)
+        found.append(
+            {
+                "path": f,
+                "bytes": st.st_size,
+                "mtime": dt.datetime.fromtimestamp(st.st_mtime, dt.UTC).astimezone().isoformat(),
+                "sha256": digest.hexdigest(),
+            }
+        )
+    lines = output.splitlines()
+    unmet.extend(
+        f"expected line not in output: {want!r}"
+        for want in expect_lines
+        if not any(want in line for line in lines)
+    )
+    return found, unmet
 
 
 def _real(path: Path) -> Path:
@@ -263,8 +351,23 @@ def validate_spec(spec: object, jobs_root: Path, cleanup_root: Path) -> list[str
         errs.append("disk_floors must map drives to finite numbers")
     if not isinstance(cleanup, list) or not all(isinstance(d, str) for d in cleanup):
         errs.append("cleanup must be a list of strings")
+    for key in ("expect_files", "expect_lines"):  # absent = none declared (finish says suspect)
+        v = spec.get(key, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            errs.append(f"{key} must be a list of non-empty strings")
     if errs:
         return errs
+    paths = [*spec["command"], spec["cwd"], *spec["cleanup"], *spec.get("expect_files", [])]
+    errs.extend(
+        f"argument {m!r} looks rewritten by Git Bash path conversion (a drive letter then '/');"
+        " launch with MSYS_NO_PATHCONV=1 set, or from PowerShell, and write Windows paths"
+        for m in mangled_args(paths)
+    )
+    errs.extend(
+        f"expected file {f} must be an absolute path"
+        for f in spec.get("expect_files", [])
+        if not Path(f).is_absolute()
+    )
     if spec["start_ram_gb"] < 8:
         errs.append("start_ram_gb may not be below the 8 GB build floor")
     if not ABORT_RAM_MIN_GB <= spec["abort_ram_gb"] < spec["start_ram_gb"]:
@@ -396,6 +499,8 @@ class Runner:
             return self.finish("error", None, "; ".join(there))
         before: dict[str, list[str]] = {d: [] for d in s["cleanup"]}
         self.save(state="running")
+        artifacts_before = {f: file_state(f) for f in s.get("expect_files", [])}
+        started = time.time()
         with (self.dir / "output.log").open("ab") as out:
             child = subprocess.Popen(  # noqa: S603 -- the command the launching session wrote
                 s["command"],
@@ -422,7 +527,8 @@ class Runner:
                 self.log(f"ABORT: {reason}")
                 dead = self.kill(child, job)
         if not reason:
-            return self.finish("done" if rc == 0 else "failed", rc, "")
+            state, why = self._judge(rc, started, artifacts_before)
+            return self.finish(state, rc, why)
         if dead:
             try:
                 self.cleanup({k: set(v) for k, v in before.items()})
@@ -431,6 +537,30 @@ class Runner:
         else:
             self.log("cleanup SKIPPED: the job is not confirmed dead, so its output may change")
         return self.finish("aborted", None, reason)
+
+    def _judge(
+        self, rc: int, started: float, before: dict[str, tuple[int, int] | None]
+    ) -> tuple[str, str]:
+        """(state, reason) for a child that exited on its own: a nonzero rc fails; rc 0 is done
+        only when every declared success check is met, else suspect."""
+        if rc != 0:
+            return "failed", ""
+        output = (self.dir / "output.log").read_bytes().decode("utf-8", errors="replace")
+        found, unmet = check_outputs(
+            self.spec.get("expect_files", []),
+            self.spec.get("expect_lines", []),
+            output,
+            started,
+            before,
+        )
+        for a in found:
+            self.log(
+                f"artifact {a['path']} bytes={a['bytes']} mtime={a['mtime']} sha256={a['sha256']}"
+            )
+        self.save(artifacts=found)
+        for u in unmet:
+            self.log(f"CHECK FAILED: {u}")
+        return ("suspect", "; ".join(unmet)) if unmet else ("done", "")
 
     def _watch(self, child: subprocess.Popen[bytes], floors: dict[str, float]) -> tuple[int, str]:
         """Sample until the child exits (its rc, "") or a floor is crossed (-1, the reason)."""
@@ -569,7 +699,24 @@ def launch(a: argparse.Namespace) -> int:
         "gate_seconds": a.gate_seconds,
         "sample_seconds": a.sample_seconds,
         "limit_hours": a.limit_hours,
+        "expect_files": a.expect_file,
+        "expect_lines": a.expect_line,
     }
+    if git_bash_conversion_on(dict(os.environ)):
+        _say(
+            "error: launched from Git Bash with path conversion on, so the command may already "
+            "be rewritten (/c -> C:/, /c/a:/c/b -> C:\\a;C:\\b); prefix the launch with "
+            "MSYS_NO_PATHCONV=1, or launch from PowerShell",
+            err=True,
+        )
+        return 2
+    if not a.expect_file and not a.expect_line:
+        _say(
+            "error: declare a success check: --expect-file PATH and/or --expect-line TEXT "
+            "(rc 0 alone is not success)",
+            err=True,
+        )
+        return 2
     try:
         spec["disk_floors"] = parse_disk_floors(a.disk)
     except ValueError as e:
@@ -671,6 +818,8 @@ def main(argv: list[str] | None = None) -> int:
     la.add_argument("--gate-seconds", type=float, default=20)
     la.add_argument("--sample-seconds", type=float, default=15)
     la.add_argument("--limit-hours", type=int, default=12)
+    la.add_argument("--expect-file", action="append", default=[], help="absolute path, repeatable")
+    la.add_argument("--expect-line", action="append", default=[], help="output text, repeatable")
     la.add_argument("command", nargs=argparse.REMAINDER)
     for name in ("status", "forget"):
         sub.add_parser(name).add_argument("name")
