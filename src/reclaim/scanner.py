@@ -1560,10 +1560,12 @@ def scan_tree(
         index.drop_opaque_rows(enclosing_opaque)
 
     all_skipped: list[SkippedPath] = []
+    root_listed = True
     try:
         top_level_entries = list(os.scandir(long_path(root)))
     except OSError as exc:
         logger.warning("scan.root_unreadable", path=str(root), error=str(exc))
+        root_listed = False
         top_level_entries = []
         size_estimate, is_lower_bound = _probe_inaccessible_dir_size(root)
         all_skipped.append(
@@ -1683,6 +1685,10 @@ def scan_tree(
                     ],
                     scanned_at=scanned_at,
                 )
+                # A root that could not be listed was not walked at all: it is not a completed
+                # scan. A record from an earlier full walk stays, since its rows are protected.
+                if root_listed:
+                    index.record_completed_scan_root(root, completed_at=scanned_at)
         except (OSError, sqlite3.OperationalError) as exc:
             if _is_disk_full(exc):
                 raise ScanDiskFullError("disk is full — free up space and try again") from exc

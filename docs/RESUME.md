@@ -34,6 +34,143 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     4. A4: `integration/run-2026-10`.
     5. A5: build 11.
     6. A6.
+- 13:00 IST checkpoint 4:
+  - **#192** (checkpoint 3 docs) merged as `c01f483`; main CI green after it. Its first CI run hit a performance-floor flake on a docs-only change; the re-run passed, and the flake is logged as one.
+  - **#190** (head `ce79f43`): verifier pass 8 PASS, CI 6/6, full verify 2262 passed, merge gate eligible. It is blocked only on the real-machine dry run: Claude Code's low-memory reaper stopped that run while it waited for RAM, and I may not restart a reaped job on my own (WHEN GG HAS TIME, item 6).
+  - **Agent artifacts** (#193, draft, head `7cc15b1`):
+    - The A3 second hostile review FAILED with 6 bypasses, 2 of them data loss.
+    - All are fixed in `3e9b659`, each with a test that reproduces the scenario and fails on the old head.
+    - Full verify 2481 passed, CI 6/6.
+    - The third review (A3b) and the mutation re-run are running.
+    - A4 and A6 stay blocked until they pass.
+  - **Cleanup:** about 9.1 GB of verifier scratch deleted on D:, with check and delete as separate commands.
+  - **Next:**
+    1. A3b verdict, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
+- 19:31 IST checkpoint 5:
+  - **Agent artifacts** (#193, draft, head `0ef5811`, rebased on `eaf734d`):
+    - The A3b third hostile review FAILED with 5 findings (2 unsafe offers, 1 read-only exclusion bypass, 1 race, 1 restore adoption). All are fixed in `d6826ad` (was `bad3e67` before the rebase), each with a test that fails on the old head. ADR-0043 addendum 3 records them.
+    - Mutation: 29 targeted mutants on the fix, 23 killed. The 6 survivors were checks shadowed by a neighbour; 7 new tests now kill 5 of them, and the sixth is equivalent on Python 3.12.12.
+    - Head `0ef5811` adds two fixes on top: a hermetic guard that the fix commit missed (`a69b599`), and a CI flake fix (`0ef5811`). Full verify: 2509 passed, rc 0. CI is still running, and the fourth (data-safety) review is under way.
+    - Next: a fourth, data-safety review on the exact head (merge bar 7), then A4.
+  - **#190**: unchanged. It is blocked only on the real-machine dry run (WHEN GG HAS TIME, item 6).
+  - **Next:**
+    1. Fourth review of agent artifacts, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
+- 21:55 IST checkpoint 6:
+  - **#195** (checkpoint 5 docs) merged as `69537f2`; main CI green after it.
+  - **Agent artifacts** (#193, draft, head `905bfa1`, rebased on `69537f2`):
+    - The fourth (data-safety) review FAILED: 1 high, 1 medium, 2 low. The high one: a repository inside an artifact backing a linked worktree OUTSIDE it, possibly in an excluded project. The vault move broke that worktree, and purge would lose its staged work. Fixed in `6794edc` (ADR addendum 4), with 8 tests that fail on the old head.
+    - The fifth review FAILED: 1 medium, 4 low. The medium one: a graft file hid an only-copy commit from the push proof. Fixed in `d2abb68` (addendum 5), with 11 tests that fail on the old head.
+    - Each round's targeted mutants were killed, apart from 2 shown equivalent.
+    - Full verify on `905bfa1`: 2536 passed, rc 0. The sixth review is running on that exact head.
+  - **Next:**
+    1. Sixth review, then A4 `integration/run-2026-10`.
+    2. A5: build 11.
+    3. A6.
+    4. B.
+- 23:10 IST checkpoint 7:
+  - **#196** (checkpoint 6 docs) merged as `1805429`; main CI green after it.
+  - **Agent artifacts** (#193, draft, head `eeeb493`, rebased on `1805429`):
+    - The sixth (data-safety) review FAILED: 1 medium, 2 low, 1 over-refusal. The medium one: an `nbstripout`-style clean filter left the only copy of notebook outputs in the working file, while `status` was empty. Fixed in `fb36f48` (ADR addendum 6), with 6 tests that fail on the old head. All 8 targeted mutants were killed.
+    - The fix's own suites pass (350). The full verify on `eeeb493` was stopped by Claude Code's low-memory reaper before it started (free RAM 5.2 GB, under the 8 GB floor). I do not restart a reaped job (WHEN GG HAS TIME, item 7).
+    - The seventh review waits for free RAM to recover.
+  - **Next:**
+    1. Seventh review when RAM allows. Full verify on `eeeb493` needs your go (item 7). Then A4.
+    2. A5: build 11.
+    3. A6.
+    4. B.
+- 02:10 IST checkpoint 8 (24 Oct):
+  - **#197** (checkpoint 7 docs) merged as `c1a9300`.
+  - **Agent artifacts** (#193, draft, head `89f6010`):
+    - **The seventh review PASSED for data safety:** no realistic state loses work, changes another worktree or writes outside the vault. It left two read-only exclusion gaps, closed in `b1254a3`.
+    - A narrow eighth review of that fix FAILED on a crash I introduced: an unexpandable `~user` path raised outside `except OSError` and aborted detection. No data was at risk. Fixed in `22cff8b`; includes in a git dir's config now count as excluded.
+    - Full verify on `89f6010`: 2566 passed. The reaped verify (item 7) is superseded and resolved.
+    - A narrow ninth review of the two small fixes is running.
+  - **Next:**
+    1. Ninth review, then A4 `integration/run-2026-10`.
+    2. A5: build 11 from it.
+    3. A6.
+    4. B.
+- 09:15 IST checkpoint 9 (24 Oct):
+  - **#198** (checkpoint 8 docs) merged as `f299ad0`; main CI green after it.
+  - **Agent artifacts:** the ninth and tenth narrow reviews PASSED (fixes `07dc814`, `b17904d`, `1c07e1d`; ADR addenda 9 and 10). No eleventh round. Full verify on `7b759ea`: 2579 passed, 22 skipped.
+  - **A4 done:** `integration/run-2026-10` = `129d982`, PR #199 open for GG's merge (size gate), CI 6/6 green. #182 closed in favour of #199.
+  - **A5 blocked:** build 12 was stopped by the low-memory reaper during the Nuitka compile (free RAM 3.8 GB, other sessions). Not restarted (section 8, item 8). Nothing installed; the installed build is still `c010a58`. A6 and #199's screenshots wait for it.
+  - **Next:**
+    1. B: relocate (spec `docs/specs/relocate.md`), built and tested hermetically; real machine dry run only.
+    2. C, then D.
+    3. A5/A6 if GG restarts build 12.
+- 10:40 IST checkpoint 10 (24 Oct):
+  - **#200** (checkpoint 9 docs) merged as `708f023`.
+  - **Phase B, relocate:**
+    - built on `feat/relocate` (engine, CLI, eval gate) and `feat/relocate-ui` (dashboard page), not yet in a PR;
+    - reviews B1 and B2 FAILED and are fixed (head `603f189`; ADR-0044 addenda 1-2);
+    - a third review is running; 115 relocate tests pass;
+    - real machine: the read-only candidate list only (review pack section 5).
+  - **A5/A6:** still waiting for build 12 (section 8, item 8).
+  - **Next:**
+    1. Third relocate review, full verify, PR into `integration/run-2026-10`.
+    2. Phase C (MCP packaging and planner).
+    3. Phase D.
+- 14:20 IST checkpoint 11 (24 Oct):
+  - **Relocate:** six hostile reviews; rollback after the swap redesigned without a merge (DECISIONS 12). Head `9474aa8`, 187 tests pass, mutation 87 mutants (all killed but 5 equivalent). Review 7 running. Draft **#202** (with the page).
+  - **Phase C:** planner, read-only tools, settings panel, HOWTO section 8, end-to-end smoke with Claude Code. Draft **#203**.
+  - **Owed:** the full verify of both (queued on an export; free RAM has been 6-7.7 GB all day). A5/A6 still wait for build 12.
+  - **Next:**
+    1. Review 7 result; full verify.
+    2. Merge #202 and #203 into `integration/run-2026-10`.
+    3. Phase D.
+- 19:45 IST checkpoint 12 (24 Oct):
+  - **Merged, main CI green after each:**
+    - #206 logging fix (`e9058c6`);
+    - #207 load-robust budgets, D4 (`c07b1cf`);
+    - #205 reconciliation survives restarts, D1 (`1a42294`; DECISIONS 16);
+    - #208 ADR-0045, D2 (`18e40d2`);
+    - #209 D7/D8 plans (after a fix to the WSL fallback order).
+  - **Open for self-merge:** #210 ADR index (D6), waiting for its verifier pass.
+  - **Relocate (#202):**
+    - mutation round 7: 3 real test gaps found and closed;
+    - review B9 FAILED, with 2 medium and 3 low and no lost byte. The worst: an 8.3 short name left the real path empty. All fixed (addendum 9), mutation 4/4, 388 relocate tests pass;
+    - the narrow review B10 is running;
+    - CI 6/6 green on `9263b2b`, after main's logging fix was merged into both branches.
+  - **Next:**
+    1. B10 result. Then the full verify (RAM), and #202/#203 into `integration/run-2026-10`, regenerating the ADR index there.
+    2. D5 (warm-up profile) and the rest of D6 (HOWTO, README screenshots).
+    3. Phase E.
+- 22:45 IST checkpoint 13 (24 Oct):
+  - **Merged:** #210, the ADR index (D6, `9a88e3c`), and checkpoint 12 (#211).
+  - **Relocate (#202):**
+    - reviews B10, B11 and B12 FAILED on narrower path and name edges, with no lost byte;
+    - all fixed (addenda 10-12), mutation 19 of 19;
+    - the series stops at twelve (DECISIONS 17);
+    - `feat/relocate-ui` = `82fa6b2`; 496 relocate, eval-gate and guard tests pass.
+  - **Full verify of `82fa6b2`:** waiting on its RAM gate.
+  - **Next:**
+    1. When the verify passes: merge #202 and #203 into `integration/run-2026-10`, regenerate the ADR index there (ADR-0043/0044), add `list_relocation_options`, and update #199.
+    2. D5 (warm-up profile).
+    3. Phase E.
+- 00:10 IST checkpoint 14 (25 Oct):
+  - **#199 is the one PR for GG's merge.** It now holds agent artifacts, relocate with its page, and the planner and read-only tools, plus the new `list_relocation_options`.
+    - Head `f8f51f5`: CI 6/6 green, CLEAN, contains main.
+    - The description is rewritten, with the handoff table.
+  - **Owed to GG** (review section 8):
+    - item 11, the full verify of `f8f51f5`, reaped while waiting for RAM;
+    - item 10, D: scratch I may not delete;
+    - item 9, three ACL-locked test folders;
+    - item 8, build 12.
+  - **Next:** D5 when RAM allows, then Phase E (soak needs build 12; docs; review pack).
+- 00:40 IST checkpoint 15 (25 Oct): the review pack is brought current: every merge in section 1, and sections 3, 4, 5, 7 and 9 updated. No code. Next: D5 when RAM allows; Phase E's soak waits for build 12.
+- 05:10 IST checkpoint 16 (25 Oct): #199 is current with main (`8a1febc`, CI 6/6, CLEAN), and HOWTO sections 9 and 10 are on it. Three run-log entries that had been glued onto the end of the previous line were split back onto their own lines; no words changed. D5's first try gave up waiting for RAM (free stayed 7.9-8.3 GB for 4 h, under its 8.5 GB gate; it never started) and is re-queued. Next: D5 when RAM allows, then the 25 Oct daily summary.
+- 14:15 IST checkpoint 17 (25 Oct): D5 measured on a scratch index copy. `generate_candidates` went from 460.1 s to 253.9 s, and `find_duplicate_clusters` from 72.0 s to 44.2 s. What remains is two deliberate live-disk checks (the exclusion walk, 119 s; the hard-link estimate, 99 s), not small costs, so no code change (DECISIONS 18). The third stage is not measured yet; a 15-hour RAM-gated try is queued. Next: the 25 Oct daily summary.
+- 23:10 IST checkpoint 18 (25 Oct): the 25 Oct daily summary. #199 is on `4f82437` (current main, CI 6/6, CLEAN, your merge). D5 is measured (DECISIONS 18); its third stage still waits for RAM. Next: Phase E upkeep, and the review pack must be final by 27 Oct 09:00.
+- 05:15 IST checkpoint 19 (26 Oct): the review pack brought current. Section 2 is rewritten for #199 as it is now (#202 and #203 inside it; relocate reviews ended at B12), and sections 1, 7, 8 and 9 are updated. D5 retries stopped: in about 28 hours over four tries, the RAM gate opened once. Next: keep the pack current, and the 26 Oct daily summary.
+- 22:50 IST checkpoint 20 (26 Oct): the 26 Oct daily summary, and the review pack's final pass (section 1 through #218, section 9's 22:30 disk row). #199 is on `1fc8616` (main `bf8aec2`, CI 6/6, CLEAN, your merge); it will take one more docs-only merge of main after this. Next: keep the pack current until 27 Oct 09:00.
+- 20:00 IST checkpoint 21 (30 Oct, GG's 30 Oct queue, which replaces the spec's §5): §1 done. Heavy jobs now run detached through `packaging/detached_job.py` (PR #220): a one-time per-user scheduled task with its own watchdog (8 GB start gate unchanged, 2 GB running abort floor, disk floors, kill-on-close Job Object, abort cleanup only in a fresh dir the job creates). VERIFIED on `504cfca` (the last commit before the pass-3 hardening `1c930f0`): a job outlived its launching shell being stopped and completed (90/90 lines, `END state=done rc=0`); full verify 2,291 passed / 0 failed run through it; mutation 24/25 killed by the run, the survivor pinned by a test in `a48af46` (killed on a hand re-run); the full verify of #199's head `e53c40b`, which contains `1c930f0`, is running through the launcher; three verifier passes, all findings fixed or documented as limits. #220 fails gate 3 on size, so it is merged into `integration/run-2026-10` (GG's merge with #199), not main. Next: §2 (ship #199 to GG's machine as build 12 without merging it). Every heavy step from now on goes through the launcher.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
