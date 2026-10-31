@@ -229,7 +229,19 @@ class FixedDrivesResponse(BaseModel):
 # --- Summary / category cards -------------------------------------------------------------
 
 
-class CategoryCardOut(BaseModel):
+class EstimateMarkingOut(BaseModel):
+    """D5: carried by every response that aggregates reclaimable bytes. `estimate_source` says how
+    much of the figure is index-derived (the last scan, not the live disk): "index" (all of it),
+    "live" (none) or "mixed"; `estimate_as_of` is the OLDEST scan time (epoch seconds) among the
+    index-derived members, None when there are none (or none recorded a time)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    estimate_source: Literal["index", "live", "mixed"] = "live"
+    estimate_as_of: float | None = None
+
+
+class CategoryCardOut(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     category_group: str
@@ -240,7 +252,7 @@ class CategoryCardOut(BaseModel):
     total_bytes_human: str
 
 
-class SummaryResponse(BaseModel):
+class SummaryResponse(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     has_scan: bool
@@ -357,7 +369,7 @@ class CandidateOut(BaseModel):
     duplicate_cluster: DuplicateClusterOut | None = None
 
 
-class DuplicateClusterReviewOut(BaseModel):
+class DuplicateClusterReviewOut(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     cluster: DuplicateClusterOut
@@ -374,7 +386,7 @@ class DuplicateClusterReviewResponse(BaseModel):
     clusters: list[DuplicateClusterReviewOut]
 
 
-class CandidatesResponse(BaseModel):
+class CandidatesResponse(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     has_scan: bool
@@ -387,7 +399,7 @@ class CandidatesResponse(BaseModel):
 # --- One-click clean (categorically-safe groups only) ----------------------------------------
 
 
-class OneClickGroupOut(BaseModel):
+class OneClickGroupOut(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     category_group: str
@@ -404,7 +416,7 @@ class OneClickGroupOut(BaseModel):
     paths: list[str]
 
 
-class OneClickCleanSummaryResponse(BaseModel):
+class OneClickCleanSummaryResponse(EstimateMarkingOut):
     model_config = ConfigDict(extra="forbid")
 
     has_scan: bool

@@ -1658,6 +1658,8 @@ def test_one_click_summary_empty_before_any_scan(tmp_path: Path) -> None:
         "total_bytes": 0,
         "total_bytes_human": "0 B",
         "total_file_count": 0,
+        "estimate_source": "live",  # D5: nothing aggregated, nothing index-derived
+        "estimate_as_of": None,
     }
 
 

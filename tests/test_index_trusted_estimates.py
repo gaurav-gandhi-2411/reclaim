@@ -7,7 +7,8 @@ Groups:
 2. Teeth -- a protected folder or a hardlink created AFTER the scan can make the index-derived
    candidate look fine, but `apply_batch` still refuses it. Each would fail if the matching
    apply-time live check were removed (mutants run by hand, see the PR description).
-3. API -- an index-derived estimate is marked as such and is refreshed live for what is applied.
+3. API -- an index-derived estimate is marked as such (per candidate and on every aggregate),
+   and a real apply drops the warm cache so the figures are recomputed afterwards.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from fastapi.testclient import TestClient
 
 from reclaim.api import security, service
 from reclaim.api.app import create_app
-from reclaim.api.schemas import ApplyRequest
 from reclaim.config import (
     CategoriesConfig,
     Config,
@@ -34,7 +34,6 @@ from reclaim.detectors import (
     _reclaimable_bytes_for_candidate,
     _reclaimable_bytes_from_index,
     generate_candidates,
-    refresh_live_estimate,
 )
 from reclaim.executor import SafetyInvariantError, apply_batch
 from reclaim.index import InaccessibleEntry, ScanIndex
@@ -295,9 +294,6 @@ def test_hardlink_added_after_the_scan_is_estimated_from_the_index_but_refused_a
         # The scan knew of one name only, so the index figure still claims the whole file...
         assert candidate.reclaimable_bytes == len(b"shared-bytes")
         assert candidate.estimate_source == "index"
-        # ...the live recompute (what refresh does for an apply selection) sees the link: 0.
-        refreshed = refresh_live_estimate(index, candidate)
-        assert (refreshed.reclaimable_bytes, refreshed.estimate_source) == (0, "live")
         assert candidate.retention_days is None
         result = _apply(candidate, index, tmp_path, safety)
     (item,) = result.items  # type: ignore[attr-defined]
@@ -339,7 +335,7 @@ def test_apply_time_exclusion_check_never_takes_the_trusted_index(
     assert seen and all(value is None for value in seen)
 
 
-# --- 3. API: index-derived estimates are marked, and refreshed for what is applied --------------
+# --- 3. API: index-derived estimates are marked, and an apply drops the warm cache --------------
 
 _HOST = "127.0.0.1"
 _PORT = 8421
@@ -371,12 +367,12 @@ def _client(tmp_path: Path, root: Path, cache: Path) -> TestClient:
     return client
 
 
-def test_api_marks_index_derived_estimates_and_apply_selection_refreshes_them(
+def test_api_marks_index_derived_estimates_on_candidates_and_every_aggregate(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "world"
     cache = root / "cache"
-    blob = _write(cache / "blob.bin", b"b" * 64)
+    _write(cache / "blob.bin", b"b" * 64)
     client = _client(tmp_path, root, cache)
 
     listed = client.get("/api/candidates", params={"tier": "both"}).json()
@@ -384,15 +380,70 @@ def test_api_marks_index_derived_estimates_and_apply_selection_refreshes_them(
     assert row["estimate_source"] == "index"
     assert row["reclaimable_bytes"] == 64
     assert isinstance(row["estimate_as_of"], float)  # the completed scan's time
+    as_of = row["estimate_as_of"]
+    assert (listed["estimate_source"], listed["estimate_as_of"]) == ("index", as_of)
 
-    # A link added after the scan: the displayed (index) figure is stale, the selection is live.
-    os.link(blob, root / "alias.bin")
-    state = client.app.state.reclaim  # type: ignore[attr-defined]
-    selected, _method, _apply = service.resolve_apply_selection(
-        state, ApplyRequest(tier="both", paths=[cache.as_posix()], dry_run=True)
+    summary = client.get("/api/summary").json()
+    assert (summary["estimate_source"], summary["estimate_as_of"]) == ("index", as_of)
+    (card,) = [c for c in summary["categories"] if c["category_group"] == "package_caches"]
+    assert (card["estimate_source"], card["estimate_as_of"]) == ("index", as_of)
+
+
+def _bare(path: str, **kw: object) -> Candidate:
+    return Candidate(
+        path=Path(path),
+        is_dir=True,
+        category="package_cache",
+        category_group="package_caches",
+        size_bytes=10,
+        tier=Tier.A,
+        rationale="r",
+        rebuild_instruction=None,
+        safety_verdict=Verdict.ELIGIBLE,
+        safety_reason_code="X",
+        retention_days=None,
+        **kw,  # type: ignore[arg-type]
     )
-    (chosen,) = selected
-    assert (chosen.estimate_source, chosen.reclaimable_bytes) == ("live", 0)
+
+
+def test_aggregate_marking_is_live_index_or_mixed_with_the_oldest_scan_time() -> None:
+    live = _bare("C:/live")
+    old = _bare("C:/old", estimate_source="index", estimate_scan_time=100.0)
+    new = _bare("C:/new", estimate_source="index", estimate_scan_time=200.0)
+    unstamped = _bare("C:/unstamped", estimate_source="index")
+    mark = service._estimate_marking
+    assert mark([]) == {"estimate_source": "live", "estimate_as_of": None}
+    assert mark([live]) == {"estimate_source": "live", "estimate_as_of": None}
+    assert mark([old, new]) == {"estimate_source": "index", "estimate_as_of": 100.0}
+    assert mark([live, new, old]) == {"estimate_source": "mixed", "estimate_as_of": 100.0}
+    assert mark([unstamped]) == {"estimate_source": "index", "estimate_as_of": None}
+    (card,) = service._category_cards([live, old])
+    assert (card.estimate_source, card.estimate_as_of) == ("mixed", 100.0)
+    (card,) = service._category_cards([live])
+    assert (card.estimate_source, card.estimate_as_of) == ("live", None)
+
+
+def test_a_real_apply_drops_the_warm_cache_and_a_dry_run_does_not(tmp_path: Path) -> None:
+    root = tmp_path / "world"
+    cache = root / "cache"
+    _write(cache / "blob.bin", b"b" * 64)
+    client = _client(tmp_path, root, cache)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    assert service.is_candidates_cache_warm(state)
+    body = {"tier": "both", "paths": [cache.as_posix()], "method": "vault"}
+
+    assert client.post("/api/apply", json={**body, "dry_run": True}).status_code == 202
+    assert service.is_candidates_cache_warm(state)  # nothing was applied
+
+    assert client.post("/api/apply", json={**body, "dry_run": False}).status_code == 202
+    assert client.get("/api/apply/status").json()["status"] == "completed"
+    assert not service.is_candidates_cache_warm(state)
+    assert state.candidates_cache is None and state.candidates_clusters_cache is None
+
+    # The next read re-warms (from the index) instead of serving the pre-apply figures.
+    assert client.post("/api/candidates/warm").status_code == 202
+    assert client.get("/api/candidates/warm-status").json()["status"] == "ready"
+    assert service.is_candidates_cache_warm(state)
 
 
 def test_candidate_out_defaults_to_live_and_carries_the_scan_time() -> None:

@@ -13,7 +13,7 @@ from dataclasses import replace as _dataclass_replace
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
@@ -101,7 +101,7 @@ from reclaim.dedup import (
     find_duplicate_clusters,
     generate_duplicate_candidates,
 )
-from reclaim.detectors import generate_candidates, refresh_live_estimate
+from reclaim.detectors import generate_candidates
 from reclaim.drives import list_fixed_drives
 from reclaim.executor import (
     BatchApplyReport,
@@ -1159,6 +1159,20 @@ def _effective_reclaimable_bytes(candidate: Candidate) -> int:
     return candidate.size_bytes
 
 
+def _estimate_marking(candidates: Sequence[Candidate]) -> dict[str, Any]:
+    """D5: the `EstimateMarkingOut` fields for an aggregate over `candidates` -- "index" when every
+    member's figure came from the last scan, "mixed" when only some did, "live" otherwise (also
+    for no members); `estimate_as_of` is the oldest recorded scan time among index members."""
+    index_members = [c for c in candidates if c.estimate_source == "index"]
+    if not index_members:
+        return {"estimate_source": "live", "estimate_as_of": None}
+    times = [c.estimate_scan_time for c in index_members if c.estimate_scan_time is not None]
+    return {
+        "estimate_source": "index" if len(index_members) == len(candidates) else "mixed",
+        "estimate_as_of": min(times) if times else None,
+    }
+
+
 def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
     grouped: dict[tuple[str, Tier], list[Candidate]] = defaultdict(list)
     for candidate in candidates:
@@ -1175,6 +1189,7 @@ def _category_cards(candidates: Sequence[Candidate]) -> list[CategoryCardOut]:
                 file_count=len(items),
                 total_bytes=total_bytes,
                 total_bytes_human=format_bytes(total_bytes),
+                **_estimate_marking(items),
             )
         )
     cards.sort(key=lambda c: c.total_bytes, reverse=True)
@@ -1317,6 +1332,7 @@ def build_summary(state: AppState, *, require_warm: bool = True) -> SummaryRespo
         reconciliation_volume=reconciliation_volume,
         reconciliation_delta_bytes=reconciliation_delta_bytes,
         reconciliation_delta_pct=reconciliation_delta_pct,
+        **_estimate_marking(tier_a + tier_b),
     )
 
 
@@ -1543,6 +1559,7 @@ def list_candidates(
         count=len(out),
         total_bytes=total_bytes,
         total_bytes_human=format_bytes(total_bytes),
+        **_estimate_marking(filtered),
     )
 
 
@@ -1608,6 +1625,7 @@ def build_one_click_summary(
                 total_bytes=total_bytes,
                 total_bytes_human=format_bytes(total_bytes),
                 paths=[item.path.as_posix() for item in items],
+                **_estimate_marking(items),
             )
         )
     groups.sort(key=lambda g: g.total_bytes, reverse=True)
@@ -1620,6 +1638,7 @@ def build_one_click_summary(
         total_bytes=total_bytes,
         total_bytes_human=format_bytes(total_bytes),
         total_file_count=total_file_count,
+        **_estimate_marking([c for g in grouped.values() for c in g]),
     )
 
 
@@ -1699,6 +1718,7 @@ def list_duplicate_cluster_review(
                 reclaimable_bytes_human=format_bytes(reclaimable_total),
                 needs_review=cluster_needs_manual_review(display_cluster),
                 rationale=member_candidates[0].rationale,
+                **_estimate_marking(member_candidates),
             )
         )
 
@@ -1955,12 +1975,6 @@ def resolve_apply_selection(
                     if user_selected is not None:
                         selected.append(user_selected)
 
-    # D5: warm-cache candidates carry an index-derived reclaimable estimate; what is about to be
-    # applied gets it recomputed live (the apply-time safety checks are separate, in apply_batch).
-    if any(c.estimate_source == "index" for c in selected):
-        with ScanIndex(state.db_path) as refresh_index:
-            selected = [refresh_live_estimate(refresh_index, c) for c in selected]
-
     # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally
     # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its
     # own method selector disabled/hidden depending on mode to avoid a confusing 400.
@@ -2047,6 +2061,16 @@ def run_apply(
         if not isinstance(exc, Exception):
             raise
         return
+    finally:
+        if apply and selected:
+            # D5: nothing invalidated the warm cache after an apply (even a failed one may have
+            # deleted some; an empty selection deleted nothing), so its cards/totals and any
+            # index-derived estimate outlived the delete. Cleared here -- no stat work on the
+            # request path -- so the next read says "not warm" and re-warms from the index.
+            with state.candidates_cache_lock:
+                state.candidates_cache = None
+                state.candidates_clusters_cache = None
+                state.candidates_cache_generation = None
 
     with state.lock:
         state.apply_status = ApplyStatus(

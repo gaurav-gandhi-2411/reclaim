@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -997,8 +997,8 @@ def _reclaimable_bytes_from_index(
     KNOWN GAP, so this is an upper bound on the live figure, never a lower one: a link to a file
     in this candidate from a path the scan never indexed (outside every scan root, or created
     after the scan) is invisible here and the live estimate would have said 0 for it. That is why
-    the candidate is marked `estimate_source="index"`, and the estimate is refreshed live for
-    whatever is selected for apply (`refresh_live_estimate`)."""
+    the candidate is marked `estimate_source="index"` (surfaced in the API/UI, and any later
+    warm-up recomputes it); apply itself never reads it and keeps every live check."""
     rows = index.subtree_link_members(path)
     opaque_bytes = 0
     if is_dir:
@@ -1021,17 +1021,6 @@ def _reclaimable_bytes_from_index(
     if opaque_bytes and reclaimable == 0:
         return None
     return reclaimable
-
-
-def refresh_live_estimate(index: ScanIndex, candidate: Candidate) -> Candidate:
-    """D5: an index-derived estimate is recomputed live (what is about to be applied only, one
-    `os.stat` per file of that candidate) and marked live; any other candidate is returned as is."""
-    if candidate.estimate_source != "index":
-        return candidate
-    live = _live_reclaimable_bytes(index, candidate.path, candidate.is_dir, candidate.size_bytes)
-    return replace(
-        candidate, reclaimable_bytes=live, estimate_source="live", estimate_scan_time=None
-    )
 
 
 def _scan_time_for(path: Path, scan_times: Sequence[tuple[Path, float]]) -> float | None:
