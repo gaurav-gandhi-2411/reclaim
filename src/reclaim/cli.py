@@ -83,7 +83,7 @@ _DEFAULT_PORT = 8420
 # flag matters most (a user can't `pip show` an installed .exe). Checked against
 # pyproject.toml's version by tests/test_version_consistency.py, the same pattern already used
 # for packaging/reclaim.iss and packaging/build_installer.ps1's own version strings.
-_VERSION = "1.3.0"
+_VERSION = "1.4.0"
 
 # Literal loopback IPs only — deliberately excludes the hostname "localhost", since that's a
 # DNS/hosts-file lookup (uvicorn/the socket layer resolves it, not this code) and a tampered
