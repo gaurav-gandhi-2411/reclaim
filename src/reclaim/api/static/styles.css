@@ -1321,3 +1321,85 @@ html[data-mode="simple"] #simple-view {
 .rc-simple-summary-line {
   margin: 0 0 var(--rc-space-4);
 }
+
+/* --- "What changed" (disk growth attribution, read-only) ---------------------------------------- */
+
+.rc-growth {
+  border: 1px solid var(--rc-border);
+  border-radius: var(--rc-radius-md);
+  padding: var(--rc-space-4);
+  margin-top: var(--rc-space-5);
+  background: var(--rc-surface);
+}
+
+.rc-growth-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--rc-space-3);
+  flex-wrap: wrap;
+}
+
+.rc-growth-head h2 {
+  margin: 0;
+  font-size: var(--rc-text-lg);
+}
+
+.rc-growth-toggle {
+  display: flex;
+  gap: var(--rc-space-2);
+}
+
+.rc-growth-toggle .rc-btn[aria-pressed="true"] {
+  background: var(--rc-brand);
+  border-color: var(--rc-brand);
+  color: var(--rc-text-on-brand);
+}
+
+.rc-growth-note {
+  color: var(--rc-text-muted);
+  font-size: var(--rc-text-sm);
+  margin: var(--rc-space-2) 0 var(--rc-space-3);
+}
+
+.rc-growth-volumes,
+.rc-growth-rows {
+  list-style: none;
+  margin: 0 0 var(--rc-space-3);
+  padding: 0;
+}
+
+.rc-growth-volumes li {
+  font-size: var(--rc-text-base);
+  padding: var(--rc-space-2) 0;
+  border-bottom: 1px solid var(--rc-border);
+}
+
+.rc-growth-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--rc-space-3);
+  padding: var(--rc-space-2) 0;
+  border-bottom: 1px solid var(--rc-border);
+}
+
+.rc-growth-label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rc-growth-bytes {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.rc-growth-partial {
+  font-size: var(--rc-text-xs);
+  color: var(--rc-warning);
+  font-weight: 600;
+}
+
+.rc-growth-link {
+  font-size: var(--rc-text-sm);
+}

@@ -530,6 +530,7 @@ async function readCandidateCache(stateEl, path) {
 }
 
 async function loadOverview() {
+  loadGrowthPanel(); // reads the growth store, not the scan: independent of everything below
   const stateEl = document.getElementById("overview-state");
   const contentEl = document.getElementById("overview-content");
   contentEl.hidden = true;
@@ -557,6 +558,156 @@ async function loadOverview() {
       message: err.message,
       actionLabel: "Retry",
       onAction: loadOverview,
+    });
+  }
+}
+
+// --- "What changed" panel (disk growth attribution, ADR-0046) -----------------------------------
+//
+// Read-only: renders GET /api/growth and never offers a delete/apply. Every string from the server
+// (labels, volume names) goes through textContent. The only action is a link that opens the
+// existing Review tab pre-filtered to the row's category; the API's `review_link` is a query for
+// /api/candidates, which the dashboard has no route for, so it is translated into the Review
+// tab's own tier/category selects.
+
+let growthWindow = "1d";
+const GROWTH_WINDOW_LABEL = { "1d": "the last day", "7d": "the last 7 days" };
+
+// {tier, category} for a row's `review_link`, or null when the row has no link or the Review tab
+// has no matching filter option (then no link is shown rather than a link that filters nothing).
+function reviewFilterFromLink(link) {
+  if (!link) return null;
+  let params;
+  try {
+    params = new URL(link, "http://reclaim.invalid").searchParams;
+  } catch {
+    return null;
+  }
+  const category = params.get("category");
+  const tier = params.get("tier") ?? "both";
+  const categorySelect = document.getElementById("review-category-filter");
+  const tierSelect = document.getElementById("review-tier-filter");
+  const has = (select, value) => !!select && [...select.options].some((o) => o.value === value);
+  if (!category || !has(categorySelect, category) || !has(tierSelect, tier)) return null;
+  return { tier, category };
+}
+
+function openReviewFiltered({ tier, category }) {
+  document.getElementById("review-tier-filter").value = tier;
+  document.getElementById("review-category-filter").value = category;
+  activateTab("review"); // its loader reads the two selects just set
+}
+
+function signedBytes(bytes) {
+  return `${bytes < 0 ? "−" : "+"}${formatFromBytes(Math.abs(bytes))}`;
+}
+
+function renderGrowthVolumes(volumes, windowLabel) {
+  const list = document.getElementById("growth-volumes");
+  list.innerHTML = "";
+  for (const v of volumes) {
+    const li = document.createElement("li");
+    if (v.status !== "ok") {
+      li.textContent = `${v.volume} — not enough snapshots for ${windowLabel} yet.`;
+    } else {
+      li.textContent =
+        `${v.volume} ${v.change_bytes < 0 ? "shrank" : "grew"} ` +
+        `${formatFromBytes(Math.abs(v.change_bytes))} in ${windowLabel}: ` +
+        `${formatFromBytes(v.attributed_bytes)} attributed to the folders below, ` +
+        `${signedBytes(v.not_attributed_bytes)} not attributed.`;
+    }
+    list.appendChild(li);
+  }
+}
+
+function renderGrowthRows(rows) {
+  const list = document.getElementById("growth-rows");
+  list.innerHTML = "";
+  for (const row of rows) {
+    const li = document.createElement("li");
+    li.className = "rc-growth-row";
+    const label = document.createElement("span");
+    label.className = "rc-growth-label";
+    label.textContent = row.label;
+    label.title = row.path;
+    const bytes = document.createElement("span");
+    bytes.className = "rc-growth-bytes";
+    bytes.textContent = signedBytes(row.growth_bytes);
+    li.appendChild(label);
+    li.appendChild(bytes);
+    if (row.partial) {
+      const partial = document.createElement("span");
+      partial.className = "rc-growth-partial";
+      partial.textContent = "partial";
+      partial.title =
+        "The latest size of this folder was cut off by the snapshot's time budget, so its growth may be understated.";
+      li.appendChild(partial);
+    }
+    const filter = reviewFilterFromLink(row.review_link);
+    if (filter) {
+      const link = document.createElement("a");
+      link.className = "rc-growth-link";
+      link.href = `#review-${filter.category}`;
+      link.textContent = "Review in Review Queue";
+      link.setAttribute("aria-label", `Review ${row.label} in the Review Queue`);
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        openReviewFiltered(filter);
+      });
+      li.appendChild(link);
+    }
+    list.appendChild(li);
+  }
+}
+
+async function loadGrowthPanel() {
+  const stateEl = document.getElementById("growth-state");
+  const contentEl = document.getElementById("growth-content");
+  if (!stateEl || !contentEl) return; // a page without the panel (e.g. a trimmed test DOM)
+  const windowAtStart = growthWindow;
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Loading what changed…" });
+  for (const btn of document.querySelectorAll("#growth-panel [data-window]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.window === windowAtStart));
+  }
+
+  try {
+    const data = await api(`/api/growth?window=${encodeURIComponent(windowAtStart)}`);
+    if (windowAtStart !== growthWindow) return; // a newer toggle click owns the panel now
+    if (data.status !== "ok") {
+      renderState(stateEl, "empty", {
+        title: "Not enough snapshots yet",
+        message: "Not enough snapshots yet — Reclaim takes one every 4 hours.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    const windowLabel = GROWTH_WINDOW_LABEL[windowAtStart];
+    renderGrowthVolumes(data.volumes, windowLabel);
+    renderGrowthRows(data.rows);
+    const excluded = document.getElementById("growth-excluded");
+    excluded.textContent =
+      `${data.excluded_aggregate.label}: ` +
+      (data.excluded_aggregate.bytes > 0
+        ? `${signedBytes(data.excluded_aggregate.bytes)} in total, not itemised.`
+        : "no change measured, never itemised.");
+  } catch (err) {
+    if (windowAtStart !== growthWindow) return;
+    renderState(stateEl, "error", {
+      title: "Could not load what changed",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadGrowthPanel,
+    });
+  }
+}
+
+function initGrowthPanel() {
+  for (const btn of document.querySelectorAll("#growth-panel [data-window]")) {
+    btn.addEventListener("click", () => {
+      growthWindow = btn.dataset.window;
+      loadGrowthPanel();
     });
   }
 }
@@ -1988,6 +2139,9 @@ export {
   ensureCandidatesWarm,
   readCandidateCache,
   loadOverview,
+  loadGrowthPanel,
+  initGrowthPanel,
+  reviewFilterFromLink,
   loadQuickClean,
   loadTreemapView,
   loadReviewQueue,
@@ -3261,6 +3415,7 @@ function init() {
   initTabs();
   initScanBar();
   initReviewQueue();
+  initGrowthPanel();
   initAISuggestions();
   initQuickClean();
   initSimpleMode();
