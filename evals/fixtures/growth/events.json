@@ -34,6 +34,36 @@
    "evaluable_reason": "shrink on C: (the matching +16 GiB on D: is not quantified in the docs), and no fixture sample near the 13:02 boot"
   },
   {
+   "id": "pagefile-to-d-2026-10-09",
+   "kind": "growth",
+   "volume": "D",
+   "start": "2026-10-09T13:02:00",
+   "end": "2026-10-09T13:02:00",
+   "size_gib": 16.0,
+   "attributed_key": "D:\\pagefile.sys",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": ["docs/RESUME.md:581", "docs/RESUME.md:533"],
+   "doc_quote": "Boot 2026-10-09 13:02. Pagefile is D:\\pagefile.sys (16 GB, system-managed) ... D:\\pagefile.sys 16,384 MB",
+   "evaluable": false,
+   "evaluable_reason": "no D: sample within 1 h of the 13:02 boot (last before: 10-08 11:42, first after: 10-09 15:21:54). Added after the first replay showed a D: volume alert of exactly 16.0 GiB at 15:21:54; the doc entry is independent of it, but it turns that alert from a false alarm into a match"
+  },
+  {
+   "id": "hf-copy-to-d-2026-10-09",
+   "kind": "growth",
+   "volume": "D",
+   "start": "2026-10-09T15:21:54",
+   "end": "2026-10-09T20:04:58",
+   "size_gib": 185.2,
+   "attributed_key": "D:\\relocated\\huggingface",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": ["docs/RESUME.md:528", "docs/RESUME.md:549"],
+   "doc_quote": "the D: peak is dominated by my concurrent 185 GiB HF copy",
+   "evaluable": true,
+   "evaluable_reason": "watchdog.csv holds D: free for the whole watchdog2 run (window = that run, ~15:22 -> ~20:00 per the doc); no D: folder series exists, so only detection is scored, not attribution. Added after the first replay, for the same reason as pagefile-to-d-2026-10-09"
+  },
+  {
    "id": "c-drop-2026-10-09-1522",
    "kind": "growth",
    "volume": "C",
