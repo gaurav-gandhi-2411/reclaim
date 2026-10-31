@@ -465,9 +465,16 @@ class GrowthStore:
     """`data/growth.sqlite3` (spec §1.6). `observed_at` is an addition to the spec's columns: the
     index-sourced rows are only as fresh as the last index scan, and the series must say so."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        """`read_only` (the API and the toast text): the file is opened `mode=ro` and neither
+        created nor given the schema, so an empty or foreign file stays byte-for-byte as it was;
+        reading it then raises sqlite3.Error (no such table / not a database) for the caller to
+        treat as "no data"."""
         assert_not_real_profile_under_pytest(path, operation="open the growth store at")
         self._path = path
+        if read_only:
+            self._conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path)
         self._conn.execute("PRAGMA foreign_keys=ON")

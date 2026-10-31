@@ -227,3 +227,24 @@ def test_exclusion_added_after_snapshots_exist_hides_old_keys(tmp_path: Path) ->
     assert "work" not in str(body["anomalies"]).lower()
     # the aggregate line is untouched: it is its own series, never itemised
     assert body["excluded_aggregate"]["bytes"] == 3 * GIB
+
+
+@pytest.mark.parametrize(
+    "content", [b"", b"this is not an sqlite database " * 20], ids=["empty", "foreign"]
+)
+def test_get_on_an_empty_or_foreign_file_is_insufficient_data_and_leaves_it_untouched(
+    tmp_path: Path, content: bytes
+) -> None:
+    # D5: the API used to open every existing file read-write and give it the schema, so a GET
+    # turned a 0-byte placeholder into a database (and failed on a foreign file).
+    store = tmp_path / "growth.sqlite3"
+    store.write_bytes(content)
+    before = hashlib.sha256(store.read_bytes()).hexdigest()
+    body = _client(tmp_path, store).get("/api/growth?window=1d&volume=C:").json()
+    assert body["status"] == "insufficient data" and body["rows"] == []
+    assert [v["status"] for v in body["volumes"]] == ["insufficient data"]
+    assert hashlib.sha256(store.read_bytes()).hexdigest() == before
+    assert store.stat().st_size == len(content)
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("growth")) == [
+        "growth.sqlite3"
+    ]  # no -journal / -wal sidecar either

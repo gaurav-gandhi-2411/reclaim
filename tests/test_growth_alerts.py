@@ -92,3 +92,14 @@ def test_an_unusable_store_path_is_contained(tmp_path: Path) -> None:
 def test_real_sampler_is_refused_under_pytest(tmp_path: Path) -> None:
     with pytest.raises(RealProfileAccessError):
         scheduled_snapshot(_config(), tmp_path / "growth.sqlite3", now=NOW)
+
+
+def test_toast_text_on_an_empty_store_file_leaves_it_untouched(tmp_path: Path) -> None:
+    # D5, toast side: the text builders open the store read-only too
+    from reclaim.growth_alerts import growth_anomaly_text, recent_growth_line
+
+    store = tmp_path / "growth.sqlite3"
+    store.write_bytes(b"")
+    assert recent_growth_line(_config(), store, NOW, "C:\\") is None
+    assert growth_anomaly_text(_config(), store, NOW, "C:\\") is None
+    assert store.stat().st_size == 0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -106,10 +107,15 @@ def build_growth_response(
         return empty_response(window, now, volume)
     cfg = state.config.growth
     slack_s, end_age_s = cfg.max_start_slack_h * 3600.0, cfg.max_end_age_h * 3600.0
-    with growth.GrowthStore(path) as store:
-        # keys stored before an exclusion was added are hidden here, not only at snapshot time
-        series = growth.hide_excluded(store.load_series(), exclusion_patterns(state.config))
-        partial = store.partial_latest_keys()
+    try:
+        # read-only: a GET never creates, migrates or fills a store file (an empty or foreign
+        # file is left exactly as it was and answers "insufficient data")
+        with growth.GrowthStore(path, read_only=True) as store:
+            # keys stored before an exclusion was added are hidden here, not only at snapshot time
+            series = growth.hide_excluded(store.load_series(), exclusion_patterns(state.config))
+            partial = store.partial_latest_keys()
+    except sqlite3.Error:
+        return empty_response(window, now, volume)
     report = growth.growth_report(series, _WINDOW_S[window], now, slack_s, end_age_s)
 
     volumes = [

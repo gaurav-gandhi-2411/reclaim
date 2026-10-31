@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -93,8 +94,11 @@ def _load_visible_series(
     "Excluded projects" ever appears, and the toasts do not use it."""
     if not store_path.is_file():
         return None
-    with growth.GrowthStore(store_path) as store:
-        series = store.load_series()
+    try:
+        with growth.GrowthStore(store_path, read_only=True) as store:
+            series = store.load_series()
+    except sqlite3.Error:
+        return None  # an empty or foreign file is no data (and is left untouched)
     root = growth.norm(volume.rstrip("\\/") + "\\")
     out: dict[str, growth.KeySeries] = {}
     for path, ks in growth.hide_excluded(series, exclusion_patterns(config)).items():
