@@ -7,7 +7,9 @@ Entries for 1.0.0 to 1.3.0 are condensed from each release's GitHub release note
 
 Reclaim is unsigned: Windows SmartScreen and some antivirus engines may warn on the installer
 (see the README). Safe mode (Recycle Bin only, review-only, riskiest categories off) is the
-default for every fresh install in every release below.
+default for every fresh install in every release below. One exception from 1.4.0: the one-click
+clean and the weekly cache clean (ADR-0034) run each tool's own cleaning command on the
+regenerable-cache list, in safe mode, without a review step and not through the Recycle Bin.
 
 ## [1.4.0] - unreleased
 
@@ -57,7 +59,7 @@ nothing is tagged or published yet.
 
 - **Performance** (each measured in its PR; see the PR for the number and the machine):
   prefix-scoped index queries (#117), scanner reads IDs, sizes and times from the NTFS directory
-  listing (#118; its second lever was not shipped), bounded parallel dedup hashing (#125),
+  listing (#118, its Lever 2; Lever 1 was not shipped), bounded parallel dedup hashing (#125),
   memoised environment-root probes (#124), `/api/summary` without materialising every row
   (#152, #160), path-scoped apply from the warm cache (#121), exclusion patterns compiled once
   (#187), bounded index WAL (#103, #151).

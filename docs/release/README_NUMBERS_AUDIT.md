@@ -5,8 +5,8 @@ applied: a number stays only if a file in the repo (code constant, report, ADR, 
 and the citation sits next to the number in the README. No number was invented or estimated; where
 no source exists the number was removed or replaced with non-numeric wording.
 
-SHAs are the last commit that touched the cited line or file on this branch
-(`git log -1 -- <file>` or `git blame -L`). "Dev-tree value" means the number is a constant in the
+SHAs are the last commit that touched the cited line (`git blame -L`), or, where a whole file is
+the source, the last commit that touched that file (`git log -1 -- <file>`), on this branch. "Dev-tree value" means the number is a constant in the
 code, not a measurement of anything.
 
 Method: `grep -n "[0-9]" README.md` over the whole file (every line containing a digit; image

@@ -128,6 +128,9 @@ Follow runbook "Publishing: SHA-256 checksum sidecar".
 
 Not done by a session or an agent; none of these has been done.
 
+- [ ] **[OWNER ONLY]** Turn on private vulnerability reporting (repo Settings > Code security).
+      It is off today (`gh api repos/gaurav-gandhi-2411/reclaim/private-vulnerability-reporting`
+      returned `{"enabled":false}` on 31 Oct), and `SECURITY.md`'s main reporting path needs it.
 - [ ] **[OWNER ONLY]** Tag the verified main SHA: `git tag -a v1.4.0 <main SHA> -m "Reclaim 1.4.0"`,
       then push the tag. The tag must point at the SHA that was built and tested.
 - [ ] **[OWNER ONLY]** Create the GitHub release for `v1.4.0` with `reclaim-setup.exe` and
