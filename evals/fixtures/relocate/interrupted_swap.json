@@ -1,0 +1,1 @@
+{"case": "interrupted_swap", "why": "Killed right after the junction: recovery finishes the move.", "files": [{"path": "a.bin", "size": 1000}], "action": "crash:after_junction", "expect": "done"}

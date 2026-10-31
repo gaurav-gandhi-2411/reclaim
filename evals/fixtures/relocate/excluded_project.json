@@ -1,0 +1,1 @@
+{"case": "excluded_project", "why": "An excluded project is refused before anything under it is read.", "files": [{"path": "zzexclproj/data.bin", "size": 10}], "source_is": "zzexclproj", "action": "move", "expect": "refused", "reason": "excluded project"}

@@ -1,0 +1,1 @@
+{"case": "hardlink_inside", "why": "Hardlinks cannot cross volumes; a copy would split them.", "files": [{"path": "a.bin", "size": 30}], "extras": ["hardlink"], "action": "move", "expect": "refused", "reason": "hardlinked"}

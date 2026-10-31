@@ -74,6 +74,7 @@
     <button class="rc-tab" role="tab" data-view="review" id="tab-review" aria-selected="false" aria-controls="view-review">Review Queue</button>
     <button class="rc-tab" role="tab" data-view="ai-suggestions" id="tab-ai-suggestions" aria-selected="false" aria-controls="view-ai-suggestions">AI Suggestions</button>
     <button class="rc-tab" role="tab" data-view="quarantine" id="tab-quarantine" aria-selected="false" aria-controls="view-quarantine">Quarantine &amp; Restore</button>
+    <button class="rc-tab" role="tab" data-view="relocate" id="tab-relocate" aria-selected="false" aria-controls="view-relocate">Move to Another Drive</button>
     <button class="rc-tab" role="tab" data-view="settings" id="tab-settings" aria-selected="false" aria-controls="view-settings">Settings</button>
   </nav>
 
@@ -183,6 +184,7 @@
             <option value="archive_pairs">Extracted Archive Pairs</option>
             <option value="large_logs">Large Stale Logs</option>
             <option value="duplicates">Exact Duplicates</option>
+            <option value="agent_artifacts">Agent Leftovers</option>
           </select>
         </div>
       </div>
@@ -258,6 +260,27 @@
       </div>
     </section>
 
+    <!-- Move to another drive (relocate; docs/specs/relocate.md, ADR-0044). Review tier: a move
+         starts only from the dialog showing its dry-run figures. -->
+    <section id="view-relocate" class="rc-view" role="tabpanel" aria-labelledby="tab-relocate" data-active="false">
+      <div class="rc-view-header">
+        <div>
+          <h1>Move to another drive</h1>
+          <p>Large folders that programs still need can live on another drive. Reclaim copies and checks every file, then leaves a link at the old place, so the programs that use the folder still find it. The original is kept until you delete it.</p>
+        </div>
+      </div>
+      <div id="relocate-state"></div>
+      <div id="relocate-result"></div>
+      <div id="relocate-content" hidden>
+        <p id="relocate-drive" class="rc-relocate-drive"></p>
+        <div id="relocate-candidates"></div>
+        <section id="relocate-moves-section" aria-labelledby="relocate-moves-heading" hidden>
+          <h2 id="relocate-moves-heading">Moves</h2>
+          <div id="relocate-moves"></div>
+        </section>
+      </div>
+    </section>
+
     <!-- Settings: per-category enable/disable toggles (P0-2 fix, 2026-08 audit) plus R2's
          Anthropic API key entry. No path/candidate ever crosses the key-entry surface -- see
          reclaim.ai.category_explainer's module docstring for the structural guarantee behind
@@ -277,6 +300,28 @@
       <!-- BH5 (2026-08-26 audit): R5's disk-space toast notification shipped with no way to turn
            it on -- no config.default.toml section, no toggle here. This closes the second half
            (the config.default.toml section is packaging/config.default.toml's own fix). -->
+      <!-- Run spec Phase C: connect an AI assistant. Text with copy buttons only: Reclaim never
+           edits a client's config file. -->
+      <section class="rc-settings-panel" aria-labelledby="assistant-heading">
+        <h2 id="assistant-heading">Use Reclaim from your AI assistant</h2>
+        <p>Claude Desktop, Claude Code and Codex CLI can use Reclaim on this computer: scan, see what is using space, and plan what to clean. Every clean still shows a card here that you approve, and everything it cleans can be restored. Paste the text for your assistant into its settings; Reclaim never changes them for you. Keep this window open while you use it.</p>
+        <p id="assistant-setup-status" class="rc-meta" role="status" aria-live="polite"></p>
+        <div id="assistant-setup" hidden>
+          <h3>Claude Desktop</h3>
+          <p class="rc-meta">Add to <code>%APPDATA%\Claude\claude_desktop_config.json</code>, then restart Claude Desktop.</p>
+          <pre class="rc-snippet"><code id="assistant-claude-desktop"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-claude-desktop">Copy</button>
+          <h3>Claude Code</h3>
+          <p class="rc-meta">Run once in a terminal.</p>
+          <pre class="rc-snippet"><code id="assistant-claude-code"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-claude-code">Copy</button>
+          <h3>Codex CLI</h3>
+          <p class="rc-meta">Add to <code>%USERPROFILE%\.codex\config.toml</code>.</p>
+          <pre class="rc-snippet"><code id="assistant-codex"></code></pre>
+          <button type="button" class="rc-btn rc-btn-secondary" data-copy="assistant-codex">Copy</button>
+        </div>
+      </section>
+
       <section class="rc-settings-panel" aria-labelledby="notifications-heading">
         <h2 id="notifications-heading">Low disk space alert</h2>
         <p>A native Windows notification when your system drive crosses a usage threshold — checked a few times a day by a background task. Off by default; nothing is sent anywhere, and no scan or file access is involved.</p>
@@ -402,6 +447,37 @@
       <div class="rc-dialog-actions">
         <button id="full-drive-confirm-cancel" type="button" class="rc-btn">Cancel</button>
         <button id="full-drive-confirm-go" type="button" class="rc-btn rc-btn-primary">Scan the whole drive</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Relocate: one confirmation per move, showing the dry run's figures; and the separate
+       confirmation for deleting the original copy. -->
+  <div id="relocate-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="relocate-dialog-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="relocate-dialog-title">Move this folder?</h2>
+      <dl class="rc-relocate-figures">
+        <dt>From</dt><dd><code id="relocate-dialog-source"></code></dd>
+        <dt>To</dt><dd><code id="relocate-dialog-target"></code></dd>
+        <dt>Size</dt><dd id="relocate-dialog-size"></dd>
+      </dl>
+      <p id="relocate-dialog-kept"></p>
+      <ul id="relocate-dialog-reasons" class="rc-relocate-reasons" role="alert" hidden></ul>
+      <div class="rc-dialog-actions">
+        <button id="relocate-dialog-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="relocate-dialog-confirm" type="button" class="rc-btn rc-btn-primary">Move it</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="relocate-delete-dialog" class="rc-overlay" role="dialog" aria-modal="true" aria-labelledby="relocate-delete-title" hidden>
+    <div class="rc-overlay-panel">
+      <h2 id="relocate-delete-title">Delete the original copy?</h2>
+      <p>Every file of <code id="relocate-delete-path"></code> is checked against the moved copy first. If any differs, nothing is deleted.</p>
+      <p id="relocate-delete-early" class="rc-batch-warning" hidden>It is less than 7 days since the move.</p>
+      <div class="rc-dialog-actions">
+        <button id="relocate-delete-cancel" type="button" class="rc-btn">Cancel</button>
+        <button id="relocate-delete-confirm" type="button" class="rc-btn rc-btn-primary">Check and delete</button>
       </div>
     </div>
   </div>
