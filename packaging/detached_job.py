@@ -375,7 +375,7 @@ def validate_spec(spec: object, jobs_root: Path, cleanup_root: Path) -> list[str
         if not Path(f).is_absolute()
     )
     kind = spec.get("kind", "build")
-    if kind not in START_RAM_FLOOR_GB:
+    if not isinstance(kind, str) or kind not in START_RAM_FLOOR_GB:  # a list/dict is unhashable
         errs.append(f"kind must be one of {sorted(START_RAM_FLOOR_GB)}, got {kind!r}")
     elif spec["start_ram_gb"] < START_RAM_FLOOR_GB[kind]:
         floor = START_RAM_FLOOR_GB[kind]

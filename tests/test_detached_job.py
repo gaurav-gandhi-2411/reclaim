@@ -360,7 +360,7 @@ def test_only_a_declared_soak_may_start_below_8_gb(tmp_path: Path) -> None:
     assert any("3 GB soak floor" in e for e in dj.validate_spec(low, jobs, tmp_path))
 
 
-@pytest.mark.parametrize("kind", ["Soak", "verify", "", None, 3])
+@pytest.mark.parametrize("kind", ["Soak", "verify", "", None, 3, ["soak"], {"soak": 1}])
 def test_an_unknown_kind_is_refused_not_treated_as_a_build(tmp_path: Path, kind: object) -> None:
     errs = dj.validate_spec(_spec(tmp_path, kind=kind), tmp_path / "jobs", tmp_path)
     assert any("kind must be one of" in e for e in errs), errs
