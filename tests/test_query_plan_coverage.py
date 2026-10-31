@@ -266,6 +266,23 @@ _CASES: dict[str, Case] = {
         reason="prefix-range scoped via _prefix_range; `opaque = 1` is a residual filter over the "
         "one subtree (ADR-0042)",
     ),
+    "subtree_exclusion_rows": Case(
+        lambda idx: list(idx.subtree_exclusion_rows(_SCOPE)),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range, one scan of the candidate subtree (D5)",
+    ),
+    "subtree_link_members": Case(
+        lambda idx: idx.subtree_link_members(_SCOPE),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range; the per-row (dev, ino) count is a "
+        "correlated seek on idx_files_dev_ino (D5)",
+    ),
+    "completed_scan_times": Case(
+        lambda idx: idx.completed_scan_times(),
+        expect_index=False,
+        reason="reads the whole completed_scan_roots table (one row per completed scan root, a "
+        "handful), no ORDER BY, so SQLite scans it -- the same rows completed_scan_roots reads",
+    ),
     "_ensure_opaque_columns": Case(
         action=None,
         expect_index=False,

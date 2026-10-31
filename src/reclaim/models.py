@@ -286,6 +286,13 @@ class Candidate:
     # root's naive logical size overclaims exactly the way ADR-0006's own uv-cache measurement
     # first found (14.3GB logical vs 5.21GB real disk-free delta).
     reclaimable_bytes: int | None = None
+    # D5: where `reclaimable_bytes` came from. "index" = derived from the last scan only
+    # (candidates warm-up, `detectors._reclaimable_bytes_from_index`; `estimate_scan_time` is
+    # that scan's completion time, None when none is recorded); "live" = computed on disk, or
+    # no link-aware estimate for this category. An index figure can be wrong after the scan
+    # (e.g. a hardlink made since); apply re-checks everything live and refreshes the figure.
+    estimate_source: str = "live"
+    estimate_scan_time: float | None = None
     # P0-K1a: the scan-time `(dev, ino, mtime)` baseline `executor._preflight_skip_reason` (via
     # `preflight.check_identity_unchanged_since_scan`) re-verifies against a fresh `os.stat()`
     # right before `apply_batch` would otherwise mutate this path -- catches a delete-and-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -925,6 +926,13 @@ _LINK_AWARE_CATEGORY_GROUPS = frozenset({_GROUP_PACKAGE_CACHES, _GROUP_MODEL_CAC
 def _reclaimable_bytes_for_candidate(
     index: ScanIndex, rc: RawCandidate, size_bytes: int
 ) -> int | None:
+    """Live (one `os.stat` per file) estimate for `rc`; see `_live_reclaimable_bytes`."""
+    return _live_reclaimable_bytes(index, rc.path, rc.is_dir, size_bytes)
+
+
+def _live_reclaimable_bytes(
+    index: ScanIndex, path: Path, is_dir: bool, size_bytes: int
+) -> int | None:
     """Hardlink-aware reclaimable-bytes estimate for one package/model-cache candidate.
 
     Deliberately scoped to ONLY this candidate's own file(s) -- never batched together with
@@ -954,17 +962,17 @@ def _reclaimable_bytes_for_candidate(
     category without a link-aware estimate.
     """
     opaque_bytes = 0
-    if rc.is_dir:
+    if is_dir:
         members = [
             (record.path, record.size_bytes)
-            for record in index.candidate_inventory(under=rc.path)
+            for record in index.candidate_inventory(under=path)
             if not record.is_dir
         ]
-        opaque_bytes = sum(record.agg_bytes for record in index.opaque_roots_under(rc.path))
+        opaque_bytes = sum(record.agg_bytes for record in index.opaque_roots_under(path))
         if not members and not opaque_bytes:
             return 0
     else:
-        members = [(rc.path, size_bytes)]
+        members = [(path, size_bytes)]
     estimates = estimate_reclaimable_bytes(members)
     reclaimable = sum(estimate.reclaimable_bytes for estimate in estimates.values())
     if opaque_bytes and reclaimable == 0:
@@ -972,8 +980,62 @@ def _reclaimable_bytes_for_candidate(
     return reclaimable
 
 
+def _reclaimable_bytes_from_index(
+    index: ScanIndex, path: Path, is_dir: bool, size_bytes: int
+) -> int | None:
+    """D5: the `_live_reclaimable_bytes` figure from the scan index alone (no `os.stat` per file:
+    99 s for 609,545 files), for the candidates WARM-UP only. The apply path never uses it.
+
+    The index stores `(dev, ino)` but NOT the link count, so the only hardlink evidence is how
+    many indexed rows share a file id (`ScanIndex.subtree_link_members`). Rule, per file id among
+    this candidate's own files: a name elsewhere in the index (`names_in_index` > the names inside
+    this candidate) -> 0 for the group, exactly the live "a surviving name keeps the blocks"
+    case; otherwise the size once. A reparse-point file counts 0 (the live estimate's
+    unresolved/0 answer). A row with no file id (`ino == 0`, a synthetic row) is estimated live,
+    as before: the index says nothing about it.
+
+    KNOWN GAP, so this is an upper bound on the live figure, never a lower one: a link to a file
+    in this candidate from a path the scan never indexed (outside every scan root, or created
+    after the scan) is invisible here and the live estimate would have said 0 for it. That is why
+    the candidate is marked `estimate_source="index"` (surfaced in the API/UI, and any later
+    warm-up recomputes it); apply itself never reads it and keeps every live check."""
+    rows = index.subtree_link_members(path)
+    opaque_bytes = 0
+    if is_dir:
+        opaque_bytes = sum(record.agg_bytes for record in index.opaque_roots_under(path))
+        if not rows and not opaque_bytes:
+            return 0
+    elif not rows:
+        return _live_reclaimable_bytes(index, path, is_dir, size_bytes)  # e.g. a placeholder
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    live_members: list[tuple[Path, int]] = []
+    for member_path, size, dev, ino, is_reparse, names in rows:
+        if ino == 0:
+            live_members.append((member_path, size))
+        elif not is_reparse:
+            groups[(dev, ino)].append((size, names))
+    reclaimable = sum(members[0][0] for members in groups.values() if members[0][1] <= len(members))
+    if live_members:
+        estimates = estimate_reclaimable_bytes(live_members)
+        reclaimable += sum(estimate.reclaimable_bytes for estimate in estimates.values())
+    if opaque_bytes and reclaimable == 0:
+        return None
+    return reclaimable
+
+
+def _scan_time_for(path: Path, scan_times: Sequence[tuple[Path, float]]) -> float | None:
+    """Newest completed-scan time of a scan root containing `path`, or None if none recorded."""
+    times = [at for root, at in scan_times if root == path or root in path.parents]
+    return max(times) if times else None
+
+
 def generate_candidates(
-    index: ScanIndex, config: Config, safety: SafetyValidator, *, now: float | None = None
+    index: ScanIndex,
+    config: Config,
+    safety: SafetyValidator,
+    *,
+    now: float | None = None,
+    trust_index: bool = False,
 ) -> list[Candidate]:
     """Runs every rule detector against `index`, then routes every raw proposal through
     `safety.evaluate()` before it is ever tagged Tier A or Tier B — the boundary the spec means
@@ -994,12 +1056,21 @@ def generate_candidates(
     Never materializes the whole inventory: each detector queries `index` directly for only
     the rows it needs, and the one `index.get_record()` call per surviving raw candidate below
     is a single indexed point lookup, not a re-scan.
+
+    `trust_index` (D5, the candidates warm-up only): take the directory exclusion subtree check
+    (`SafetyValidator.evaluate(trusted_index=...)`) and the hardlink-aware reclaimable estimate
+    (`_reclaimable_bytes_from_index`) from the scan index instead of the live disk, and mark such
+    estimates `estimate_source="index"`. A stale index can then show a wrong estimate or offer a
+    candidate that has since gained an excluded entry or a link, but nothing is applied on this
+    basis: `apply_batch` repeats the live exclusion walk, the hardlink guard and the identity
+    re-checks. Default False keeps every other caller (CLI, apply-time regeneration) live.
     """
     now_ts = now if now is not None else time.time()
     raw = _run_all_detectors(index, config, now_ts)
     raw = _dedupe_by_path(raw)
     raw = _drop_nested_candidates(raw)
 
+    scan_times = index.completed_scan_times() if trust_index else []
     candidates: list[Candidate] = []
     for rc in raw:
         record = index.get_record(rc.path)
@@ -1010,7 +1081,7 @@ def generate_candidates(
             logger.warning("candidates.raw_path_not_in_inventory", path=str(rc.path))
             continue
 
-        result = safety.evaluate(record)
+        result = safety.evaluate(record, trusted_index=index if trust_index else None)
         if result.verdict == Verdict.BLOCKED:
             continue
         if config.mode == Mode.SAFE or result.verdict == Verdict.REVIEW_ONLY:
@@ -1019,11 +1090,14 @@ def generate_candidates(
             tier = rc.suggested_tier if _category_enabled(rc.category_group, config) else Tier.B
 
         size_bytes = index.subtree_size_bytes(rc.path) if rc.is_dir else record.size_bytes
-        reclaimable_bytes = (
-            _reclaimable_bytes_for_candidate(index, rc, size_bytes)
-            if rc.category_group in _LINK_AWARE_CATEGORY_GROUPS
-            else None
-        )
+        link_aware = rc.category_group in _LINK_AWARE_CATEGORY_GROUPS
+        if link_aware and trust_index:
+            reclaimable_bytes = _reclaimable_bytes_from_index(index, rc.path, rc.is_dir, size_bytes)
+        elif link_aware:
+            reclaimable_bytes = _reclaimable_bytes_for_candidate(index, rc, size_bytes)
+        else:
+            reclaimable_bytes = None
+        from_index = link_aware and trust_index
         candidates.append(
             Candidate(
                 path=rc.path,
@@ -1041,6 +1115,8 @@ def generate_candidates(
                 size_guard_exempt=_category_size_guard_exempt(rc.category_group, config),
                 rebuildable=rc.category_group in REBUILDABLE_CATEGORY_GROUPS,
                 reclaimable_bytes=reclaimable_bytes,
+                estimate_source="index" if from_index else "live",
+                estimate_scan_time=_scan_time_for(rc.path, scan_times) if from_index else None,
                 # P0-K1a: scan-time identity baseline, already read above -- no new os.stat().
                 dev=record.dev,
                 ino=record.ino,

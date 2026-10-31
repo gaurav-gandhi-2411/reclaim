@@ -547,6 +547,7 @@ async function loadOverview() {
     stateEl.innerHTML = "";
     contentEl.hidden = false;
     renderSummaryStats(summary);
+    renderEstimateSourceNote(summary);
     renderSkippedUnreadableNote(summary);
     renderInaccessibleNote(summary);
     renderCategoryCards(summary.categories);
@@ -588,6 +589,24 @@ function renderSummaryStats(summary) {
     stat.appendChild(dd);
     row.appendChild(stat);
   }
+}
+
+// D5: the reclaimable totals can include figures taken from the last scan's index instead of
+// the live disk (the API marks that on every aggregate); say so once, next to the headline stats.
+function renderEstimateSourceNote(summary) {
+  const note = document.getElementById("estimate-source-note");
+  if (summary.estimate_source === "live") {
+    note.hidden = true;
+    note.textContent = "";
+    return;
+  }
+  note.hidden = false;
+  const asOf = summary.estimate_as_of
+    ? ` (${new Date(summary.estimate_as_of * 1000).toLocaleString()})`
+    : "";
+  const scope =
+    summary.estimate_source === "mixed" ? "Part of the reclaimable totals is" : "Reclaimable totals are";
+  note.textContent = `${scope} estimated from the last scan${asOf}; safety is re-checked when you apply.`;
 }
 
 // D12: visible (not just logged) accounting of paths the last scan couldn't stat/list --
@@ -1910,6 +1929,19 @@ function renderCandidateCard(candidate) {
     cost.className = "rc-candidate-rationale rc-candidate-recovery-cost";
     cost.textContent = `Recovery cost: ${candidate.recovery_cost_note}`;
     card.appendChild(cost);
+  }
+
+  if (candidate.estimate_source === "index") {
+    const source = document.createElement("p");
+    source.className = "rc-candidate-rationale";
+    const asOf = candidate.estimate_as_of
+      ? ` (${new Date(candidate.estimate_as_of * 1000).toLocaleString()})`
+      : "";
+    const bytes = candidate.reclaimable_bytes === null
+      ? ""
+      : `${candidate.reclaimable_bytes.toLocaleString()} bytes, `;
+    source.textContent = `Reclaimable: ${bytes}estimate from the last scan${asOf}; safety is re-checked when you apply.`;
+    card.appendChild(source);
   }
 
   if (candidate.duplicate_cluster) {
