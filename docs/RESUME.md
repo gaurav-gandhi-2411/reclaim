@@ -190,6 +190,14 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
   - **Integration** `519a9c9` (main merged).
   - **Build 13** is building from integration (= main after #199), not from main, which would remove shipped features.
   - **Next:** install build 13; full-profile scan time and warm-up on it; wave 1 on build 13; D5/#230 verifies and screenshots; RC checklist; §3.
+- 03:00 IST checkpoint 26 (1 Nov).
+  - **§3 disk growth attribution built:** draft PR #233 (base main), all 6 CI checks green at `4bef6a7` (the head is now `ed7c8ba`, a screenshot-only commit; its CI was still running at the 03:05 check).
+    - Read-only feature: a 4-hourly budgeted snapshot, a "What changed" view (CLI, API, Advanced dashboard), an anomaly toast, and a "why" line in the 80% toast.
+    - Excluded projects appear only as one aggregate.
+    - A falsifying verifier broke the exclusion claim three ways; all fixed with tests.
+    - Gate 3 fails on size, so it goes to the release PR.
+  - **Eval:** too thin to rank the detector. 30.77 h of fragments; detector 1/5 vs threshold baseline 2/5; per-week numbers not meaningful. Needs >= 4 weeks of snapshots from the shipped feature.
+  - **Next:** install build 13 when it ends; full-profile scan time, warm-up and D5 on it; wave 1; full verify of #233, #229 and #230; RC checklist.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
