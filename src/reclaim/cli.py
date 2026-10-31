@@ -9,6 +9,7 @@ import time
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from reclaim import autoclean_schedule, autoclean_state, regenerable
 from reclaim.app_paths import data_root
@@ -50,6 +51,9 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.safety import SafetyValidator
 from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import ScanDiskFullError, scan_tree
+
+if TYPE_CHECKING:
+    from reclaim.growth import GrowthStore
 
 # Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
 # this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
@@ -435,6 +439,54 @@ def _build_parser() -> argparse.ArgumentParser:
         "packaging/reclaim.iss), never by a user directly. Suppresses checks for "
         "config.toml's [notifications] snooze_days (default 7), then exits; fires no toast.",
     )
+
+    growth_parser = subparsers.add_parser(
+        "growth",
+        help="Disk growth attribution (read-only): 'snapshot' records folder sizes under a fixed "
+        "IO budget, 'report' ranks what grew over a window. Writes only growth.sqlite3.",
+    )
+    growth_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml ([growth] section; default: {_DEFAULT_CONFIG_PATH}).",
+    )
+    growth_parser.add_argument(
+        "--db",
+        dest="growth_db",
+        type=Path,
+        default=None,
+        help="Growth store path (default: data/growth.sqlite3). Not the scan index.",
+    )
+    growth_subparsers = growth_parser.add_subparsers(dest="growth_action", required=True)
+    growth_snapshot_parser = growth_subparsers.add_parser(
+        "snapshot", help="Record one budgeted snapshot of volumes, caches and folder sizes."
+    )
+    growth_snapshot_parser.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=None,
+        help="Wall-clock IO budget (default: [growth] budget_seconds, 120).",
+    )
+    growth_snapshot_parser.add_argument(
+        "--volume",
+        type=Path,
+        action="append",
+        default=None,
+        help="Volume root to record (repeatable; default: every fixed drive).",
+    )
+    growth_snapshot_parser.add_argument(
+        "--index",
+        type=Path,
+        default=None,
+        help="Scan index to read opaque-tree and excluded-project sizes from "
+        "(default: the configured index, used only if it exists).",
+    )
+    growth_report_parser = growth_subparsers.add_parser(
+        "report", help="Rank folders by growth over a window, with the volume remainder."
+    )
+    growth_report_parser.add_argument("--window", choices=("1d", "7d"), default="1d")
+    growth_report_parser.add_argument("--json", action="store_true", help="Machine-readable.")
 
     auto_clean_parser = subparsers.add_parser(
         "auto-clean",
@@ -1133,6 +1185,69 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_growth(args: argparse.Namespace) -> int:
+    # Deferred import, same reasoning as `_run_check_disk_space`: only this subcommand needs it.
+    import dataclasses
+
+    from reclaim import growth
+
+    config = _load_config_or_none("growth", args.config)
+    if config is None:
+        return 1
+    db_path: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
+    assert_not_real_profile_under_pytest(db_path, operation="write the growth store at")
+    with growth.GrowthStore(db_path) as store:
+        if args.growth_action == "snapshot":
+            return _growth_snapshot(args, config, store)
+        window_s = {"1d": 86400.0, "7d": 7 * 86400.0}[args.window]
+        report = growth.growth_report(store.load_series(), window_s, time.time())
+    if args.json:
+        print(json.dumps(dataclasses.asdict(report), indent=2))  # noqa: T201
+        return 0
+    print(f"reclaim growth report: window={args.window}")  # noqa: T201
+    for vol in report.volumes:
+        print(  # noqa: T201
+            f"  {vol.volume} used {growth.fmt_gib(vol.delta)}; attributed "
+            f"{growth.fmt_gib(vol.attributed)}; not attributed {growth.fmt_gib(vol.not_attributed)}"
+        )
+    for row in report.rows[:15]:
+        print(f"  {growth.fmt_gib(row.growth):>12}  {row.label}  ({row.path})")  # noqa: T201
+    if not report.rows:
+        print("  no growth data yet (needs two snapshots spanning the window)")  # noqa: T201
+    return 0
+
+
+def _growth_snapshot(args: argparse.Namespace, config: Config, store: GrowthStore) -> int:
+    from reclaim import growth
+
+    env = growth.environment_from_config(config, args.volume)
+    index_path: Path | None = args.index
+    if index_path is None:
+        try:
+            index_path = resolve_index_db(None, args.config)
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            index_path = None
+    index = ScanIndex(index_path) if index_path is not None and index_path.is_file() else None
+    try:
+        snap = growth.collect_snapshot(
+            env,
+            last_seen=store.last_seen(),
+            index=index,
+            budget_s=args.budget_seconds or config.growth.budget_seconds,
+            budget_entries=config.growth.budget_entries,
+        )
+    finally:
+        if index is not None:
+            index.close()
+    store.write(snap)
+    partial = sum(1 for m in snap.sizes if m.partial)
+    print(  # noqa: T201
+        f"reclaim growth snapshot: keys={len(snap.sizes)} partial={partial} "
+        f"complete={snap.complete}"
+    )
+    return 0
+
+
 def _record_autoclean_state(
     previous: autoclean_state.AutoCleanState,
     plan: autoclean_state.ScheduledRunPlan,
@@ -1780,6 +1895,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_recover(args)
     if args.command == "check-disk-space":
         return _run_check_disk_space(args)
+    if args.command == "growth":
+        return _run_growth(args)
     if args.command == "auto-clean":
         if args.reconcile_task:
             return _run_reconcile_autoclean_task(args)
