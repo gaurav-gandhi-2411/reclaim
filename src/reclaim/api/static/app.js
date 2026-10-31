@@ -3004,25 +3004,41 @@ function renderMcpApprovalCard(approval, decide) {
   const who = approval.client_id ?? "An AI assistant";
   const heading = document.createElement("h3");
   heading.className = "rc-approval-heading";
-  heading.textContent =
-    `${who} wants to clean ${approval.item_count} item(s), ${formatFromBytes(approval.bytes_total)}`;
+  const relocation = approval.kind === "relocate" ? approval.relocation : null;
+  heading.textContent = relocation
+    ? `${who} wants to move a folder to another drive: ${approval.item_count} file(s), ${formatFromBytes(approval.bytes_total)}`
+    : `${who} wants to clean ${approval.item_count} item(s), ${formatFromBytes(approval.bytes_total)}`;
   card.append(heading);
 
-  const rule = document.createElement("p");
-  rule.className = "rc-approval-line";
-  rule.append("Category: ");
-  const code = document.createElement("code");
-  code.textContent = approval.rule_id_or_category;
-  rule.append(code);
-  card.append(rule);
+  if (relocation) {
+    // Creator text, so textContent only. The executing side re-plans after the click and refuses
+    // if the source, destination or figures differ from what is shown here.
+    card.append(
+      mcpApprovalLine(`From: ${relocation.source}`),
+      mcpApprovalLine(
+        `To: ${relocation.target} (${formatFromBytes(relocation.target_free_bytes)} free there)`
+      ),
+      mcpApprovalLine(
+        `Reversible: a link is left at the old path, the old copy is kept at ${relocation.moved} until you delete it yourself, and nothing is removed by this move. To undo: ${relocation.rollback_hint}`
+      )
+    );
+  } else {
+    const rule = document.createElement("p");
+    rule.className = "rc-approval-line";
+    rule.append("Category: ");
+    const code = document.createElement("code");
+    code.textContent = approval.rule_id_or_category;
+    rule.append(code);
+    card.append(rule);
 
-  card.append(
-    mcpApprovalLine(
-      approval.method === "recycle_bin"
-        ? "Method: moved to the Windows Recycle Bin. Nothing is permanently deleted; restore from the Recycle Bin."
-        : `Method: moved to Reclaim's vault. Nothing is permanently deleted; you can restore it for at least ${approval.reversible_until_days ?? 1} day(s).`
-    )
-  );
+    card.append(
+      mcpApprovalLine(
+        approval.method === "recycle_bin"
+          ? "Method: moved to the Windows Recycle Bin. Nothing is permanently deleted; restore from the Recycle Bin."
+          : `Method: moved to Reclaim's vault. Nothing is permanently deleted; you can restore it for at least ${approval.reversible_until_days ?? 1} day(s).`
+      )
+    );
+  }
   card.append(
     mcpApprovalLine(
       approval.protected_names.length > 0
@@ -3099,7 +3115,7 @@ function initMcpApprovals() {
     await api(`/api/mcp/approvals/${encodeURIComponent(id)}/${action}`, { method: "POST" });
     status.textContent =
       action === "approve"
-        ? "Approved. If the assistant is still waiting it will clean those items now; an approval nobody picks up expires after 2 minutes."
+        ? "Approved. If the assistant is still waiting it will go ahead now; an approval nobody picks up expires after 2 minutes."
         : "Declined. Nothing was changed.";
     await poll();
   };
@@ -3121,7 +3137,7 @@ function initMcpApprovals() {
         list.replaceChildren(...pending.map((a) => renderMcpApprovalCard(a, decide)));
         section.hidden = pending.length === 0;
         document.title = pending.length > 0 ? `(${pending.length}) Assistant request - ${MCP_BASE_TITLE}` : MCP_BASE_TITLE;
-        if (pending.length > 0) status.textContent = "An AI assistant is asking to clean your disk. Review it below.";
+        if (pending.length > 0) status.textContent = "An AI assistant is asking to change your disk. Review it below.";
       }
     } catch {
       // Fail quiet: an unreachable approvals endpoint must not read as an alarm. The assistant
