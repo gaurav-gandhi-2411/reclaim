@@ -838,6 +838,10 @@ class GrowthVolumeOut(BaseModel):
     attributed_bytes: int
     not_attributed_bytes: int
     status: str  # "ok" | "insufficient data"
+    # ISO time of the newest snapshot sample the figures rest on (for "insufficient data": the
+    # newest sample there is, None when there is none). With a 4-hourly snapshot it can be hours
+    # old, so the view shows it.
+    as_of: str | None = None
 
 
 class GrowthRowOut(BaseModel):

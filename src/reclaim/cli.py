@@ -1257,19 +1257,26 @@ def _run_growth(args: argparse.Namespace) -> int:
             window_s,
             time.time(),
             config.growth.max_start_slack_h * 3600.0,
-            config.growth.max_end_age_h * 3600.0,
+            # the view limit, not the alert's `max_end_age_h`: this is not an alert
+            config.growth.view_max_end_age_h * 3600.0,
         )
     if args.json:
         print(json.dumps(dataclasses.asdict(report), indent=2))  # noqa: T201
         return 0
     print(f"reclaim growth report: window={args.window}")  # noqa: T201
     for vol in report.volumes:
+        as_of = (
+            ""
+            if vol.as_of is None
+            else f" (as of {time.strftime('%H:%M', time.localtime(vol.as_of))})"
+        )
         if vol.status != "ok":
-            print(f"  {vol.volume} insufficient data for this window")  # noqa: T201
+            print(f"  {vol.volume} insufficient data for this window{as_of}")  # noqa: T201
             continue
         print(  # noqa: T201
             f"  {vol.volume} used {growth.fmt_gib(vol.delta)}; attributed "
             f"{growth.fmt_gib(vol.attributed)}; not attributed {growth.fmt_gib(vol.not_attributed)}"
+            f"{as_of}"
         )
     for row in report.rows[:15]:
         print(f"  {growth.fmt_gib(row.growth):>12}  {row.label}  ({row.path})")  # noqa: T201

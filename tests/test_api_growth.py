@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from reclaim.api import security
 from reclaim.api.app import create_app
-from reclaim.config import Config
+from reclaim.config import Config, GrowthConfig
 from reclaim.growth import GIB, GrowthStore, Measurement, Root, Snapshot
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="volume paths are Windows paths")
@@ -248,3 +248,42 @@ def test_get_on_an_empty_or_foreign_file_is_insufficient_data_and_leaves_it_unto
     assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("growth")) == [
         "growth.sqlite3"
     ]  # no -journal / -wal sidecar either
+
+
+# ---------------------------------------------------------------- the view vs the alert freshness
+
+
+def _as_of(volume: dict[str, object]) -> float:
+    from datetime import datetime
+
+    return datetime.fromisoformat(str(volume["as_of"])).timestamp()
+
+
+def test_view_answers_between_snapshots_and_says_how_old_the_data_is(tmp_path: Path) -> None:
+    # D3: the newest sample is 3 h old (a 4-hourly cadence is like this most of the time). The
+    # alert limit (1 h) would say "insufficient data" here; the view must not.
+    store = tmp_path / "growth.sqlite3"
+    _write_series(store, age_h=2.5)  # newest sample = 0.5 h + 2.5 h ago
+    body = _client(tmp_path, store).get("/api/growth?window=1d").json()
+    assert body["status"] == "ok" and len(body["rows"]) == 3
+    (vol,) = body["volumes"]
+    assert vol["status"] == "ok" and vol["change_bytes"] == 14 * GIB
+    assert abs(_as_of(vol) - (time.time() - 3 * 3600)) < 120
+    # ...but nothing is ALERTED on data that old (spec 1.5 keeps max_end_age_h = 1 h)
+    assert body["anomalies"] == []
+
+
+def test_view_limit_is_configurable_and_a_stale_volume_still_reports_its_as_of(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "growth.sqlite3"
+    _write_series(store, age_h=7.0)  # newest sample 7.5 h old: past the 6 h default
+    body = _client(tmp_path, store).get("/api/growth?window=1d").json()
+    (vol,) = body["volumes"]
+    assert (body["status"], vol["status"]) == ("insufficient data", "insufficient data")
+    assert abs(_as_of(vol) - (time.time() - 7.5 * 3600)) < 120  # "last data: ..." is still known
+    strict = Config(growth=GrowthConfig(view_max_end_age_h=1.0))
+    second = tmp_path / "second.sqlite3"
+    _write_series(second, age_h=2.5)
+    body = _client(tmp_path, second, strict).get("/api/growth?window=1d").json()
+    assert body["status"] == "insufficient data"

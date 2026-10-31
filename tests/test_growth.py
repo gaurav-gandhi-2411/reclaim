@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: PTH118 -- the fake filesystem keys on plain str paths exactly like the product code
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -732,6 +733,41 @@ def test_growth_report_says_insufficient_data_for_a_stale_window() -> None:
 
 
 # ---------------------------------------------------------------- config and CLI
+
+
+def test_view_freshness_default_is_the_cadence_plus_slack_and_alerts_keep_one_hour() -> None:
+    cfg = Config().growth
+    assert (cfg.view_max_end_age_h, cfg.max_end_age_h) == (6.0, 1.0)
+
+
+def test_growth_report_carries_the_as_of_time_of_each_volume() -> None:
+    now = 10 * DAY
+    vol = Root("C:\\", "volume", "C:\\")
+    fresh = {vol.path: KeySeries(vol, [(now - DAY - 600, 100), (now - 3 * 3600, 120)])}
+    (v,) = growth_report(fresh, DAY, now, 6 * 3600.0, 6 * 3600.0).volumes
+    assert (v.status, v.delta, v.as_of) == ("ok", 20, now - 3 * 3600)
+    # past the limit: no number, but the newest sample time is still reported
+    (v,) = growth_report(fresh, DAY, now, 6 * 3600.0, 1 * 3600.0).volumes
+    assert (v.status, v.as_of) == ("insufficient data", now - 3 * 3600)
+
+
+def test_cli_report_uses_the_view_limit_and_prints_the_as_of_time(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from reclaim import cli
+
+    now = time.time()
+    db = tmp_path / "growth.sqlite3"
+    with GrowthStore(db) as store:
+        for t, used in ((now - 25 * 3600, 100), (now - 3 * 3600, 120)):  # newest sample: 3 h old
+            root = Root("C:\\", "volume", "C:\\")
+            store.write(Snapshot(t, 120.0, True, [Measurement(root, used * GIB)]))
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[growth]\nproject_roots = []\n", encoding="utf-8")
+    assert cli.main(["growth", "--config", str(cfg), "--db", str(db), "report"]) == 0
+    out = capsys.readouterr().out
+    assert "used 20.0 GiB" in out and "insufficient" not in out
+    assert re.search(r"\(as of \d\d:\d\d\)", out), out
 
 
 def test_growth_config_defaults_and_toml(tmp_path: Path) -> None:

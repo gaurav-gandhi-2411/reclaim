@@ -666,6 +666,11 @@ class GrowthConfig(BaseModel):
     # old; otherwise that window reports "insufficient data" instead of growth over a gap.
     max_start_slack_h: float = Field(default=6.0, ge=0)
     max_end_age_h: float = Field(default=1.0, ge=0)
+    # The same newest-sample limit for the "what changed" VIEW (API, CLI report, panel), which is
+    # not an alert. 6 h = the 4-hourly snapshot cadence + 2 h of slack: with max_end_age_h = 1 h
+    # the view would say "insufficient data" for about 3 of every 4 hours between snapshots. The
+    # view shows the data's as-of time, so an older figure is never passed off as current.
+    view_max_end_age_h: float = Field(default=6.0, ge=0)
     # One level below each of these is sized as "top-level folders"; "~" is expanded at use.
     project_roots: list[str] = Field(default_factory=lambda: ["~/ml-projects"])
 

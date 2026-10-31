@@ -665,6 +665,9 @@ class VolumeDelta:
     attributed: int
     not_attributed: int
     status: str = "ok"  # "insufficient data": no fresh enough samples for this window
+    # Unix time of the newest sample the figure rests on (None: the volume has no sample yet).
+    # The view shows it, because with a long `view_max_end_age_h` it can be hours old.
+    as_of: float | None = None
 
 
 @dataclass(frozen=True)
@@ -701,18 +704,20 @@ def growth_report(
     than `window_s + max_start_slack_s` or whose newest sample is older than `max_end_age_s`
     has no number for this window; a volume in that state is listed as "insufficient data"."""
     rows: list[GrowthRow] = []
-    volumes: dict[str, int] = {}
-    stale_volumes: list[str] = []
+    volumes: dict[str, tuple[int, float]] = {}  # volume -> (growth, as_of)
+    stale_volumes: list[tuple[str, float | None]] = []
     insufficient = 0
     for ks in series.values():
         res = window_growth(ks.points, now, window_s, max_start_slack_s, max_end_age_s)
         if res is None:
             insufficient += 1
             if ks.root.kind == "volume":
-                stale_volumes.append(ks.root.path)
+                newest = value_at_or_before(ks.points, now)
+                stale_volumes.append((ks.root.path, newest[0] if newest else None))
             continue
         if ks.root.kind == "volume":
-            volumes[ks.root.path] = res[0]
+            end = value_at_or_before(ks.points, now)
+            volumes[ks.root.path] = (res[0], end[0] if end else now)
         elif _attributable(ks):
             r = ks.root
             rows.append(
@@ -720,11 +725,13 @@ def growth_report(
             )
     rows.sort(key=lambda r: -r.growth)
     deltas: list[VolumeDelta] = []
-    for vol, delta in sorted(volumes.items()):
+    for vol, (delta, as_of) in sorted(volumes.items()):
         mine = [r for r in rows if is_within(norm(r.path), norm(vol))]
         attributed = sum(r.growth for r in non_nested(mine) if r.growth > 0)
-        deltas.append(VolumeDelta(vol, delta, attributed, delta - attributed))
-    deltas.extend(VolumeDelta(vol, 0, 0, 0, "insufficient data") for vol in sorted(stale_volumes))
+        deltas.append(VolumeDelta(vol, delta, attributed, delta - attributed, "ok", as_of))
+    deltas.extend(
+        VolumeDelta(vol, 0, 0, 0, "insufficient data", seen) for vol, seen in sorted(stale_volumes)
+    )
     return GrowthReport(window_s, rows, deltas, insufficient)
 
 

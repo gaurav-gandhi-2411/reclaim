@@ -135,7 +135,7 @@ def _anomaly_config(config: Config) -> growth.AnomalyConfig:
 
 def recent_growth_line(config: Config, store_path: Path, now: float, volume: str) -> str | None:
     """`Last 3 days: +18.0 GiB from <label>, ...` for the 80% toast, or None when the store has
-    no fresh enough window (same freshness limits as the report) or nothing grew >= 1 GiB.
+    no fresh enough window (the alert freshness limits, not the view's) or nothing grew >= 1 GiB.
     Never raises."""
     if not config.growth.enabled:
         return None

@@ -602,19 +602,28 @@ function signedBytes(bytes) {
   return `${bytes < 0 ? "−" : "+"}${formatFromBytes(Math.abs(bytes))}`;
 }
 
+// " (as of 14:05)" for the newest snapshot a figure rests on, in local time; "" when unknown.
+// Snapshots are 4-hourly, so the figure can be hours old and the panel says so.
+function growthAsOf(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) return "";
+  const two = (n) => String(n).padStart(2, "0");
+  return ` (as of ${two(d.getHours())}:${two(d.getMinutes())})`;
+}
+
 function renderGrowthVolumes(volumes, windowLabel) {
   const list = document.getElementById("growth-volumes");
   list.innerHTML = "";
   for (const v of volumes) {
     const li = document.createElement("li");
     if (v.status !== "ok") {
-      li.textContent = `${v.volume} — not enough snapshots for ${windowLabel} yet.`;
+      li.textContent = `${v.volume} — not enough snapshots for ${windowLabel} yet${growthAsOf(v.as_of)}.`;
     } else {
       li.textContent =
         `${v.volume} ${v.change_bytes < 0 ? "shrank" : "grew"} ` +
         `${formatFromBytes(Math.abs(v.change_bytes))} in ${windowLabel}: ` +
         `${formatFromBytes(v.attributed_bytes)} attributed to the folders below, ` +
-        `${signedBytes(v.not_attributed_bytes)} not attributed.`;
+        `${signedBytes(v.not_attributed_bytes)} not attributed${growthAsOf(v.as_of)}.`;
     }
     list.appendChild(li);
   }

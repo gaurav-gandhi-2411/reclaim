@@ -106,7 +106,9 @@ def build_growth_response(
     if not path.is_file():
         return empty_response(window, now, volume)
     cfg = state.config.growth
-    slack_s, end_age_s = cfg.max_start_slack_h * 3600.0, cfg.max_end_age_h * 3600.0
+    # The view tolerates a snapshot up to `view_max_end_age_h` old and shows its as-of time; the
+    # anomalies below keep the alert limit `max_end_age_h` (an alert must rest on fresh data).
+    slack_s, view_end_age_s = cfg.max_start_slack_h * 3600.0, cfg.view_max_end_age_h * 3600.0
     try:
         # read-only: a GET never creates, migrates or fills a store file (an empty or foreign
         # file is left exactly as it was and answers "insufficient data")
@@ -116,7 +118,7 @@ def build_growth_response(
             partial = store.partial_latest_keys()
     except sqlite3.Error:
         return empty_response(window, now, volume)
-    report = growth.growth_report(series, _WINDOW_S[window], now, slack_s, end_age_s)
+    report = growth.growth_report(series, _WINDOW_S[window], now, slack_s, view_end_age_s)
 
     volumes = [
         GrowthVolumeOut(
@@ -125,6 +127,7 @@ def build_growth_response(
             attributed_bytes=v.attributed,
             not_attributed_bytes=v.not_attributed,
             status=v.status,
+            as_of=None if v.as_of is None else datetime.fromtimestamp(v.as_of, UTC).isoformat(),
         )
         for v in report.volumes
         if volume is None or _same_volume(v.volume, volume)
@@ -154,7 +157,7 @@ def build_growth_response(
     excluded = 0
     for ks in series.values():
         if ks.root.kind == "excluded":
-            res = growth.window_growth(ks.points, now, _WINDOW_S[window], slack_s, end_age_s)
+            res = growth.window_growth(ks.points, now, _WINDOW_S[window], slack_s, view_end_age_s)
             excluded = max(res[0], 0) if res else 0
 
     return GrowthResponse(

@@ -169,3 +169,27 @@ test("the 7d toggle requests the 7d window and marks it pressed", async () => {
   assert.equal(document.querySelector('[data-window="1d"]').getAttribute("aria-pressed"), "false");
   assert.match(document.getElementById("growth-volumes").textContent, /in the last 7 days/);
 });
+
+test("the volume line says how old the data is: (as of HH:MM) in local time", async () => {
+  const asOf = new Date(2026, 10, 1, 9, 5).toISOString(); // 09:05 local, whatever the zone
+  globalThis.fetch = async () => reply({ ...BODY, volumes: [{ ...BODY.volumes[0], as_of: asOf }] });
+  await loadGrowthPanel();
+  assert.match(document.getElementById("growth-volumes").textContent, /not attributed \(as of 09:05\)\.$/);
+});
+
+test("a volume without data for the window still says when its latest data is from", async () => {
+  const asOf = new Date(2026, 10, 1, 21, 40).toISOString();
+  const stale = { ...BODY.volumes[0], status: "insufficient data", as_of: asOf };
+  globalThis.fetch = async () => reply({ ...BODY, volumes: [stale] });
+  await loadGrowthPanel();
+  assert.match(
+    document.getElementById("growth-volumes").textContent,
+    /not enough snapshots for the last day yet \(as of 21:40\)\.$/
+  );
+});
+
+test("no as_of from the server means no as-of text", async () => {
+  globalThis.fetch = async () => reply(BODY);
+  await loadGrowthPanel();
+  assert.doesNotMatch(document.getElementById("growth-volumes").textContent, /as of/);
+});
