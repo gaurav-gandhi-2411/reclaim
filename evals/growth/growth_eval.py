@@ -435,8 +435,9 @@ HONESTY = """\
   covers a documented growth event of >= 5 GiB; the docs do not list every real write, so some
   "false alarms" may be real, undocumented growth (D: in particular).
 - **The key rule never ran.** It needs >= 6 thinned (30 min) intervals of history before the
-  window start and a 24/72 h window. No folder series in the data is longer than 2 h except the
-  two census snapshots (2 points), so every detector detection below comes from the volume rule;
+  window start and a 24/72 h window. No folder series in the data spans more than about 2 h
+  except the two census snapshots (2 points), so every detector detection comes from the
+  volume rule;
   key-level z-scores are all `None` (see `event_diagnostics` in the JSON).
 - **Gaps make the as-is replay look busy.** The sources are fragments, so a "24 h" window often
   starts from a sample days old (`start_age_h`), and census-time alerts use a C: sample 52 h old.
@@ -491,6 +492,14 @@ def render_markdown(res: Res, sha: str) -> str:
         "with spec defaults, replayed unchanged; baseline = alert when any key's growth over",
         "24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.",
         "",
+        f"**Summary.** As replayed, the detector finds {m['detector']['recall']} evaluable events "
+        "and "
+        f"the baseline {m['baseline']['recall']}; read literally (spec 1.5) the detector finds "
+        f"{m['detector_literal']['recall']} and the baseline {m['baseline_literal']['recall']}. "
+        f"That is {res['events_evaluable']} events from {cov['all_sources']['hours']} h of "
+        "fragments: it ranks neither method and says nothing about the spec's success metric "
+        "(see the honesty section).",
+        "",
         "| " + " | ".join(head) + " |",
         "|---|---|---|---|---|",
     ]
@@ -537,6 +546,12 @@ def render_markdown(res: Res, sha: str) -> str:
             )
         lines.append(f"| {row['id']} | " + " | ".join(cells) + " |")
     lines += ["", "What the detector's windows saw at each evaluable event's end:", ""]
+    lines += [
+        "A negative volume growth means used space FELL between the window's start sample and the",
+        "event's end (BELIEVED: the pagefile left C: at the 9 Oct 13:02 boot and the HF cache",
+        "moved off C: 9 Oct 15:47-18:59, so a rise on top is invisible to the 5 GiB volume rule).",
+        "",
+    ]
     for eid, d in res["event_diagnostics"].items():
         lines.append(f"- `{eid}`: {json.dumps(d)}")
     lines += ["", "## Events not evaluable for detection", ""]
