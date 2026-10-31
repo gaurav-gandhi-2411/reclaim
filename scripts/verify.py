@@ -114,6 +114,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # every category that defaults to `enabled=True`. No [ai] extra, no network -- same "no excuse to
 # skip" bar as every file above. Confirmed to have teeth: fails against the pre-PR-#76 detector
 # code (verified this session by swapping in that commit's `detectors.py` and re-running).
+#
+# evals/growth/test_growth_eval.py added with the disk-growth attribution eval (spec
+# docs/specs/disk-growth-attribution.md, ADR-0046): replays the committed real-data fixtures in
+# evals/fixtures/growth through reclaim.growth's detector and a threshold baseline and asserts
+# INVARIANTS only (fixtures load, events are cited and their evaluable flag matches the data,
+# metrics carry provenance), never metric values. Committed files only (no D: access, no machine
+# state, no [ai] extra, no network) -- same "no excuse to skip" reasoning as every file above.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -133,6 +140,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_config_env_var_normalization_gate.py",
     "evals/test_data_path_cwd_independence_gate.py",
     "evals/test_default_enabled_category_floor_gate.py",
+    "evals/growth/test_growth_eval.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (
