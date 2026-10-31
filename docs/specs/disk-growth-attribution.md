@@ -33,7 +33,7 @@ Source: GG's 31 Oct round, §3. Read-only by design: nothing here deletes, moves
    - Volume-level check: used space grew ≥ `abs_floor` within ≤ 3 days.
    - The toast names the biggest contributing keys, e.g. "C: grew 20 GB in 3 days — 18 GB from %TEMP%\claude\gg-portfolio". Its debounce state is separate from the 80% toast's.
    - When the 80% toast fires, its body gains the same explanation line (the top contributors over the last 3 days), so it says why the disk is full.
-6. **Store:** `data/growth.sqlite3`, with tables `keys(id, path, kind, label, project, session)`, `snapshots(id, taken_at, budget_s, complete)` and `sizes(snapshot_id, key_id, bytes, partial)`. Snapshots older than 400 days are dropped. At ~250 keys and 6 snapshots a day this is about 550k rows a year (BELIEVED ≤ 15 MB; measured in the eval).
+6. **Store:** `data/growth.sqlite3`, with tables `keys(id, path, kind, label, project, session)`, `snapshots(id, taken_at, budget_s, complete)` and `sizes(snapshot_id, key_id, bytes, partial)`. Snapshots older than 400 days are dropped. At ~250 keys and 6 snapshots a day this is about 550k rows a year (measured, see §3 "Store size": 11.5 MB a year, so the 5 MB target of the success metric is **not met**).
 
 ## 2. Candidates considered
 
@@ -47,11 +47,13 @@ Source: GG's 31 Oct round, §3. Read-only by design: nothing here deletes, moves
 ## 3. Eval (`evals/growth/`)
 
 - **Data** (this engagement, real):
-  - `D:\reclaim-build\c_attrib{6,7,8}.csv`: three 30-40 min windows on 13 and 15 Oct, with per-path sizes every ~60 s and per-process writers;
+  - `D:\reclaim-build\c_attrib{6,7,8}.csv`: three 30-40 min windows on 13 and 15 Oct, with per-path sizes every 1.7-2.5 min (mean per window) and per-process writers;
   - `c_census.csv` / `c_census_20261012.csv`: two per-folder snapshots, 9 and 12 Oct;
   - `watchdog*.csv`: C:/D: free during builds, 8-24 Oct;
   - `jobs\*\runner.log`: C:/D: free every 15 s, 30 Oct - 1 Nov.
   - The richer 9-10 Oct sampler (`%TEMP%\reclaim_soak\2026-10-09-attrib\sizes.csv`, which held the gg-portfolio +43 GiB event) no longer exists.
-- **Ground truth:** only events already attributed in the run logs and RESUME history, each cited by file and line, in `evals/fixtures/growth_events.json`. No manual labelling.
+- **Ground truth:** only events already attributed in the run logs and RESUME history, each cited by file and line, in `evals/fixtures/growth/events.json` (the compact series sit beside it, built by `scripts/growth_eval_extract.py`). No manual labelling. Shrink events (a move or deletion freeing space) are listed but not evaluable: the detector is growth-only.
 - **Metrics:** event-detection precision/recall, attribution accuracy (top-1 key = documented folder), and false alarms per week of data, each for the detector and for a baseline that alerts on any key whose window growth ≥ 5 GiB.
 - **Honesty rule:** the report states how many hours of data each source covers. If there are fewer than about 4 weeks of continuous snapshots, the per-week figures are labelled as not meaningful, and the report says what is needed: ≥ 4 weeks of 4-hourly snapshots on this machine, with the documented events inside them.
+- **Results:** `reports/growth_eval.md` (with `growth_eval.json`). On the data that exists, the detector and the baseline cannot be ranked: 30.8 h of fragments, 5 evaluable events, and the per-week figures are labelled not meaningful.
+- **Store size** (measured this pass, `GrowthStore` writing a synthetic year: 250 keys, 6 snapshots a day, 30% of the keys change per snapshot, seed 42, 547,500 rows): **11,526,144 bytes (11.5 MB)**. ADR-0046 records 11.6 MB from the earlier run. Both are above the 5 MB target in the success metric above; the target is unchanged and **not met**. Reaching it needs storing only changed values (forward-fill on read), which is not built.
