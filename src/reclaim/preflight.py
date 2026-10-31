@@ -43,6 +43,8 @@ PreflightSkipReason = Literal[
     "identity_changed_since_scan",
     "size_or_mtime_changed_since_scan",
     "outside_user_scope",
+    "agent_artifact_not_provably_finished",
+    "agent_artifact_requires_vault",
 ]
 
 # --- (a) live-process handle probe -------------------------------------------------------------

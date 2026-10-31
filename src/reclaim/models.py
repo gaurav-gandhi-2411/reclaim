@@ -132,7 +132,11 @@ class Mode(StrEnum):
 # archive_pairs, large_logs) may still be enabled in SAFE mode — see `config.
 # apply_safe_mode_category_overrides` — but every deletion for any of them still goes through
 # SAFE mode's other two structural guarantees (recycle-bin-only, review-only) regardless.
-SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS = frozenset({"duplicates", "model_caches", "dev_artifacts"})
+# `agent_artifacts` (stale agent worktrees/clones/scratch): other tools' data, removed by a vault
+# move that SAFE mode (recycle-bin-only) never performs.
+SAFE_MODE_FORCED_OFF_CATEGORY_GROUPS = frozenset(
+    {"duplicates", "model_caches", "dev_artifacts", "agent_artifacts"}
+)
 
 
 class Tier(StrEnum):
