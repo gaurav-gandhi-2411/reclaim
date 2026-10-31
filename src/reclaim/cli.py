@@ -1214,15 +1214,27 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
 
 
 def _scheduled_growth_snapshot(config: Config, config_path: Path, store_path: Path) -> str:
-    """The 4-hourly task's growth snapshot (spec 1.1): never raises, see `growth_alerts`."""
+    """The 4-hourly task's growth snapshot (spec 1.1): never raises, see `growth_alerts`. Any
+    failure on the growth path, including resolving the index location, is logged and contained:
+    the disk-space check that called this carries on."""
+    import structlog
+
     from reclaim import growth_alerts
 
+    logger = structlog.get_logger(__name__)
     index_path: Path | None
     try:
         index_path = resolve_index_db(None, config_path)
     except (OSError, ValueError, tomllib.TOMLDecodeError):
         index_path = None
-    return growth_alerts.scheduled_snapshot(config, store_path, index_path=index_path)
+    except Exception:  # a growth failure must never break the disk-space check
+        logger.warning("growth.index_location_failed", exc_info=True)
+        index_path = None  # still take the snapshot, without the opaque keys
+    try:
+        return growth_alerts.scheduled_snapshot(config, store_path, index_path=index_path)
+    except Exception:  # scheduled_snapshot contains its own; this is the last line
+        logger.warning("growth.scheduled_snapshot_failed", exc_info=True)
+        return "failed"
 
 
 def _run_growth(args: argparse.Namespace) -> int:

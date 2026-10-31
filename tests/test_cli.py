@@ -10,6 +10,7 @@ import pytest
 import reclaim.reconciliation as reconciliation_module
 import reclaim.scanner as scanner_module
 from reclaim.cli import _VERSION, _build_parser, _run_serve, main
+from reclaim.config import Config
 from reclaim.index import InaccessibleEntry, ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 from reclaim.models import FileRecord
@@ -1068,3 +1069,45 @@ def test_mcp_serve_builds_state_and_runs_the_server_over_stdio(
 
     assert exit_code == 0
     assert run_calls == [{"transport": "stdio"}]
+
+
+def test_scheduled_growth_snapshot_contains_any_failure_resolving_the_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D6: only OSError/ValueError/TOMLDecodeError used to be caught around resolve_index_db
+    from reclaim import cli
+
+    seen: list[Path | None] = []
+
+    def fake_snapshot(config: object, store_path: Path, *, index_path: Path | None) -> str:
+        seen.append(index_path)
+        return "taken"
+
+    def boom(*_a: object, **_k: object) -> Path:
+        raise RuntimeError("simulated resolver bug")
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", fake_snapshot)
+    monkeypatch.setattr("reclaim.cli.resolve_index_db", boom)
+    status = cli._scheduled_growth_snapshot(Config(), tmp_path / "config.toml", tmp_path / "g.db")
+    assert status == "taken" and seen == [None]  # the snapshot still runs, minus the opaque keys
+
+
+def test_check_disk_space_carries_on_when_the_growth_path_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> str:
+        raise RuntimeError("simulated growth bug")
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", boom)
+    exit_code = main(
+        [
+            "check-disk-space",
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--state",
+            str(tmp_path / "s.json"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "growth_snapshot=failed" in out and "percent_used=" in out
