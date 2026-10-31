@@ -4,6 +4,7 @@ import bisect
 import os
 import shutil
 import sqlite3
+import stat
 import statistics
 import tempfile
 import time
@@ -178,6 +179,25 @@ class _Frame:
     complete: bool = True
 
 
+class SkippedRoot(OSError):
+    """A root the walker refuses to enter. Subclasses OSError so it is handled exactly like an
+    absent or unreadable root: no row is stored for it (not a 0-byte "complete" size, which would
+    read as a measurement; not a partial lower bound either, since nothing was measured)."""
+
+
+def is_reparse_point(path: str) -> bool:
+    """True when `path` itself is a junction or symlink (metadata only, never follows it); a
+    path that cannot be examined is treated as not a reparse point (the listing will then fail
+    the same way and the root is skipped as unreadable)."""
+    try:
+        st = os.lstat(long_path(Path(path)))
+    except OSError:
+        return False
+    return bool(
+        getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    ) or stat.S_ISLNK(st.st_mode)
+
+
 class Walker:
     """Sums file sizes below a root. Never follows a reparse point, never lists an excluded
     directory (matched by name before any IO), and stops at the shared budget. `memo` holds the
@@ -188,10 +208,14 @@ class Walker:
         list_fn: ListFn,
         budget: Budget,
         exclusions: Sequence[str],
+        reparse_fn: Callable[[str], bool] | None = None,
+        resolve_fn: Callable[[str], str] | None = None,
     ) -> None:
         self._list = list_fn
         self.budget = budget
         self._exclusions = tuple(exclusions)
+        self._is_reparse = reparse_fn or is_reparse_point
+        self._resolve = resolve_fn or os.path.realpath
         self.marked: set[str] = set()  # norm paths of roots: their totals are memoised
         self.memo: dict[str, int] = {}
         self.excluded: dict[str, str] = {}  # norm path -> real path, internal only (never stored)
@@ -200,6 +224,14 @@ class Walker:
         return bool(self._exclusions) and (
             first_matching_pattern(path, self._exclusions, is_dir=True) is not None
         )
+
+    def note_if_excluded(self, path: str) -> bool:
+        """True (and remembered for the "Excluded projects" aggregate, never stored by name) when
+        `path` is excluded: the one check every kind of root goes through before any IO."""
+        if self.is_excluded(path):
+            self.excluded[norm(path)] = path
+            return True
+        return False
 
     def children(self, path: str) -> tuple[list[tuple[str, str]], list[Entry]]:
         """`(dirs as (name, full path), files)` of `path`; raises OSError if unreadable."""
@@ -230,9 +262,17 @@ class Walker:
         return _Frame(path, sum(f[2] for f in files), [d[1] for d in reversed(dirs)])
 
     def total(self, root: str) -> tuple[int, bool]:
-        """`(bytes, complete)`; a root not finished within the budget is a lower bound."""
+        """`(bytes, complete)`; a root not finished within the budget is a lower bound. Raises
+        `SkippedRoot` (an OSError, so the caller treats it like an absent root) when the root is
+        itself a junction/symlink or lies below one that leads into an excluded path: the walk
+        only skips reparse points it meets inside a tree, so the root is checked here, with
+        metadata calls only and before anything is listed."""
         if (cached := self.memo.get(norm(root))) is not None:
             return cached, True
+        if self._is_reparse(root):
+            raise SkippedRoot(f"root is a reparse point: {root}")
+        if self.is_excluded(self._resolve(root)):
+            raise SkippedRoot("root resolves into an excluded path")
         stack = [self._enter(root, root=True)]
         while True:
             frame = stack[-1]
@@ -268,9 +308,13 @@ def _plan_roots(env: Environment, walker: Walker) -> tuple[list[Root], list[Meas
         roots.setdefault(norm(root.path), root)
 
     for cache in env.cache_paths:
+        if walker.note_if_excluded(cache):
+            continue  # a cache root inside an excluded path is never walked or named (spec 1.3)
         add(Root(os.path.normpath(cache), "cache", Path(cache).name or cache))
     claude = os.path.join(env.temp, "claude")  # noqa: PTH118 -- str paths
     try:
+        if walker.note_if_excluded(claude):
+            raise FileNotFoundError(claude)  # same as an absent scratch dir: nothing to list
         projects, _ = walker.children(claude)
         for project, project_dir in projects:
             try:
@@ -283,6 +327,8 @@ def _plan_roots(env: Environment, walker: Walker) -> tuple[list[Root], list[Meas
         pass
     parents = [env.profile, *env.volumes, *env.project_roots]
     for parent in parents:
+        if walker.note_if_excluded(str(parent)):
+            continue  # e.g. a project root that is itself an excluded project
         try:
             dirs, files = walker.children(str(parent))
         except OSError:

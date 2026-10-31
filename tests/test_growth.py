@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: PTH118 -- the fake filesystem keys on plain str paths exactly like the product code
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -229,6 +230,131 @@ def test_opaque_roots_come_from_index_with_scan_time(tmp_path: Path) -> None:
     opaque = [m for m in snap.sizes if m.root.kind == "opaque"]
     assert [(m.bytes, m.observed_at) for m in opaque] == [(123, 77.0)]
     assert not any("node_modules" in c for c in fs.calls)  # no listing for the opaque root
+
+
+# ---------------------------------------------------------------- exclusions on every root kind
+
+
+class _ExcludedIndex:
+    """Index stub: the excluded folders hold 4242 bytes, nothing is opaque."""
+
+    def subtree_size_bytes(self, path: Path) -> int:
+        return 4242 if "secret-app" in str(path) else 0
+
+    def opaque_aggregates(self, *_: object, **__: object) -> list[tuple[str, int, float]]:
+        return []
+
+
+def test_excluded_cache_root_is_never_walked_or_named(tmp_path: Path) -> None:
+    # F2b: the cache loop used to add every configured cache without the exclusion check.
+    cache = str(tmp_path / "d" / "secret-app" / "hf")
+    fs = FakeFS()
+    fs.add(cache, ("f", 0, 5))
+    env = _env(tmp_path, volumes=[], cache_paths=[cache], exclusions=["*secret-app*"])
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage, index=_ExcludedIndex())  # type: ignore[arg-type]
+    assert not any("secret" in m.root.path.lower() for m in snap.sizes)
+    assert not any("secret" in c.lower() for c in fs.calls), fs.calls
+    # its share is only ever the aggregate line
+    assert _by_label(snap)["Excluded projects"].bytes == 4242
+
+
+def test_excluded_temp_and_project_root_are_never_listed(tmp_path: Path) -> None:
+    fs = FakeFS()
+    temp = tmp_path / "secret-app" / "Temp"
+    fs.add(str(temp / "claude"), ("proj", DIR, 0))
+    root = tmp_path / "secret-app-projects"
+    fs.add(str(root), ("a", DIR, 0))
+    env = _env(
+        tmp_path,
+        volumes=[],
+        temp=temp,
+        project_roots=[root],
+        cache_paths=[str(temp)],
+        exclusions=["*secret-app*"],
+    )
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage)
+    assert not any("secret" in c.lower() for c in fs.calls), fs.calls
+    assert not any("secret" in m.root.path.lower() for m in snap.sizes)
+
+
+def test_excluded_aggregate_has_the_excluded_kind_and_key(tmp_path: Path) -> None:
+    # D4: kills the mutant that changes the aggregate's root kind (it is neither walked nor
+    # attributable; `toplevel` would make it a ranked folder named "<excluded projects>").
+    env = _env(tmp_path, volumes=[], exclusions=["*secret-app*"])
+    fs = FakeFS()
+    fs.add(str(tmp_path / "home"))
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage, index=_ExcludedIndex())  # type: ignore[arg-type]
+    agg = next(m for m in snap.sizes if m.root.label == "Excluded projects")
+    assert (agg.root.kind, agg.root.path) == ("excluded", growth.EXCLUDED_KEY)
+
+
+def _junction(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(  # noqa: S603 -- fixed argv, paths under tmp_path
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607
+        check=True,
+        capture_output=True,
+    )
+
+
+class _SpyLister:
+    """The real lister, recording every directory it is asked to list."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._real = growth.make_default_lister()
+
+    def __call__(self, path: str) -> list[growth.Entry]:
+        self.calls.append(path)
+        return self._real(path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions")
+def test_cache_root_that_is_a_junction_into_an_excluded_tree_is_not_walked(tmp_path: Path) -> None:
+    # F2c: Walker.total used to enter the root without asking whether the root itself is a
+    # junction, so a cache path configured as a link into an excluded project was listed.
+    target = tmp_path / "real" / "secret-app"
+    target.mkdir(parents=True)
+    (target / "big.bin").write_bytes(b"x" * 1000)
+    link = tmp_path / "home" / "cachelink"
+    _junction(link, target)
+    spy = _SpyLister()
+    env = _env(tmp_path, volumes=[], cache_paths=[str(link)], exclusions=["*secret-app*"])
+    snap = collect_snapshot(env, list_fn=spy, disk_usage=_usage)
+    assert "cachelink" not in _by_label(snap)  # absent, not a 0-byte "complete" size
+    assert not any("secret-app" in c.lower() for c in spy.calls), spy.calls
+    assert not any(m.bytes == 1000 for m in snap.sizes)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions")
+def test_cache_root_that_is_a_junction_to_an_allowed_tree_is_skipped_too(tmp_path: Path) -> None:
+    # a reparse point is never followed, root or not (spec 1.2): no row, nothing listed
+    target = tmp_path / "real" / "fine"
+    target.mkdir(parents=True)
+    (target / "big.bin").write_bytes(b"x" * 1000)
+    link = tmp_path / "home" / "cachelink"
+    _junction(link, target)
+    spy = _SpyLister()
+    env = _env(tmp_path, volumes=[], cache_paths=[str(link)])
+    snap = collect_snapshot(env, list_fn=spy, disk_usage=_usage)
+    assert "cachelink" not in _by_label(snap)
+    assert not any(c.lower().endswith("fine") for c in spy.calls), spy.calls
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions")
+def test_cache_root_below_a_junction_into_an_excluded_tree_is_not_walked(tmp_path: Path) -> None:
+    # the root itself is a plain directory, but an ancestor leads into the excluded project
+    target = tmp_path / "real" / "secret-app"
+    (target / "sub").mkdir(parents=True)
+    (target / "sub" / "big.bin").write_bytes(b"x" * 1000)
+    _junction(tmp_path / "home" / "linkdir", target)
+    spy = _SpyLister()
+    cache = tmp_path / "home" / "linkdir" / "sub"
+    env = _env(tmp_path, volumes=[], cache_paths=[str(cache)], exclusions=["*secret-app*"])
+    snap = collect_snapshot(env, list_fn=spy, disk_usage=_usage)
+    assert "sub" not in _by_label(snap)
+    assert not any("secret-app" in c.lower() for c in spy.calls), spy.calls
+    assert not any(c.lower().endswith("sub") for c in spy.calls), spy.calls
 
 
 # ---------------------------------------------------------------- store and window math
