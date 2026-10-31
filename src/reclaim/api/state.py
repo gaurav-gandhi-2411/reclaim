@@ -326,6 +326,9 @@ class AppState:
     # this dataclass is (test isolation; see `create_app`'s matching constructor parameters).
     anthropic_key_path: Path = field(default_factory=lambda: DEFAULT_ANTHROPIC_KEY_PATH)
     ai_explanation_cache_dir: Path = field(default_factory=lambda: DEFAULT_AI_EXPLANATION_CACHE_DIR)
+    # ADR-0046: the read-only growth store `GET /api/growth` reads (written only by the
+    # `reclaim growth snapshot` CLI); None = the CLI's default, resolved at use.
+    growth_db_path: Path | None = None
     # R7 concurrency fix (docs/AUDIT-2026-08.md, adversarial re-verification of PR #39): a
     # single-flight guard for `reclaim.mcp.server.delete`, same "check-and-set under `lock`,
     # refuse if already running" idiom `POST /api/apply` uses for `apply_status` above --

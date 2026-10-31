@@ -17,6 +17,7 @@ from reclaim.dirlist import ListingUnsupported, list_directory
 from reclaim.index import ScanIndex
 from reclaim.models import FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT
 from reclaim.safety import first_matching_pattern
+from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import long_path
 
 # Disk growth attribution (docs/specs/disk-growth-attribution.md, ADR-0046): a READ-ONLY,
@@ -31,6 +32,7 @@ _SYSTEM_FILES = ("pagefile.sys", "hiberfil.sys", "swapfile.sys")
 # One aggregate line for everything the user excluded (spec §1.3): never walked, never named.
 EXCLUDED_KEY = "<excluded projects>"
 _TOTAL_SUFFIX = "|total"
+TOTAL_SUFFIX = _TOTAL_SUFFIX  # the volume-total key is path + this suffix
 _OPAQUE_KEYS_MAX = 40  # biggest index opaque roots kept per snapshot: bounds the store's row count
 _DRILL_SHARE = 0.6  # a descendant explaining >= 60% of an ancestor's growth is the better name
 
@@ -390,6 +392,8 @@ class GrowthStore:
     index-sourced rows are only as fresh as the last index scan, and the series must say so."""
 
     def __init__(self, path: Path) -> None:
+        assert_not_real_profile_under_pytest(path, operation="open the growth store at")
+        self._path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path)
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -406,6 +410,7 @@ class GrowthStore:
 
     def write(self, snap: Snapshot) -> int:
         """Stores a snapshot and drops those older than RETENTION_DAYS (and orphaned keys)."""
+        assert_not_real_profile_under_pytest(self._path, operation="write the growth store at")
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO snapshots(taken_at, budget_s, complete) VALUES (?,?,?)",
@@ -442,6 +447,17 @@ class GrowthStore:
             "JOIN snapshots s ON s.id = z.snapshot_id GROUP BY k.id"
         )
         return {norm(p): t for p, t in rows}
+
+    def partial_latest_keys(self) -> set[str]:
+        """Paths whose most recent stored measurement was cut off by the budget (a lower bound):
+        their series ends earlier than their real size, so a growth figure may lag."""
+        rows = self._conn.execute(
+            "SELECT k.path FROM sizes z JOIN keys k ON k.id = z.key_id "
+            "JOIN snapshots s ON s.id = z.snapshot_id WHERE z.partial = 1 AND s.taken_at = "
+            "(SELECT MAX(s2.taken_at) FROM sizes z2 JOIN snapshots s2 ON s2.id = z2.snapshot_id "
+            "WHERE z2.key_id = z.key_id)"
+        )
+        return {str(p) for (p,) in rows}
 
     def last_snapshot_time(self) -> float | None:
         row = self._conn.execute("SELECT MAX(taken_at) FROM snapshots").fetchone()
