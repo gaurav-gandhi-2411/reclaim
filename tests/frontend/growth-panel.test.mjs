@@ -168,6 +168,11 @@ test("the 7d toggle requests the 7d window and marks it pressed", async () => {
   assert.equal(document.querySelector('[data-window="7d"]').getAttribute("aria-pressed"), "true");
   assert.equal(document.querySelector('[data-window="1d"]').getAttribute("aria-pressed"), "false");
   assert.match(document.getElementById("growth-volumes").textContent, /in the last 7 days/);
+  // app.js keeps the window in module state shared by every test in this file: put it back
+  globalThis.fetch = async () => reply(BODY);
+  document.querySelector('#growth-panel [data-window="1d"]').click();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(document.querySelector('[data-window="1d"]').getAttribute("aria-pressed"), "true");
 });
 
 test("the volume line says how old the data is: (as of HH:MM) in local time", async () => {
