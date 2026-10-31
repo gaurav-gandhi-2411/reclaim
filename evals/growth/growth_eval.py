@@ -457,7 +457,7 @@ HONESTY = """\
   so top-1 cannot exceed 1 of 2 there. The census is too shallow to hold the gg-portfolio scratch
   folder itself, so naming `Temp` is scored correct and naming `AppData` coarse.
 - **Fixtures are thinned, not 4-hourly snapshots:** 60 s (watchdog, attrib) and 300 s (jobs)
-  samples, folder sizes every ~100 s in three 30-40 min windows, two census snapshots. The
+  samples, folder sizes every 1.7-2.5 min in three 30-40 min windows, two census snapshots. The
   `uv` growth inside those windows (0.58 -> 20.8 GiB and similar) is a budget-truncated walk of
   the old sampler and is excluded from the ground truth; the baseline does alert on it.
 
