@@ -1,9 +1,10 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `26877c281b1a5db51c06d2ce8ed62bb61ac71e7a` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
-with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert when any key's growth over
+with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
+when any key's growth over
 24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.
 
 **Summary.** As replayed, the detector finds 1/5 evaluable events and the baseline 2/5; read literally (spec 1.5) the detector finds 1/5 and the baseline 0/5. That is 5 events from 30.77 h of fragments: it ranks neither method and says nothing about the spec's success metric (see the honesty section).

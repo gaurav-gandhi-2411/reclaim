@@ -488,7 +488,7 @@ FIX_SHA = "4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e"  # fix(growth): fresh start
 
 
 def change_log(m: Res) -> list[str]:
-    """Before/after of the detector for the window-freshness fix (same fixtures, same thresholds)."""
+    """Before/after of the detector for the window-freshness fix (same fixtures and thresholds)."""
     lines = [
         "## Change log",
         "",
@@ -546,7 +546,8 @@ def render_markdown(res: Res, sha: str) -> str:
         "machine-readable twin: `reports/growth_eval.json`. Ground truth:",
         f"`evals/fixtures/growth/events.json` ({res['events_evaluable']} evaluable of "
         f"{res['events_total']} documented events). Detector = `reclaim.growth.detect_anomalies`",
-        "with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert when any key's growth over",
+        "with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert",
+        "when any key's growth over",
         "24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.",
         "",
         f"**Summary.** As replayed, the detector finds {m['detector']['recall']} evaluable events "
