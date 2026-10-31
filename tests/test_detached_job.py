@@ -349,6 +349,35 @@ def test_validate_spec_accepts_the_floor_itself(tmp_path: Path) -> None:
     assert dj.validate_spec(_spec(tmp_path, start_ram_gb=8.0), tmp_path / "jobs", tmp_path) == []
 
 
+def test_only_a_declared_soak_may_start_below_8_gb(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    soak = _spec(tmp_path, kind="soak", start_ram_gb=3.0)
+    assert dj.validate_spec(soak, jobs, tmp_path) == []
+    for over in ({"kind": "build"}, {}):  # explicit build, and an older spec with no kind
+        spec = _spec(tmp_path, start_ram_gb=3.0, **over)
+        assert any("8 GB build floor" in e for e in dj.validate_spec(spec, jobs, tmp_path))
+    low = _spec(tmp_path, kind="soak", start_ram_gb=2.9, abort_ram_gb=2.0)
+    assert any("3 GB soak floor" in e for e in dj.validate_spec(low, jobs, tmp_path))
+
+
+@pytest.mark.parametrize("kind", ["Soak", "verify", "", None, 3])
+def test_an_unknown_kind_is_refused_not_treated_as_a_build(tmp_path: Path, kind: object) -> None:
+    errs = dj.validate_spec(_spec(tmp_path, kind=kind), tmp_path / "jobs", tmp_path)
+    assert any("kind must be one of" in e for e in errs), errs
+
+
+def test_launch_records_the_kind_and_applies_its_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cmd = ["--start-ram-gb", "3", "--", "cmd", "/c", "exit"]
+    assert dj.main(["launch", "--name", "x", *_OK, *cmd]) == 2
+    assert "8 GB build floor" in capsys.readouterr().err
+    seen: list[dict[str, object]] = []
+    monkeypatch.setattr(dj, "validate_spec", lambda spec, *a: seen.append(spec) or ["stop"])
+    dj.main(["launch", "--name", "x", "--kind", "soak", *_OK, *cmd])
+    assert seen and seen[0]["kind"] == "soak" and seen[0]["start_ram_gb"] == 3.0
+
+
 def test_cleanup_dir_may_not_be_the_root_or_hold_the_jobs_dir(tmp_path: Path) -> None:
     jobs = tmp_path / "jobs"
     jobs.mkdir()

@@ -8,7 +8,8 @@ reaper event (or the session ending) cannot reach it.
 
 The job keeps its own watchdog instead:
 - start gate: free RAM >= --start-ram-gb (default 8, the build floor; never lower it) for 3
-  consecutive samples, and every disk floor met. Gives up after --wait-max-min.
+  consecutive samples, and every disk floor met. Gives up after --wait-max-min. Only a job
+  declared `--kind soak` (it runs the app and nothing else) may start from 3 GB.
 - while running: every --sample-seconds it logs free RAM and disk space. It aborts if free RAM
   stays below --abort-ram-gb for 2 consecutive samples, or a disk floor is crossed.
 - abort: the whole child tree is ended (a Job Object, with taskkill /T as a fallback). Then, in
@@ -53,6 +54,11 @@ CLEANUP_ROOT = Path(r"D:\reclaim-build")
 TASK_PREFIX = "ReclaimJob-"
 TERMINAL = ("done", "failed", "aborted", "gave_up", "error", "suspect")
 ABORT_RAM_MIN_GB = 0.5  # below this the abort would fire only after the machine is starved
+# Lowest allowed start gate per declared job kind. A build or full verify peaks at several GB, so
+# 8 GB is its floor. A soak runs the app (under 1 GB resident in every soak so far) and nothing
+# else, so it may start at 3 GB (GG decision, 31 Oct 2026); waiting for 8 GB on a machine other
+# sessions keep at 4-5 GB free made a soak give up after 3 hours. A spec without a kind is a build.
+START_RAM_FLOOR_GB = {"build": 8.0, "soak": 3.0}
 MAX_PERIOD_S = 60  # longest gap between two watchdog samples
 MTIME_SLACK_S = 2.0  # filesystem timestamp granularity; the before/after snapshot is the real test
 # What Git Bash makes of a POSIX-looking argument: /c -> C:/, /tmp/x -> C:/Users/.../Temp/x,
@@ -368,8 +374,12 @@ def validate_spec(spec: object, jobs_root: Path, cleanup_root: Path) -> list[str
         for f in spec.get("expect_files", [])
         if not Path(f).is_absolute()
     )
-    if spec["start_ram_gb"] < 8:
-        errs.append("start_ram_gb may not be below the 8 GB build floor")
+    kind = spec.get("kind", "build")
+    if kind not in START_RAM_FLOOR_GB:
+        errs.append(f"kind must be one of {sorted(START_RAM_FLOOR_GB)}, got {kind!r}")
+    elif spec["start_ram_gb"] < START_RAM_FLOOR_GB[kind]:
+        floor = START_RAM_FLOOR_GB[kind]
+        errs.append(f"start_ram_gb may not be below the {floor:g} GB {kind} floor")
     if not ABORT_RAM_MIN_GB <= spec["abort_ram_gb"] < spec["start_ram_gb"]:
         errs.append(f"abort_ram_gb must be at least {ABORT_RAM_MIN_GB} and below start_ram_gb")
     # A longer period would leave the job effectively unwatched between samples.
@@ -691,6 +701,7 @@ def launch(a: argparse.Namespace) -> int:
         "name": a.name,
         "command": a.command,
         "cwd": a.cwd,
+        "kind": a.kind,
         "start_ram_gb": a.start_ram_gb,
         "abort_ram_gb": a.abort_ram_gb,
         "disk_floors": {},
@@ -810,6 +821,7 @@ def main(argv: list[str] | None = None) -> int:
     la = sub.add_parser("launch")
     la.add_argument("--name", required=True)
     la.add_argument("--cwd", default=str(Path.cwd()))
+    la.add_argument("--kind", choices=sorted(START_RAM_FLOOR_GB), default="build")
     la.add_argument("--start-ram-gb", type=float, default=8.0)
     la.add_argument("--abort-ram-gb", type=float, default=2.0)
     la.add_argument("--disk", action="append", default=None, help="DRIVE=GB, repeatable")
