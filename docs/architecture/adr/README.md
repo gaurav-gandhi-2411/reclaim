@@ -50,3 +50,4 @@ it. These numbers are used by more than one ADR: 0032.
 | 0041 | [`[storage] index_dir` -- the scan index may live on another volume](0041-index-dir-setting.md) |
 | 0042 | [dependency trees are opaque in the scan index (one aggregate row per root)](0042-opaque-dependency-trees.md) |
 | 0045 | [keep `idx_files_path_lower` -- it is not a duplicate of the primary key](0045-keep-path-lower-index.md) |
+| 0046 | [Disk growth attribution](0046-disk-growth-attribution.md) |
