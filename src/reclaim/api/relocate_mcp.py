@@ -77,19 +77,31 @@ def list_drives(anchor: str) -> list[DriveOption]:
 
 def rollback_hint(state: AppState) -> str:
     """The undo command as far as it is known before the move has an id."""
-    return f"reclaim relocate status (shows this move's id), then {_rollback_prefix(state)} <id>"
+    base = _relocate_prefix(state)
+    return f"{base} status (shows this move's id), then {base} rollback <id>"
+
+
+def recover_hint(state: AppState) -> str:
+    """What to run after a move that failed or was cut off part-way: the folder may sit between
+    stages, and only `recover` (finish or roll back) puts it in a known state again."""
+    base = _relocate_prefix(state)
+    return (
+        "The folder may be part-way through the move. Run "
+        f"`{base} status` to see its stage and id, then `{base} recover <id>` to finish or "
+        "roll it back; nothing else will run for this approval."
+    )
 
 
 def rollback_command(state: AppState, move_id: str) -> str:
-    return f"{_rollback_prefix(state)} {move_id}"
+    return f"{_relocate_prefix(state)} rollback {move_id}"
 
 
-def _rollback_prefix(state: AppState) -> str:
+def _relocate_prefix(state: AppState) -> str:
     journals = relocate_routes.journal_dir(state)
     # The CLI's own default journal folder needs no flag; any other one must be named or the
     # command would look in the wrong place and report "no move with that id".
     flag = "" if journals == data_root() / "data" / "relocate" else f' --journal-dir "{journals}"'
-    return f"reclaim relocate{flag} rollback"
+    return f"reclaim relocate{flag}"
 
 
 def resolve_relocation(

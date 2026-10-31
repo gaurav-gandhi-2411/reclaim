@@ -939,8 +939,9 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                 approval_id=approval_id,
                 error=str(exc)[:1000],
             )
-            _finish_quietly(approval_id, status="failed", error=str(exc))
-            raise
+            message = f"{exc} {relocate_mcp.recover_hint(state)}"
+            _finish_quietly(approval_id, status="failed", error=message)
+            raise RuntimeError(f"The move did not complete: {message}") from exc
         journal = outcome.journal
         command = relocate_mcp.rollback_command(state, journal.id)
         log_mcp_action(
@@ -1085,9 +1086,22 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                     f"used). Nothing was {past}. Call {again} again."
                 )
             elif status in ("failed", "stale"):
-                raise RuntimeError(
-                    f"This {what} did not complete ({status}): {record.get('error') or 'no detail'}"
-                )
+                detail = str(record.get("error") or "no detail")
+                if kind == "relocate" and status == "failed":
+                    # Also reached when the lease ran out with nobody reporting back, which the
+                    # executing call never got to log or explain.
+                    log_mcp_action(
+                        "mcp.relocation_failed",
+                        client_id=client_id,
+                        request_id=request_id,
+                        approval_id=approval_id,
+                        error=detail[:1000],
+                        seen_by="status",
+                    )
+                    hint = relocate_mcp.recover_hint(state)
+                    if hint not in detail:
+                        detail = f"{detail} {hint}"
+                raise RuntimeError(f"This {what} did not complete ({status}): {detail}")
             if time.monotonic() >= deadline:
                 running = status == "executing"
                 log_mcp_action(
@@ -1350,7 +1364,16 @@ def build_mcp_server(state: AppState, approval_gate: ApprovalGate | None = None)
                     "target_free_bytes": plan.target_free,
                 },
             }
-            record = await anyio.to_thread.run_sync(gate.request, payload)
+            try:
+                record = await anyio.to_thread.run_sync(gate.request, payload)
+            except ApprovalUnavailableError:
+                log_mcp_action(
+                    "mcp.relocation_refused",
+                    client_id=client_id,
+                    request_id=request_id,
+                    reason="approval_unavailable",
+                )
+                raise
             log_mcp_action(
                 "mcp.relocation_awaiting_approval",
                 client_id=client_id,

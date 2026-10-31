@@ -658,3 +658,74 @@ def test_the_rollback_command_names_the_journal_folder_only_when_it_is_not_the_d
     assert relocate_mcp.rollback_command(other, "abc") == (  # type: ignore[arg-type]
         'reclaim relocate --journal-dir "X:\\elsewhere\\relocate" rollback abc'
     )
+    # The status/recover hints name the same folder, or they would look in the wrong place.
+    assert relocate_mcp.rollback_hint(other).startswith(  # type: ignore[arg-type]
+        'reclaim relocate --journal-dir "X:\\elsewhere\\relocate" status'
+    )
+    assert 'relocate --journal-dir "X:\\elsewhere\\relocate" recover <id>' in (
+        relocate_mcp.recover_hint(other)  # type: ignore[arg-type]
+    )
+
+
+# --- a move that fails part-way says how to recover, and is audited however it failed ---------
+
+
+def _text(result: Any) -> str:
+    return " ".join(getattr(c, "text", "") for c in result.content)
+
+
+async def test_a_move_that_fails_after_the_click_names_the_recover_command(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_state: Any, _live: Any) -> Any:
+        raise OSError("the target drive went away mid-copy")
+
+    monkeypatch.setattr(relocate_mcp, "execute_relocation", broken)
+    async with create_connected_server_and_client_session(env.server()._mcp_server) as session:
+        option_id, drive_id, _ = await _ids(session, env.hub)
+        plan = await _plan(session, option_id, drive_id)
+        clicker = asyncio.create_task(_click_when_pending(env, approve=True))
+        result = await _request(session, option_id, drive_id, plan["plan_hash"])
+        await clicker
+    assert result.isError is True
+    text = _text(result)
+    assert "the target drive went away mid-copy" in text
+    assert "reclaim relocate" in text and "recover <id>" in text and "status" in text
+    (record,) = env.gate.broker.listing()
+    assert record.status == "failed" and "recover <id>" in (record.error or "")
+    (failed,) = env.audit.named("mcp.relocation_failed")
+    assert "went away" in failed["error"]
+
+
+async def test_a_lease_that_ran_out_is_reported_with_the_recover_command_and_audited(
+    env: Env,
+) -> None:
+    async with create_connected_server_and_client_session(env.server()._mcp_server) as session:
+        approval_id, *_ = await _pending_request(session, env)
+        broker = env.gate.broker
+        broker.approve(approval_id, channel=_CLICK)
+        assert broker.claim(approval_id) is True  # an executing call that then died
+        broker._items[approval_id].claim_deadline = 0.0  # its lease has run out
+        result = await session.call_tool(
+            "relocation_status", {"approval_id": approval_id, "wait_seconds": 0}
+        )
+    assert result.isError is True
+    text = _text(result)
+    assert "(failed)" in text and "never reported back" in text and "recover <id>" in text
+    (failed,) = env.audit.named("mcp.relocation_failed", approval_id=approval_id)
+    assert failed["seen_by"] == "status"
+
+
+async def test_request_relocation_audits_an_unreachable_approval_window(env: Env) -> None:
+    class _Closed(_Gate):
+        def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+            raise ApprovalUnavailableError("Reclaim's window is not running")
+
+    server = build_mcp_server(env.state, approval_gate=_Closed())
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        option_id, drive_id, _ = await _ids(session, env.hub)
+        plan = await _plan(session, option_id, drive_id)
+        result = await _request(session, option_id, drive_id, plan["plan_hash"])
+    assert result.isError is True
+    assert env.audit.named("mcp.relocation_refused", reason="approval_unavailable")
+    _assert_nothing_moved(env)
