@@ -155,15 +155,16 @@ def test_the_production_policy_checks_the_original_path_text_of_a_junction(
 ) -> None:
     _make_tree(env.source)
     env.move()
-    # A path pattern naming the original folder: the junction's text hits it, while the default
-    # check sees the junction resolved to the target, whose path does not.
+    # A path pattern naming the original folder: the junction's text hits it. The default check
+    # resolves the junction to the target, but since #190 a directory check also walks the
+    # exact path when it differs from the resolved one, so it sees the original text too.
     config = Config(safety=SafetyConfig(deny=["re:" + env.source.as_posix().replace(".", r"\.")]))
     home = tmp_path / "home"
     home.mkdir()
     policy = relocate.default_policy(config, environ={"USERPROFILE": str(home)}, app_dirs=[])
     assert policy.exclusion_match_text is not None
     assert policy.exclusion_match_text(env.source) is not None
-    assert policy.exclusion_match(env.source) is None
+    assert policy.exclusion_match(env.source) is not None
     with pytest.raises(RelocateError, match="excluded"):
         delete_old_copy(env.journal_path(), policy=policy, confirmed=True)
     assert _exists(_moved(env)) and os.path.isdir(_x(env.target))
