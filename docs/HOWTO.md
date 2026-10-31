@@ -116,3 +116,49 @@ unless you set `[regenerable] pytest_temp = true`.
   both scheduled tasks and the Windows notification identity; the dialog path with Yes/Yes removes the whole folder, data, config,
   tasks and identity. Reinstalling puts the tasks back. An index you moved with `index_dir` (6c) is on another drive and is
   **not** removed by either path; delete that folder by hand.
+
+
+## 8. Use Reclaim from Claude or Codex (your own AI assistant)
+Reclaim can be driven from Claude Desktop, Claude Code or Codex CLI on this machine. The assistant talks to
+`reclaim.exe mcp-serve` over a local pipe: nothing goes over the network, and Reclaim itself calls no AI service
+for this.
+
+What the assistant can do:
+- scan a folder in your profile and list what Reclaim found;
+- plan how to free a given amount (`plan_free_space`), using Reclaim's own categories only;
+- ask to clean a selection.
+
+What it cannot do:
+- name a file or folder to delete;
+- approve anything. Every clean shows a card in Reclaim's own window, and nothing happens until you click
+  **Approve**. Everything it cleans goes to the vault or the Recycle Bin, so it can be restored.
+- move folders to another drive. It can only list the options; you start a move yourself, on the
+  **Move to Another Drive** page.
+
+Keep Reclaim's window open while you use it: without the window there is nobody to approve, and a clean is refused.
+
+Set it up (once). The exact text for your machine is on **Settings > Use Reclaim from your AI assistant**, with a copy
+button. The formats below are from each client's documentation as I know it; they were not checked against a live install
+(BELIEVED):
+- **Claude Desktop:** add to `%APPDATA%\Claude\claude_desktop_config.json`:
+  ```json
+  {"mcpServers": {"reclaim": {"command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Reclaim\\reclaim.exe",
+                              "args": ["mcp-serve"]}}}
+  ```
+  Then restart Claude Desktop.
+- **Claude Code:**
+  ```
+  claude mcp add --scope user reclaim -- "C:\Users\<you>\AppData\Local\Programs\Reclaim\reclaim.exe" mcp-serve
+  ```
+- **Codex CLI:** add to `%USERPROFILE%\.codex\config.toml`:
+  ```toml
+  [mcp_servers.reclaim]
+  command = 'C:\Users\<you>\AppData\Local\Programs\Reclaim\reclaim.exe'
+  args = ["mcp-serve"]
+  ```
+
+Reclaim never edits these files for you.
+
+Things to ask: "free 20 GB, keep my projects, rebuildable things only", "what is using my disk?", "plan 50 GB but no
+duplicates". A plan says when the number cannot be reached under what you asked (`reaches_target: false` with the
+shortfall), rather than quietly including more.
