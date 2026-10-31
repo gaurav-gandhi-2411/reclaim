@@ -21,7 +21,7 @@ with `forget`.
 
 | check | default | what happens |
 |---|---|---|
-| start gate | free RAM >= 8 GB (`--start-ram-gb`; refused below 8, the build floor) and every disk floor met, 3 samples in a row, `--gate-seconds` 20 apart | waits; gives up after `--wait-max-min` (600, must be under the time limit) with state `gave_up` |
+| start gate | free RAM >= 8 GB (`--start-ram-gb`; refused below the floor of the job's `--kind`: 8 for `build`, the default, 3 for `soak`) and every disk floor met, 3 samples in a row, `--gate-seconds` 20 apart | waits; gives up after `--wait-max-min` (600, must be under the time limit) with state `gave_up` |
 | disk floors | `--disk C:=20 --disk D:=50` (repeatable) | crossing one while running aborts; an unreadable drive counts as crossed |
 | RAM while running | free RAM < `--abort-ram-gb` (2; at least 0.5) for 2 samples in a row, `--sample-seconds` 15 apart | aborts |
 | time limit | `--limit-hours` (12) | Task Scheduler ends the task: the runner dies and the Job Object ends the command, but there is no cleanup and no `END` line, so `status` shows it as stale |
@@ -35,6 +35,13 @@ and it is unchanged. A build or verify then uses several GB itself, so a running
 would abort nearly every job on its own memory use. The running floor exists to stop the
 machine from running out (the reaper fired at 3.6-4.3 GB free last run, with other sessions'
 jobs holding the rest). The value is a flag; raise it for a job that must yield sooner.
+
+**Why a soak may start at 3 GB.** A soak runs the installed app and nothing else, and the app
+stayed under 1 GB resident in every soak so far, so the 8 GB build bar only made it wait: on 31
+Oct a soak waited its full 180 minutes at 4.3-4.9 GB free and gave up without starting. Declare
+it with `--kind soak --start-ram-gb 3` (GG decision, 31 Oct 2026). The kind is recorded in
+`spec.json`, an unknown kind is refused, and a spec without one is a build, so nothing else can
+start below 8 GB.
 
 **Abort.** The command runs in a Windows Job Object with kill-on-close, so the whole tree ends
 together (`taskkill /T` is the fallback). Only once the child is confirmed gone, the entries
