@@ -20,6 +20,7 @@ import pytest
 
 _PROBE_PATH = Path(__file__).resolve().parents[1] / "packaging" / "smoke" / "http_probe.py"
 _NOT_WARM = {"detail": "cold", "code": "candidates_not_warm", "stale_reason": "cold"}
+_NON_JSON = "<non-json>"  # a warm-status script entry that makes the fake answer non-JSON
 
 
 def _load_probe() -> ModuleType:
@@ -46,10 +47,11 @@ def _serve(script: _Script) -> Iterator[str]:
             script.calls.append(self.path)
             if self.path.startswith("/api/candidates/warm-status"):
                 state = script.warm.pop(0) if len(script.warm) > 1 else script.warm[0]
-                code, body = (
-                    200,
-                    json.dumps({"status": state, "error": "boom" if state == "failed" else None}),
-                )
+                if state == _NON_JSON:
+                    code, body = 200, "<html>proxy error</html>"
+                else:
+                    error = "boom" if state == "failed" else None
+                    code, body = 200, json.dumps({"status": state, "error": error})
             elif self.path.startswith("/api/candidates"):
                 code, body = script.candidates.pop(0)
             else:
@@ -124,6 +126,17 @@ def test_other_409_bodies_are_returned_as_is(probe: ModuleType, body: str) -> No
     status, returned = _run(probe, script)
     assert (status, returned) == (409, body)
     assert script.calls == ["/api/candidates?tier=both"]
+
+
+@pytest.mark.parametrize("state", ["stale", "idle", "something-new", _NON_JSON])
+def test_a_state_that_is_not_computing_ends_the_wait_at_once(probe: ModuleType, state: str) -> None:
+    # A long timeout: the old loop spun on these until it expired, so a pass here within the
+    # test's runtime proves the wait ended on the first poll, not at the deadline.
+    script = _Script([(409, json.dumps(_NOT_WARM))], ["computing", state])
+    status, _ = _run(probe, script, timeout=60.0)
+    assert status == 409
+    assert script.calls.count("/api/candidates/warm-status") == 2
+    assert script.calls.count("/api/candidates?tier=both") == 1
 
 
 def test_warm_up_that_never_finishes_times_out(probe: ModuleType) -> None:

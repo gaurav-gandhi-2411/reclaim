@@ -148,9 +148,13 @@ class Client:
         Since the candidates warm-up (ADR-0040), a reader on a cold cache answers 409
         `candidates_not_warm` and starts the warm-up itself; the client polls
         `/api/candidates/warm-status` until "ready" and reads once more (static/app.js does the
-        same). Treating that 409 as a failure made check 7 fail on every healthy build. Any other
-        status, or a warm-up that ends "failed"/"cancelled", is returned as-is for the caller to
-        report -- never retried in a loop."""
+        same). Treating that 409 as a failure made check 7 fail on every healthy build.
+
+        It polls only while the warm-up is "computing" (the 409 handler sets that synchronously
+        before answering). Any other state ("failed", "cancelled", "stale", "idle", an unknown
+        one, or a body that is not JSON) ends the wait at once and is returned with the original
+        409 so the caller reports it, never spun on until the timeout. The read after "ready" is
+        made once; a second 409 there is returned as-is."""
         status, body = self.get(path)
         if status != 409 or _response_code(body) != "candidates_not_warm":
             return status, body
@@ -159,23 +163,27 @@ class Client:
             warm_status, warm_body = self.get("/api/candidates/warm-status")
             if warm_status != 200:
                 return warm_status, warm_body
-            state = json.loads(warm_body).get("status")
+            state = _json_field(warm_body, "status")
             if state == "ready":
                 return self.get(path)
-            if state in ("failed", "cancelled"):
+            if state != "computing":
                 # Keep the 409 so a caller's `status != 200` check reports it, with the
-                # warm-up's own body (its `error`) as the detail.
+                # warm-up's own body (its `status` and `error`) as the detail.
                 return status, warm_body
             time.sleep(_POLL_INTERVAL_SECONDS)
         raise TimeoutError(f"candidates warm-up did not become ready within {timeout}s")
 
 
-def _response_code(body: str) -> str | None:
+def _json_field(body: str, field: str) -> Any:
     try:
         parsed = json.loads(body)
     except ValueError:
         return None
-    return parsed.get("code") if isinstance(parsed, dict) else None
+    return parsed.get(field) if isinstance(parsed, dict) else None
+
+
+def _response_code(body: str) -> str | None:
+    return _json_field(body, "code")
 
 
 def cmd_dpapi_roundtrip(client: Client) -> None:
