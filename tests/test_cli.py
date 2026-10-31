@@ -29,6 +29,21 @@ def _isolate_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("reclaim.cli.DEFAULT_LOG_PATH", tmp_path / "reclaim.log")
 
 
+@pytest.fixture(autouse=True)
+def _fake_growth_snapshot(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """`check-disk-space` takes a growth snapshot by default (`[growth] enabled`); the real
+    sampler walks this machine's drives, so every test in this file gets a recorder instead.
+    Returns the store paths it was asked for."""
+    stores: list[Path] = []
+
+    def fake(config: object, store_path: Path, **_kw: object) -> str:
+        stores.append(store_path)
+        return "taken"
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", fake)
+    return stores
+
+
 def test_apply_dry_run_skips_duplicates_by_default(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -890,6 +905,57 @@ def test_check_disk_space_does_not_debounce_a_toast_windows_refused(
     assert exit_code == 0
     assert "toast=not_delivered" in capsys.readouterr().out
     assert not state_path.exists()
+
+
+def test_check_disk_space_takes_a_growth_snapshot_into_the_given_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _fake_growth_snapshot: list[Path]
+) -> None:
+    store = tmp_path / "g.sqlite3"
+    exit_code = main(
+        [
+            "check-disk-space",
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--state",
+            str(tmp_path / "state.json"),
+            "--growth-db",
+            str(store),
+        ]
+    )
+    assert exit_code == 0
+    assert _fake_growth_snapshot == [store]
+    assert "growth_snapshot=taken" in capsys.readouterr().out
+
+
+def test_check_disk_space_growth_disabled_makes_no_growth_call(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _fake_growth_snapshot: list[Path]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[growth]\nenabled = false\n", encoding="utf-8")
+    exit_code = main(
+        ["check-disk-space", "--config", str(config_path), "--state", str(tmp_path / "s.json")]
+    )
+    assert exit_code == 0
+    assert _fake_growth_snapshot == []
+    assert "growth_snapshot" not in capsys.readouterr().out
+
+
+def test_check_disk_space_still_toasts_when_the_snapshot_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[notifications]\nenabled = true\ndisk_threshold_percent = 10.0\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", lambda *a, **k: "failed")
+    monkeypatch.setattr("reclaim.notifications.send_disk_space_toast", lambda result: True)
+    exit_code = main(
+        ["check-disk-space", "--config", str(config_path), "--state", str(tmp_path / "s.json")]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "toast=sent" in out
+    assert "growth_snapshot=failed" in out
 
 
 def test_check_disk_space_apply_snooze_writes_state_without_checking(

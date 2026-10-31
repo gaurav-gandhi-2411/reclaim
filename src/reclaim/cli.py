@@ -432,6 +432,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "data/notification_state.json).",
     )
     check_disk_space_parser.add_argument(
+        "--growth-db",
+        type=Path,
+        default=None,
+        help="Override the growth store path (default: data/growth.sqlite3).",
+    )
+    check_disk_space_parser.add_argument(
         "--apply-snooze",
         action="store_true",
         help="Apply a snooze instead of running a normal check -- invoked by the toast's "
@@ -1169,6 +1175,14 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
         )
         return 0
 
+    growth_db: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
+    # Snapshot first so the toast's explanation reads fresh data. Never raises; with
+    # `[growth] enabled = false` there is no growth IO at all.
+    growth_note = ""
+    if config.growth.enabled:
+        status = _scheduled_growth_snapshot(config, args.config, growth_db)
+        growth_note = f" growth_snapshot={status}"
+
     result = check_disk_space(config.notifications, state_path=state_path)
     toast_note = ""
     if result.should_notify:
@@ -1180,9 +1194,22 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
             toast_note = " toast=not_delivered"
     print(  # noqa: T201
         f"reclaim check-disk-space: status={result.status} reason={result.reason} "
-        f"percent_used={result.percent_used} threshold={result.threshold_percent}{toast_note}"
+        f"percent_used={result.percent_used} threshold={result.threshold_percent}"
+        f"{toast_note}{growth_note}"
     )
     return 0
+
+
+def _scheduled_growth_snapshot(config: Config, config_path: Path, store_path: Path) -> str:
+    """The 4-hourly task's growth snapshot (spec 1.1): never raises, see `growth_alerts`."""
+    from reclaim import growth_alerts
+
+    index_path: Path | None
+    try:
+        index_path = resolve_index_db(None, config_path)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        index_path = None
+    return growth_alerts.scheduled_snapshot(config, store_path, index_path=index_path)
 
 
 def _run_growth(args: argparse.Namespace) -> int:
