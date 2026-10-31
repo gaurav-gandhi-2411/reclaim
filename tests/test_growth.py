@@ -448,6 +448,42 @@ def test_cli_report_hides_keys_of_a_project_excluded_after_the_snapshots(
     assert '"rows": []' in out
 
 
+def test_cache_roots_get_the_name_people_know_them_by(tmp_path: Path) -> None:
+    # pass 1 labelled every cache with its folder name, so pip's cache read "Cache"
+    cfg = Config()
+    labels = {
+        p: growth.cache_label(p)
+        for p in [*cfg.categories.package_caches.paths, *cfg.categories.model_caches.paths]
+    }
+    assert sorted(set(labels.values())) == sorted(
+        [
+            "pip cache",
+            "npm cache",
+            "uv cache",
+            "Yarn cache",
+            "conda packages",
+            "Maven repository",
+            "Gradle caches",
+            "Hugging Face cache",
+            "Hugging Face datasets cache",
+            "Hugging Face xet cache",
+            "PyTorch hub cache",
+            "Ollama models",
+        ]
+    ), labels
+    assert growth.cache_label("C:\\Users\\g\\AppData\\Local\\Docker") == "Docker"
+    assert growth.cache_label("C:\\Windows\\Temp") == "Windows Temp"
+    temp = tmp_path / "Temp"
+    assert growth.cache_label(str(temp), temp) == "Temp"
+    assert growth.cache_label("D:\\somewhere\\custom-cache") == "custom-cache"  # unknown: its name
+    fs = FakeFS()
+    cache = str(tmp_path / "AppData" / "Local" / "pip" / "Cache")
+    fs.add(cache, ("f", 0, 5))
+    env = _env(tmp_path, volumes=[], cache_paths=[cache])
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage)
+    assert [m.root.label for m in snap.sizes if m.root.kind == "cache"] == ["pip cache"]
+
+
 # ---------------------------------------------------------------- store and window math
 
 

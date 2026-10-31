@@ -105,6 +105,38 @@ class Environment:
     exclusions: list[str]
 
 
+# Path tail (lower-case, forward slashes) -> the name a person knows the cache by. The tails are
+# the default package/model cache locations of `config` (so a custom path with the same tail gets
+# the same name) plus Docker's data dir; checked in order, first match wins.
+_CACHE_LABELS: tuple[tuple[str, str], ...] = (
+    ("/pip/cache", "pip cache"),
+    ("/npm-cache", "npm cache"),
+    ("/uv/cache", "uv cache"),
+    ("/yarn/cache", "Yarn cache"),
+    ("/.conda/pkgs", "conda packages"),
+    ("/.m2/repository", "Maven repository"),
+    ("/.gradle/caches", "Gradle caches"),
+    ("/.cache/huggingface/hub", "Hugging Face cache"),
+    ("/.cache/huggingface/datasets", "Hugging Face datasets cache"),
+    ("/.cache/huggingface/xet", "Hugging Face xet cache"),
+    ("/.cache/torch/hub", "PyTorch hub cache"),
+    ("/.ollama/models", "Ollama models"),
+    ("/windows/temp", "Windows Temp"),
+    ("/docker", "Docker"),
+)
+
+
+def cache_label(path: str, temp: str | Path | None = None) -> str:
+    """Display name of a cache root: "pip cache" rather than the folder name "Cache"."""
+    if temp is not None and norm(path) == norm(temp):
+        return "Temp"
+    key = os.path.normpath(path).replace("\\", "/").lower()
+    for tail, label in _CACHE_LABELS:
+        if key.endswith(tail):
+            return label
+    return Path(path).name or path
+
+
 def environment_from_config(config: Config, volumes: Sequence[Path] | None = None) -> Environment:
     """Builds the real-machine Environment. Cache paths are the ones the package/model-cache
     detectors already use (so custom `[categories.*] paths` are honoured) plus Docker's data dir."""
@@ -314,7 +346,7 @@ def _plan_roots(env: Environment, walker: Walker) -> tuple[list[Root], list[Meas
     for cache in env.cache_paths:
         if walker.note_if_excluded(cache):
             continue  # a cache root inside an excluded path is never walked or named (spec 1.3)
-        add(Root(os.path.normpath(cache), "cache", Path(cache).name or cache))
+        add(Root(os.path.normpath(cache), "cache", cache_label(cache, env.temp)))
     claude = os.path.join(env.temp, "claude")  # noqa: PTH118 -- str paths
     try:
         if walker.note_if_excluded(claude):
