@@ -1,6 +1,6 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `26877c281b1a5db51c06d2ce8ed62bb61ac71e7a` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `8fc9bc6f5f8489516780d2e884cb1778ba7b4e4f` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
 with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
@@ -8,6 +8,8 @@ when any key's growth over
 24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.
 
 **Summary.** As replayed, the detector finds 1/5 evaluable events and the baseline 2/5; read literally (spec 1.5) the detector finds 1/5 and the baseline 0/5. That is 5 events from 30.77 h of fragments: it ranks neither method and says nothing about the spec's success metric (see the honesty section).
+
+**Not an independent hit.** Event `hf-copy-to-d-2026-10-09` was added to the ground truth after the first replay had shown a D: alert, and the alert-to-event match uses a factor-2 size band that was added after a 16 GiB alert was seen matching a 185 GiB copy (both described under "Two events were added after the first replay" below). Counting only the events that existed before that replay, the detector finds 0/4 as replayed and 0/4 read literally, the baseline 2/4 and 0/4. The detector's one detection is therefore not evidence that it works.
 
 | metric | detector (as replayed) | detector (spec-literal) | baseline | baseline (spec-literal) |
 |---|---|---|---|---|

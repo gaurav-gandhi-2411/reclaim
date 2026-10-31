@@ -139,3 +139,31 @@ def test_attribution_levels() -> None:
 
 def test_report_writer_targets_reports_dir() -> None:
     assert (Path(ge.__file__).resolve().parents[2] / "reports").is_dir()
+
+
+def _methods(detected: dict[str, list[str]]) -> ge.Res:
+    ids = ["old-event", "hf-copy-to-d-2026-10-09"]
+    return {
+        v: {"events": [{"id": i, "detected": i in detected.get(v, [])} for i in ids]}
+        for v in ge.VARIANTS
+    }
+
+
+def test_a_detection_of_a_post_hoc_event_is_flagged_in_the_summary() -> None:
+    lines = ge.post_hoc_caveat(_methods({"detector": ["hf-copy-to-d-2026-10-09"]}))
+    text = "\n".join(lines)
+    assert "Not an independent hit" in text and "`hf-copy-to-d-2026-10-09`" in text
+    assert "the detector finds 0/1 as replayed" in text  # without the post-hoc event: 0 of 1
+    assert ge.post_hoc_caveat(_methods({"detector": ["old-event"]})) == []
+    assert ge.post_hoc_caveat(_methods({})) == []
+
+
+def test_the_published_report_carries_the_caveat(result: ge.Res) -> None:
+    sha = "0" * 40
+    text = ge.render_markdown(result, sha)
+    flagged = any(
+        r["detected"] and r["id"] in ge.POST_HOC_EVENTS
+        for v in ge.VARIANTS
+        for r in result["methods"][v]["events"]
+    )
+    assert ("Not an independent hit" in text) == flagged

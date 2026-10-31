@@ -386,6 +386,36 @@ def steady_growth_control(rate_gib_day: float, days: int = 14, every_h: int = 4)
 # ---------------------------------------------------------------- report
 
 VARIANTS = ("detector", "detector_literal", "baseline", "baseline_literal")
+# Events added to events.json AFTER the first replay had shown a D: alert (see the honesty
+# section). A detection of one of these is not independent of the replay that motivated it.
+POST_HOC_EVENTS = ("pagefile-to-d-2026-10-09", "hf-copy-to-d-2026-10-09")
+
+
+def post_hoc_caveat(m: Res) -> list[str]:
+    """Summary paragraph flagging detections that rest on post-hoc events (empty when none do)."""
+    hits = {
+        v: [r["id"] for r in m[v]["events"] if r["detected"] and r["id"] in POST_HOC_EVENTS]
+        for v in VARIANTS
+    }
+    if not any(hits.values()):
+        return []
+
+    def without(v: str) -> str:
+        rows = [r for r in m[v]["events"] if r["id"] not in POST_HOC_EVENTS]
+        return f"{sum(bool(r['detected']) for r in rows)}/{len(rows)}"
+
+    named = ", ".join(f"`{i}`" for i in sorted({i for ids in hits.values() for i in ids}))
+    return [
+        f"**Not an independent hit.** Event {named} was added to the ground truth after the first "
+        "replay had shown a D: alert, and the alert-to-event match uses a factor-2 size band that "
+        "was added after a 16 GiB alert was seen matching a 185 GiB copy (both described under "
+        '"Two events were added after the first replay" below). Counting only the events that '
+        f"existed before that replay, the detector finds {without('detector')} as replayed and "
+        f"{without('detector_literal')} read literally, the baseline {without('baseline')} and "
+        f"{without('baseline_literal')}. The detector's one detection is therefore not evidence "
+        "that it works.",
+        "",
+    ]
 
 
 def evaluate() -> Res:
@@ -558,6 +588,7 @@ def render_markdown(res: Res, sha: str) -> str:
         "fragments: it ranks neither method and says nothing about the spec's success metric "
         "(see the honesty section).",
         "",
+        *post_hoc_caveat(m),
         "| " + " | ".join(head) + " |",
         "|---|---|---|---|---|",
     ]
