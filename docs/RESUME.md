@@ -178,13 +178,13 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
   - **Done earlier on 31 Oct:**
     - PVR on (`{"enabled":true}`).
     - D: scratch deleted: 24.19 GiB freed, 1,801 links removed as links, 0 link targets lost.
-    - Soak PASS on build 12: private bytes +0.77 MB/h, handles −0.8/h, threads −0.1/h over 2 h, via #228's `--kind soak` 3 GB gate (in integration).
+    - Soak PASS on build 12: private bytes +0.77 MB/h, handles −0.8/h, threads −0.1/h over 2 h (started with the 8 GB gate, before #228's `--kind soak` 3 GB gate existed; #228 is in integration).
     - #223's success check, in integration.
     - D5 as draft #229; assistant relocations as draft #230 (F1/F3 fixed).
     - Agent-artifacts wave 1 STOPPED with nothing applied: build 12's apply path selected 0 of the items the final code selects; parked for build 13.
   - **Scan slowdown solved and merged: #231** (`9178ede`, main CI green).
     - The cost was the per-repo git clean check over about 2,000 throwaway test-fixture repos that other sessions leave in `%TEMP%` (1,963 of 2,050 repo roots in a fresh scan).
-    - #186 `--no-optional-locks` is refuted as the cause: median 58 ms per repo on 81 real repos.
+    - #186 `--no-optional-locks` is refuted as the cause: median 58 ms per repo over the 70 non-fixture repos whose status succeeds.
     - Git now runs only where a verdict reads the answer (`node_modules`): `AppData` scan 709.7 s → 436.6 s; 0 verdict changes on real data.
   - **Rule breach flagged:** whole-profile scans run read-only `git status` inside the three hard-excluded projects; since then this session scans only roots that avoid them.
   - **Integration** `519a9c9` (main merged).
