@@ -10,7 +10,6 @@ import structlog
 from reclaim import growth
 from reclaim.config import Config, exclusion_patterns
 from reclaim.index import ScanIndex
-from reclaim.safety import first_matching_pattern
 from reclaim.safety_env import refuse_real_side_effect_under_pytest
 
 logger = structlog.get_logger(__name__)
@@ -96,18 +95,15 @@ def _load_visible_series(
         return None
     with growth.GrowthStore(store_path) as store:
         series = store.load_series()
-    patterns = exclusion_patterns(config)
     root = growth.norm(volume.rstrip("\\/") + "\\")
     out: dict[str, growth.KeySeries] = {}
-    for path, ks in series.items():
+    for path, ks in growth.hide_excluded(series, exclusion_patterns(config)).items():
         if ks.root.kind == "excluded":
             continue
         if ks.root.kind in ("volume", "volume_total"):
             if _same(path.removesuffix(growth.TOTAL_SUFFIX), volume):
                 out[path] = ks
-        elif growth.is_within(growth.norm(path), root) and (
-            not patterns or first_matching_pattern(path, patterns, is_dir=True) is None
-        ):
+        elif growth.is_within(growth.norm(path), root):
             out[path] = ks
     return out
 

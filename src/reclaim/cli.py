@@ -1241,7 +1241,7 @@ def _run_growth(args: argparse.Namespace) -> int:
             return _growth_snapshot(args, config, store)
         window_s = {"1d": 86400.0, "7d": 7 * 86400.0}[args.window]
         report = growth.growth_report(
-            store.load_series(),
+            growth.hide_excluded(store.load_series(), exclusion_patterns(config)),
             window_s,
             time.time(),
             config.growth.max_start_slack_h * 3600.0,

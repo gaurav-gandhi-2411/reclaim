@@ -343,13 +343,16 @@ def _plan_roots(env: Environment, walker: Walker) -> tuple[list[Root], list[Meas
     return list(roots.values()), sysfiles
 
 
-def _index_aggregates(index: ScanIndex, env: Environment) -> list[Measurement]:
+def _index_aggregates(index: ScanIndex, env: Environment, walker: Walker) -> list[Measurement]:
     """Opaque roots (node_modules, .venv...) under the profile/project roots, from the index:
-    no filesystem IO, stamped with the index's own scan time."""
+    no filesystem IO, stamped with the index's own scan time. One under an excluded path is never
+    a key of its own: it is remembered for the "Excluded projects" aggregate (spec 1.3)."""
     out: list[Measurement] = []
     seen: set[str] = set()
     for base in [env.profile, *env.project_roots]:
         for path, agg, scanned in index.opaque_aggregates(base, limit=_OPAQUE_KEYS_MAX):
+            if walker.note_if_excluded(path):
+                continue
             if norm(path) not in seen:
                 seen.add(norm(path))
                 out.append(Measurement(Root(path, "opaque", Path(path).name), agg, False, scanned))
@@ -397,10 +400,11 @@ def collect_snapshot(
             continue  # absent/unreadable root (e.g. a cache this machine does not have)
         snap.sizes.append(Measurement(root, size, partial=not complete))
         snap.complete = snap.complete and complete
+    if index is not None:
+        # before the aggregate: it also learns which opaque roots are excluded
+        snap.sizes.extend(_index_aggregates(index, env, walker))
     if env.exclusions:
         snap.sizes.append(_excluded_measurement(walker, index))
-    if index is not None:
-        snap.sizes.extend(_index_aggregates(index, env))
     return snap
 
 
@@ -408,8 +412,32 @@ def _excluded_measurement(walker: Walker, index: ScanIndex | None) -> Measuremen
     root = Root(EXCLUDED_KEY, "excluded", "Excluded projects")
     if index is None:
         return Measurement(root, 0, partial=True)  # unknown, not zero
-    total = sum(index.subtree_size_bytes(Path(p)) for p in walker.excluded.values())
+    # An excluded path nested in another (an opaque root inside an excluded project) is part of
+    # the outer one's subtree size already: count each byte once.
+    outer: list[str] = []
+    for key in sorted(walker.excluded, key=len):
+        if not any(is_within(key, o) for o in outer):
+            outer.append(key)
+    total = sum(index.subtree_size_bytes(Path(walker.excluded[k])) for k in outer)
     return Measurement(root, total, partial=False, observed_at=None)
+
+
+def hide_excluded(series: Mapping[str, KeySeries], patterns: Sequence[str]) -> dict[str, KeySeries]:
+    """`series` without any key whose path is excluded: the read-side twin of the snapshot-time
+    rule, applied by every consumer (API, CLI report, anomalies, toasts) so a key stored before an
+    exclusion existed is never named. Volume and aggregate keys are kept (they are not paths of
+    a project). The key is DROPPED, not folded into the "Excluded projects" series: that series
+    comes from the index at each snapshot, and adding a key's history to it would invent a step
+    in the aggregate at the moment the exclusion was added. The aggregate catches up at the next
+    snapshot, which measures the now-excluded folder through the index."""
+    if not patterns:
+        return dict(series)
+    return {
+        path: ks
+        for path, ks in series.items()
+        if ks.root.kind in ("volume", "volume_total", "excluded")
+        or first_matching_pattern(path, patterns, is_dir=True) is None
+    }
 
 
 # ---------------------------------------------------------------- store

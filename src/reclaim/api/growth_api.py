@@ -16,7 +16,7 @@ from reclaim.api.schemas import (
 )
 from reclaim.api.state import AppState
 from reclaim.app_paths import data_root
-from reclaim.config import Config
+from reclaim.config import Config, exclusion_patterns
 
 # Read-only view over the growth store (ADR-0046, spec 1.4): nothing here writes, lists a
 # directory or opens a file other than the store itself.
@@ -107,7 +107,8 @@ def build_growth_response(
     cfg = state.config.growth
     slack_s, end_age_s = cfg.max_start_slack_h * 3600.0, cfg.max_end_age_h * 3600.0
     with growth.GrowthStore(path) as store:
-        series = store.load_series()
+        # keys stored before an exclusion was added are hidden here, not only at snapshot time
+        series = growth.hide_excluded(store.load_series(), exclusion_patterns(state.config))
         partial = store.partial_latest_keys()
     report = growth.growth_report(series, _WINDOW_S[window], now, slack_s, end_age_s)
 

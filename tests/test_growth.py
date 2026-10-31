@@ -4,12 +4,13 @@ from __future__ import annotations
 import os
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from reclaim import growth
-from reclaim.config import Config, load_config
+from reclaim.config import Config, exclusion_patterns, load_config
 from reclaim.growth import (
     GIB,
     AnomalyConfig,
@@ -355,6 +356,96 @@ def test_cache_root_below_a_junction_into_an_excluded_tree_is_not_walked(tmp_pat
     assert "sub" not in _by_label(snap)
     assert not any("secret-app" in c.lower() for c in spy.calls), spy.calls
     assert not any(c.lower().endswith("sub") for c in spy.calls), spy.calls
+
+
+class _OpaqueIndex:
+    """Index stub with fixed opaque roots; a subtree under `secret-app` holds 9 GiB."""
+
+    def __init__(self, rows: list[tuple[str, int, float]]) -> None:
+        self.rows = rows
+
+    def subtree_size_bytes(self, path: Path) -> int:
+        return 9 * GIB if "secret-app" in str(path) else 0
+
+    def opaque_aggregates(self, *_: object, **__: object) -> list[tuple[str, int, float]]:
+        return self.rows
+
+
+def test_opaque_root_under_an_excluded_project_folds_into_the_aggregate(tmp_path: Path) -> None:
+    # F2a (verifier probe test_opaque_under_excluded_project_not_named): an index row such as
+    # ...\secret-app\.venv used to become a named key; it must be only part of the aggregate.
+    projects = tmp_path / "home" / "ml-projects"
+    bad = str(projects / "secret-app" / ".venv")
+    good = str(projects / "fine-app" / "node_modules")
+    fs = FakeFS()
+    fs.add(str(tmp_path / "home"))
+    fs.add(str(projects))  # the project folder is not even listed: only the index knows it
+    index = _OpaqueIndex([(bad, 9 * GIB, 7.0), (good, 2 * GIB, 7.0)])
+    cfg = Config()
+    cfg.exclusions.project_names = ["Secret-App"]
+    env = _env(
+        tmp_path,
+        volumes=[],
+        project_roots=[projects],
+        exclusions=exclusion_patterns(cfg),
+    )
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage, index=index)  # type: ignore[arg-type]
+    assert not any("secret" in m.root.path.lower() for m in snap.sizes)
+    assert [m.root.path for m in snap.sizes if m.root.kind == "opaque"] == [good]
+    assert _by_label(snap)["Excluded projects"].bytes == 9 * GIB
+
+
+def test_excluded_project_and_its_opaque_root_are_counted_once(tmp_path: Path) -> None:
+    projects = tmp_path / "home" / "ml-projects"
+    fs = FakeFS()
+    fs.add(str(tmp_path / "home"))
+    fs.add(str(projects), ("secret-app", DIR, 0))
+    index = _OpaqueIndex([(str(projects / "secret-app" / ".venv"), 9 * GIB, 7.0)])
+    env = _env(tmp_path, volumes=[], project_roots=[projects], exclusions=["*secret-app*"])
+    snap = collect_snapshot(env, list_fn=fs, disk_usage=_usage, index=index)  # type: ignore[arg-type]
+    # the stub answers 9 GiB for the project and for the .venv inside it: one subtree, not two
+    assert _by_label(snap)["Excluded projects"].bytes == 9 * GIB
+
+
+def _write_two_point_series(path: Path, now: float) -> None:
+    """C: +20 GiB over the last day, and an opaque root under `secret-app` +12 GiB."""
+    bad = "C:\\Users\\g\\ml-projects\\secret-app\\.venv"
+    with GrowthStore(path) as store:
+        for t, used, opaque in ((now - 86400 - 60, 100, 1), (now - 60, 120, 13)):
+            store.write(
+                Snapshot(
+                    t,
+                    120.0,
+                    True,
+                    [
+                        Measurement(Root("C:\\", "volume", "C:\\"), used * GIB),
+                        Measurement(Root(bad, "opaque", ".venv"), opaque * GIB, False, t),
+                    ],
+                )
+            )
+
+
+def test_cli_report_hides_keys_of_a_project_excluded_after_the_snapshots(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from reclaim import cli
+
+    db = tmp_path / "growth.sqlite3"
+    _write_two_point_series(db, time.time())
+    plain = tmp_path / "plain.toml"
+    plain.write_text("[growth]\nproject_roots = []\n", encoding="utf-8")
+    excluding = tmp_path / "excluding.toml"
+    excluding.write_text(
+        '[growth]\nproject_roots = []\n[exclusions]\nproject_names = ["secret-app"]\n',
+        encoding="utf-8",
+    )
+    base = ["growth", "--db", str(db), "report", "--window", "1d", "--json"]
+    assert cli.main(["growth", "--config", str(plain), *base[1:]]) == 0
+    assert "secret-app" in capsys.readouterr().out  # the scenario names it without exclusions
+    assert cli.main(["growth", "--config", str(excluding), *base[1:]]) == 0
+    out = capsys.readouterr().out
+    assert "secret-app" not in out.lower()
+    assert '"rows": []' in out
 
 
 # ---------------------------------------------------------------- store and window math

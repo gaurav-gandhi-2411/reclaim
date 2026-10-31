@@ -28,10 +28,10 @@ OPAQUE = "C:\\Users\\g\\work\\app\\node_modules"
 EXCLUDED = Root("<excluded projects>", "excluded", "Excluded projects")
 
 
-def _client(tmp_path: Path, store: Path | None) -> TestClient:
+def _client(tmp_path: Path, store: Path | None, config: Config | None = None) -> TestClient:
     app = create_app(
         db_path=tmp_path / "index.sqlite3",
-        config=Config(),
+        config=config or Config(),
         vault_dir=tmp_path / "vault",
         manifest_path=tmp_path / "manifest.jsonl",
         mode_log_path=tmp_path / "mode_log.jsonl",
@@ -163,3 +163,67 @@ def test_get_never_modifies_the_store(tmp_path: Path) -> None:
     assert client.get("/api/growth?window=7d").status_code == 200
     assert hashlib.sha256(store.read_bytes()).hexdigest() == before
     assert client.post("/api/growth").status_code == 405  # read-only: no mutating verb exists
+
+
+# ---------------------------------------------------------------- exclusions on the read side
+
+EXCLUDED_VENV = "C:\\Users\\g\\ml-projects\\secret-app\\.venv"
+
+
+def _write_opaque_under_secret_app(path: Path) -> None:
+    """Three snapshots 13 h apart: C: +14 GiB, an opaque root under the project `secret-app`
+    +9 GiB, i.e. the one that would be named as the cause of the volume's growth."""
+    now = time.time()
+    with GrowthStore(path) as store:
+        for k in range(3):
+            t = now - 26 * 3600 + k * 13 * 3600
+            store.write(
+                Snapshot(
+                    t,
+                    120.0,
+                    True,
+                    [
+                        Measurement(Root(VOL, "volume", VOL), (100 + 14 * (k > 0)) * GIB),
+                        Measurement(Root(VOL + "|total", "volume_total", VOL), 500 * GIB),
+                        Measurement(
+                            Root(EXCLUDED_VENV, "opaque", ".venv"),
+                            (1 + 9 * (k > 0)) * GIB,
+                            False,
+                            t,
+                        ),
+                    ],
+                )
+            )
+
+
+def _excluding(*names: str) -> Config:
+    cfg = Config()
+    cfg.exclusions.project_names = list(names)
+    return cfg
+
+
+def test_opaque_row_under_an_excluded_project_is_never_named(tmp_path: Path) -> None:
+    # F2a (verifier probe test_api_names_excluded_opaque): the row, the volume anomaly's
+    # `attributed` path and its explanation all came from the stored opaque key.
+    store = tmp_path / "growth.sqlite3"
+    _write_opaque_under_secret_app(store)
+    control = _client(tmp_path, store).get("/api/growth?window=1d").json()
+    assert "secret-app" in str(control).lower()  # the scenario does name it without exclusions
+    body = _client(tmp_path, store, _excluding("Secret-App")).get("/api/growth?window=1d").json()
+    assert "secret-app" not in str(body).lower()
+    assert body["rows"] == []
+    (vol,) = body["volumes"]
+    assert vol["change_bytes"] == 14 * GIB and vol["not_attributed_bytes"] == 14 * GIB
+
+
+def test_exclusion_added_after_snapshots_exist_hides_old_keys(tmp_path: Path) -> None:
+    # the keys were stored while nothing was excluded; the user then excluded the project
+    store = tmp_path / "growth.sqlite3"
+    _write_series(store)
+    names = {r["path"] for r in _client(tmp_path, store).get("/api/growth").json()["rows"]}
+    assert {SCRATCH, TOP, OPAQUE} <= names
+    body = _client(tmp_path, store, _excluding("work")).get("/api/growth").json()
+    assert {r["path"] for r in body["rows"]} == {SCRATCH}
+    assert "work" not in str(body["anomalies"]).lower()
+    # the aggregate line is untouched: it is its own series, never itemised
+    assert body["excluded_aggregate"]["bytes"] == 3 * GIB
