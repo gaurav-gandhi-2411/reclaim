@@ -444,10 +444,13 @@ HONESTY = """\
   starts from a sample days old (`start_age_h`), and census-time alerts use a C: sample 52 h old.
   Real snapshots every 4 h would not have those holes. The *literal* columns drop alerts whose
   start sample is older than 72 h or whose newest sample is older than 1 h; they are the closer
-  reading of the spec, not a tuned variant. The finding stands on its own: `detect_anomalies`
-  does not check the age of the window's start sample, so after any run of missed snapshots
-  (laptop off for a week) the volume rule reports growth accumulated over the whole gap as growth
-  "in 3 days".
+  reading of the spec, not a tuned variant. The finding that `detect_anomalies` reported growth
+  accumulated over a whole gap as growth "in 3 days" is FIXED (see the change log): a window's
+  start sample may now be at most window + 6 h old and the newest sample at most 1 h old. The
+  detector's "as replayed" column therefore now loses the two census-time detections of the
+  9 -> 12 Oct growth: their volume alert rested on a C: sample 52 h old, which is a hole in the
+  fragments, not a missed snapshot a real 4-hourly run would have. The loss comes from the data
+  being fragmentary and is not evidence about the detector on real snapshots.
 - **Two events were added after the first replay** (`pagefile-to-d-2026-10-09`,
   `hf-copy-to-d-2026-10-09`, both D:, both documented in RESUME.md); the first replay showed D:
   alerts and the original event list had only C: events. The alert-to-event matching also gained
@@ -473,6 +476,59 @@ to be tested honestly.
 """
 
 
+# Numbers of the report before the window-freshness fix, as published at commit 6002874 (the
+# detector code at 4435381 is identical). Kept as constants: the old detector no longer exists.
+BEFORE_SHA = "60028742245f969a6aebf0d62d666687711f7e80"
+BEFORE_CODE_SHA = "4435381165df666cb67b5c5d5bea8b56e31e13b9"
+BEFORE = {  # variant -> (recall, alert episodes, false-alarm episodes, precision)
+    "detector": ("3/5", 16, 14, 0.125),
+    "detector_literal": ("1/5", 10, 9, 0.1),
+}
+FIX_SHA = "4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e"  # fix(growth): fresh start and end samples
+
+
+def change_log(m: Res) -> list[str]:
+    """Before/after of the detector for the window-freshness fix (same fixtures, same thresholds)."""
+    lines = [
+        "## Change log",
+        "",
+        f"- Detector fix, window freshness (spec 1.5): before = code `{BEFORE_CODE_SHA}` "
+        f"(report `{BEFORE_SHA}`), after = `{FIX_SHA}`. Fixtures, abs_floor, share_floor and z "
+        "thresholds unchanged; the baseline is unchanged (it passes no freshness limits).",
+        "",
+        "| detector variant | recall before -> after | alert episodes | false-alarm episodes | "
+        "precision (lower bound) |",
+        "|---|---|---|---|---|",
+    ]
+    for v, (rec, eps, fa, prec) in BEFORE.items():
+        a = m[v]
+        lines.append(
+            f"| {v} | {rec} -> {a['recall']} | {eps} -> {a['episodes']} | "
+            f"{fa} -> {a['false_alarm_episodes']} | {prec} -> {a['precision']} |"
+        )
+    lines += [
+        "",
+        "Read the drop in recall with the honesty section: it is the two census-time detections "
+        "that rested on a 52 h old C: sample.",
+        "",
+    ]
+    return lines
+
+
+OPEN_ISSUE = [
+    "## Open design issue: steady growth trips the 3-day volume rule (NOT fixed)",
+    "",
+    "Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) trips the volume rule and keeps it tripped "
+    "for as long as the growth lasts (synthetic control above: 2.0 and 3.0 GiB/day alert on "
+    "66 of 84 snapshots). The key rule does not have this problem because it needs a high "
+    "robust z-score. Candidate fix, not built: also require the volume rate's own robust z-score "
+    "once >= 6 intervals of history exist (same estimator as `key_z`, applied to the volume's "
+    "used-space series). Not applied here: the control is synthetic and the fix must not be "
+    "tuned on the 5 evaluable events.",
+    "",
+]
+
+
 def render_markdown(res: Res, sha: str) -> str:
     m: Res = res["methods"]
     cov: Res = res["coverage"]
@@ -490,7 +546,7 @@ def render_markdown(res: Res, sha: str) -> str:
         "machine-readable twin: `reports/growth_eval.json`. Ground truth:",
         f"`evals/fixtures/growth/events.json` ({res['events_evaluable']} evaluable of "
         f"{res['events_total']} documented events). Detector = `reclaim.growth.detect_anomalies`",
-        "with spec defaults, replayed unchanged; baseline = alert when any key's growth over",
+        "with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert when any key's growth over",
         "24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.",
         "",
         f"**Summary.** As replayed, the detector finds {m['detector']['recall']} evaluable events "
@@ -520,7 +576,7 @@ def render_markdown(res: Res, sha: str) -> str:
         for v in VARIANTS
     ]
     lines.append("| false-alarm episodes per week of data | " + " | ".join(per_week) + " |")
-    lines += ["", "## Coverage (hours of data per source)", ""]
+    lines += ["", *change_log(m), "## Coverage (hours of data per source)", ""]
     lines += [
         "| source | hours | continuous stretches | longest stretch (h) | samples | span (days) |",
         "|---|---|---|---|---|---|",
@@ -598,6 +654,7 @@ def render_markdown(res: Res, sha: str) -> str:
         f"{len(stale)} rest on a start sample older than 72 h or a newest sample older than 1 h "
         "(gap artifacts); the rest are in the JSON (`methods.detector_literal`).",
         "",
+        *OPEN_ISSUE,
         HONESTY.format(
             hours=cov["all_sources"]["hours"],
             stretches=cov["all_sources"]["stretches"],

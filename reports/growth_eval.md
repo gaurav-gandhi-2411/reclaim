@@ -1,21 +1,32 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `60028742245f969a6aebf0d62d666687711f7e80` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
-with spec defaults, replayed unchanged; baseline = alert when any key's growth over
+with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert when any key's growth over
 24 h or 72 h is >= 5 GiB, blamed on the largest grower. No tuning on these events.
 
-**Summary.** As replayed, the detector finds 3/5 evaluable events and the baseline 2/5; read literally (spec 1.5) the detector finds 1/5 and the baseline 0/5. That is 5 events from 30.77 h of fragments: it ranks neither method and says nothing about the spec's success metric (see the honesty section).
+**Summary.** As replayed, the detector finds 1/5 evaluable events and the baseline 2/5; read literally (spec 1.5) the detector finds 1/5 and the baseline 0/5. That is 5 events from 30.77 h of fragments: it ranks neither method and says nothing about the spec's success metric (see the honesty section).
 
 | metric | detector (as replayed) | detector (spec-literal) | baseline | baseline (spec-literal) |
 |---|---|---|---|---|
-| recall (evaluable events detected) | 3/5 | 1/5 | 2/5 | 0/5 |
-| top-1 attribution (detected events with a known folder) | 1/2 | 0/0 | 0/2 | 0/0 |
-| alert episodes | 16 | 10 | 2 | 1 |
-| false-alarm episodes | 14 | 9 | 1 | 1 |
-| precision (lower bound) | 0.125 | 0.1 | 0.5 | 0.0 |
-| false-alarm episodes per week of data | 76.44 (not meaningful) | 49.14 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) |
+| recall (evaluable events detected) | 1/5 | 1/5 | 2/5 | 0/5 |
+| top-1 attribution (detected events with a known folder) | 0/0 | 0/0 | 0/2 | 0/0 |
+| alert episodes | 5 | 3 | 2 | 1 |
+| false-alarm episodes | 4 | 2 | 1 | 1 |
+| precision (lower bound) | 0.2 | 0.333 | 0.5 | 0.0 |
+| false-alarm episodes per week of data | 21.84 (not meaningful) | 10.92 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) |
+
+## Change log
+
+- Detector fix, window freshness (spec 1.5): before = code `4435381165df666cb67b5c5d5bea8b56e31e13b9` (report `60028742245f969a6aebf0d62d666687711f7e80`), after = `4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e`. Fixtures, abs_floor, share_floor and z thresholds unchanged; the baseline is unchanged (it passes no freshness limits).
+
+| detector variant | recall before -> after | alert episodes | false-alarm episodes | precision (lower bound) |
+|---|---|---|---|---|
+| detector | 3/5 -> 1/5 | 16 -> 5 | 14 -> 4 | 0.125 -> 0.2 |
+| detector_literal | 1/5 -> 1/5 | 10 -> 3 | 9 -> 2 | 0.1 -> 0.333 |
+
+Read the drop in recall with the honesty section: it is the two census-time detections that rested on a 52 h old C: sample.
 
 ## Coverage (hours of data per source)
 
@@ -36,8 +47,8 @@ Stretches end at a hole longer than 1 h. `census` is two snapshots, so 0 h.
 | hf-copy-to-d-2026-10-09 | detected (volume alert 177.6 GiB, start 29.2 h old, attribution n/a) | detected (volume alert 177.6 GiB, start 29.2 h old, attribution n/a) | missed | missed |
 | c-drop-2026-10-09-1522 | missed | missed | missed | missed |
 | build-c-drop-2026-10-10 | missed | missed | missed | missed |
-| temp-growth-2026-10-09-to-12 | detected (volume alert 84.6 GiB, start 73.5 h old, attribution correct) | missed | detected (key alert 60.6 GiB, start 78.0 h old, attribution coarse) | missed |
-| ml-projects-growth-2026-10-09-to-12 | detected (volume alert 84.6 GiB, start 73.5 h old, attribution wrong) | missed | detected (key alert 60.6 GiB, start 78.0 h old, attribution wrong) | missed |
+| temp-growth-2026-10-09-to-12 | missed | missed | detected (key alert 60.6 GiB, start 78.0 h old, attribution coarse) | missed |
+| ml-projects-growth-2026-10-09-to-12 | missed | missed | detected (key alert 60.6 GiB, start 78.0 h old, attribution wrong) | missed |
 
 What the detector's windows saw at each evaluable event's end:
 
@@ -82,7 +93,11 @@ Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cann
 - 2026-10-31T13:49:19: 4.5 h, -5.7 GiB net, -30.4 GiB/day
 - 2026-10-31T22:49:51: 2.6 h, 3.9 GiB net, 35.7 GiB/day
 
-Of the 14 as-replayed detector false-alarm episodes, 5 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`).
+Of the 4 as-replayed detector false-alarm episodes, 2 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`).
+
+## Open design issue: steady growth trips the 3-day volume rule (NOT fixed)
+
+Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) trips the volume rule and keeps it tripped for as long as the growth lasts (synthetic control above: 2.0 and 3.0 GiB/day alert on 66 of 84 snapshots). The key rule does not have this problem because it needs a high robust z-score. Candidate fix, not built: also require the volume rate's own robust z-score once >= 6 intervals of history exist (same estimator as `key_z`, applied to the volume's used-space series). Not applied here: the control is synthetic and the fix must not be tuned on the 5 evaluable events.
 
 ## Honesty section
 
@@ -105,10 +120,13 @@ Of the 14 as-replayed detector false-alarm episodes, 5 rest on a start sample ol
   starts from a sample days old (`start_age_h`), and census-time alerts use a C: sample 52 h old.
   Real snapshots every 4 h would not have those holes. The *literal* columns drop alerts whose
   start sample is older than 72 h or whose newest sample is older than 1 h; they are the closer
-  reading of the spec, not a tuned variant. The finding stands on its own: `detect_anomalies`
-  does not check the age of the window's start sample, so after any run of missed snapshots
-  (laptop off for a week) the volume rule reports growth accumulated over the whole gap as growth
-  "in 3 days".
+  reading of the spec, not a tuned variant. The finding that `detect_anomalies` reported growth
+  accumulated over a whole gap as growth "in 3 days" is FIXED (see the change log): a window's
+  start sample may now be at most window + 6 h old and the newest sample at most 1 h old. The
+  detector's "as replayed" column therefore now loses the two census-time detections of the
+  9 -> 12 Oct growth: their volume alert rested on a C: sample 52 h old, which is a hole in the
+  fragments, not a missed snapshot a real 4-hourly run would have. The loss comes from the data
+  being fragmentary and is not evidence about the detector on real snapshots.
 - **Two events were added after the first replay** (`pagefile-to-d-2026-10-09`,
   `hf-copy-to-d-2026-10-09`, both D:, both documented in RESUME.md); the first replay showed D:
   alerts and the original event list had only C: events. The alert-to-event matching also gained

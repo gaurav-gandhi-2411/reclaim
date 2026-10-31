@@ -31,7 +31,7 @@
    "start": "2026-10-31T22:49:51"
   }
  ],
- "commit": "60028742245f969a6aebf0d62d666687711f7e80",
+ "commit": "4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e",
  "continuous_hours_needed": 672,
  "coverage": {
   "all_sources": {
@@ -252,8 +252,8 @@
    "top1": "0/0"
   },
   "detector": {
-   "alerts_raw": 241,
-   "episodes": 16,
+   "alerts_raw": 55,
+   "episodes": 5,
    "events": [
     {
      "alert": {
@@ -286,39 +286,21 @@
      "named": null
     },
     {
-     "alert": {
-      "end_age_h": 52.0,
-      "growth_gib": 84.6,
-      "key": "C:\\",
-      "scope": "volume",
-      "start_age_h": 73.5,
-      "t": "2026-10-12T21:31:43",
-      "volume": "C",
-      "window_h": 72
-     },
-     "attribution": "correct",
-     "detected": true,
+     "alert": null,
+     "attribution": "none",
+     "detected": false,
      "id": "temp-growth-2026-10-09-to-12",
-     "named": "C:\\Users\\gaura\\AppData\\Local\\Temp"
+     "named": null
     },
     {
-     "alert": {
-      "end_age_h": 52.0,
-      "growth_gib": 84.6,
-      "key": "C:\\",
-      "scope": "volume",
-      "start_age_h": 73.5,
-      "t": "2026-10-12T21:31:43",
-      "volume": "C",
-      "window_h": 72
-     },
-     "attribution": "wrong",
-     "detected": true,
+     "alert": null,
+     "attribution": "none",
+     "detected": false,
      "id": "ml-projects-growth-2026-10-09-to-12",
-     "named": "C:\\Users\\gaura\\AppData\\Local\\Temp"
+     "named": null
     }
    ],
-   "false_alarm_episodes": 14,
+   "false_alarm_episodes": 4,
    "false_alarm_list": [
     {
      "alerts": 3,
@@ -332,136 +314,26 @@
      "window_h": 24
     },
     {
-     "alerts": 1,
-     "end_age_h": 52.0,
-     "growth_gib": 33.9,
-     "key": "D:\\",
+     "alerts": 19,
+     "end_age_h": 0.0,
+     "growth_gib": 153.8,
+     "key": "C:\\",
      "scope": "volume",
-     "start_age_h": 73.5,
-     "t": "2026-10-12T21:31:43",
-     "volume": "D",
+     "start_age_h": 74.3,
+     "t": "2026-10-13T03:54:56",
+     "volume": "C",
      "window_h": 72
     },
     {
      "alerts": 19,
      "end_age_h": 0.0,
-     "growth_gib": 68.0,
-     "key": "C:\\",
-     "scope": "volume",
-     "start_age_h": 58.4,
-     "t": "2026-10-13T03:54:56",
-     "volume": "C",
-     "window_h": 24
-    },
-    {
-     "alerts": 19,
-     "end_age_h": 0.0,
-     "growth_gib": 42.5,
+     "growth_gib": 64.7,
      "key": "D:\\",
      "scope": "volume",
-     "start_age_h": 58.4,
+     "start_age_h": 74.3,
      "t": "2026-10-13T03:54:56",
      "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 44,
-     "end_age_h": 0.0,
-     "growth_gib": 22.6,
-     "key": "C:\\",
-     "scope": "volume",
-     "start_age_h": 55.0,
-     "t": "2026-10-15T11:32:49",
-     "volume": "C",
-     "window_h": 24
-    },
-    {
-     "alerts": 44,
-     "end_age_h": 0.0,
-     "growth_gib": 27.0,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 55.0,
-     "t": "2026-10-15T11:32:49",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 5,
-     "end_age_h": 0.0,
-     "growth_gib": 27.6,
-     "key": "C:\\",
-     "scope": "volume",
-     "start_age_h": 91.4,
-     "t": "2026-10-16T23:58:49",
-     "volume": "C",
      "window_h": 72
-    },
-    {
-     "alerts": 5,
-     "end_age_h": 0.0,
-     "growth_gib": 37.9,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 34.4,
-     "t": "2026-10-16T23:58:49",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 2,
-     "end_age_h": 0.0,
-     "growth_gib": 41.2,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 54.7,
-     "t": "2026-10-19T10:47:57",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 2,
-     "end_age_h": 0.0,
-     "growth_gib": 10.1,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 67.4,
-     "t": "2026-10-19T23:28:37",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 1,
-     "end_age_h": 0.0,
-     "growth_gib": 6.4,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 105.0,
-     "t": "2026-10-24T08:57:56",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 43,
-     "end_age_h": 0.0,
-     "growth_gib": 50.5,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 152.9,
-     "t": "2026-10-30T17:58:19",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 28,
-     "end_age_h": 0.0,
-     "growth_gib": 59.5,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 172.8,
-     "t": "2026-10-31T13:49:19",
-     "volume": "D",
-     "window_h": 24
     },
     {
      "alerts": 3,
@@ -477,15 +349,15 @@
    ],
    "false_alarms_per_week": {
     "meaningful": false,
-    "value": 76.44
+    "value": 21.84
    },
-   "precision": 0.125,
-   "recall": "3/5",
-   "top1": "1/2"
+   "precision": 0.2,
+   "recall": "1/5",
+   "top1": "0/0"
   },
   "detector_literal": {
-   "alerts_raw": 162,
-   "episodes": 10,
+   "alerts_raw": 17,
+   "episodes": 3,
    "events": [
     {
      "alert": {
@@ -532,7 +404,7 @@
      "named": null
     }
    ],
-   "false_alarm_episodes": 9,
+   "false_alarm_episodes": 2,
    "false_alarm_list": [
     {
      "alerts": 3,
@@ -542,83 +414,6 @@
      "scope": "volume",
      "start_age_h": 24.0,
      "t": "2026-10-10T16:47:28",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 19,
-     "end_age_h": 0.0,
-     "growth_gib": 68.0,
-     "key": "C:\\",
-     "scope": "volume",
-     "start_age_h": 58.4,
-     "t": "2026-10-13T03:54:56",
-     "volume": "C",
-     "window_h": 24
-    },
-    {
-     "alerts": 19,
-     "end_age_h": 0.0,
-     "growth_gib": 42.5,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 58.4,
-     "t": "2026-10-13T03:54:56",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 44,
-     "end_age_h": 0.0,
-     "growth_gib": 22.6,
-     "key": "C:\\",
-     "scope": "volume",
-     "start_age_h": 55.0,
-     "t": "2026-10-15T11:32:49",
-     "volume": "C",
-     "window_h": 24
-    },
-    {
-     "alerts": 44,
-     "end_age_h": 0.0,
-     "growth_gib": 27.0,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 55.0,
-     "t": "2026-10-15T11:32:49",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 5,
-     "end_age_h": 0.0,
-     "growth_gib": 37.9,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 34.4,
-     "t": "2026-10-16T23:58:49",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 2,
-     "end_age_h": 0.0,
-     "growth_gib": 41.2,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 54.7,
-     "t": "2026-10-19T10:47:57",
-     "volume": "D",
-     "window_h": 24
-    },
-    {
-     "alerts": 2,
-     "end_age_h": 0.0,
-     "growth_gib": 10.1,
-     "key": "D:\\",
-     "scope": "volume",
-     "start_age_h": 67.4,
-     "t": "2026-10-19T23:28:37",
      "volume": "D",
      "window_h": 24
     },
@@ -636,9 +431,9 @@
    ],
    "false_alarms_per_week": {
     "meaningful": false,
-    "value": 49.14
+    "value": 10.92
    },
-   "precision": 0.1,
+   "precision": 0.333,
    "recall": "1/5",
    "top1": "0/0"
   }
