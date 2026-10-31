@@ -24,6 +24,17 @@ SnapshotFn = Callable[..., growth.Snapshot]
 EnvFactory = Callable[[Config], growth.Environment]
 
 
+def open_index_read_only(index_path: Path) -> ScanIndex | None:
+    """The scan index for the opaque aggregates, opened `mode=ro` (this task must not write to
+    it, take its write lock or checkpoint it). None when it cannot be opened: the snapshot is
+    then taken without the opaque keys."""
+    try:
+        return ScanIndex(index_path, busy_timeout_ms=2000, read_only=True)
+    except (sqlite3.Error, OSError):
+        logger.warning("growth.index_unavailable", exc_info=True)
+        return None
+
+
 def scheduled_snapshot(
     config: Config,
     store_path: Path,
@@ -50,7 +61,7 @@ def scheduled_snapshot(
                 return "not_due"
             env = env_factory(config)
             if index_path is not None and index_path.is_file():
-                index = ScanIndex(index_path)
+                index = open_index_read_only(index_path)
             snap = collect(
                 env,
                 last_seen=store.last_seen(),

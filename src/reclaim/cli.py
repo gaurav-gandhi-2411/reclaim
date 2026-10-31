@@ -1266,6 +1266,16 @@ def _run_growth(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_growth_index(index_path: Path | None) -> ScanIndex | None:
+    """The scan index for the opaque aggregates, read-only; None (no opaque keys) when it is
+    absent or cannot be opened."""
+    from reclaim import growth_alerts
+
+    if index_path is None or not index_path.is_file():
+        return None
+    return growth_alerts.open_index_read_only(index_path)
+
+
 def _growth_snapshot(args: argparse.Namespace, config: Config, store: GrowthStore) -> int:
     from reclaim import growth
 
@@ -1276,7 +1286,7 @@ def _growth_snapshot(args: argparse.Namespace, config: Config, store: GrowthStor
             index_path = resolve_index_db(None, args.config)
         except (OSError, ValueError, tomllib.TOMLDecodeError):
             index_path = None
-    index = ScanIndex(index_path) if index_path is not None and index_path.is_file() else None
+    index = _open_growth_index(index_path)
     try:
         snap = growth.collect_snapshot(
             env,

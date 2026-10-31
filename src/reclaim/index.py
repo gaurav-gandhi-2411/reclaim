@@ -460,11 +460,27 @@ class ScanIndex:
     about the entry, not a safety-policy decision), never anything policy-driven.
     """
 
-    def __init__(self, db_path: Path, *, busy_timeout_ms: int | None = None) -> None:
+    def __init__(
+        self, db_path: Path, *, busy_timeout_ms: int | None = None, read_only: bool = False
+    ) -> None:
         # Hermetic-test guard (ADR-0034 addendum): the ONLY place a connection is opened, so no
         # ScanIndex can exist for a real-profile database under pytest.
         assert_not_real_profile_under_pytest(db_path, operation="open the scan index at")
         self._db_path = Path(db_path)
+        self._read_only = read_only
+        if read_only:
+            # For readers that must not touch the index at all (the growth sampler's opaque
+            # aggregates): `mode=ro`, so no WAL pragma, no schema or migration write, no
+            # checkpoint on close. A missing file is an error, never created.
+            timeout = 5.0 if busy_timeout_ms is None else busy_timeout_ms / 1000
+            self._conn = sqlite3.connect(
+                f"{self._db_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+                timeout=timeout,
+            )
+            self._conn.row_factory = sqlite3.Row
+            return
         # `busy_timeout_ms` (None = sqlite3's 5 s default): how long a statement waits on another
         # connection's write lock before `database is locked`. The candidates warm-up passes a
         # long one -- its dedup hash flushes are the writes most likely to meet a concurrent
@@ -641,6 +657,9 @@ class ScanIndex:
         return self.wal_size_bytes()
 
     def close(self) -> None:
+        if self._read_only:
+            self._conn.close()  # nothing to checkpoint: this connection never wrote
+            return
         # TRUNCATE checkpoint reclaims whatever the session's writes left in the WAL (see the
         # `journal_size_limit` comment in __init__) -- without this, closing never shrinks the
         # file, only SQLite's own automatic checkpoints do, and those don't truncate either.

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 
+import structlog
+
 from reclaim.config import Config, exclusion_patterns
 from reclaim.dirlist import ListingUnsupported, list_directory
 from reclaim.index import ScanIndex
@@ -25,6 +27,8 @@ from reclaim.scanner import long_path
 # budgeted sampler of folder sizes plus the pure analysis (window growth, anomaly detection) over
 # the stored series. Nothing here deletes, moves or opens a file; the only write is Reclaim's own
 # growth.sqlite3.
+
+logger = structlog.get_logger(__name__)
 
 GIB = 1024**3
 RETENTION_DAYS = 400  # spec §1.6
@@ -400,11 +404,18 @@ def collect_snapshot(
             continue  # absent/unreadable root (e.g. a cache this machine does not have)
         snap.sizes.append(Measurement(root, size, partial=not complete))
         snap.complete = snap.complete and complete
+    index_ok = index is not None
     if index is not None:
-        # before the aggregate: it also learns which opaque roots are excluded
-        snap.sizes.extend(_index_aggregates(index, env, walker))
+        try:
+            # before the aggregate: it also learns which opaque roots are excluded
+            snap.sizes.extend(_index_aggregates(index, env, walker))
+        except sqlite3.Error:
+            # a locked, busy or foreign index only costs the opaque keys (the folder sizes do not
+            # need it); the excluded aggregate is then a lower bound
+            logger.warning("growth.index_unreadable", exc_info=True)
+            index_ok = False
     if env.exclusions:
-        snap.sizes.append(_excluded_measurement(walker, index))
+        snap.sizes.append(_excluded_measurement(walker, index if index_ok else None))
     return snap
 
 
@@ -418,7 +429,11 @@ def _excluded_measurement(walker: Walker, index: ScanIndex | None) -> Measuremen
     for key in sorted(walker.excluded, key=len):
         if not any(is_within(key, o) for o in outer):
             outer.append(key)
-    total = sum(index.subtree_size_bytes(Path(walker.excluded[k])) for k in outer)
+    try:
+        total = sum(index.subtree_size_bytes(Path(walker.excluded[k])) for k in outer)
+    except sqlite3.Error:
+        logger.warning("growth.index_unreadable", exc_info=True)
+        return Measurement(root, 0, partial=True)
     return Measurement(root, total, partial=False, observed_at=None)
 
 

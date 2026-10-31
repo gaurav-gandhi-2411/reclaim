@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -103,3 +105,142 @@ def test_toast_text_on_an_empty_store_file_leaves_it_untouched(tmp_path: Path) -
     assert recent_growth_line(_config(), store, NOW, "C:\\") is None
     assert growth_anomaly_text(_config(), store, NOW, "C:\\") is None
     assert store.stat().st_size == 0
+
+
+# ------------------------------------------------ the scan index is opened read-only
+
+
+def _no_fs(_path: str) -> list[growth.Entry]:
+    raise FileNotFoundError(_path)
+
+
+def _real_collect(env: Environment, **kwargs: object) -> Snapshot:
+    """The real sampler over an empty fake filesystem: only the index can contribute keys."""
+    return growth.collect_snapshot(
+        env,
+        list_fn=_no_fs,
+        disk_usage=lambda _p: (1000, 400, 600),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _index_with_opaque_root(path: Path) -> None:
+    from reclaim.index import ScanIndex
+    from reclaim.models import FileRecord
+
+    record = FileRecord(
+        path=Path("p/proj/node_modules"),
+        is_dir=True,
+        size_bytes=0,
+        attributes=0x10,
+        ext="",
+        git_repo_root=None,
+        git_repo_clean=False,
+        mtime=50.0,
+        ctime=50.0,
+        dev=1,
+        ino=0,
+        opaque=True,
+        agg_files=3,
+        agg_bytes=123,
+        agg_newest_mtime=50.0,
+        agg_physical_bytes=123,
+    )
+    with ScanIndex(path) as idx:
+        idx.upsert_records([record], scanned_at=77.0)
+
+
+def test_scheduled_snapshot_reads_the_index_without_modifying_it(tmp_path: Path) -> None:
+    # D7: the 4-hourly task opened the real index read-write (WAL pragma, schema, checkpoint)
+    # only to read the opaque aggregates
+    index = tmp_path / "index.sqlite3"
+    _index_with_opaque_root(index)
+    before = (index.stat().st_size, hashlib.sha256(index.read_bytes()).hexdigest())
+    store = tmp_path / "growth.sqlite3"
+    status = scheduled_snapshot(
+        _config(), store, index_path=index, now=NOW, collect=_real_collect, env_factory=_env
+    )
+    assert status == "taken"
+    assert (index.stat().st_size, hashlib.sha256(index.read_bytes()).hexdigest()) == before
+    with growth.GrowthStore(store) as s:
+        opaque = [ks for ks in s.load_series().values() if ks.root.kind == "opaque"]
+    assert [(ks.root.label, ks.points) for ks in opaque] == [("node_modules", [(77.0, 123)])]
+
+
+def test_scan_index_read_only_rejects_writes_and_does_not_create_a_file(tmp_path: Path) -> None:
+    from reclaim.index import ScanIndex
+
+    index = tmp_path / "index.sqlite3"
+    _index_with_opaque_root(index)
+    with ScanIndex(index, read_only=True) as idx:
+        assert idx.opaque_aggregates(Path("p"), limit=5)[0][1] == 123
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            idx._conn.execute("DELETE FROM files")
+    missing = tmp_path / "missing.sqlite3"
+    with pytest.raises(sqlite3.OperationalError):
+        ScanIndex(missing, read_only=True)
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("content", [b"", b"not a database " * 40], ids=["empty", "foreign"])
+def test_an_unreadable_index_only_costs_the_opaque_keys(tmp_path: Path, content: bytes) -> None:
+    index = tmp_path / "index.sqlite3"
+    index.write_bytes(content)
+    store = tmp_path / "growth.sqlite3"
+    status = scheduled_snapshot(
+        _config(), store, index_path=index, now=NOW, collect=_real_collect, env_factory=_env
+    )
+    assert status == "taken"
+    assert index.read_bytes() == content
+    with growth.GrowthStore(store) as s:
+        assert s.last_snapshot_time() is not None  # the snapshot was taken and stored
+
+
+def test_a_locked_index_skips_opaque_keys_and_keeps_the_snapshot(tmp_path: Path) -> None:
+    class Locked:
+        def opaque_aggregates(self, *_: object, **__: object) -> list[tuple[str, int, float]]:
+            raise sqlite3.OperationalError("database is locked")
+
+        def subtree_size_bytes(self, _path: Path) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+    env = Environment(Path("p"), Path("t"), [], [], [], ["*secret*"])
+    snap = growth.collect_snapshot(
+        env,
+        list_fn=_no_fs,
+        disk_usage=lambda _p: (1000, 400, 600),
+        index=Locked(),  # type: ignore[arg-type]
+    )
+    assert not [m for m in snap.sizes if m.root.kind == "opaque"]
+    (excluded,) = [m for m in snap.sizes if m.root.kind == "excluded"]
+    assert excluded.partial  # unknown, not zero
+
+
+def test_both_snapshot_entry_points_open_the_index_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim import cli
+    from reclaim.index import ScanIndex
+
+    index = tmp_path / "index.sqlite3"
+    _index_with_opaque_root(index)
+    opened: list[bool] = []
+
+    def spy(path: Path, **kwargs: bool) -> ScanIndex:
+        opened.append(bool(kwargs.get("read_only")))
+        return ScanIndex(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("reclaim.growth_alerts.ScanIndex", spy)
+    scheduled_snapshot(
+        _config(),
+        tmp_path / "growth.sqlite3",
+        index_path=index,
+        now=NOW,
+        collect=_real_collect,
+        env_factory=_env,
+    )
+    opened_by_cli = cli._open_growth_index(index)
+    assert opened_by_cli is not None
+    opened_by_cli.close()
+    assert cli._open_growth_index(tmp_path / "absent.sqlite3") is None
+    assert opened == [True, True]
