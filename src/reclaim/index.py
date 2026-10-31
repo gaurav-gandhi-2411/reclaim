@@ -846,6 +846,19 @@ class ScanIndex:
         )
         return [_row_to_record(row) for row in cursor]
 
+    def opaque_aggregates(self, root: Path, *, limit: int) -> list[tuple[str, int, float]]:
+        """`(path, agg_bytes, last_scanned)` of the `limit` largest opaque roots at or under
+        `root`. Read-only; the growth sampler uses it to size dependency trees without any
+        filesystem IO (the aggregate is only as fresh as `last_scanned`)."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT path, agg_bytes, last_scanned FROM files WHERE opaque = 1 AND "
+            "(path = ? OR (path >= ? AND path < ?)) ORDER BY agg_bytes DESC LIMIT ?",
+            (prefix, lower, upper, limit),
+        )
+        return [(str(r[0]), int(r[1]), float(r[2])) for r in cursor]
+
     def vacuum(self) -> None:
         """Rebuilds the database file so pages freed by deletes are returned to the OS. Needs
         free disk roughly equal to the database size and an exclusive lock (fails with
