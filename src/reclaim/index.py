@@ -861,6 +861,60 @@ class ScanIndex:
         recreate next time."""
         self._conn.execute("DROP TABLE IF EXISTS temp.scan_seen")
 
+    def subtree_exclusion_rows(self, root: Path) -> Iterator[tuple[str, bool, bool, bool]]:
+        """`(path, is_dir, is_reparse_point, opaque)` for `root` and every row under it, cloud
+        placeholders included (the live exclusion walk lists them too). One prefix-range scan, no
+        `FileRecord` per row: `safety.index_subtree_exclusion_match` (D5) runs over all of them."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        cursor = self._conn.execute(
+            "SELECT path, is_dir, is_reparse_point, opaque FROM files "
+            "WHERE path = ? OR (path >= ? AND path < ?)",
+            (prefix, lower, upper),
+        )
+        for row in cursor:
+            yield (
+                row["path"],
+                bool(row["is_dir"]),
+                bool(row["is_reparse_point"]),
+                bool(row["opaque"]),
+            )
+
+    def subtree_link_members(self, root: Path) -> list[tuple[Path, int, int, int, bool, int]]:
+        """`(path, size, dev, ino, is_reparse_point, names_in_index)` for every non-directory,
+        non-placeholder row under `root` (the rows `candidate_inventory(under=root)` returns minus
+        directories). `names_in_index` counts the rows ANYWHERE in the index sharing that
+        `(dev, ino)` -- the only hardlink evidence a scan leaves, since the index stores no link
+        count (D5: `detectors._reclaimable_bytes_from_index`). `dev`/`ino` are the raw stored
+        (signed) values: usable as a grouping key, not comparable to a live `os.stat`."""
+        prefix = root.as_posix().rstrip("/")
+        lower, upper = _prefix_range(prefix)
+        # Unary `+` on the non-key terms keeps the primary-key range as the access path (see
+        # `subtree_entry_count`); the correlated count is an `idx_files_dev_ino` seek per row.
+        cursor = self._conn.execute(
+            "SELECT f.path, f.size, f.dev, f.ino, f.is_reparse_point, "
+            "(SELECT COUNT(*) FROM files g WHERE g.dev = f.dev AND g.ino = f.ino) AS names "
+            "FROM files f WHERE (f.path = ? OR (f.path >= ? AND f.path < ?)) "
+            "AND +f.is_dir = 0 AND +f.is_cloud_placeholder = 0",
+            (prefix, lower, upper),
+        )
+        return [
+            (
+                Path(row["path"]),
+                row["size"],
+                row["dev"],
+                row["ino"],
+                bool(row["is_reparse_point"]),
+                row["names"],
+            )
+            for row in cursor
+        ]
+
+    def completed_scan_times(self) -> list[tuple[Path, float]]:
+        """`(root, completed_at)` for every `record_completed_scan_root` row."""
+        rows = self._conn.execute("SELECT root, completed_at FROM completed_scan_roots")
+        return [(Path(row["root"]), float(row["completed_at"])) for row in rows]
+
     # --- P0-5: persisted accounting for directories/entries the scanner couldn't fully account
     # for --------------------------------------------------------------------------------------
 

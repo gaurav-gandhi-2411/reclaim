@@ -1912,6 +1912,19 @@ function renderCandidateCard(candidate) {
     card.appendChild(cost);
   }
 
+  if (candidate.estimate_source === "index") {
+    const source = document.createElement("p");
+    source.className = "rc-candidate-rationale";
+    const asOf = candidate.estimate_as_of
+      ? ` (${new Date(candidate.estimate_as_of * 1000).toLocaleString()})`
+      : "";
+    const bytes = candidate.reclaimable_bytes === null
+      ? ""
+      : `${candidate.reclaimable_bytes.toLocaleString()} bytes, `;
+    source.textContent = `Reclaimable: ${bytes}estimate from the last scan${asOf}; re-checked when you apply.`;
+    card.appendChild(source);
+  }
+
   if (candidate.duplicate_cluster) {
     card.appendChild(renderClusterTable(candidate.duplicate_cluster));
   }

@@ -101,7 +101,7 @@ from reclaim.dedup import (
     find_duplicate_clusters,
     generate_duplicate_candidates,
 )
-from reclaim.detectors import generate_candidates
+from reclaim.detectors import generate_candidates, refresh_live_estimate
 from reclaim.drives import list_fixed_drives
 from reclaim.executor import (
     BatchApplyReport,
@@ -254,7 +254,8 @@ def _all_candidates(
     config = state.effective_config
     if checkpoint is not None:
         checkpoint()
-    candidates = generate_candidates(index, config, state.safety)
+    # D5: warm-up only -- exclusion subtree check and link estimate from the scan index.
+    candidates = generate_candidates(index, config, state.safety, trust_index=True)
     if checkpoint is not None:
         checkpoint()
     clusters = find_duplicate_clusters(
@@ -1490,6 +1491,8 @@ def _candidate_out(candidate: Candidate, cluster: DuplicateCluster | None) -> Ca
         rebuild_instruction=candidate.rebuild_instruction,
         recovery_cost_note=candidate.recovery_cost_note,
         reclaimable_bytes=candidate.reclaimable_bytes,
+        estimate_source="index" if candidate.estimate_source == "index" else "live",
+        estimate_as_of=candidate.estimate_scan_time,
         safety_verdict=candidate.safety_verdict,
         safety_reason_code=candidate.safety_reason_code,
         duplicate_cluster=_duplicate_cluster_out(cluster) if cluster is not None else None,
@@ -1951,6 +1954,12 @@ def resolve_apply_selection(
                     )
                     if user_selected is not None:
                         selected.append(user_selected)
+
+    # D5: warm-cache candidates carry an index-derived reclaimable estimate; what is about to be
+    # applied gets it recomputed live (the apply-time safety checks are separate, in apply_batch).
+    if any(c.estimate_source == "index" for c in selected):
+        with ScanIndex(state.db_path) as refresh_index:
+            selected = [refresh_live_estimate(refresh_index, c) for c in selected]
 
     # Safe mode only ever allows recycle_bin (apply_batch enforces this structurally
     # regardless of what's resolved here) — auto-resolved so the dashboard doesn't need its

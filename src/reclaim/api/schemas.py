@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from reclaim.executor import PreflightSkipReason, QuarantineMethod
@@ -346,6 +348,10 @@ class CandidateOut(BaseModel):
     # ADR-0006: hardlink-aware estimate, distinct from size_bytes's logical size. `None` means
     # "not computed for this category" — the dashboard must never treat that as a claim of zero.
     reclaimable_bytes: int | None = None
+    # D5: "index" when `reclaimable_bytes` comes from the last scan, not the live disk (then
+    # `estimate_as_of` is that scan's completion time, epoch seconds, when recorded).
+    estimate_source: Literal["index", "live"] = "live"
+    estimate_as_of: float | None = None
     safety_verdict: Verdict
     safety_reason_code: str
     duplicate_cluster: DuplicateClusterOut | None = None

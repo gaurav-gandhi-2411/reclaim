@@ -6,10 +6,13 @@ import os
 import re
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from reclaim.config import Config, exclusion_patterns
 from reclaim.models import FileRecord, SafetyResult, Verdict
+
+if TYPE_CHECKING:
+    from reclaim.index import ScanIndex
 
 REASON_PROTECTED_SYSTEM_ROOT = "PROTECTED_SYSTEM_ROOT"
 REASON_IN_GIT_REPOSITORY = "IN_GIT_REPOSITORY"
@@ -296,6 +299,46 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     return unreadable
 
 
+def index_subtree_exclusion_match(
+    index: ScanIndex, root: Path, patterns: Sequence[str]
+) -> str | None:
+    """D5: `subtree_exclusion_match` answered from the scan index instead of a live walk, for the
+    candidates WARM-UP only (it cost 119 s of `os.scandir` over 230,045 folders). Never used at
+    apply: `apply_batch` and `_reverify_direct_delete_candidates` keep the live walk, so a folder
+    created after the scan is still refused there. On a stale index this can only be wrong in
+    ways the apply-time walk covers: it misses entries created since the scan (the apply walk
+    sees them) and still reports entries deleted since (stricter, never looser).
+
+    Same match text and pattern order as the live walk: an indexed path is already the pathlib
+    posix text the walk builds per entry, matched with the same compiled patterns (`_first_hit`).
+
+    FAILS CLOSED, returning the same `<unreadable directory: ...>` marker the live walk does:
+    no index row at all for `root` (never scanned, so nothing is known about it) and any
+    `inaccessible_paths` row at or under `root` (the scan could not list part of it). Cases the
+    index cannot answer fall back to the live walk rather than guessing: a junction or other
+    reparse directory (the walk descends into its target, which has no rows below that path)
+    and an opaque dependency-tree root (ADR-0042: its files are not rows)."""
+    if not patterns:
+        return None
+    hit = first_matching_pattern(root, patterns, is_dir=True)
+    if hit is not None:
+        return hit
+    ordered = tuple(patterns)
+    seen_any = False
+    for path_text, is_dir, is_reparse, is_opaque in index.subtree_exclusion_rows(root):
+        seen_any = True
+        if is_dir and (is_reparse or is_opaque):
+            return subtree_exclusion_match(root, patterns)
+        hit = _first_hit(ordered, path_text)
+        if hit is not None:
+            return hit
+    if not seen_any:
+        return f"{UNREADABLE_PREFIX}{root} (no row in the scan index)>"
+    if index.inaccessible_summary(root).path_count:
+        return f"{UNREADABLE_PREFIX}{root} (part of it was unreadable at the last scan)>"
+    return None
+
+
 def _one_component_only(pattern: str) -> bool:
     """True when `pattern` can only match inside a single path component: `*lit*` with no
     wildcard and no separator in `lit`. A glob `*`/`?`/`[...]` matches separators in fnmatch,
@@ -450,17 +493,26 @@ class SafetyValidator:
         the same list outside `evaluate`, e.g. the regenerable tier and the apply report)."""
         return tuple(self._user_exclusions)
 
-    def exclusion_match(self, path: Path, *, is_dir: bool = False) -> str | None:
+    def exclusion_match(
+        self, path: Path, *, is_dir: bool = False, trusted_index: ScanIndex | None = None
+    ) -> str | None:
         """The user deny/exclusion pattern `path` matches (canonicalised first, like
         `evaluate`), or -- for a directory -- one matched by anything beneath it; else None.
         Stat-free for files; a directory costs one name-only subtree walk, and only when any
-        pattern is configured. Never consults the built-in deny list or the allow-list."""
+        pattern is configured. Never consults the built-in deny list or the allow-list.
+
+        `trusted_index` (D5, candidates warm-up only): answer the subtree part from the scan
+        index (`index_subtree_exclusion_match`) instead of walking the disk. Honoured only when
+        the path is its own canonical form (no junction/alias/trailing-dot rewriting); anything
+        else still takes the live walk. Every apply-time caller omits it."""
         patterns = self._user_exclusions
         if not patterns:
             return None
         canonical = _canonical_path(path)
         hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
-        if hit is None and is_dir:
+        if hit is None and is_dir and trusted_index is not None and str(canonical) == str(path):
+            hit = index_subtree_exclusion_match(trusted_index, path, patterns)
+        elif hit is None and is_dir:
             hit = subtree_exclusion_match(canonical, patterns)
             # resolve() parses through Win32, which strips a trailing space/dot: for `sp ` it
             # can name a clean sibling `sp` while the deleter (exact name) acts on `sp `. Walk
@@ -469,7 +521,11 @@ class SafetyValidator:
                 hit = subtree_exclusion_match(path, patterns)
         return hit
 
-    def evaluate(self, record: FileRecord) -> SafetyResult:
+    def evaluate(
+        self, record: FileRecord, *, trusted_index: ScanIndex | None = None
+    ) -> SafetyResult:
+        """`trusted_index`: see `exclusion_match` (D5, warm-up only; apply-time callers never
+        pass it, so their directory exclusion walk stays live)."""
         # D13 second pass: resolved ONCE per record (not once per pattern -- `_canonical_path`
         # is a real OS call, and every pattern-based check below, built-in and user-configured
         # alike, shares this single canonical form) so an alias of `record.path` (subst'd drive,
@@ -494,7 +550,9 @@ class SafetyValidator:
 
         # ADR-0039: `[exclusions] project_names` (and, for a directory candidate, a user pattern
         # matched by anything INSIDE it -- deleting the directory would delete that content).
-        exclusion_hit = self.exclusion_match(record.path, is_dir=record.is_dir)
+        exclusion_hit = self.exclusion_match(
+            record.path, is_dir=record.is_dir, trusted_index=trusted_index
+        )
         if exclusion_hit is not None and exclusion_hit.startswith(UNREADABLE_PREFIX):
             return SafetyResult(
                 record=record,
