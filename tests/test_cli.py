@@ -41,6 +41,7 @@ def _fake_growth_snapshot(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
         return "taken"
 
     monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", fake)
+    monkeypatch.setattr("reclaim.notifications.send_growth_toast", lambda _text: True)
     return stores
 
 

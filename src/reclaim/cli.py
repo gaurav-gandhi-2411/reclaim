@@ -1154,6 +1154,9 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     # Imports deferred to inside the function, same reasoning as `_run_serve`'s deferred uvicorn
     # import: `reclaim.notifications` is only needed for this one subcommand, so `scan`/`apply`/
     # `undo`/etc. never pay its (small, but non-zero) import cost.
+    import dataclasses
+
+    from reclaim import growth_alerts
     from reclaim.notifications import (
         DEFAULT_STATE_PATH,
         apply_snooze,
@@ -1186,12 +1189,22 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     result = check_disk_space(config.notifications, state_path=state_path)
     toast_note = ""
     if result.should_notify:
+        if config.growth.enabled:
+            line = growth_alerts.recent_growth_line(
+                config, growth_db, time.time(), growth_alerts.system_volume()
+            )
+            result = dataclasses.replace(result, growth_line=line)
         # Debounce only once Windows accepted the toast: a refused one retries on the next run.
         if send_disk_space_toast(result):
             record_notified(state_path)
             toast_note = " toast=sent"
         else:
             toast_note = " toast=not_delivered"
+    if config.growth.enabled:
+        # Its own debounce state; never raises (spec 1.5).
+        growth_note += (
+            f" growth_toast={growth_alerts.maybe_send_growth_toast(config, growth_db, state_path)}"
+        )
     print(  # noqa: T201
         f"reclaim check-disk-space: status={result.status} reason={result.reason} "
         f"percent_used={result.percent_used} threshold={result.threshold_percent}"
