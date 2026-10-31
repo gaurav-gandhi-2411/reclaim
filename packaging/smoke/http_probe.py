@@ -142,6 +142,41 @@ class Client:
             f"{status_path} did not reach a terminal status within {timeout}s (last seen: {last})"
         )
 
+    def get_candidates(self, path: str, timeout: float = _POLL_TIMEOUT_SECONDS) -> tuple[int, str]:
+        """GET a candidates-cache reader, following the cold-cache contract a browser follows.
+
+        Since the candidates warm-up (ADR-0040), a reader on a cold cache answers 409
+        `candidates_not_warm` and starts the warm-up itself; the client polls
+        `/api/candidates/warm-status` until "ready" and reads once more (static/app.js does the
+        same). Treating that 409 as a failure made check 7 fail on every healthy build. Any other
+        status, or a warm-up that ends "failed"/"cancelled", is returned as-is for the caller to
+        report -- never retried in a loop."""
+        status, body = self.get(path)
+        if status != 409 or _response_code(body) != "candidates_not_warm":
+            return status, body
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            warm_status, warm_body = self.get("/api/candidates/warm-status")
+            if warm_status != 200:
+                return warm_status, warm_body
+            state = json.loads(warm_body).get("status")
+            if state == "ready":
+                return self.get(path)
+            if state in ("failed", "cancelled"):
+                # Keep the 409 so a caller's `status != 200` check reports it, with the
+                # warm-up's own body (its `error`) as the detail.
+                return status, warm_body
+            time.sleep(_POLL_INTERVAL_SECONDS)
+        raise TimeoutError(f"candidates warm-up did not become ready within {timeout}s")
+
+
+def _response_code(body: str) -> str | None:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    return parsed.get("code") if isinstance(parsed, dict) else None
+
 
 def cmd_dpapi_roundtrip(client: Client) -> None:
     if not client.fetch_csrf():
@@ -232,7 +267,7 @@ def cmd_scan_apply_undo(client: Client, seed_dir: str) -> None:
             _emit("FAIL", "scan did not complete", scan_status=scan_final)
             return
 
-        status, body = client.get("/api/candidates?tier=both")
+        status, body = client.get_candidates("/api/candidates?tier=both")
         if status != 200:
             _emit("FAIL", "GET /api/candidates failed", status=status, body=body)
             return
