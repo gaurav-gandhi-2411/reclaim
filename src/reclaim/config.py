@@ -661,6 +661,11 @@ class GrowthConfig(BaseModel):
     # Anomaly floors: a window must grow at least this many GiB AND this percent of the volume.
     abs_floor_gib: float = Field(default=5.0, gt=0)
     share_floor_pct: float = Field(default=2.0, ge=0)
+    # Window freshness (spec 1.5): a window's start sample may be at most window + max_start_slack_h
+    # old (6 h = 1.5x the 4-hourly snapshot cadence) and the newest sample at most max_end_age_h
+    # old; otherwise that window reports "insufficient data" instead of growth over a gap.
+    max_start_slack_h: float = Field(default=6.0, ge=0)
+    max_end_age_h: float = Field(default=1.0, ge=0)
     # One level below each of these is sized as "top-level folders"; "~" is expanded at use.
     project_roots: list[str] = Field(default_factory=lambda: ["~/ml-projects"])
 

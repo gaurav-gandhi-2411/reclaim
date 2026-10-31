@@ -1200,12 +1200,21 @@ def _run_growth(args: argparse.Namespace) -> int:
         if args.growth_action == "snapshot":
             return _growth_snapshot(args, config, store)
         window_s = {"1d": 86400.0, "7d": 7 * 86400.0}[args.window]
-        report = growth.growth_report(store.load_series(), window_s, time.time())
+        report = growth.growth_report(
+            store.load_series(),
+            window_s,
+            time.time(),
+            config.growth.max_start_slack_h * 3600.0,
+            config.growth.max_end_age_h * 3600.0,
+        )
     if args.json:
         print(json.dumps(dataclasses.asdict(report), indent=2))  # noqa: T201
         return 0
     print(f"reclaim growth report: window={args.window}")  # noqa: T201
     for vol in report.volumes:
+        if vol.status != "ok":
+            print(f"  {vol.volume} insufficient data for this window")  # noqa: T201
+            continue
         print(  # noqa: T201
             f"  {vol.volume} used {growth.fmt_gib(vol.delta)}; attributed "
             f"{growth.fmt_gib(vol.attributed)}; not attributed {growth.fmt_gib(vol.not_attributed)}"

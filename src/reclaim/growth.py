@@ -37,6 +37,9 @@ _DRILL_SHARE = 0.6  # a descendant explaining >= 60% of an ancestor's growth is 
 Entry = tuple[str, int, int]  # (name, attributes, size) of one listed directory entry
 ListFn = Callable[[str], list[Entry]]
 Point = tuple[float, int]  # (unix seconds, bytes)
+# Spec 1.5 window freshness (see AnomalyConfig): 6 h is 1.5x the 4-hourly snapshot cadence.
+DEFAULT_START_SLACK_S = 6 * 3600.0
+DEFAULT_END_AGE_S = 3600.0
 
 
 def norm(path: str | Path) -> str:
@@ -476,12 +479,26 @@ def value_at_or_before(points: Sequence[Point], t: float) -> Point | None:
     return points[i - 1] if i else None
 
 
-def window_growth(points: Sequence[Point], now: float, window_s: float) -> tuple[int, Point] | None:
+def window_growth(
+    points: Sequence[Point],
+    now: float,
+    window_s: float,
+    max_start_slack_s: float | None = None,
+    max_end_age_s: float | None = None,
+) -> tuple[int, Point] | None:
     """`(growth, start_point)`: latest complete value (<= now) minus the latest complete value
-    at or before the window start; None when either endpoint does not exist."""
+    at or before the window start; None when either endpoint does not exist. With the optional
+    limits (spec 1.5: growth "within" the window, on a fresh snapshot) None is also returned
+    when the start sample is older than `window_s + max_start_slack_s` or the newest sample is
+    older than `max_end_age_s`: after missed snapshots the gap is not growth "in the window".
+    Both limits are inclusive."""
     end = value_at_or_before(points, now)
     start = value_at_or_before(points, now - window_s)
     if end is None or start is None or end[0] <= start[0]:
+        return None
+    if max_start_slack_s is not None and now - start[0] > window_s + max_start_slack_s:
+        return None
+    if max_end_age_s is not None and now - end[0] > max_end_age_s:
         return None
     return end[1] - start[1], start
 
@@ -503,6 +520,7 @@ class VolumeDelta:
     delta: int
     attributed: int
     not_attributed: int
+    status: str = "ok"  # "insufficient data": no fresh enough samples for this window
 
 
 @dataclass(frozen=True)
@@ -528,14 +546,26 @@ def non_nested(rows: Sequence[GrowthRow]) -> list[GrowthRow]:
     return chosen
 
 
-def growth_report(series: Mapping[str, KeySeries], window_s: float, now: float) -> GrowthReport:
+def growth_report(
+    series: Mapping[str, KeySeries],
+    window_s: float,
+    now: float,
+    max_start_slack_s: float | None = DEFAULT_START_SLACK_S,
+    max_end_age_s: float | None = DEFAULT_END_AGE_S,
+) -> GrowthReport:
+    """Ranks the keys by growth over the window. A key (or volume) whose start sample is older
+    than `window_s + max_start_slack_s` or whose newest sample is older than `max_end_age_s`
+    has no number for this window; a volume in that state is listed as "insufficient data"."""
     rows: list[GrowthRow] = []
     volumes: dict[str, int] = {}
+    stale_volumes: list[str] = []
     insufficient = 0
     for ks in series.values():
-        res = window_growth(ks.points, now, window_s)
+        res = window_growth(ks.points, now, window_s, max_start_slack_s, max_end_age_s)
         if res is None:
             insufficient += 1
+            if ks.root.kind == "volume":
+                stale_volumes.append(ks.root.path)
             continue
         if ks.root.kind == "volume":
             volumes[ks.root.path] = res[0]
@@ -550,6 +580,7 @@ def growth_report(series: Mapping[str, KeySeries], window_s: float, now: float) 
         mine = [r for r in rows if is_within(norm(r.path), norm(vol))]
         attributed = sum(r.growth for r in non_nested(mine) if r.growth > 0)
         deltas.append(VolumeDelta(vol, delta, attributed, delta - attributed))
+    deltas.extend(VolumeDelta(vol, 0, 0, 0, "insufficient data") for vol in sorted(stale_volumes))
     return GrowthReport(window_s, rows, deltas, insufficient)
 
 
@@ -598,6 +629,12 @@ class AnomalyConfig:
     windows_h: tuple[int, ...] = (24, 72)
     thin_s: float = 1800.0  # sub-30-minute samples are thinned: rates are meant to be hourly
     min_ref_intervals: int = 6
+    # A window's start sample may be at most window + this old, and the newest sample at most
+    # max_end_age_h old (spec 1.5). 6 h is 1.5x the 4-hourly snapshot cadence: one missed
+    # snapshot still counts, a longer gap is not growth "in 3 days". Same defaults as
+    # GrowthConfig.
+    max_start_slack_h: float = 6.0
+    max_end_age_h: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -649,17 +686,18 @@ def detect_anomalies(
     the eval replays it over recorded series. `keys` holds attributable keys only."""
     cfg = cfg or AnomalyConfig()
     floor = max(cfg.abs_floor, cfg.share_floor * volume_total)
+    slack_s, end_age_s = cfg.max_start_slack_h * 3600.0, cfg.max_end_age_h * 3600.0
     found: list[Anomaly] = []
     flagged: set[str] = set()
     vol_name = volume.rstrip("\\/") or volume
     for window_h in sorted(cfg.windows_h):
         window_s = window_h * 3600.0
-        rows = growth_report(keys, window_s, now).rows
+        rows = growth_report(keys, window_s, now, slack_s, end_age_s).rows
         for row in rows:
             if row.growth < floor:
                 break
             pts = keys[row.path].points
-            res = window_growth(pts, now, window_s)
+            res = window_growth(pts, now, window_s, slack_s, end_age_s)
             if res is None:
                 continue
             z = key_z(pts, res[1][0], row.growth / window_h, cfg)
@@ -668,7 +706,7 @@ def detect_anomalies(
                 where = drill_down(rows, row)
                 text = f"{row.label} grew {fmt_gib(row.growth)} in {window_h} h"
                 found.append(Anomaly("key", row.path, row.growth, window_h, z, where.path, text))
-        vres = window_growth(volume_used, now, window_s)
+        vres = window_growth(volume_used, now, window_s, slack_s, end_age_s)
         if vres is not None and vres[0] >= cfg.abs_floor:
             top = contributors(rows, 2)
             days = window_h / 24

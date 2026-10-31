@@ -404,6 +404,80 @@ def test_snapshot_due_respects_min_interval(tmp_path: Path) -> None:
         assert growth.snapshot_due(store, 3.0, 1e6 + 3 * 3600)
 
 
+# ---------------------------------------------------------------- window freshness (spec 1.5)
+
+_H = 3600.0
+
+
+def test_window_growth_start_slack_boundary() -> None:
+    now = 150 * _H
+    # window 72 h + slack 6 h: the start sample may be at most 78 h old, inclusive
+    at_limit = [(now - 78 * _H, 130), (now, 400)]
+    assert window_growth(at_limit, now, 72 * _H, max_start_slack_s=6 * _H) == (
+        270,
+        (now - 78 * _H, 130),
+    )
+    past_limit = [(now - 78 * _H - 1.0, 130), (now, 400)]
+    assert window_growth(past_limit, now, 72 * _H, max_start_slack_s=6 * _H) is None
+    assert window_growth(past_limit, now, 72 * _H) is not None  # no limit: the old behaviour
+
+
+def test_window_growth_end_age_boundary() -> None:
+    pts = [(0.0, 100), (100 * _H, 400)]
+    assert window_growth(pts, 101 * _H, 100 * _H, max_end_age_s=_H) == (300, (0.0, 100))
+    assert window_growth(pts, 101 * _H + 1.0, 100 * _H, max_end_age_s=_H) is None
+
+
+def test_detector_does_not_report_a_gap_as_growth_in_three_days() -> None:
+    # 4-hourly samples for ~5 days, 20 days with the laptop off, then one sample 40 GiB up.
+    vol = [(i * 4 * _H, 100 * GIB) for i in range(30)]
+    now = vol[-1][0] + 20 * 86400.0
+    vol.append((now, 140 * GIB))
+    pre_fix = AnomalyConfig(max_start_slack_h=1e9, max_end_age_h=1e9)
+    found = detect_anomalies({}, "C:\\", vol, 1000 * GIB, now, pre_fix)
+    assert [a.scope for a in found] == ["volume"]  # what the old detector said
+    assert detect_anomalies({}, "C:\\", vol, 1000 * GIB, now) == []
+
+
+def test_detector_volume_rule_start_slack_boundary() -> None:
+    def run(extra_s: float) -> list[growth.Anomaly]:
+        now = 100 * _H
+        start_t = now - 24 * _H - 6 * _H - extra_s
+        vol = [(start_t, 100 * GIB), (now - _H, 100 * GIB), (now, 120 * GIB)]
+        return detect_anomalies({}, "C:\\", vol, 1000 * GIB, now)
+
+    assert [a.window_h for a in run(0.0)] == [24]
+    assert run(1.0) == []
+
+
+def test_key_rule_needs_a_fresh_newest_sample() -> None:
+    hist = _history()
+    spike = [*hist[:-1], hist[-1] + 20 * GIB]
+    path = "C:\\scratch"
+    keys = {path: KeySeries(Root(path, "toplevel", "scratch"), _series(spike))}
+    vol = _series([400 * GIB] * len(hist))
+    now = vol[-1][0]
+    assert any(a.scope == "key" for a in detect_anomalies(keys, "C:\\", vol, 1000 * GIB, now))
+    later = now + 2 * _H  # the key's newest sample is 2 h old: not part of a fresh snapshot
+    vol2 = [*vol, (later, 400 * GIB)]
+    assert detect_anomalies(keys, "C:\\", vol2, 1000 * GIB, later) == []
+
+
+def test_growth_report_says_insufficient_data_for_a_stale_window() -> None:
+    def ks(path: str, kind: str, pts: list[growth.Point]) -> KeySeries:
+        return KeySeries(Root(path, kind, path), pts)
+
+    series = {
+        "V:\\": ks("V:\\", "volume", [(0.0, 100), (100 * _H, 900)]),
+        "V:\\big": ks("V:\\big", "toplevel", [(0.0, 10), (100 * _H, 500)]),
+    }
+    report = growth_report(series, 24 * _H, 100 * _H)  # the earliest sample is 100 h old
+    assert report.rows == []
+    assert [(v.volume, v.status) for v in report.volumes] == [("V:\\", "insufficient data")]
+    ok = growth_report(series, 100 * _H, 100 * _H)
+    assert [(v.status, v.delta) for v in ok.volumes] == [("ok", 800)]
+
+
 # ---------------------------------------------------------------- config and CLI
 
 

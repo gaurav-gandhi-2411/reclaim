@@ -142,7 +142,8 @@ def replay(ds: Dataset, method: str) -> list[Alert]:
     for now in eval_times(ds):
         if method == "baseline":
             for window_h in WINDOWS_H:
-                rows = g.growth_report(keys, window_h * 3600.0, now).rows
+                # no freshness limits: the baseline is the unchanged plain threshold
+                rows = g.growth_report(keys, window_h * 3600.0, now, None, None).rows
                 if rows and rows[0].growth >= 5 * GIB:  # the largest grower, no drill-down
                     r = rows[0]
                     out.append(
