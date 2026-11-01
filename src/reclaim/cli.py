@@ -137,6 +137,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Thread pool size for the per-top-level-directory walk (default: cpu-based).",
     )
+    scan_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml (default: {_DEFAULT_CONFIG_PATH}, built-in defaults if "
+        "missing); its exclusions keep the scan from running git inside an excluded project.",
+    )
 
     prune_parser = subparsers.add_parser(
         "index-prune",
@@ -705,6 +712,12 @@ def _run_scan(args: argparse.Namespace) -> int:
         print(f"reclaim: scan path does not exist or is not a directory: {root}", file=sys.stderr)  # noqa: T201
         return 1
 
+    # Fail closed: without the config the exclusions are unknown, and the scan must not run git
+    # inside an excluded project.
+    config = _load_config_or_none("scan", args.config)
+    if config is None:
+        return 1
+
     assert_not_real_profile_under_pytest(args.db, operation="create the index directory")
     args.db.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -715,6 +728,7 @@ def _run_scan(args: argparse.Namespace) -> int:
                 incremental=not args.full,
                 max_workers=args.workers,
                 on_progress=_on_scan_progress_printer,
+                excluded_patterns=exclusion_patterns(config),
             )
     except ScanDiskFullError as exc:
         print(f"reclaim scan: {exc}", file=sys.stderr)  # noqa: T201
@@ -1830,9 +1844,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             args.db = resolve_index_db(None, own_config or default_config_path())
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
-            if own_config is None:
-                # scan/reconcile/index-prune have no config handling of their own: refuse rather
-                # than quietly use (or create) the legacy index when [storage] cannot be read.
+            if own_config is None or args.command == "scan":
+                # reconcile/index-prune have no config handling of their own, and scan reads the
+                # config only for its exclusions (not for [storage], which a config it can load
+                # may still break): refuse rather than quietly use (or create) the legacy index
+                # when [storage] cannot be read.
                 print(  # noqa: T201
                     f"reclaim {args.command}: cannot resolve the index location: {exc}",
                     file=sys.stderr,

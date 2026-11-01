@@ -1026,6 +1026,7 @@ def run_scan(state: AppState, roots: Sequence[Path], started_at: float) -> None:
                     on_progress=on_scan_progress,
                     entries_estimated_total=entries_estimated_total,
                     cancel_event=state.cancel_scan_event,
+                    excluded_patterns=state.safety.exclusion_patterns,
                 )
 
                 dirs_visited_total += stats.dirs_visited
@@ -1934,7 +1935,7 @@ def resolve_apply_selection(
         already_matched = {c.path.as_posix() for c in selected}
         unmatched_paths = wanted - already_matched
         if unmatched_paths:
-            git_cache = GitRepoCache()
+            git_cache = GitRepoCache(state.safety.exclusion_patterns)
             # AN5: a fresh `ScanIndex` handle for the outside-home membership check below --
             # the one opened above (for `generate_candidates`) has already closed by this point,
             # and reopening only here (not unconditionally) keeps the common, all-matched case

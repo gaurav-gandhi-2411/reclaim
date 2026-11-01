@@ -171,7 +171,9 @@ def _io_path(path: str) -> str:
     return "\\\\?\\" + full
 
 
-def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | None:
+def subtree_exclusion_match(
+    root: Path | str, patterns: Sequence[str], *, match_junction_targets: bool = False
+) -> str | None:
     """First pattern matched by `root` or by ANY entry (file or directory, by full path) beneath
     it, else None. Name-only `os.scandir` walk (no stat). Used before deleting a whole directory:
     a directory that merely CONTAINS an excluded tree (e.g. `%TEMP%/claude` holding
@@ -212,7 +214,13 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
     for a tree with several matches is the same one as before. There is deliberately NO subtree
     pruning: an excluded name can sit anywhere below a directory whose own path says nothing
     (e.g. a package named like an excluded project inside `node_modules`), so skipping a subtree
-    cannot be proven safe for the `*name*` patterns this is used with."""
+    cannot be proven safe for the `*name*` patterns this is used with.
+
+    `match_junction_targets` (default off, so every delete-path caller is unchanged): also match
+    the REAL path of each junction met on the walk. A tool that reads through junctions (git lists
+    a junction's content as the repository's own) reads the target project even when no name
+    under the junction path matches. Used by the scanner's "no git inside an excluded project"
+    check."""
     if not patterns:
         return None
     hit = first_matching_pattern(root, patterns, is_dir=True)
@@ -269,9 +277,21 @@ def subtree_exclusion_match(root: Path | str, patterns: Sequence[str]) -> str | 
                             pass  # unknown: try to walk it, so listing it fails closed below
                         try:
                             child_real = _real_path(entry.path)
+                            target_text = (
+                                _real_path_text(entry.path) if match_junction_targets else ""
+                            )
                         except OSError:
                             unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
                             continue
+                        if target_text:
+                            # The target as it really is, also as `target/` (a path-shaped
+                            # `*/proj/*` needs the separator), and from here on its content under
+                            # that real text, not under the junction's own name.
+                            plain = _strip_candidate(Path(target_text))
+                            hit = _first_hit(ordered, plain, plain + "/")
+                            if hit is not None:
+                                return hit
+                            child_text = target_text
                         if cover_once:
                             if _within(child_real, covered_set):
                                 continue  # listed at its real place (or fails closed there)
@@ -322,12 +342,17 @@ def _within(real: str, roots: set[str]) -> bool:
 def _real_path(path: str) -> str:
     """`os.path.realpath`, without the extended-length prefix realpath keeps on `\\\\?\\` input,
     case-folded, so real paths from plain and prefixed inputs compare equal."""
+    return os.path.normcase(_real_path_text(path))
+
+
+def _real_path_text(path: str) -> str:
+    """`_real_path` before case-folding: the text a pattern is matched against."""
     real = os.path.realpath(path)
     if real.startswith("\\\\?\\UNC\\"):
         real = "\\\\" + real[8:]
     elif real.startswith("\\\\?\\"):
         real = real[4:]
-    return os.path.normcase(real)
+    return real
 
 
 def _child_text_prefix(directory: str) -> str:
