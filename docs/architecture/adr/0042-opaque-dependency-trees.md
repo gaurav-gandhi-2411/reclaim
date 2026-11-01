@@ -200,9 +200,9 @@ These refine, and do not change, the decisions above.
 
 ## Addendum 2026-11-01 -- opaque rows hide hard-link partners
 
-Because no file inside an opaque tree is recorded, the index cannot see that a package-cache file
-(uv, pnpm, conda) also has a name inside a `.venv`, `site-packages` or `node_modules` it was linked
-into. Any reclaimable-bytes figure derived from the index alone therefore overclaims linked caches:
-by 25.15 GB on the uv cache in the 1 Nov 2026 real-index A/B of #229. That index-derived estimate is
-rejected; see ADR-0006, addendum 2026-11-01. Whoever changes what this ADR records inside opaque
-trees should re-read that addendum first.
+Because no file inside an opaque tree is recorded, the index cannot see that a cache file also has
+a name inside a `.venv`, `site-packages` or `node_modules` it was hard-linked into. An index-only
+estimate that groups files by file id therefore overclaims such caches: by 25.15 GB on the uv cache
+in the 1 Nov 2026 real-index A/B of #229 (only uv was measured). That estimate is rejected; see
+ADR-0006, addendum 2026-11-01. Whoever changes what this ADR records inside opaque trees should
+re-read that addendum first.

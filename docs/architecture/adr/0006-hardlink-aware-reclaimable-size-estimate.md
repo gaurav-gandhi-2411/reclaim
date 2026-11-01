@@ -110,38 +110,48 @@ overstate reclaimable space by construction, not just by coincidence.
 ## Addendum 2026-11-01 -- an index-derived estimate (D5, #229) is rejected; the live estimate stays
 
 **Owner decision (GG, 1 Nov 2026): dropped.** Do not retry an index-derived hard-link estimate
-until the index can see every name a cache file has, including names inside opaque trees.
+without solving link visibility first (see "A retry needs" below).
 
 **What was tried.** #229 ("D5") let the candidates warm-up take two answers from the scan index
 instead of the filesystem: the directory exclusion verdicts, and this ADR's reclaimable-bytes
-figure. The index stores `(dev, ino)` but not the link count. So the estimate treated a file as
-shared only when a second indexed row had the same file id, and counted the full size otherwise.
-Its docstring called links from un-indexed paths a "known gap", and it marked such figures
-`estimate_source="index"`.
+figure. The index stores `(dev, ino)` but not the link count. So the estimate grouped a
+candidate's files by file id and treated a file as shared only when another indexed row had the
+same id; otherwise it counted the full size. Its docstring called links from un-indexed paths a
+"known gap", and it marked such figures `estimate_source="index"`.
 
-**What the real index showed** (head `b72cb0c`, read-only on a scratch copy, the installed
-config in power mode, live and trusted runs alternated; harness `d5_real_ab.py`, results
-`d5ab_b72cb0c.json` and `d5ab_liveest.json`, PR #229 issuecomment-6554050380):
-- **Safety held:** the same 5,999 candidates either way, 0 looser and 0 stricter.
+**What the real index showed** (head `b72cb0c`, read-only on a scratch copy; the installed
+config minus `[categories.agent_artifacts]`, a #199 key that main's loader refused at the time;
+power mode; live and trusted runs alternated; harness `d5_real_ab.py`, results `d5ab_b72cb0c.json`
+and `d5ab_liveest.json`, PR #229 issuecomment-6554050380):
+- **The candidate set held:** the same 5,999 candidates either way, 0 looser and 0 stricter (one
+  index snapshot and one config, `generate_candidates` only).
 - **The estimate did not hold.** `AppData\Local\uv\cache` came to 46,451,082,484 bytes from the
-  index against 21,299,206,608 live: +25.15 GB, 2.18×. The total over all candidates was
-  81.50 GB against 56.35 GB.
-- **Mechanism:** ADR-0042 records `.venv`, `venv`, `site-packages` and `node_modules` as one
-  aggregate row each and never records the files below them. uv, pnpm and conda hard-link their
-  caches into exactly those trees. So for the caches this ADR exists for, the second name is
-  never in the index, and the "known gap" is the normal case.
-- **Speed:** live 312.8 / 248.0 s, index-trusted 184.2 / 154.8 s. A variant kept the trusted
-  verdicts but used the live estimate: 291.5 / 302.3 s against live 300.2 / 303.7 s, with
-  identical candidates and bytes.
-  - Within two runs per arm (the live arm alone spread 248-313 s), the trusted verdicts bought no
-    measurable time. The speed-up came from the estimate that overclaims.
+  index against 21,299,206,608 live: +25.15 GB, 2.18×. `npm-cache` differed by 12,980 bytes;
+  nothing else differed. The total over all candidates was 81.50 GB against 56.35 GB.
+- **Mechanism (read from the code, not pinned by a test):** ADR-0042 records `.venv`, `venv`,
+  `site-packages`, `node_modules`, `.git` and `__pycache__` as one aggregate row each and never
+  records the files below them. uv hard-links its cache into venvs, so a uv cache file's second
+  name is usually inside an opaque tree, invisible to file-id grouping. Only the uv cache was
+  measured: pnpm and conda caches, which also hard-link, are expected to behave the same way where
+  their partners sit inside opaque trees, but that is not measured.
+- **Speed:** live 312.8 / 248.0 s, index-trusted 184.2 / 154.8 s. A separate variant job kept the
+  trusted verdicts but used the live estimate: 291.5 / 302.3 s against live 300.2 / 303.7 s, with
+  identical candidates and bytes. With two runs per arm and the live arm alone spreading
+  248-313 s, most of the observed speed-up disappears when the estimate is live; a small
+  verdict-side gain (a few percent) cannot be ruled out.
 
 **Consequences.**
 - The live `os.stat()` estimate (this ADR's decision) stays for the warm-up and for apply.
-- Alternative 3 above (cache `nlink` in the index) is now also rejected on evidence, not only on
-  staleness: an index-only link count is wrong for linked caches until the scanner records, for
-  every file inside an opaque tree, which file id it carries. That would undo most of ADR-0042's
-  row savings.
-- A retry needs (a) that link visibility, by recording file ids or `nlink` inside opaque trees,
-  with its cost measured against ADR-0042, and (b) a real-index A/B like the one above, with 0
-  byte differences on linked caches before any speed claim.
+- The evidence rejects **file-id grouping** as an index-only link test while partners can sit in
+  opaque trees.
+- It does **not** test alternative 3 above (cache `nlink` as an index column). A stored `nlink` sits
+  on the cache file's own row, so it would reveal "another name exists" without recording anything
+  inside opaque trees. Alternative 3 stays rejected for its original reason: a cached count can be
+  stale between scan and report.
+
+**A retry needs**, before any speed claim:
+- either a cached `nlink` per file with an answer to that staleness (when it is refreshed, and what
+  a stale value can overclaim), or file ids recorded inside opaque trees, with its cost measured
+  against ADR-0042's row savings;
+- and a real-index A/B like the one above with 0 byte differences on the linked caches present
+  (uv at least; pnpm and conda where installed).
