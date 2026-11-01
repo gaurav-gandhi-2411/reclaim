@@ -275,7 +275,12 @@ async def test_approve_moves_keeps_the_old_copy_and_records_the_rollback_command
     # The folder now lives on the other drive behind a link; the old copy is kept.
     assert _is_link(env.hub)
     assert (env.hub / "models--org--big" / "blobs" / "b1").read_bytes() == b"w" * 4_096
-    assert (Path(body["target"]) / "models--org--big" / "blobs" / "b1").exists()
+    # The target mirrors the whole source path under `reclaim-relocated\C\`, so under a deep
+    # pytest basetemp it passes MAX_PATH (262 chars on the dev machine, LongPathsEnabled=0) and a
+    # plain `exists()` says False although the move succeeded. Check through the extended-length
+    # form, as the engine itself does; a genuinely missing file still fails.
+    moved = Path(body["target"]) / "models--org--big" / "blobs" / "b1"
+    assert Path("\\\\?\\" + str(moved.resolve())).exists()
     assert env.old_copy.is_dir() and body["old_copy_kept_at"] == str(env.old_copy)
     # The exact rollback command names this move and the journal folder it lives in.
     (journal_file,) = env.journals.glob("relocate-*.json")
