@@ -858,8 +858,12 @@ def _gitdir_excluded(env: PatternView, gitdir: Path, depth: int = 0) -> bool:
             resolved = Path(os.path.normpath(gitdir / common.strip()))
             targets += [resolved, resolved.parent]
             deeper.append(resolved)
-        config = read(gitdir / "config")
-        if config is not None:
+        # `config.worktree` is read by git too when extensions.worktreeConfig is set (sparse
+        # checkout and submodule absorb turn it on), and can carry core.worktree or an include.
+        for config_name in ("config", "config.worktree"):
+            config = read(gitdir / config_name)
+            if config is None:
+                continue
             if _UNFOLLOWABLE_CONFIG.search(config):
                 return True
             for match in _CORE_WORKTREE.finditer(config):

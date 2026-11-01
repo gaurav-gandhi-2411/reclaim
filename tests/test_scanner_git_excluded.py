@@ -285,6 +285,38 @@ def test_unreadable_or_foreign_git_pointer_fails_closed_but_a_plain_one_is_check
     assert len(fake_git.cwds) == 3
 
 
+# --- D2: config.worktree is read by git too --------------------------------------------------
+
+
+def _config_worktree_repo(tmp_path: Path, text: str) -> Path:
+    repo = _repo(tmp_path / "sparse")
+    (repo / ".git" / "config.worktree").write_text(text, encoding="utf-8")
+    return repo
+
+
+def test_core_worktree_in_config_worktree_into_a_protected_project_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    repo = _config_worktree_repo(tmp_path, f"[core]\n\tworktree = {main.as_posix()}\n")
+    assert GitRepoCache(_patterns()).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+def test_include_in_config_worktree_runs_no_git(tmp_path: Path, fake_git: _FakeGit) -> None:
+    repo = _config_worktree_repo(tmp_path, "[include]\n\tpath = elsewhere.cfg\n")
+    assert GitRepoCache(_patterns()).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+def test_ordinary_config_worktree_still_gets_the_git_check(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    repo = _config_worktree_repo(tmp_path, "[core]\n\tsparseCheckout = true\n")
+    assert GitRepoCache(_patterns()).is_clean(repo) is True
+    assert len(fake_git.cwds) == 3
+
+
 # --- G1: a junction inside the repo that points into an excluded project ---------------------
 
 _Junction = Callable[[Path, Path], None]
