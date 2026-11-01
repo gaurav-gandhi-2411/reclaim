@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -742,6 +743,77 @@ def test_volume_rule_without_history_alerts_on_the_floor_alone() -> None:
     found = detect_anomalies({}, "C:\\", vol, 1000 * GIB, vol[-1][0])
     assert [a.scope for a in found] == ["volume"]
     assert found[0].z is None
+
+
+# --- volume rule: pins for the median-excess design (one test per behaviour-changing mutant) ---
+# Not tested on purpose: dropping the `max(base_h, 0.0)` clamp is an equivalent mutant. `used`
+# series are monotone enough that a negative median never occurs where the window growth is above
+# the floor, so the clamp cannot change a decision.
+
+_DAY = 86400.0
+
+
+def _stepped_volume(days: int, add: Callable[[float], int]) -> list[growth.Point]:
+    """4-hourly series over `days`; `add(t_seconds)` is the cumulative bytes added by then."""
+    return [(i * 4 * _H, 400 * GIB + add(i * 4 * _H)) for i in range(days * 6 + 1)]
+
+
+def test_one_big_copy_does_not_raise_the_baseline_enough_to_hide_a_later_surge() -> None:
+    # A mean baseline would be dragged to ~10 GiB/day by a single +150 GiB copy at day 9 and then
+    # swallow a +10 GiB / 24 h surge at day 20; the median stays at 0 and the surge alerts.
+    def add(t: float) -> int:
+        copy = 150 * GIB if t >= 9 * _DAY else 0
+        surge = int(10 * GIB * min(max((t - 20 * _DAY) / _DAY, 0.0), 1.0))
+        return copy + surge
+
+    vol = _stepped_volume(21, add)
+    found = _volume_anomalies_at(vol, len(vol) - 1)
+    assert [(a.scope, a.window_h) for a in found] == [("volume", 24)]
+
+
+def test_excess_exactly_at_the_floor_alerts() -> None:
+    # Flat history, then exactly abs_floor (5 GiB) in the last 24 h: baseline 0, excess == floor.
+    # Only `excess < floor` is suppressed, so equality alerts (as before the baseline existed).
+    ramp = 5 * GIB
+    vol = _stepped_volume(13, lambda t: ramp if t >= 13 * _DAY else 0)
+    found = _volume_anomalies_at(vol, len(vol) - 1)
+    assert [(a.scope, a.growth) for a in found] == [("volume", ramp)]
+
+
+def test_baseline_exists_from_exactly_six_daily_intervals() -> None:
+    cfg = AnomalyConfig()
+    vol = _stepped_volume(10, lambda t: int(3 * GIB * t / _DAY))
+    assert growth.volume_baseline_rate_h(vol, 6 * _DAY, cfg) is not None  # 7 points = 6 intervals
+    assert growth.volume_baseline_rate_h(vol, 5 * _DAY, cfg) is None  # 6 points = 5 intervals
+
+
+def test_baseline_looks_back_the_full_fourteen_days() -> None:
+    # Busy daily steps of 20 GiB on days 7-13, flat after; the window starts at day 20, so the busy
+    # week is 7-13 days back. Seven of the fourteen daily rates are busy: the median is half a
+    # step, 10 GiB/day. A 7-day history would see only the flat tail and report 0, and a +12 GiB
+    # surge (excess 2 GiB over the real baseline) would alert.
+    def add(t: float) -> int:
+        steps = sum(1 for d in range(7, 14) if t >= d * _DAY)
+        return steps * 20 * GIB + int(12 * GIB * min(max((t - 20 * _DAY) / _DAY, 0.0), 1.0))
+
+    vol = _stepped_volume(21, add)
+    base = growth.volume_baseline_rate_h(vol, 20 * _DAY, AnomalyConfig())
+    assert base is not None and abs(base - 10 * GIB / 24) < 0.01 * GIB / 24
+    assert _volume_anomalies_at(vol, len(vol) - 1) == []
+
+
+def test_baseline_ignores_growth_inside_the_window() -> None:
+    # Daily rates before the window start: 0, 0, 0, 20, 20, 20 GiB (median 10), then a 16 GiB step
+    # inside the 24 h window. Excess 6 GiB alerts on the 24 h window. If the window's own rate
+    # joined the baseline (median 16) the 24 h window would be suppressed and the alert would only
+    # appear later, on the 72 h window.
+    def add(t: float) -> int:
+        steps = sum(1 for d in (4, 5, 6) if t >= d * _DAY)
+        return 20 * GIB * steps + (16 * GIB if t >= 7 * _DAY else 0)
+
+    vol = _stepped_volume(7, add)
+    found = _volume_anomalies_at(vol, len(vol) - 1)
+    assert [(a.scope, a.window_h) for a in found] == [("volume", 24)]
 
 
 def test_drill_down_prefers_the_specific_folder_over_its_ancestor() -> None:
