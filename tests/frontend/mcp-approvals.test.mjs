@@ -109,3 +109,47 @@ test("a failed answer re-enables the buttons and shows the error", async () => {
   assert.match(error.textContent, /already answered or has expired/);
   assert.equal(decline.textContent, "Decline");
 });
+
+const relocation = (over = {}) =>
+  approval({
+    kind: "relocate",
+    item_count: 12,
+    bytes_total: 3 * 1024 * 1024 * 1024,
+    sample_paths: [],
+    relocation: {
+      source: "C:/Users/x/.cache/huggingface/hub",
+      target: "D:/reclaim-relocated/C/Users/x/.cache/huggingface/hub",
+      moved: "C:/Users/x/.cache/huggingface/hub.reclaim-moved",
+      rollback_hint: "reclaim relocate status (shows this move's id), then reclaim relocate rollback <id>",
+      target_free_bytes: 200 * 1024 * 1024 * 1024,
+    },
+    ...over,
+  });
+
+test("a relocation card shows source, destination, size and how to undo it", () => {
+  const card = renderMcpApprovalCard(relocation(), async () => {});
+  const text = card.textContent;
+  assert.match(text, /Claude Desktop wants to move a folder to another drive: 12 file\(s\), 3\.0 GB/);
+  assert.match(text, /From: C:\/Users\/x\/\.cache\/huggingface\/hub/);
+  assert.match(text, /To: D:\/reclaim-relocated/);
+  assert.match(text, /old copy is kept at .*hub\.reclaim-moved until you delete it yourself/);
+  assert.match(text, /reclaim relocate rollback <id>/);
+  assert.doesNotMatch(text, /Category:/);
+  assert.deepEqual(
+    [...card.querySelectorAll("button")].map((b) => b.textContent),
+    ["Approve", "Decline"]
+  );
+});
+
+test("hostile relocation text renders as inert text", () => {
+  const evil = '<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script>';
+  const base = relocation();
+  const card = renderMcpApprovalCard(
+    relocation({ relocation: { ...base.relocation, source: evil, target: evil, moved: evil, rollback_hint: evil } }),
+    async () => {}
+  );
+  document.body.append(card);
+  assert.equal(card.querySelectorAll("img, script").length, 0);
+  assert.equal(window.__pwned, undefined);
+  assert.ok(card.textContent.includes(evil));
+});

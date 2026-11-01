@@ -89,6 +89,8 @@ class DeleteRequestSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approval_id: str
+    # "clean" (a delete: use delete_status) or "relocate" (a folder move: use relocation_status).
+    kind: str = "clean"
     status: str
     rule_id_or_category: str
     tier: str
@@ -253,6 +255,8 @@ class RelocationOption(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # The only way a later tool may refer to this folder (`plan_relocation(option_id, ...)`).
+    option_id: str
     path: str
     verdict: str
     size_bytes: int
@@ -261,14 +265,70 @@ class RelocationOption(BaseModel):
     suggested_target: str | None
 
 
+class RelocationDrive(BaseModel):
+    """A drive a folder could move to. `drive_id` is the only way a later tool may name it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    drive_id: str
+    drive: str
+    free_bytes: int
+
+
 class RelocationOptionsResult(BaseModel):
     """`list_relocation_options()`: large folders that could move to another drive, movable
-    first, then by size. Nothing is moved by this tool or by any other: the user moves a folder
-    on the dashboard's "Move to Another Drive" page or with `reclaim relocate`, after a dry
-    run they confirm."""
+    first, then by size. This tool only reads. A move is `plan_relocation` then
+    `request_relocation`, which the user approves in Reclaim's window (or the user moves a
+    folder on the dashboard's "Move to Another Drive" page or with `reclaim relocate`)."""
 
     model_config = ConfigDict(extra="forbid")
 
     target_drive: str | None
     target_drive_free_bytes: int | None
+    drives: list[RelocationDrive]
     options: list[RelocationOption]
+
+
+class RelocationPlanResult(BaseModel):
+    """`plan_relocation(option_id, drive_id)`: the dry run. Nothing was changed (not even the
+    in-use probe's rename: the in-use check runs when the user approves, and refuses then)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    option_id: str
+    drive_id: str
+    ok: bool
+    # Why the move is refused (exclusion, hardlink cache, links inside, no room, ...). Empty if ok.
+    reasons: list[str]
+    source: str
+    target: str
+    files: int
+    bytes_total: int
+    target_free_bytes: int
+    # Only when ok: pass it to `request_relocation`. It commits to the folder's identity and size,
+    # so a changed folder is refused rather than moved under an approval for another one.
+    plan_hash: str | None
+    reversible: bool = True
+    old_copy_kept_at: str
+    rollback: str
+    note: str
+
+
+class RelocationResult(BaseModel):
+    """`request_relocation` / `relocation_status`: nothing moves until the user clicks Approve in
+    Reclaim's window. Declined, expired, stale and refused are errors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["executed", "awaiting_user"] = "executed"
+    approval_id: str | None = None
+    message: str | None = None
+    move_id: str | None = None
+    source: str | None = None
+    target: str | None = None
+    files: int = 0
+    bytes_moved: int = 0
+    old_copy_kept_at: str | None = None
+    # The exact command that puts the folder back. The old copy is deleted only by the user
+    # (`reclaim relocate delete-old`); no assistant tool can do it.
+    rollback_command: str | None = None
