@@ -16,7 +16,8 @@ Typical use (frozen build, ~2 h, isolated data dir, deterministic 20k-file fixtu
 Everything the run writes (isolated data dir, fixture, server logs, CSV, report, SVG) lives under
 `--out-dir` (default: %TEMP%\\reclaim_soak\\<timestamp>). The server is launched with --db /
 --vault-dir / --manifest / --mode-log / --first-run-state / --log-path all overridden into that
-directory, so the installed app's index and vault are never touched.
+directory and --config pointing at an empty config.toml there (built-in defaults, unless the
+operator passes `--config`), so the installed app's index, vault and config are never touched.
 
 Exit codes: 0 PASS, 1 FAIL (leak signal), 2 INCONCLUSIVE (too little post-warm-up data, or the
 server died), 3 harness error.
@@ -810,6 +811,35 @@ def _wait_http(base: str, seconds: float, proc: subprocess.Popen[bytes] | None =
     return False
 
 
+def resolve_soak_config(out_dir: Path, operator_config: str | None) -> Path:
+    """The `--config` the launched server gets. Without one, a frozen build reads the REAL
+    installed config.toml (its default path is next to the exe), so the soak would depend on the
+    operator's settings. Default: an empty config.toml under out_dir (all built-in defaults);
+    an operator-supplied path is passed through untouched."""
+    if operator_config:
+        return Path(operator_config)
+    path = out_dir / "config.toml"
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def build_serve_command(
+    exe: str, exe_args: str, port: int, data: Path, config_path: Path
+) -> list[str]:
+    """argv for the launched server: every per-user path flag `serve` has points under `data`
+    (db, vault, manifest, mode log, first-run state, log path); config is explicit."""
+    return [
+        exe, *exe_args.split(), "serve", "--port", str(port),
+        "--config", str(config_path),
+        "--db", str(data / "reclaim_index.sqlite3"),
+        "--vault-dir", str(data / "quarantine"),
+        "--manifest", str(data / "quarantine" / "manifest.jsonl"),
+        "--mode-log", str(data / "mode_log.jsonl"),
+        "--first-run-state", str(data / "first_run_state.json"),
+        "--log-path", str(data / "logs" / "reclaim.log"),
+    ]  # fmt: skip
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--exe", help="Path to reclaim.exe (frozen) to launch as `<exe> serve ...`.")
@@ -818,6 +848,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default="",
         help='Extra args placed before `serve`, e.g. "-m reclaim" when --exe is python.exe '
         "(dev-server self-test).",
+    )
+    p.add_argument(
+        "--config",
+        help="config.toml for the launched server (default: an empty one in --out-dir, i.e. "
+        "built-in defaults). Ignored in attach mode.",
     )
     p.add_argument(
         "--env",
@@ -879,15 +914,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.exe:
         port = args.port or _free_port()
         base = f"http://127.0.0.1:{port}"
-        cmd = [args.exe, *args.exe_args.split(), "serve", "--port", str(port)]
-        cmd += [
-            "--db", str(data / "reclaim_index.sqlite3"),
-            "--vault-dir", str(data / "quarantine"),
-            "--manifest", str(data / "quarantine" / "manifest.jsonl"),
-            "--mode-log", str(data / "mode_log.jsonl"),
-            "--first-run-state", str(data / "first_run_state.json"),
-            "--log-path", str(data / "logs" / "reclaim.log"),
-        ]  # fmt: skip
+        config_path = resolve_soak_config(out_dir, args.config)
+        cmd = build_serve_command(args.exe, args.exe_args, port, data, config_path)
         # Files, not pipes: an undrained pipe would block a chatty server during a multi-hour run.
         logs = [
             (out_dir / "server_stdout.log").open("wb"),
