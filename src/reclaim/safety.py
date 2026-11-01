@@ -284,9 +284,14 @@ def subtree_exclusion_match(
                             unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
                             continue
                         if target_text:
-                            hit = first_matching_pattern(target_text, ordered, is_dir=True)
+                            # The target as it really is, also as `target/` (a path-shaped
+                            # `*/proj/*` needs the separator), and from here on its content under
+                            # that real text, not under the junction's own name.
+                            plain = _strip_candidate(Path(target_text))
+                            hit = _first_hit(ordered, plain, plain + "/")
                             if hit is not None:
                                 return hit
+                            child_text = target_text
                         if cover_once:
                             if _within(child_real, covered_set):
                                 continue  # listed at its real place (or fails closed there)

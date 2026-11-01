@@ -346,3 +346,37 @@ def test_the_delete_path_walk_default_is_unchanged_by_the_junction_option(
     assert subtree_exclusion_match(root, patterns) is None
     assert subtree_exclusion_match(root, patterns, match_junction_targets=False) is None
     assert subtree_exclusion_match(root, patterns, match_junction_targets=True) is not None
+
+
+# --- D1: path-shaped patterns against a junction target and its content ----------------------
+
+_SHAPED = ["*/zqdir/*", "*/zqdir/data/*"]
+
+
+@pytest.mark.parametrize("pattern", _SHAPED)
+def test_junction_into_a_project_named_by_a_path_shaped_pattern_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit, junction: _Junction, pattern: str
+) -> None:
+    target = tmp_path / "zqdir"
+    (target / "data").mkdir(parents=True)
+    (target / "data" / "f1.txt").write_text("x\n", encoding="utf-8")
+    repo = _repo(tmp_path / "outer")
+    junction(repo / "node_modules" / "lnk", target)
+
+    assert GitRepoCache((pattern,)).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+@pytest.mark.parametrize("pattern", _SHAPED)
+def test_the_delete_path_default_ignores_path_shaped_junction_targets(
+    tmp_path: Path, junction: _Junction, pattern: str
+) -> None:
+    target = tmp_path / "zqdir"
+    (target / "data").mkdir(parents=True)
+    (target / "data" / "f1.txt").write_text("x\n", encoding="utf-8")
+    root = tmp_path / "outer"
+    root.mkdir()
+    junction(root / "lnk", target)
+    assert subtree_exclusion_match(root, [pattern]) is None
+    assert subtree_exclusion_match(root, [pattern], match_junction_targets=False) is None
+    assert subtree_exclusion_match(root, [pattern], match_junction_targets=True) is not None
