@@ -13,8 +13,8 @@ regenerable-cache list, in safe mode, without a review step and not through the 
 
 ## [1.4.0] - unreleased
 
-1.4.0 is everything merged to `main` since v1.3.0 plus the integration branch of PR #199
-(agent leftovers, move to another drive, the assistant planner and read-only tools, and the
+1.4.0 is everything merged to `main` since v1.3.0, including PR #199 (merged 1 Nov 2026:
+agent leftovers, move to another drive, the assistant planner and read-only tools, and the
 fail-closed exclusion walk of #190). The version number is bumped on the release-prep branch;
 nothing is tagged or published yet.
 
@@ -62,7 +62,8 @@ nothing is tagged or published yet.
   listing (#118, its Lever 2; Lever 1 was not shipped), bounded parallel dedup hashing (#125),
   memoised environment-root probes (#124), `/api/summary` without materialising every row
   (#152, #160), path-scoped apply from the warm cache (#121), exclusion patterns compiled once
-  (#187), bounded index WAL (#103, #151).
+  (#187), bounded index WAL (#103, #151), and the scanner asks git whether a repo is clean only
+  under `node_modules`, the one place a verdict reads it (#231).
 - Bytes are reported as **freed** only when really released; Recycle Bin and vault moves are
   reported as **moved** (#115, #48, #54).
 - Default scan scope is the invoking user's own profile, not a volume-root traversal (#47); a
@@ -98,7 +99,8 @@ nothing is tagged or published yet.
   follows the current `sys.stderr` (#206); a present-but-unloadable optional package is reported
   as a load failure (#109); onnxruntime was dead in the frozen build (#108).
 - Test hermeticity: tests redirect every profile root and refuse destructive operations on the
-  real profile (#140, #143, #145).
+  real profile (#140, #143, #145). The frozen-build smoke suite follows the cold-cache contract,
+  passes its own `--config`, and checks the per-account task name (#235).
 
 ### Security
 
