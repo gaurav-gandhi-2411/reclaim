@@ -6,14 +6,16 @@
 
 Reclaim finds files on your Windows PC that are safe to remove — caches your tools rebuild
 automatically, temp files, and duplicate copies — and shows you exactly why each one is safe
-before anything happens. Nothing is ever deleted without your review, and by default everything
-Reclaim removes goes to the Windows Recycle Bin, so it's always recoverable the same way as if
-you'd deleted it yourself.
+before anything happens. Nothing is deleted without you clicking, and by default what you review
+and select goes to the Windows Recycle Bin, so it's recoverable the same way as if you'd deleted
+it yourself. The one exception is the fixed list of caches other programs rebuild on their own
+(the one-click clean and the optional weekly clean, below), which are removed with each tool's
+own cleaning command and so have nothing to restore.
 
 ## Download
 
 **[Download Reclaim for Windows -> latest release](https://github.com/gaurav-gandhi-2411/reclaim/releases/latest)**
-&nbsp;—&nbsp; **Windows only (Windows 10/11).**
+&nbsp;—&nbsp; **Windows only (Windows 10 and 11; `packaging/RELEASE_RUNBOOK.md`, `c0ad89f`).**
 
 Download `reclaim-setup.exe` from the page above and run it. No admin prompt, no account, no
 sign-up, nothing installed beyond the app itself.
@@ -33,14 +35,18 @@ Reclaim starts in **Simple mode** — one button, no path typing, no decisions t
 2. Open **Reclaim** from the Start Menu.
 3. Your browser opens automatically to the Reclaim dashboard.
 4. A one-time screen explains safe mode before anything else is usable — read it, then continue.
-5. Click **Clean My Computer**. Reclaim scans every fixed drive on your machine, showing a live
-   progress bar and time estimate the whole way through — never a silent wait.
-6. Once it's done, you'll see exactly what it found, in plain language and real measured sizes
-   (e.g. "Temporary & browser cache files — 890 MB — safe, recreated automatically as you
-   browse"). Only categorically-safe clutter is ever offered here.
-7. Click **Clean now** — one confirmation, then it's done.
-8. Whatever you clean is **moved to the Recycle Bin** — empty the Recycle Bin afterward to
-   actually free up the disk space.
+5. Click **Clean My Computer**. This is one click and no scan first: it cleans only the fixed list
+   of caches other programs rebuild by themselves (package-manager caches, temp files not touched
+   for a week, old crash dumps, and the caches of browsers that are closed), then reports what was
+   freed and what was skipped and why. Your own documents and downloads are never on that list.
+6. Want more to review? Click **Scan my files for more to review**. It scans your own user folder
+   (never a whole-drive traversal unless you separately choose **Scan the whole drive (advanced)**
+   and confirm), with a live progress bar, and shows what it found in plain language and real
+   measured sizes. Only categorically-safe clutter is ever offered in Simple mode.
+7. Click **Clean now** on those results — one confirmation, then it's done.
+8. What you clean from a scan is **moved to the Recycle Bin** — empty the Recycle Bin afterward to
+   actually free up the disk space. The one-click clean above has nothing to restore (rebuildable
+   caches).
 
 Want more control — custom folders, duplicate detection, AI-powered suggestions, individual
 review of every item before it's touched? Click **Switch to Advanced** in the header at any
@@ -51,13 +57,35 @@ background at low priority so the dashboard is ready when you open it; a new sca
 Reclaim cancels it and already-computed work is kept (`[dedup] warm_after_scan`, default on;
 [ADR-0040](docs/architecture/adr/0040-background-dedup-warmup.md)).
 
+## New in 1.4.0
+
+Full list and known limits: [CHANGELOG.md](CHANGELOG.md). Guide: [docs/HOWTO.md](docs/HOWTO.md).
+
+- **Agent Leftovers** ([ADR-0043](docs/architecture/adr/0043-agent-artifacts-cleanup.md)): git worktrees,
+  throwaway clones and scratch folders that AI coding agents leave behind, offered only when
+  proven finished (everything pushed, nothing hidden, no program using it) and never deleted
+  outright: each goes to the restorable vault. Off by default and always off in safe mode.
+  `reclaim agent-artifacts` shows what would be offered without changing anything.
+- **Move to Another Drive** ([ADR-0044](docs/architecture/adr/0044-relocate-behind-a-junction.md)): moves a big
+  folder (a model cache, say) to another fixed drive and leaves a link at the old place, checking
+  every file by SHA-256 and keeping the original until you separately confirm deleting it.
+  Docker and WSL are shown with their own steps and never moved by Reclaim. Dashboard tab and
+  `reclaim relocate`.
+- **Use Reclaim from your AI assistant**: Claude Desktop, Claude Code or Codex CLI can ask for a
+  plan to free space and read the disk status over a local MCP server. The assistant cannot name
+  a file, and every clean needs your click on an approval card in Reclaim's own window.
+- **Fail-closed exclusions**: if Reclaim cannot fully read a folder, it protects it instead of
+  assuming nothing in it is excluded (#190).
+
 ## Safe mode
 
 Safe mode is on for every fresh install, and it isn't just a default that could quietly slip —
 it's a structural guarantee (see [ADR-0023](docs/architecture/adr/0023-stage2-safe-mode-safety-boundary.md)
 for the full technical proof):
 
-- **Every delete goes to the Recycle Bin.** Never a permanent delete, no matter what you select.
+- **Everything you select in a review goes to the Recycle Bin.** Never a permanent delete, no
+  matter what you select. (The fixed list of rebuildable caches cleaned by the one click and the
+  weekly clean is the exception: those use each tool's own cleaning command.)
 - **Nothing applies automatically.** You always pick what to clean and confirm it — Reclaim never
   acts on its own (the one opt-in exception is the [weekly cache clean](#weekly-cache-clean-optional-off-by-default),
   which you must switch on and which only touches regenerable caches).
@@ -70,12 +98,14 @@ for the full technical proof):
 ## Weekly cache clean (optional, off by default)
 
 **Settings -> Weekly cache clean** lets Reclaim clear only what other programs rebuild on their
-own, once a week (Sundays, 10:00), with no clicks from you. It is the one thing in Reclaim that
+own, once a week (Sundays, 10:00; `src/reclaim/autoclean_schedule.py`, `2b08812`), with no clicks
+from you. It is the one thing in Reclaim that
 runs without you picking each item, so it is **off until you turn it on**, and it is deliberately
 tiny (see ADR-0034):
 
 - **Only a fixed list:** package-manager download caches (cleaned with each tool's own command),
-  temp files untouched for 7+ days, old crash dumps, and caches of browsers that are *not
+  temp files untouched for 7+ days (`DEFAULT_MIN_AGE_SECONDS` in `src/reclaim/regenerable.py`,
+  `6f1379e`), old crash dumps, and caches of browsers that are *not
   running*. Never your documents, downloads, the Recycle Bin, or the quarantine vault.
 - **Skips anything in use,** and tells you how many files it left alone. If a package-manager
   cache (such as uv's) was busy, it also retries shortly after you next sign in; a sign-in
@@ -102,7 +132,7 @@ adds one status and one reason for its success path: `{"status": "ok", "reason":
 Ctrl+C / `SystemExit` are deliberately not caught.
 
 **Pytest temp folders (a separate opt-in, config file only).** Old `pytest-<N>` folders in
-`%TEMP%\pytest-of-<you>` (newest file over 7 days old, nothing open) are *not* in the list above
+`%TEMP%\pytest-of-<you>` (newest file over 7 days old, nothing open; `PYTEST_TEMP_MIN_AGE_SECONDS` in `src/reclaim/regenerable.py`, `67925c6`) are *not* in the list above
 and are never touched unless you set `[regenerable] pytest_temp = true` in `config.toml` (there is
 no Settings toggle for it). Pytest temp folders are shared by every project you test, and Reclaim
 cannot tell which project made a given folder: turn it on only if none of them is a project you
@@ -190,11 +220,12 @@ the Recycle Bin, with an explicit reminder that emptying it is a separate, manua
   <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/10-ai-suggestions.png" alt="AI Suggestions tab explaining that AI features are not included in the installer and are recommend-only when available" width="800" />
 </p>
 
-**AI stays recommend-only, and honest about what's installed** — the packaged installer doesn't
-bundle the optional AI/ML layer, and the dashboard says so plainly instead of showing a broken
-or empty tab. When the AI extra *is* installed (source checkouts only, `uv sync --extra ai`),
-every suggestion still goes through the exact same apply/safety check as everything else in
-Reclaim — recommend-only, never auto-applied.
+**AI stays recommend-only, and honest about what's installed** — this screenshot is from v1.3.0,
+whose installer did not bundle the AI layer, so the tab said so instead of showing a broken or
+empty tab. Since the bundled-ONNX change ([ADR-0030](docs/architecture/adr/0030-onnx-conversion-and-bundled-ai-installer.md))
+the installer ships the models (see "Distribution status"), and the screenshot has not been
+retaken. Either way, every suggestion goes through the exact same apply/safety check as
+everything else in Reclaim — recommend-only, never auto-applied.
 
 <p>
   <img src="https://raw.githubusercontent.com/gaurav-gandhi-2411/reclaim/main/docs/assets/screenshots/11-light-theme.png" alt="Overview tab in light theme" width="800" />
@@ -202,9 +233,10 @@ Reclaim — recommend-only, never auto-applied.
 
 </details>
 
-Crash-recovery and live-apply-progress screenshots (introduced in v1.2.0) aren't retaken this
-release — only the color tokens changed underneath them, not the behavior — see the v1.2.0
-screenshots in git history for those two states.
+Crash-recovery and live-apply-progress screenshots (introduced in v1.2.0) have not been retaken
+since — see the v1.2.0 screenshots in git history for those two states. Screenshots for the 1.4.0
+pages (Move to Another Drive, Use Reclaim from your AI assistant) are under
+`reports/screenshots/relocate/` and `reports/screenshots/assistant-setup/`.
 
 ## Questions, bugs, and privacy
 
@@ -220,8 +252,8 @@ screenshots in git history for those two states.
 
 Rules-first Windows disk-cleanup tool. Deterministic detection for provably-safe categories, a
 hard safety gate that runs before any candidate is generated, and fully recoverable actions
-(vault + manifest, dry-run by default). No ML — see `docs/CASE_STUDY.md` for what's actually
-wired in vs. specced for later. Full design: `reclaim-spec.md`. Build history: `PLAN.md`.
+(vault + manifest, dry-run by default). The optional AI suggestions are recommend-only — see
+`docs/CASE_STUDY.md` for what's actually wired in vs. specced for later. Full design: `reclaim-spec.md`. Build history: `PLAN.md`.
 
 **Status:** Stage 2 shipped a double-click Windows installer with safe mode on by default —
 see "Distribution status" below for the full picture, including what safe mode restricts and
@@ -275,7 +307,7 @@ reclaim apply "C:\Users\you\Downloads" --apply --tier A
 
 ## Restoring a batch (CLI / power-mode detail)
 
-Every `apply` prints a `batch_id`. Most categories vault into `data/quarantine/` with a 30-day
+Every `apply` prints a `batch_id`. Most categories vault into `data/quarantine/` with a 30-day (ADR-0001, `bead7a0`)
 (or category-specific) retention window before permanent deletion; a few deterministically
 rebuildable categories (package caches, dev artifacts, browser/temp caches, crash dumps) delete
 immediately since their real recovery path was always "rebuild it," not "restore it" — see
@@ -350,8 +382,9 @@ double-click Windows installer aimed at people who won't read the source first:
   verifying the binary yourself from source, or for building a fresh copy.
 - **AI layer bundled, zero user steps** (Wave 1 P0-B, [ADR-0030](docs/architecture/adr/0030-onnx-conversion-and-bundled-ai-installer.md) — supersedes ADR-0024's
   original core-only decision). CLIP and MiniLM ship as pre-converted, pinned, SHA256-verified
-  ONNX files (CLIP fp16, 175.8MB; MiniLM int8, 23.6MB — **199.4MB total**, vs. the old
-  torch-based `[ai]` extra's ~1,028MB delta) bundled directly into the installer — no separate
+  ONNX files (CLIP fp16, 175.8MB; MiniLM int8, 23.6MB — **199.4MB total**; `reports/ai/onnx_quality_parity/payload_sizes.json`, `8ca59fb`; the CLIP file is
+  175,784,030 bytes, and the runbook's 167.6 is the same file in MiB (175,784,030 / 1,048,576); vs. the old
+  torch-based `[ai]` extra's ~1,028MB delta, same file) bundled directly into the installer — no separate
   `pip install reclaim[ai]` step, no terminal, no Python knowledge required. Quality-parity
   measurement against the original torch models (on this project's own real gold eval sets, not
   a proxy): `reports/ai/onnx_quality_parity/`. Models load lazily (first AI-analysis click, never
@@ -361,7 +394,7 @@ double-click Windows installer aimed at people who won't read the source first:
 ### First run: SmartScreen and antivirus prompts (expected, not a compromise signal)
 
 **This installer and `reclaim.exe` are unsigned.** Stage 2 Part C assessed code-signing options
-(Azure Trusted Signing, ~$9.99/month, vs. staying unsigned) and the project shipped unsigned —
+(Azure Trusted Signing, ~$9.99/month, ADR-0031 `8ca59fb`, vs. staying unsigned) and the project shipped unsigned —
 there's no revenue or user base yet to justify a recurring cost, and nothing about staying
 unsigned today blocks signing later (see "Staying signing-agnostic" below). Two prompts are
 expected as a direct consequence, and neither means the binary is unsafe:
@@ -393,8 +426,9 @@ Build it yourself:
 ```powershell
 uv run python packaging/build_brand_assets.py   # regenerates packaging/reclaim.ico + wizard bitmaps
 
-# Requires Git LFS (git lfs pull) so the bundled clip_vision_fp16.onnx (175.8MB, exceeds
-# GitHub's 100MB plain-git limit) is a real file, not a pointer stub — see
+# Requires Git LFS (git lfs pull) so the bundled clip_vision_fp16.onnx (175,784,030 bytes per
+# reports/ai/onnx_quality_parity/payload_sizes.json, over GitHub's plain-git per-file limit) is a
+# real file, not a pointer stub — see
 # packaging/RELEASE_RUNBOOK.md's preconditions (free RAM, disk space, closing other heavy
 # sessions) before running a real release build.
 pwsh packaging/build_installer.ps1

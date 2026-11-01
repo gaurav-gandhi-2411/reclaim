@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/gaurav-gandhi-2411/reclaim/blob/main/SECURITY.md
+    about: Do not file security problems as issues. Read SECURITY.md for how to report one privately.
+  - name: Support and what to include in a report
+    url: https://github.com/gaurav-gandhi-2411/reclaim/blob/main/SUPPORT.md
+    about: How to get the log and diagnostics, and what never to post.
