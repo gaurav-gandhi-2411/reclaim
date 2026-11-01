@@ -3,12 +3,13 @@ from __future__ import annotations
 import secrets
 import time
 from pathlib import Path
+from typing import Literal
 
 import structlog
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-from reclaim.api import ai_orchestration, service
+from reclaim.api import ai_orchestration, growth_api, service
 from reclaim.api.schemas import (
     AIAnalysisStatusOut,
     AISuggestionsResponse,
@@ -25,6 +26,7 @@ from reclaim.api.schemas import (
     FixedDrivesResponse,
     FullDriveScanConfirmIntentResponse,
     FullDriveScanRequest,
+    GrowthResponse,
     ModeStatusResponse,
     NotificationsSettingOut,
     OneClickCleanSummaryResponse,
@@ -805,6 +807,21 @@ def update_autoclean_setting(
         return service.update_autoclean_setting(get_state(request), enabled=payload.enabled)
     except AutoCleanScheduleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+# --- ADR-0046: disk growth attribution (read-only) ----------------------------------------------
+
+
+@router.get("/growth", response_model=GrowthResponse)
+def growth_changes(
+    request: Request,
+    window: Literal["1d", "7d"] = "1d",
+    volume: str | None = Query(default=None, pattern=r"^[A-Za-z]:[\\/]?$"),
+) -> GrowthResponse:
+    """What grew over the last day or week, from the growth store only: no scan, no file IO, no
+    write. An invalid `window`/`volume` is FastAPI's standard 422. No store (or too little
+    history for the window) is a 200 with empty rows and status "insufficient data"."""
+    return growth_api.build_growth_response(get_state(request), window, volume)
 
 
 # --- Update check (opt-in; see PRIVACY.md's "Updates" section) ---------------------------------

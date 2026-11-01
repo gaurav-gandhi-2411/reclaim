@@ -115,6 +115,13 @@ _JUNIT_PATH = "pytest-results.xml"
 # skip" bar as every file above. Confirmed to have teeth: fails against the pre-PR-#76 detector
 # code (verified this session by swapping in that commit's `detectors.py` and re-running).
 #
+# evals/growth/test_growth_eval.py added with the disk-growth attribution eval (spec
+# docs/specs/disk-growth-attribution.md, ADR-0046): replays the committed real-data fixtures in
+# evals/fixtures/growth through reclaim.growth's detector and a threshold baseline and asserts
+# INVARIANTS only (fixtures load, events are cited and their evaluable flag matches the data,
+# metrics carry provenance), never metric values. Committed files only (no D: access, no machine
+# state, no [ai] extra, no network) -- same "no excuse to skip" reasoning as every file above.
+#
 # test_relocate_gate.py added 2026-10-24 (run spec Phase B, docs/specs/relocate.md): the
 # relocate move's zero-data-loss gate -- one fixture per case in evals/fixtures/relocate/ (links,
 # hardlinks, long paths, open handles, read-only and ACL-denied files, kills at every step, too
@@ -140,6 +147,7 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_config_env_var_normalization_gate.py",
     "evals/test_data_path_cwd_independence_gate.py",
     "evals/test_default_enabled_category_floor_gate.py",
+    "evals/growth/test_growth_eval.py",
     "evals/test_relocate_gate.py",
 )
 
