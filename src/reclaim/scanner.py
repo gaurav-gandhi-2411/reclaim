@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
@@ -33,6 +33,7 @@ from reclaim.models import (
     FileRecord,
     recorded_attributes,
 )
+from reclaim.safety import subtree_exclusion_match
 
 logger = structlog.get_logger(__name__)
 
@@ -438,7 +439,11 @@ class GitRepoCache:
 
     _UNSET = object()
 
-    def __init__(self) -> None:
+    def __init__(self, excluded_patterns: Sequence[str] = ()) -> None:
+        # The user's exclusion patterns (`SafetyValidator.exclusion_patterns`): no git process is
+        # ever started in a repo that is, is inside, or contains an excluded project. Empty = the
+        # product default (no exclusions configured).
+        self._excluded_patterns = tuple(excluded_patterns)
         self._repo_root_cache: dict[Path, Path | None] = {}
         self._clean_cache: dict[Path, bool] = {}
 
@@ -479,7 +484,7 @@ class GitRepoCache:
     def is_clean(self, repo_root: Path) -> bool:
         if repo_root in self._clean_cache:
             return self._clean_cache[repo_root]
-        clean = _query_git_clean(repo_root)
+        clean = _query_git_clean(repo_root, excluded_patterns=self._excluded_patterns)
         self._clean_cache[repo_root] = clean
         return clean
 
@@ -532,7 +537,31 @@ _GIT_REPO_ENV = frozenset(
 _GIT_CLEAN_MAX_DEPTH = 8
 
 
-def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
+def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
+    """True iff `repo_root` is, is inside, or CONTAINS something the user excluded. Fails closed:
+    anything unreadable or unresolvable counts as excluded.
+
+    "Contains" is needed because `git status` at an outer root lists untracked files and
+    `ls-files --recurse-submodules` enters submodules, so it reads inside a nested excluded
+    project even when the outer path itself matches nothing. Uses the same matching as the delete
+    path (`first_matching_pattern`/`subtree_exclusion_match`), on the path as given and on its
+    resolved form (a junction into an excluded project)."""
+    if not patterns:
+        return False
+    try:
+        if subtree_exclusion_match(repo_root, patterns) is not None:
+            return True
+        resolved = repo_root.resolve()
+        return str(resolved) != str(repo_root) and (
+            subtree_exclusion_match(resolved, patterns) is not None
+        )
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def _query_git_clean(
+    repo_root: Path, _depth: int = 0, excluded_patterns: Sequence[str] = ()
+) -> bool:
     """Runs `git status --porcelain`, `git ls-files -v` and `git ls-files -s -z` for a repo root,
     then the same check in every checked-out gitlink (submodule or embedded repo) below it. Any
     failure (git missing, not a repo, timeout) is treated as not-clean — conservative, matching
@@ -548,8 +577,15 @@ def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
     `.gitmodules` entry, `submodule.<name>.ignore=all` in a submodule's own config) are not
     reachable from the outer command line, so each checked-out gitlink is checked as a repo of
     its own, under the same rules.
+
+    A repo (or gitlink) that is, is inside, or contains an `excluded_patterns` match is never
+    touched: no git process, not-clean. The same check runs for every nested gitlink.
     """
     if _depth > _GIT_CLEAN_MAX_DEPTH:
+        return False
+    if _git_target_excluded(repo_root, excluded_patterns):
+        # No path, name or pattern in the event: an excluded project is not named in logs.
+        logger.debug("scan.git_skipped_excluded", nested=_depth > 0)
         return False
     git_exe = shutil.which("git")
     if git_exe is None:
@@ -649,7 +685,7 @@ def _query_git_clean(repo_root: Path, _depth: int = 0) -> bool:
         except (OSError, RuntimeError):
             # e.g. an access-denied `.git` (Path.exists raises PermissionError): unknown state
             return False
-        if not _query_git_clean(nested, _depth + 1):
+        if not _query_git_clean(nested, _depth + 1, excluded_patterns):
             return False
     return True
 
@@ -1295,6 +1331,7 @@ def _walk_subtree(
     risk_counter: _RiskCounter,
     tracker: _ProgressTracker | None = None,
     cancel_event: threading.Event | None = None,
+    excluded_patterns: Sequence[str] = (),
 ) -> _SubtreeResult:
     r"""Iterative (not recursive, to avoid Python's recursion limit on deep trees) walk of one
     top-level directory and everything reachable under it without crossing a reparse point.
@@ -1321,7 +1358,7 @@ def _walk_subtree(
     whatever this worker had pending is flushed as one clean, complete batch — never abandoned
     mid-transaction (see `_BatchIndexWriter`'s docstring).
     """
-    git_cache = GitRepoCache()
+    git_cache = GitRepoCache(excluded_patterns)
     skipped: list[SkippedPath] = []
     dirs_visited = 0
     pending_upserts: list[FileRecord] = []
@@ -1517,6 +1554,7 @@ def scan_tree(
     on_progress: ScanProgressCallback | None = None,
     entries_estimated_total: int | None = None,
     cancel_event: threading.Event | None = None,
+    excluded_patterns: Sequence[str] = (),
 ) -> ScanStats:
     """Walks `root`, populates `index` with a complete inventory, and prunes rows for entries
     that no longer exist. One `ThreadPoolExecutor` task per top-level directory under `root`
@@ -1541,6 +1579,10 @@ def scan_tree(
     `_entry_is_risky`'s module comment) so a single stalled syscall can't wedge the walk
     silently, without paying a per-file thread-hop cost on the overwhelming majority of entries
     that are never actually at risk of stalling.
+
+    `excluded_patterns` (the user's exclusions, `SafetyValidator.exclusion_patterns`): no git
+    process is started in a repo that is, is inside or contains an excluded project (it reads
+    not-clean). Default `()` = none configured; every production caller passes its own.
 
     `cancel_event` (scan cancellation): optional, shared `threading.Event` — checked in the
     top-level loop below AND passed straight through to every `_walk_subtree` worker (same
@@ -1600,7 +1642,7 @@ def scan_tree(
             )
         )
 
-    root_git_cache = GitRepoCache()
+    root_git_cache = GitRepoCache(excluded_patterns)
     pending_upserts: list[FileRecord] = []
     pending_unchanged: list[str] = []
     recurse_into: list[Path] = []
@@ -1656,6 +1698,7 @@ def scan_tree(
                     risk_counter=risk_counter,
                     tracker=tracker,
                     cancel_event=cancel_event,
+                    excluded_patterns=excluded_patterns,
                 )
                 # as_completed, not executor.map: map()'s iterator yields in SUBMISSION order,
                 # blocking on an earlier-submitted-but-still-pending directory even once every
