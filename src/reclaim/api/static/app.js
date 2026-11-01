@@ -729,7 +729,7 @@ function initGrowthPanel() {
 // Only the row `label` is ever named (never `path`), and an excluded project can only appear as
 // the aggregate's own label (the server never itemises one, this also guards the client side).
 
-const SIMPLE_GROWTH_STEADY_BYTES = 0.05 * 1024 ** 3; // below this the one-decimal GB would read 0.0
+const SIMPLE_GROWTH_STEADY_BYTES = 0.05 * 1024 ** 3; // tiny changes read as noise, not as growth
 
 // The text for GET /api/growth?window=7d, or null when there is no figure to show yet.
 function simpleGrowthLineText(data) {
@@ -750,12 +750,32 @@ function simpleGrowthLineText(data) {
   // /api/growth without `volume` returns rows from every volume: keep this volume's own (the
   // server's rule: case-insensitive, slash-insensitive prefix of "<volume>\\").
   const root = `${name}\\`.toLowerCase();
-  const onVolume = (r) => {
-    const p = String(r.path ?? "").replace(/\//g, "\\").toLowerCase();
-    return p === name.toLowerCase() || p.startsWith(root);
-  };
+  const norm = (r) => String(r.path ?? "").replace(/\//g, "\\").toLowerCase();
+  const onVolume = (r) => norm(r) === name.toLowerCase() || norm(r).startsWith(root);
   const growing = (data.rows ?? []).filter((r) => r.growth_bytes > 0 && onVolume(r));
-  const top = growing.reduce((a, b) => (a && a.growth_bytes >= b.growth_bytes ? a : b), null);
+  // The API lists nested folders too (Users, Users\g\AppData, ...\Docker), so the biggest row is
+  // usually an ancestor. Mirror growth.drill_down (src/reclaim/growth.py, _DRILL_SHARE = 0.6) and
+  // keep the two in sync: from the biggest row, while a strictly-inside descendant has at least
+  // 60% of the current growth, move to the largest such one (ties: longer path).
+  const DRILL_SHARE = 0.6;
+  let top = growing.reduce((a, b) => (a && a.growth_bytes >= b.growth_bytes ? a : b), null);
+  while (top) {
+    const p = norm(top);
+    const parent = p.replace(/\\+$/, "");
+    const inner = growing.filter(
+      (r) =>
+        norm(r) !== p &&
+        (norm(r) === parent || norm(r).startsWith(`${parent}\\`)) &&
+        r.growth_bytes >= DRILL_SHARE * top.growth_bytes
+    );
+    if (inner.length === 0) break;
+    top = inner.reduce((a, b) =>
+      b.growth_bytes > a.growth_bytes ||
+      (b.growth_bytes === a.growth_bytes && String(b.path).length > String(a.path).length)
+        ? b
+        : a
+    );
+  }
   let line = `${name} grew ${formatFromBytes(vol.change_bytes)} this week`;
   if (top) {
     const who = top.kind === "excluded" ? data.excluded_aggregate.label : top.label;

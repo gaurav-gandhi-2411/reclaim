@@ -101,7 +101,7 @@ test("shrink: says it shrank, plainly, with a positive figure", async () => {
   assert.equal(lineEl().textContent, "C: shrank 3.0 GB this week.");
 });
 
-test("steady: a change that would round to 0.0 GB reads as held steady", async () => {
+test("steady: a tiny change reads as held steady", async () => {
   await idleWith(reply(body({ volumes: [volume(0.01 * GIB)], rows: [] })));
   assert.equal(lineEl().textContent, "C: held steady this week.");
 });
@@ -205,23 +205,53 @@ test("two volumes: a bigger row on D: is never named for C:", () => {
   const data = body({
     volumes: [volume(2 * GIB), volume(9 * GIB, { volume: "D:\\" })],
     rows: [
-      row("DataLake", 9 * GIB, { path: "D:\lake" }),
-      row("CD cache", 1.5 * GIB, { path: "CD:\odd" }),
-      row("npm cache", 1.5 * GIB, { path: "C:\Users\g\npm" }),
+      row("DataLake", 9 * GIB, { path: "D:\\lake" }),
+      row("CD cache", 1.5 * GIB, { path: "CD:\\odd" }),
+      row("npm cache", 1.5 * GIB, { path: "C:\\Users\\g\\npm" }),
     ],
   });
   assert.equal(simpleGrowthLineText(data), "C: grew 2.0 GB this week, mostly npm cache.");
   const noC = body({
     volumes: [volume(2 * GIB), volume(9 * GIB, { volume: "D:\\" })],
-    rows: [row("DataLake", 9 * GIB, { path: "D:\lake" })],
+    rows: [row("DataLake", 9 * GIB, { path: "D:\\lake" })],
   });
   assert.equal(simpleGrowthLineText(noC), "C: grew 2.0 GB this week.");
 });
 
 test("a forward-slash or lower-case row path still counts for its volume", () => {
   const data = body({
-    volumes: [volume(2 * GIB)],
-    rows: [row("Docker", 2 * GIB, { path: "c:/users/g/docker" })],
+    volumes: [volume(2 * GIB), volume(9 * GIB, { volume: "D:\\" })],
+    rows: [
+      row("DataLake", 3 * GIB, { path: "D:\\lake" }), // bigger, but on another volume
+      row("Docker", 2 * GIB, { path: "c:/users/g/docker" }),
+    ],
   });
   assert.equal(simpleGrowthLineText(data), "C: grew 2.0 GB this week, mostly Docker.");
+});
+
+const nested = (rows) => body({ volumes: [volume(6.2 * GIB)], rows });
+
+test("nested rows: drills down from the biggest ancestor to the folder that explains it", () => {
+  const data = nested([
+    row("Users", 6 * GIB, { path: "C:\\Users" }),
+    row("AppData", 5.5 * GIB, { path: "C:\\Users\\g\\AppData" }),
+    row("Docker", 5 * GIB, { path: "C:\\Users\\g\\AppData\\Local\\Docker" }),
+  ]);
+  assert.equal(simpleGrowthLineText(data), "C: grew 6.2 GB this week, mostly Docker.");
+});
+
+test("nested rows: a child under 60% of its parent stops the drill-down at the parent", () => {
+  const data = nested([
+    row("Users", 6 * GIB, { path: "C:\\Users" }),
+    row("Docker", 3 * GIB, { path: "C:\\Users\\g\\Docker" }),
+  ]);
+  assert.equal(simpleGrowthLineText(data), "C: grew 6.2 GB this week, mostly Users.");
+});
+
+test("nested rows: C:\\Users2 is not inside C:\\Users", () => {
+  const data = nested([
+    row("Users", 6 * GIB, { path: "C:\\Users" }),
+    row("Users2", 5.5 * GIB, { path: "C:\\Users2" }),
+  ]);
+  assert.equal(simpleGrowthLineText(data), "C: grew 6.2 GB this week, mostly Users.");
 });
