@@ -197,3 +197,12 @@ These refine, and do not change, the decisions above.
   ("N selected file(s) changed on disk"). Triggers measured on CPython: winerror 5/21 (PermissionError),
   123/1920/1117 (OSError). A locked-for-write file and an ACL deny-read file do not trigger it (lstat
   succeeds). The refusal detail now says the item could not be inspected rather than that it was swapped.
+
+## Addendum 2026-11-01 -- opaque rows hide hard-link partners
+
+Because no file inside an opaque tree is recorded, the index cannot see that a cache file also has
+a name inside a `.venv`, `site-packages` or `node_modules` it was hard-linked into. An index-only
+estimate that groups files by file id therefore overclaims such caches: by 25.15 GB on the uv cache
+in the 1 Nov 2026 real-index A/B of #229 (only uv was measured). That estimate is rejected; see
+ADR-0006, addendum 2026-11-01. Whoever changes what this ADR records inside opaque trees should
+re-read that addendum first.
