@@ -257,6 +257,9 @@ class DiskSpaceCheckResult:
     reason: str
     # "disabled" | "measurement_failed" | "below_threshold" | "snoozed" | "debounced" |
     # "would_notify"
+    # One line naming what grew over the last 3 days (spec 1.5); set by the caller from the
+    # growth store, never by `check_disk_space` (which stays free of growth IO).
+    growth_line: str | None = None
 
 
 def check_disk_space(
@@ -402,17 +405,37 @@ def send_disk_space_toast(result: DiskSpaceCheckResult) -> bool:
         _refuse_real_toast_under_pytest()
         ensure_toast_aumid()
         toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
-        toast = Toast(
-            [
-                "Disk space is running low",
-                f"{result.percent_used:.0f}% used ({result.percent_free:.0f}% free) -- above "
-                f"your {result.threshold_percent:.0f}% alert threshold.",
-            ]
-        )
+        toast = Toast(["Disk space is running low", disk_space_toast_body(result)])
         toast.AddAction(ToastButton("Snooze for a week", launch=SNOOZE_LAUNCH_URI))
         return _show_toast_checked(toaster, toast)
     except Exception:
         logger.info("notifications.toast_failed", exc_info=True)
+        return False
+
+
+def disk_space_toast_body(result: DiskSpaceCheckResult) -> str:
+    """The 80% toast body, plus the growth explanation line when the caller attached one. Pure,
+    so the exact user-facing text is unit-testable without any toast stack."""
+    body = (
+        f"{result.percent_used:.0f}% used ({result.percent_free:.0f}% free) -- above "
+        f"your {result.threshold_percent:.0f}% alert threshold."
+    )
+    return f"{body}\n{result.growth_line}" if result.growth_line else body
+
+
+def send_growth_toast(text: str) -> bool:
+    """Fires the growth-anomaly toast (`C: grew X in N days -- Y from <label>`). Same reliability
+    posture as `send_disk_space_toast`: NEVER raises, `windows_toasts` imported lazily, `True`
+    only means Windows accepted it. Its debounce is the caller's (a separate state file)."""
+    try:
+        from windows_toasts import InteractableWindowsToaster, Toast
+
+        _refuse_real_toast_under_pytest()
+        ensure_toast_aumid()
+        toaster = InteractableWindowsToaster("Reclaim", TOAST_AUMID)
+        return _show_toast_checked(toaster, Toast(["Your disk is growing fast", text]))
+    except Exception:
+        logger.info("notifications.growth_toast_failed", exc_info=True)
         return False
 
 

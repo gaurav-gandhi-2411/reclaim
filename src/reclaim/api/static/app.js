@@ -531,6 +531,7 @@ async function readCandidateCache(stateEl, path) {
 }
 
 async function loadOverview() {
+  loadGrowthPanel(); // reads the growth store, not the scan: independent of everything below
   const stateEl = document.getElementById("overview-state");
   const contentEl = document.getElementById("overview-content");
   contentEl.hidden = true;
@@ -559,6 +560,241 @@ async function loadOverview() {
       actionLabel: "Retry",
       onAction: loadOverview,
     });
+  }
+}
+
+// --- "What changed" panel (disk growth attribution, ADR-0046) -----------------------------------
+//
+// Read-only: renders GET /api/growth and never offers a delete/apply. Every string from the server
+// (labels, volume names) goes through textContent. The only action is a link that opens the
+// existing Review tab pre-filtered to the row's category; the API's `review_link` is a query for
+// /api/candidates, which the dashboard has no route for, so it is translated into the Review
+// tab's own tier/category selects.
+
+let growthWindow = "1d";
+const GROWTH_WINDOW_LABEL = { "1d": "the last day", "7d": "the last 7 days" };
+
+// {tier, category} for a row's `review_link`, or null when the row has no link or the Review tab
+// has no matching filter option (then no link is shown rather than a link that filters nothing).
+function reviewFilterFromLink(link) {
+  if (!link) return null;
+  let params;
+  try {
+    params = new URL(link, "http://reclaim.invalid").searchParams;
+  } catch {
+    return null;
+  }
+  const category = params.get("category");
+  const tier = params.get("tier") ?? "both";
+  const categorySelect = document.getElementById("review-category-filter");
+  const tierSelect = document.getElementById("review-tier-filter");
+  const has = (select, value) => !!select && [...select.options].some((o) => o.value === value);
+  if (!category || !has(categorySelect, category) || !has(tierSelect, tier)) return null;
+  return { tier, category };
+}
+
+function openReviewFiltered({ tier, category }) {
+  document.getElementById("review-tier-filter").value = tier;
+  document.getElementById("review-category-filter").value = category;
+  activateTab("review"); // its loader reads the two selects just set
+}
+
+function signedBytes(bytes) {
+  return `${bytes < 0 ? "−" : "+"}${formatFromBytes(Math.abs(bytes))}`;
+}
+
+// " (as of 14:05)" for the newest snapshot a figure rests on, in local time; "" when unknown.
+// Snapshots are 4-hourly, so the figure can be hours old and the panel says so.
+function growthAsOf(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || Number.isNaN(d.getTime())) return "";
+  const two = (n) => String(n).padStart(2, "0");
+  return ` (as of ${two(d.getHours())}:${two(d.getMinutes())})`;
+}
+
+function renderGrowthVolumes(volumes, windowLabel) {
+  const list = document.getElementById("growth-volumes");
+  list.innerHTML = "";
+  for (const v of volumes) {
+    const li = document.createElement("li");
+    if (v.status !== "ok") {
+      li.textContent = `${v.volume} — not enough snapshots for ${windowLabel} yet${growthAsOf(v.as_of)}.`;
+    } else {
+      li.textContent =
+        `${v.volume} ${v.change_bytes < 0 ? "shrank" : "grew"} ` +
+        `${formatFromBytes(Math.abs(v.change_bytes))} in ${windowLabel}: ` +
+        `${formatFromBytes(v.attributed_bytes)} attributed to the folders below, ` +
+        `${signedBytes(v.not_attributed_bytes)} not attributed${growthAsOf(v.as_of)}.`;
+    }
+    list.appendChild(li);
+  }
+}
+
+function renderGrowthRows(rows) {
+  const list = document.getElementById("growth-rows");
+  list.innerHTML = "";
+  for (const row of rows) {
+    const li = document.createElement("li");
+    li.className = "rc-growth-row";
+    const label = document.createElement("span");
+    label.className = "rc-growth-label";
+    label.textContent = row.label;
+    label.title = row.path;
+    const bytes = document.createElement("span");
+    bytes.className = "rc-growth-bytes";
+    bytes.textContent = signedBytes(row.growth_bytes);
+    li.appendChild(label);
+    li.appendChild(bytes);
+    if (row.partial) {
+      const partial = document.createElement("span");
+      partial.className = "rc-growth-partial";
+      partial.textContent = "partial";
+      partial.title =
+        "The latest size of this folder was cut off by the snapshot's time budget, so its growth may be understated.";
+      li.appendChild(partial);
+    }
+    const filter = reviewFilterFromLink(row.review_link);
+    if (filter) {
+      const link = document.createElement("a");
+      link.className = "rc-growth-link";
+      link.href = `#review-${filter.category}`;
+      link.textContent = "Review in Review Queue";
+      link.setAttribute("aria-label", `Review ${row.label} in the Review Queue`);
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        openReviewFiltered(filter);
+      });
+      li.appendChild(link);
+    }
+    list.appendChild(li);
+  }
+}
+
+async function loadGrowthPanel() {
+  const stateEl = document.getElementById("growth-state");
+  const contentEl = document.getElementById("growth-content");
+  if (!stateEl || !contentEl) return; // a page without the panel (e.g. a trimmed test DOM)
+  const windowAtStart = growthWindow;
+  contentEl.hidden = true;
+  renderState(stateEl, "loading", { title: "Loading what changed…" });
+  for (const btn of document.querySelectorAll("#growth-panel [data-window]")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.window === windowAtStart));
+  }
+
+  try {
+    const data = await api(`/api/growth?window=${encodeURIComponent(windowAtStart)}`);
+    if (windowAtStart !== growthWindow) return; // a newer toggle click owns the panel now
+    if (data.status !== "ok") {
+      renderState(stateEl, "empty", {
+        title: "Not enough snapshots yet",
+        message: "Not enough snapshots yet — Reclaim takes one every 4 hours.",
+      });
+      return;
+    }
+    stateEl.innerHTML = "";
+    contentEl.hidden = false;
+    const windowLabel = GROWTH_WINDOW_LABEL[windowAtStart];
+    renderGrowthVolumes(data.volumes, windowLabel);
+    renderGrowthRows(data.rows);
+    const excluded = document.getElementById("growth-excluded");
+    excluded.textContent =
+      `${data.excluded_aggregate.label}: ` +
+      (data.excluded_aggregate.bytes > 0
+        ? `${signedBytes(data.excluded_aggregate.bytes)} in total, not itemised.`
+        : "no change measured, never itemised.");
+  } catch (err) {
+    if (windowAtStart !== growthWindow) return;
+    renderState(stateEl, "error", {
+      title: "Could not load what changed",
+      message: err.message,
+      actionLabel: "Retry",
+      onAction: loadGrowthPanel,
+    });
+  }
+}
+
+function initGrowthPanel() {
+  for (const btn of document.querySelectorAll("#growth-panel [data-window]")) {
+    btn.addEventListener("click", () => {
+      growthWindow = btn.dataset.window;
+      loadGrowthPanel();
+    });
+  }
+}
+
+// --- SIMPLE mode: one-line disk-growth summary (same GET /api/growth data as the panel above) -----
+//
+// One line under the Clean My Computer buttons, e.g. "C: grew 6.2 GB this week, mostly Docker".
+// It is read-only and never blocks or breaks the page: a failed request just hides the line.
+// Only the row `label` is ever named (never `path`), and an excluded project can only appear as
+// the aggregate's own label (the server never itemises one, this also guards the client side).
+
+const SIMPLE_GROWTH_STEADY_BYTES = 0.05 * 1024 ** 3; // tiny changes read as noise, not as growth
+
+// The text for GET /api/growth?window=7d, or null when there is no figure to show yet.
+function simpleGrowthLineText(data) {
+  if (!data || data.status !== "ok") return null;
+  const ok = (data.volumes ?? []).filter((v) => v.status === "ok");
+  if (ok.length === 0) return null;
+  // The system drive when it has data, else whichever volume changed most.
+  const vol =
+    ok.find((v) => /^c:/i.test(v.volume)) ??
+    ok.reduce((a, b) => (Math.abs(b.change_bytes) > Math.abs(a.change_bytes) ? b : a));
+  const name = vol.volume.replace(/[\\/]+$/, "");
+  if (Math.abs(vol.change_bytes) < SIMPLE_GROWTH_STEADY_BYTES) {
+    return `${name} held steady this week.`;
+  }
+  if (vol.change_bytes < 0) {
+    return `${name} shrank ${formatFromBytes(-vol.change_bytes)} this week.`;
+  }
+  // /api/growth without `volume` returns rows from every volume: keep this volume's own (the
+  // server's rule: case-insensitive, slash-insensitive prefix of "<volume>\\").
+  const root = `${name}\\`.toLowerCase();
+  const norm = (r) => String(r.path ?? "").replace(/\//g, "\\").toLowerCase();
+  const onVolume = (r) => norm(r) === name.toLowerCase() || norm(r).startsWith(root);
+  const growing = (data.rows ?? []).filter((r) => r.growth_bytes > 0 && onVolume(r));
+  // The API lists nested folders too (Users, Users\g\AppData, ...\Docker), so the biggest row is
+  // usually an ancestor. Mirror growth.drill_down (src/reclaim/growth.py, _DRILL_SHARE = 0.6) and
+  // keep the two in sync: from the biggest row, while a strictly-inside descendant has at least
+  // 60% of the current growth, move to the largest such one (ties: longer path).
+  const DRILL_SHARE = 0.6;
+  let top = growing.reduce((a, b) => (a && a.growth_bytes >= b.growth_bytes ? a : b), null);
+  while (top) {
+    const p = norm(top);
+    const parent = p.replace(/\\+$/, "");
+    const inner = growing.filter(
+      (r) =>
+        norm(r) !== p &&
+        (norm(r) === parent || norm(r).startsWith(`${parent}\\`)) &&
+        r.growth_bytes >= DRILL_SHARE * top.growth_bytes
+    );
+    if (inner.length === 0) break;
+    top = inner.reduce((a, b) =>
+      b.growth_bytes > a.growth_bytes ||
+      (b.growth_bytes === a.growth_bytes && String(b.path).length > String(a.path).length)
+        ? b
+        : a
+    );
+  }
+  let line = `${name} grew ${formatFromBytes(vol.change_bytes)} this week`;
+  if (top) {
+    const who = top.kind === "excluded" ? data.excluded_aggregate.label : top.label;
+    line += top.growth_bytes * 2 >= vol.change_bytes ? `, mostly ${who}` : `, biggest: ${who}`;
+  }
+  return `${line}.`;
+}
+
+async function loadSimpleGrowthLine(el) {
+  el.hidden = false;
+  el.textContent = "Checking disk growth…";
+  try {
+    const data = await api("/api/growth?window=7d");
+    if (!el.isConnected) return; // the idle screen was replaced while the request ran
+    el.textContent = simpleGrowthLineText(data) ?? "Disk growth: not enough snapshots yet.";
+  } catch {
+    if (!el.isConnected) return;
+    el.textContent = "";
+    el.hidden = true; // quiet: a missing summary is never worth an error on the Simple page
   }
 }
 
@@ -1060,6 +1296,14 @@ function renderSimpleIdle() {
     note.textContent = `Last cleaned this session: ${simpleLastCleanedNote}.`;
     container.appendChild(note);
   }
+
+  // Last, so nothing above it (the buttons) can shift when the figure arrives.
+  const growthLine = document.createElement("p");
+  growthLine.id = "simple-growth-line";
+  growthLine.className = "rc-scan-status rc-simple-growth";
+  growthLine.setAttribute("aria-live", "polite");
+  container.appendChild(growthLine);
+  loadSimpleGrowthLine(growthLine);
 }
 
 // Human wording per regenerable item status. "Skipped" outcomes are surfaced, never hidden: a
@@ -1996,6 +2240,10 @@ export {
   ensureCandidatesWarm,
   readCandidateCache,
   loadOverview,
+  loadGrowthPanel,
+  initGrowthPanel,
+  simpleGrowthLineText,
+  reviewFilterFromLink,
   loadQuickClean,
   loadTreemapView,
   loadReviewQueue,
@@ -3577,6 +3825,7 @@ function init() {
   initTabs();
   initScanBar();
   initReviewQueue();
+  initGrowthPanel();
   initAISuggestions();
   initQuickClean();
   initSimpleMode();

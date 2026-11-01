@@ -148,6 +148,11 @@ _CASES: dict[str, Case] = {
         expect_index=False,
         reason="same query shape as duplicate_size_candidates (pinned whole-table aggregate)",
     ),
+    "opaque_aggregates": Case(
+        lambda idx: idx.opaque_aggregates(_SCOPE, limit=10),
+        expect_index=True,
+        reason="prefix-range scoped via _prefix_range (the growth sampler, ADR-0046)",
+    ),
     "subtree_size_bytes": Case(
         lambda idx: idx.subtree_size_bytes(_SCOPE),
         expect_index=True,
