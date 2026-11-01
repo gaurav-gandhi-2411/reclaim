@@ -370,24 +370,41 @@ def diagnose(ds: Dataset, events: list[Res]) -> Res:
 # ---------------------------------------------------------------- steady-growth control
 
 
-def steady_growth_control(rate_gib_day: float, days: int = 14, every_h: int = 4) -> Res:
-    """Synthetic, deterministic: used space rises at a constant rate, snapshots every 4 h. No
-    event and no noise, so every volume alert is a false alarm by construction."""
+# Alerts at snapshots before this index use the no-history fallback (volume z is None, floor
+# alone), which keeps a fresh install from going quiet: the 72 h window starts 18 snapshots back
+# and needs >= 6 thinned intervals (min_ref_intervals) before that.
+WARMUP_SNAPSHOTS = 24
+
+
+def steady_growth_control(
+    rate_gib_day: float, days: int = 14, every_h: int = 4, surge_gib: int = 0
+) -> Res:
+    """Synthetic, deterministic: used space rises at a constant rate, snapshots every 4 h. With
+    surge_gib = 0 there is no event and no noise, so every volume alert is a false alarm by
+    construction. With surge_gib > 0 that much extra growth is spread over one day (6 snapshots)
+    ending 1 day before the series ends: the volume rule must still fire on it."""
     base, total = 100 * GIB, 500 * GIB
     n = days * 24 // every_h
-    pts = [
-        (i * every_h * 3600.0, int(base + rate_gib_day * GIB * i * every_h / 24)) for i in range(n)
-    ]
+    per_day = 24 // every_h
+    surge_from = n - 2 * per_day  # first snapshot of the surge day
+    pts = []
+    for i in range(n):
+        share = min(max(i - surge_from, 0), per_day) / per_day
+        value = base + rate_gib_day * GIB * i * every_h / 24 + surge_gib * GIB * share
+        pts.append((i * every_h * 3600.0, int(value)))
     fired = [
-        t
-        for t, _ in pts
+        i
+        for i, (t, _) in enumerate(pts)
         if any(a.scope == "volume" for a in g.detect_anomalies({}, "C:\\", pts, total, t))
     ]
     return {
         "rate_gib_per_day": rate_gib_day,
+        "surge_gib": surge_gib,
         "snapshots": len(pts),
         "alerting_snapshots": len(fired),
-        "first_alert_day": round(fired[0] / 86400, 2) if fired else None,
+        "alerting_after_warmup": sum(i >= WARMUP_SNAPSHOTS for i in fired),
+        "alerting_from_surge_start": sum(i >= surge_from for i in fired),
+        "first_alert_day": round(pts[fired[0]][0] / 86400, 2) if fired else None,
     }
 
 
@@ -457,6 +474,7 @@ def evaluate() -> Res:
         "event_diagnostics": diagnose(ds, events),
         "c_used_drift": c_used_drift(ds),
         "steady_growth_control": [steady_growth_control(r) for r in (1.0, 1.5, 2.0, 3.0)],
+        "surge_on_steady_control": [steady_growth_control(2.0, surge_gib=20)],
     }
 
 
@@ -525,8 +543,8 @@ BEFORE = {  # variant -> (recall, alert episodes, false-alarm episodes, precisio
 FIX_SHA = "4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e"  # fix(growth): fresh start and end samples
 
 
-def change_log(m: Res) -> list[str]:
-    """Before/after of the detector for the window-freshness fix (same fixtures and thresholds)."""
+def change_log(m: Res, steady: list[Res], surge: list[Res]) -> list[str]:
+    """Before/after of the detector for each fix (same fixtures and thresholds)."""
     lines = [
         "## Change log",
         "",
@@ -549,20 +567,72 @@ def change_log(m: Res) -> list[str]:
         "Read the drop in recall with the honesty section: it is the two census-time detections "
         "that rested on a 52 h old C: sample.",
         "",
+        f"- Detector fix, volume rule needs a robust z (steady growth): before = code "
+        f"`{Z_BEFORE_CODE_SHA}` (report `{Z_BEFORE_REPORT_SHA}`), after = `{Z_FIX_SHA}`. "
+        "Fixtures, abs_floor, share_floor, z_min, windows and the key rule unchanged; the "
+        "baseline is unchanged (it does not call the detector).",
+        "",
+        "| detector variant | recall before -> after | alert episodes | false-alarm episodes | "
+        "precision (lower bound) |",
+        "|---|---|---|---|---|",
+    ]
+    for v, (rec, eps, fa, prec) in Z_BEFORE.items():
+        a = m[v]
+        lines.append(
+            f"| {v} | {rec} -> {a['recall']} | {eps} -> {a['episodes']} | "
+            f"{fa} -> {a['false_alarm_episodes']} | {prec} -> {a['precision']} |"
+        )
+    lines += [
+        "",
+        "Steady-growth control, alerting snapshots of 84 (before -> after; the after alerts are "
+        "all in the first 24 snapshots, before the volume has 6 intervals of history):",
+        "",
+        "| growth (GiB/day) | alerting snapshots | alerting after warm-up |",
+        "|---|---|---|",
+    ]
+    for c in steady:
+        b = Z_BEFORE_STEADY[c["rate_gib_per_day"]]
+        lines.append(
+            f"| {c['rate_gib_per_day']} | {b[0]} -> {c['alerting_snapshots']} | "
+            f"{b[1]} -> {c['alerting_after_warmup']} |"
+        )
+    s = surge[0]
+    lines += [
+        "",
+        f"Surge control ({s['rate_gib_per_day']} GiB/day plus {s['surge_gib']} GiB in one day): "
+        f"alerting snapshots {Z_BEFORE_SURGE[0]} -> {s['alerting_snapshots']}, of which from the "
+        f"surge day on {Z_BEFORE_SURGE[1]} -> {s['alerting_from_surge_start']}. The rule still "
+        "fires on the surge; it no longer fires on the steady growth underneath it.",
+        "",
     ]
     return lines
 
 
+# Numbers before the volume-z fix, as published in this report at commit c768b92 (detector code
+# at e1c40b0 is identical). Constants: the old detector no longer exists.
+Z_BEFORE_CODE_SHA = "e1c40b0847ac11d6455f8205a0fa6534859e69c9"
+Z_BEFORE_REPORT_SHA = "c768b927cedabc339bbb61be76ca352b0f260086"
+Z_FIX_SHA = "c21cc05aef6cfbf5660c9b425753e520b423c89d"  # fix(growth): volume rule robust z
+Z_BEFORE = {  # variant -> (recall, alert episodes, false-alarm episodes, precision)
+    "detector": ("1/5", 5, 4, 0.2),
+    "detector_literal": ("1/5", 3, 2, 0.333),
+}
+Z_BEFORE_STEADY = {1.0: (0, 0), 1.5: (0, 0), 2.0: (66, 60), 3.0: (66, 60)}  # rate -> (all, warm)
+Z_BEFORE_SURGE = (66, 12)  # alerting snapshots, of which from the surge day on
+
 OPEN_ISSUE = [
-    "## Open design issue: steady growth trips the 3-day volume rule (NOT fixed)",
+    "## Steady growth and the 3-day volume rule (FIXED)",
     "",
-    "Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) trips the volume rule and keeps it tripped "
-    "for as long as the growth lasts (synthetic control above: 2.0 and 3.0 GiB/day alert on "
-    "66 of 84 snapshots). The key rule does not have this problem because it needs a high "
-    "robust z-score. Candidate fix, not built: also require the volume rate's own robust z-score "
-    "once >= 6 intervals of history exist (same estimator as `key_z`, applied to the volume's "
-    "used-space series). Not applied here: the control is synthetic and the fix must not be "
-    "tuned on the 5 evaluable events.",
+    "Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) used to trip the volume rule and keep it "
+    "tripped for as long as the growth lasted (2.0 and 3.0 GiB/day alerted on 66 of 84 "
+    "snapshots). Fixed as applied in the change log: the volume rule now also computes the "
+    "volume rate's robust z with `key_z` (same estimator, history and thinning as the key rule) "
+    "and skips a window whose z is below `z_min`. With fewer than 6 thinned intervals of "
+    "history z is None and the floor alone still alerts, so a fresh install does not go quiet "
+    "(the remaining control alerts are all in that warm-up). No threshold was changed and the "
+    "fix was decided on the synthetic control, not tuned on the 5 evaluable events. Steady "
+    "growth that fills a disk is still covered by the 80%-full notification (R5), not by this "
+    "rule.",
     "",
 ]
 
@@ -616,7 +686,12 @@ def render_markdown(res: Res, sha: str) -> str:
         for v in VARIANTS
     ]
     lines.append("| false-alarm episodes per week of data | " + " | ".join(per_week) + " |")
-    lines += ["", *change_log(m), "## Coverage (hours of data per source)", ""]
+    lines += [
+        "",
+        *change_log(m, res["steady_growth_control"], res["surge_on_steady_control"]),
+        "## Coverage (hours of data per source)",
+        "",
+    ]
     lines += [
         "| source | hours | continuous stretches | longest stretch (h) | samples | span (days) |",
         "|---|---|---|---|---|---|",
@@ -662,19 +737,35 @@ def render_markdown(res: Res, sha: str) -> str:
         "Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots): "
         "every volume alert is a false alarm by construction.",
         "",
-        "| growth (GiB/day) | snapshots | alerting snapshots | first alert (day) |",
-        "|---|---|---|---|",
+        "| growth (GiB/day) | snapshots | alerting snapshots | alerting after warm-up | "
+        "first alert (day) |",
+        "|---|---|---|---|---|",
     ]
     for c in res["steady_growth_control"]:
         lines.append(
             f"| {c['rate_gib_per_day']} | {c['snapshots']} | {c['alerting_snapshots']} |"
-            f" {c['first_alert_day']} |"
+            f" {c['alerting_after_warmup']} | {c['first_alert_day']} |"
         )
     lines += [
         "",
-        "Arithmetic: a steady rate r trips the 5 GiB / 72 h rule once 3r >= 5, "
-        "i.e. r >= 1.67 GiB/day;"
-        " after that it stays tripped for as long as the growth lasts.",
+        "Arithmetic: a steady rate r crosses the 5 GiB / 72 h floor once 3r >= 5, "
+        "i.e. r >= 1.67 GiB/day. Before the volume-z fix it then stayed tripped for as long as "
+        f"the growth lasted. Now only the warm-up (the first {WARMUP_SNAPSHOTS} snapshots, "
+        "while the volume has < 6 intervals of history and z is None) can alert.",
+        "",
+        "Surge on top of steady growth (the fix must not blind the rule): same series, plus "
+        "extra growth spread over one day ending 1 day before the end.",
+        "",
+        "| growth (GiB/day) | surge (GiB) | alerting snapshots | alerting after warm-up | "
+        "alerting from surge day on |",
+        "|---|---|---|---|---|",
+    ]
+    for c in res["surge_on_steady_control"]:
+        lines.append(
+            f"| {c['rate_gib_per_day']} | {c['surge_gib']} | {c['alerting_snapshots']} |"
+            f" {c['alerting_after_warmup']} | {c['alerting_from_surge_start']} |"
+        )
+    lines += [
         "",
         "Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cannot be "
         "measured on it. Net C: used change per continuous stretch of >= 2 h:",

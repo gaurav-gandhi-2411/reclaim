@@ -101,9 +101,17 @@ def test_replay_is_fast_and_deterministic() -> None:
 
 
 def test_steady_growth_control_matches_the_arithmetic() -> None:
-    # 3 days of r GiB/day cross 5 GiB iff r >= 1.67: below it never alerts, above it does.
+    # 3 days of r GiB/day cross 5 GiB iff r >= 1.67: below it never alerts; above it only the
+    # no-history warm-up alerts (volume z is None), never once the volume has history.
     assert ge.steady_growth_control(1.0)["alerting_snapshots"] == 0
-    assert ge.steady_growth_control(3.0)["alerting_snapshots"] > 0
+    steady = ge.steady_growth_control(3.0)
+    assert steady["alerting_snapshots"] > 0
+    assert steady["alerting_after_warmup"] == 0
+
+
+def test_surge_on_steady_growth_still_alerts() -> None:
+    surge = ge.steady_growth_control(2.0, surge_gib=20)
+    assert surge["alerting_from_surge_start"] > 0
 
 
 def _alert(t: float, key: str = "k", growth: int = 6 * ge.GIB) -> ge.Alert:
