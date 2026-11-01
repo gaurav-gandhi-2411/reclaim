@@ -14,7 +14,7 @@ from reclaim.index_location import INDEX_FILE_NAME, default_index_path, resolve_
 # the subcommand also has its own `--config` option. ADR-0041: all of them must land on the same
 # index for the same config.toml.
 _DB_COMMANDS: list[tuple[list[str], str, bool]] = [
-    (["scan", "SCANROOT"], "_run_scan", False),
+    (["scan", "SCANROOT"], "_run_scan", True),
     (["index-prune"], "_run_index_prune", False),
     (["reconcile", "C:\\"], "_run_reconcile", False),
     (["apply", "SCANROOT"], "_run_apply", True),
@@ -136,9 +136,33 @@ def test_unreadable_config_for_a_command_without_config_handling_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     (tmp_path / "config.toml").write_text("[storage\n", encoding="utf-8")
-    monkeypatch.setattr(cli_module, "_run_scan", lambda *_a, **_k: pytest.fail("must not scan"))
-    assert main(["scan", str(tmp_path)]) == 2
+    monkeypatch.setattr(
+        cli_module, "_run_reconcile", lambda *_a, **_k: pytest.fail("must not reconcile")
+    )
+    assert main(["reconcile", "C:\\"]) == 2
     assert "cannot resolve the index location" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("config_text", ["[storage\n", "[storage]\nindex_dir = 5\n"])
+def test_scan_with_an_unreadable_config_refuses_before_touching_any_index(
+    config_text: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ADR-0041: scan has its own --config now (for exclusions), but a config whose [storage]
+    cannot be read still must not fall back to the legacy index. Nothing is scanned, no index
+    is opened, and no database file appears anywhere."""
+    (tmp_path / "config.toml").write_text(config_text, encoding="utf-8")
+    default_db = tmp_path / "legacy" / "index.sqlite3"
+    monkeypatch.setattr(cli_module, "_DEFAULT_DB_PATH", default_db)
+    monkeypatch.setattr(cli_module, "scan_tree", lambda *_a, **_k: pytest.fail("must not scan"))
+    monkeypatch.setattr(cli_module, "ScanIndex", lambda *_a, **_k: pytest.fail("must not open"))
+    for extra in ([], ["--config", str(tmp_path / "config.toml")]):
+        assert main(["scan", str(tmp_path), *extra]) != 0
+    assert "cannot resolve the index location" in capsys.readouterr().err
+    assert not default_db.exists() and not default_db.parent.exists()
+    assert list(tmp_path.rglob("*.sqlite3")) == []
 
 
 def test_vault_default_is_not_moved_by_index_dir(

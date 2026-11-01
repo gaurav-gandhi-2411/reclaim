@@ -1844,9 +1844,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             args.db = resolve_index_db(None, own_config or default_config_path())
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
-            if own_config is None:
-                # scan/reconcile/index-prune have no config handling of their own: refuse rather
-                # than quietly use (or create) the legacy index when [storage] cannot be read.
+            if own_config is None or args.command == "scan":
+                # reconcile/index-prune have no config handling of their own, and scan reads the
+                # config only for its exclusions (not for [storage], which a config it can load
+                # may still break): refuse rather than quietly use (or create) the legacy index
+                # when [storage] cannot be read.
                 print(  # noqa: T201
                     f"reclaim {args.command}: cannot resolve the index location: {exc}",
                     file=sys.stderr,
