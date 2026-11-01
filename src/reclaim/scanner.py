@@ -483,6 +483,33 @@ class GitRepoCache:
         self._clean_cache[repo_root] = clean
         return clean
 
+    def clean_for(self, repo_root: Path | None, path_text: str) -> bool:
+        """`git_repo_clean` for the record at `path_text` (either separator style): runs the git
+        check only where a safety verdict can read it (`needs_git_clean_status`), else `False`,
+        the same not-clean value every git failure already yields."""
+        if repo_root is None or not needs_git_clean_status(path_text):
+            return False
+        return self.is_clean(repo_root)
+
+
+# Scan speed (2026-10-31, build-12 scan slowdown): `git_repo_clean` is read by exactly one rule,
+# `SafetyValidator`'s dev-artifacts exemption, and only for a record with a `node_modules` path
+# segment (`safety._has_path_segment`, case-insensitive). Every other in-repo record is blocked
+# as in-repo whatever the value. Running three git commands per repo for those records cost most
+# of a profile scan on this machine: 1,963 of the 2,050 repo roots in a fresh scan were throwaway
+# test fixtures under %TEMP%, and 11 repos had a `node_modules` row at all. A case-insensitive
+# substring test is a strict superset of the segment test (a part equal to `node_modules` is a
+# substring of the whole lowered path), so every record the exemption can consider still gets
+# the real git answer; the rest get `False`, the conservative value every git failure already
+# produces. If another rule ever reads `git_repo_clean`, widen this predicate in the same change
+# (tests/test_scanner.py pins the equivalence against the validator).
+_GIT_CLEAN_READ_MARKER = "node_modules"
+
+
+def needs_git_clean_status(path_text: str) -> bool:
+    """True iff a safety verdict for a record at `path_text` can depend on `git_repo_clean`."""
+    return _GIT_CLEAN_READ_MARKER in path_text.lower()
+
 
 # Wave 1 finding #5 (2026-07-30 real-disk diagnosis): on a real developer machine, a large
 # fraction of directories `GitRepoCache` finds a `.git` marker under are legitimately owned but
@@ -791,7 +818,7 @@ def build_record(
 
     repo_search_start = entry_path if is_dir_entry else current_dir
     repo_root = git_cache.repo_root_for(repo_search_start)
-    git_clean = git_cache.is_clean(repo_root) if repo_root is not None else False
+    git_clean = git_cache.clean_for(repo_root, str(entry_path))
 
     record = FileRecord(
         path=entry_path,
@@ -912,7 +939,7 @@ def build_record_from_listing(
 
     repo_search_start = entry_path if is_dir_entry else current_dir
     repo_root = git_cache.repo_root_for(repo_search_start)
-    git_clean = git_cache.is_clean(repo_root) if repo_root is not None else False
+    git_clean = git_cache.clean_for(repo_root, str(entry_path))
 
     record = FileRecord(
         path=entry_path,
@@ -1327,7 +1354,7 @@ def _walk_subtree(
             # Resolved at most once per directory, and only if a row actually needs building:
             # every plain file here shares `current_dir`'s repo root, which `build_record`
             # re-derived (from the same memo) once per file.
-            plain_git: tuple[str | None, bool] | None = None
+            plain_git: tuple[str | None, Path | None] | None = None
             plain_count = 0
             for item in listed:
                 if cancel_event is not None and cancel_event.is_set():
@@ -1380,12 +1407,8 @@ def _walk_subtree(
                         if plain_git is None:
                             repo_root = git_cache.repo_root_for(current_dir)
                             plain_git = (
-                                (
-                                    repo_root.as_posix(),
-                                    git_cache.is_clean(repo_root),
-                                )
-                                if repo_root is not None
-                                else (None, False)
+                                repo_root.as_posix() if repo_root is not None else None,
+                                repo_root,
                             )
                         pending_rows.append(
                             file_row(
@@ -1400,7 +1423,7 @@ def _walk_subtree(
                                 ino=id_low,
                                 is_dir=False,
                                 git_repo_root_posix=plain_git[0],
-                                git_repo_clean=plain_git[1],
+                                git_repo_clean=git_cache.clean_for(plain_git[1], posix_path),
                                 scanned_at=scanned_at,
                             )
                         )
