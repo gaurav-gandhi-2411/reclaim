@@ -825,6 +825,24 @@ def key_z(
     return robust_z(rate_h, rates, cfg.eps_per_day / 24)
 
 
+def volume_baseline_rate_h(
+    points: Sequence[Point], start_t: float, cfg: AnomalyConfig
+) -> float | None:
+    """The volume's usual growth in bytes/hour: the median of its day-to-day rates over the
+    `history_s` before `start_t`; None with fewer than `min_ref_intervals` such rates.
+
+    Daily steps, not the 30-minute thinning of key_z: the scale of the reference must match the
+    24/72 h window it is compared with (a window average against per-interval rates mixes two
+    scales, and bursty but steady growth then looks anomalous). There is no division by
+    dispersion either, so a noisy volume cannot hide a real surge: the caller compares the
+    window's growth with baseline * window length against a fixed floor."""
+    ref = _thin([p for p in points if start_t - cfg.history_s <= p[0] <= start_t], 86400.0)
+    rates = [(b[1] - a[1]) / ((b[0] - a[0]) / 3600) for a, b in pairwise(ref)]
+    if len(rates) < cfg.min_ref_intervals:
+        return None
+    return statistics.median(rates)
+
+
 def detect_anomalies(
     keys: Mapping[str, KeySeries],
     volume: str,
@@ -859,10 +877,11 @@ def detect_anomalies(
                 found.append(Anomaly("key", row.path, row.growth, window_h, z, where.path, text))
         vres = window_growth(volume_used, now, window_s, slack_s, end_age_s)
         if vres is not None and vres[0] >= cfg.abs_floor:
-            # Same estimator as the key rule: steady growth is not an anomaly. Steady growth that
-            # fills a disk is still caught by the 80%-full notification (notifications.py, R5).
-            vz = key_z(volume_used, vres[1][0], vres[0] / window_h, cfg)
-            if vz is not None and vz < cfg.z_min:
+            # Steady growth is not an anomaly: only growth in excess of the volume's own usual
+            # daily rate counts. Steady growth that fills a disk is still caught by the
+            # 80%-full notification (notifications.py, R5).
+            base_h = volume_baseline_rate_h(volume_used, vres[1][0], cfg)
+            if base_h is not None and vres[0] - max(base_h, 0.0) * window_h < cfg.abs_floor:
                 continue  # usual for this volume; a longer window may still be unusual
             top = contributors(rows, 2)
             days = window_h / 24
@@ -870,6 +889,8 @@ def detect_anomalies(
             text = f"{vol_name} grew {fmt_gib(vres[0])} in {days:g} days"
             explanation = f"{text} — {parts}" if parts else f"{text} — not attributed"
             attributed = top[0].path if top else None
-            found.append(Anomaly("volume", volume, vres[0], window_h, vz, attributed, explanation))
+            found.append(
+                Anomaly("volume", volume, vres[0], window_h, None, attributed, explanation)
+            )
             break  # the shortest qualifying window is the one worth reporting
     return found

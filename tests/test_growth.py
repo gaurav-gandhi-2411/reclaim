@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: PTH118 -- the fake filesystem keys on plain str paths exactly like the product code
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -644,11 +645,46 @@ def _volume_anomalies_at(vol: list[growth.Point], i: int) -> list[growth.Anomaly
     return detect_anomalies({}, "C:\\", vol[: i + 1], 1000 * GIB, vol[i][0])
 
 
+# The baseline needs 6 daily intervals before the window start, and the 72 h window starts 3 days
+# back: before day 9 only the no-history fallback (floor alone) can alert. Checked after day 10.
+_WARMUP = 10 * 6
+
+
+def _bursty_volume(gib_per_day: float, days: int = 30) -> list[growth.Point]:
+    """Steady growth that arrives as one step a day (03:00-ish), flat in between."""
+    out, v = [], 400 * GIB
+    for i in range(days * 6):
+        if i % 6 == 0:
+            v += int(gib_per_day * GIB)
+        out.append((i * 4 * _H, v))
+    return out
+
+
+def _noisy_volume(sd_gib: float, surge: bool, days: int = 20) -> list[growth.Point]:
+    """Random walk (seed 42), sd_gib per 4 h; optionally +40 GiB spread over day 14."""
+    rng = random.Random(42)  # noqa: S311 -- deterministic test data, not security
+    out, v = [], 400 * GIB
+    for i in range(days * 6):
+        v += rng.gauss(0, sd_gib * GIB)
+        if surge and 14 * 6 <= i < 15 * 6:
+            v += 40 * GIB / 6
+        out.append((i * 4 * _H, int(v)))
+    return out
+
+
 @pytest.mark.parametrize("rate", [2.0, 3.0])
 def test_steady_volume_growth_is_not_flagged_once_history_exists(rate: float) -> None:
-    vol = _steady_volume(rate)
-    # The 72 h window starts 18 samples back; it needs >= 6 intervals before that start.
-    flagged = [i for i in range(24, len(vol)) if _volume_anomalies_at(vol, i)]
+    vol = _steady_volume(rate, days=20)
+    flagged = [i for i in range(_WARMUP, len(vol)) if _volume_anomalies_at(vol, i)]
+    assert flagged == []
+
+
+@pytest.mark.parametrize("rate", [2, 3])
+def test_bursty_steady_volume_growth_is_not_flagged_once_history_exists(rate: int) -> None:
+    # One step a day: the per-interval dispersion is zero, so a dispersion-scaled gate would
+    # alarm on every snapshot. The daily-step baseline matches the window's scale.
+    vol = _bursty_volume(rate)
+    flagged = [i for i in range(_WARMUP, len(vol)) if _volume_anomalies_at(vol, i)]
     assert flagged == []
 
 
@@ -656,7 +692,48 @@ def test_volume_surge_on_top_of_steady_growth_is_still_flagged() -> None:
     vol = _steady_volume(2.0, surge_gib=20)
     found = _volume_anomalies_at(vol, len(vol) - 1)
     assert [a.scope for a in found] == ["volume"]
-    assert (found[0].z or 0) >= 4
+    assert found[0].z is None
+
+
+@pytest.mark.parametrize("sd", [1, 3, 5, 8])
+def test_surge_on_a_noisy_volume_is_still_flagged(sd: int) -> None:
+    # Noise must not hide a real +40 GiB / 24 h: it starts at sample 84 (day 14) and the first
+    # alert has to come within 8 h. The same walk without the surge is silent in that span.
+    surge, quiet = _noisy_volume(sd, True), _noisy_volume(sd, False)
+    span = range(14 * 6, 14 * 6 + 3)
+    assert any(_volume_anomalies_at(surge, i) for i in span)
+    assert not any(_volume_anomalies_at(quiet, i) for i in span)
+
+
+def test_fast_surge_after_flat_history_is_flagged() -> None:
+    vol = [(i * 4 * _H, 400 * GIB + int(50 * GIB * min(max(i * 4 - 14 * 24, 0) / 6, 1)))
+           for i in range(16 * 6)]  # fmt: skip
+    first = next(i for i in range(14 * 6, len(vol)) if _volume_anomalies_at(vol, i))
+    assert first <= 14 * 6 + 1  # within 4 h of the surge starting
+
+
+def test_a_low_excess_window_does_not_hide_a_longer_qualifying_one() -> None:
+    # 2 GiB/day, a 20 GiB step on day 17, then 4.5 GiB extra in the last 24 h. The 24 h window
+    # (6.5 GiB, baseline 2) has an excess of 4.5 GiB, under the floor: skip it with `continue`
+    # and the 72 h window (30.5 GiB, baseline 6) still reports. A `break` would lose it.
+    out, v = [], 400 * GIB
+    for i in range(20 * 6):
+        v += int(2 * GIB / 6) + (i % 3) * 1024**2
+        if 17 * 6 <= i < 18 * 6:
+            v += 20 * GIB // 6
+        if i >= 19 * 6 + 1:
+            v += int(4.5 * GIB / 5)
+        out.append((i * 4 * _H, v))
+    found = _volume_anomalies_at(out, len(out) - 1)
+    assert [(a.scope, a.window_h) for a in found] == [("volume", 72)]
+
+
+def test_volume_baseline_is_the_median_daily_rate_and_none_without_history() -> None:
+    cfg = AnomalyConfig()
+    vol = _steady_volume(3.0, days=20)
+    base = growth.volume_baseline_rate_h(vol, 15 * 86400.0, cfg)
+    assert base is not None and abs(base - 3 * GIB / 24) < 0.01 * GIB / 24
+    assert growth.volume_baseline_rate_h(vol, 5 * 86400.0, cfg) is None  # 5 daily intervals
 
 
 def test_volume_rule_without_history_alerts_on_the_floor_alone() -> None:
