@@ -323,8 +323,13 @@ def test_a_copy_that_stays_bad_fails_the_move_and_rolls_back(
         if dst.endswith("a.bin"):
             st = os.stat(dst)
             relocate._set_attributes(dst, 0)
+            # Flip the first byte rather than writing a constant: a.bin is os.urandom, and a
+            # constant equal to its first byte (1 run in 256) leaves the copy correct, so the
+            # move succeeds and the test fails (CI, release/2026-11-01 run 41315385203).
             with open(dst, "r+b") as fh:
-                fh.write(b"X")
+                first = fh.read(1)
+                fh.seek(0)
+                fh.write(bytes([first[0] ^ 0xFF]))
             os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
 
     monkeypatch.setattr(relocate, "_copy_file", bad_copy)
