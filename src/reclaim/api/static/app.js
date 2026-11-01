@@ -747,7 +747,14 @@ function simpleGrowthLineText(data) {
   if (vol.change_bytes < 0) {
     return `${name} shrank ${formatFromBytes(-vol.change_bytes)} this week.`;
   }
-  const growing = (data.rows ?? []).filter((r) => r.growth_bytes > 0);
+  // /api/growth without `volume` returns rows from every volume: keep this volume's own (the
+  // server's rule: case-insensitive, slash-insensitive prefix of "<volume>\\").
+  const root = `${name}\\`.toLowerCase();
+  const onVolume = (r) => {
+    const p = String(r.path ?? "").replace(/\//g, "\\").toLowerCase();
+    return p === name.toLowerCase() || p.startsWith(root);
+  };
+  const growing = (data.rows ?? []).filter((r) => r.growth_bytes > 0 && onVolume(r));
   const top = growing.reduce((a, b) => (a && a.growth_bytes >= b.growth_bytes ? a : b), null);
   let line = `${name} grew ${formatFromBytes(vol.change_bytes)} this week`;
   if (top) {

@@ -200,3 +200,28 @@ test("advanced: the full What-changed panel still renders, without the one-liner
     "the one-liner is not part of the panel"
   );
 });
+
+test("two volumes: a bigger row on D: is never named for C:", () => {
+  const data = body({
+    volumes: [volume(2 * GIB), volume(9 * GIB, { volume: "D:\\" })],
+    rows: [
+      row("DataLake", 9 * GIB, { path: "D:\lake" }),
+      row("CD cache", 1.5 * GIB, { path: "CD:\odd" }),
+      row("npm cache", 1.5 * GIB, { path: "C:\Users\g\npm" }),
+    ],
+  });
+  assert.equal(simpleGrowthLineText(data), "C: grew 2.0 GB this week, mostly npm cache.");
+  const noC = body({
+    volumes: [volume(2 * GIB), volume(9 * GIB, { volume: "D:\\" })],
+    rows: [row("DataLake", 9 * GIB, { path: "D:\lake" })],
+  });
+  assert.equal(simpleGrowthLineText(noC), "C: grew 2.0 GB this week.");
+});
+
+test("a forward-slash or lower-case row path still counts for its volume", () => {
+  const data = body({
+    volumes: [volume(2 * GIB)],
+    rows: [row("Docker", 2 * GIB, { path: "c:/users/g/docker" })],
+  });
+  assert.equal(simpleGrowthLineText(data), "C: grew 2.0 GB this week, mostly Docker.");
+});
