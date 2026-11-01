@@ -10,6 +10,7 @@ import pytest
 import reclaim.reconciliation as reconciliation_module
 import reclaim.scanner as scanner_module
 from reclaim.cli import _VERSION, _build_parser, _run_serve, main
+from reclaim.config import Config
 from reclaim.index import InaccessibleEntry, ScanIndex
 from reclaim.mode import REQUIRED_POWER_MODE_CONFIRMATION, switch_to_power_mode
 from reclaim.models import FileRecord
@@ -27,6 +28,22 @@ def _isolate_log_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     unconditionally on every `main()` call, unlike the opt-in-per-test `--db`/`--manifest`
     overrides)."""
     monkeypatch.setattr("reclaim.cli.DEFAULT_LOG_PATH", tmp_path / "reclaim.log")
+
+
+@pytest.fixture(autouse=True)
+def _fake_growth_snapshot(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """`check-disk-space` takes a growth snapshot by default (`[growth] enabled`); the real
+    sampler walks this machine's drives, so every test in this file gets a recorder instead.
+    Returns the store paths it was asked for."""
+    stores: list[Path] = []
+
+    def fake(config: object, store_path: Path, **_kw: object) -> str:
+        stores.append(store_path)
+        return "taken"
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", fake)
+    monkeypatch.setattr("reclaim.notifications.send_growth_toast", lambda _text: True)
+    return stores
 
 
 def test_apply_dry_run_skips_duplicates_by_default(
@@ -892,6 +909,57 @@ def test_check_disk_space_does_not_debounce_a_toast_windows_refused(
     assert not state_path.exists()
 
 
+def test_check_disk_space_takes_a_growth_snapshot_into_the_given_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _fake_growth_snapshot: list[Path]
+) -> None:
+    store = tmp_path / "g.sqlite3"
+    exit_code = main(
+        [
+            "check-disk-space",
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--state",
+            str(tmp_path / "state.json"),
+            "--growth-db",
+            str(store),
+        ]
+    )
+    assert exit_code == 0
+    assert _fake_growth_snapshot == [store]
+    assert "growth_snapshot=taken" in capsys.readouterr().out
+
+
+def test_check_disk_space_growth_disabled_makes_no_growth_call(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _fake_growth_snapshot: list[Path]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[growth]\nenabled = false\n", encoding="utf-8")
+    exit_code = main(
+        ["check-disk-space", "--config", str(config_path), "--state", str(tmp_path / "s.json")]
+    )
+    assert exit_code == 0
+    assert _fake_growth_snapshot == []
+    assert "growth_snapshot" not in capsys.readouterr().out
+
+
+def test_check_disk_space_still_toasts_when_the_snapshot_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[notifications]\nenabled = true\ndisk_threshold_percent = 10.0\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", lambda *a, **k: "failed")
+    monkeypatch.setattr("reclaim.notifications.send_disk_space_toast", lambda result: True)
+    exit_code = main(
+        ["check-disk-space", "--config", str(config_path), "--state", str(tmp_path / "s.json")]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "toast=sent" in out
+    assert "growth_snapshot=failed" in out
+
+
 def test_check_disk_space_apply_snooze_writes_state_without_checking(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1001,3 +1069,45 @@ def test_mcp_serve_builds_state_and_runs_the_server_over_stdio(
 
     assert exit_code == 0
     assert run_calls == [{"transport": "stdio"}]
+
+
+def test_scheduled_growth_snapshot_contains_any_failure_resolving_the_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D6: only OSError/ValueError/TOMLDecodeError used to be caught around resolve_index_db
+    from reclaim import cli
+
+    seen: list[Path | None] = []
+
+    def fake_snapshot(config: object, store_path: Path, *, index_path: Path | None) -> str:
+        seen.append(index_path)
+        return "taken"
+
+    def boom(*_a: object, **_k: object) -> Path:
+        raise RuntimeError("simulated resolver bug")
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", fake_snapshot)
+    monkeypatch.setattr("reclaim.cli.resolve_index_db", boom)
+    status = cli._scheduled_growth_snapshot(Config(), tmp_path / "config.toml", tmp_path / "g.db")
+    assert status == "taken" and seen == [None]  # the snapshot still runs, minus the opaque keys
+
+
+def test_check_disk_space_carries_on_when_the_growth_path_raises(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: object, **_k: object) -> str:
+        raise RuntimeError("simulated growth bug")
+
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", boom)
+    exit_code = main(
+        [
+            "check-disk-space",
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--state",
+            str(tmp_path / "s.json"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "growth_snapshot=failed" in out and "percent_used=" in out

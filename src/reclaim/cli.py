@@ -9,6 +9,7 @@ import time
 import tomllib
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from reclaim import (
     agent_artifacts,
@@ -56,6 +57,9 @@ from reclaim.reconciliation import NotAVolumeRootError, compute_disk_reconciliat
 from reclaim.safety import SafetyValidator
 from reclaim.safety_env import assert_not_real_profile_under_pytest
 from reclaim.scanner import ScanDiskFullError, scan_tree
+
+if TYPE_CHECKING:
+    from reclaim.growth import GrowthStore
 
 # Anchored via reclaim.app_paths.data_root (see PR #51 for the original confirmed-live crash
 # this class of bug caused elsewhere): CWD-independent when compiled -- the frozen build now
@@ -458,6 +462,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "data/notification_state.json).",
     )
     check_disk_space_parser.add_argument(
+        "--growth-db",
+        type=Path,
+        default=None,
+        help="Override the growth store path (default: data/growth.sqlite3).",
+    )
+    check_disk_space_parser.add_argument(
         "--apply-snooze",
         action="store_true",
         help="Apply a snooze instead of running a normal check -- invoked by the toast's "
@@ -465,6 +475,54 @@ def _build_parser() -> argparse.ArgumentParser:
         "packaging/reclaim.iss), never by a user directly. Suppresses checks for "
         "config.toml's [notifications] snooze_days (default 7), then exits; fires no toast.",
     )
+
+    growth_parser = subparsers.add_parser(
+        "growth",
+        help="Disk growth attribution (read-only): 'snapshot' records folder sizes under a fixed "
+        "IO budget, 'report' ranks what grew over a window. Writes only growth.sqlite3.",
+    )
+    growth_parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"Path to config.toml ([growth] section; default: {_DEFAULT_CONFIG_PATH}).",
+    )
+    growth_parser.add_argument(
+        "--db",
+        dest="growth_db",
+        type=Path,
+        default=None,
+        help="Growth store path (default: data/growth.sqlite3). Not the scan index.",
+    )
+    growth_subparsers = growth_parser.add_subparsers(dest="growth_action", required=True)
+    growth_snapshot_parser = growth_subparsers.add_parser(
+        "snapshot", help="Record one budgeted snapshot of volumes, caches and folder sizes."
+    )
+    growth_snapshot_parser.add_argument(
+        "--budget-seconds",
+        type=float,
+        default=None,
+        help="Wall-clock IO budget (default: [growth] budget_seconds, 120).",
+    )
+    growth_snapshot_parser.add_argument(
+        "--volume",
+        type=Path,
+        action="append",
+        default=None,
+        help="Volume root to record (repeatable; default: every fixed drive).",
+    )
+    growth_snapshot_parser.add_argument(
+        "--index",
+        type=Path,
+        default=None,
+        help="Scan index to read opaque-tree and excluded-project sizes from "
+        "(default: the configured index, used only if it exists).",
+    )
+    growth_report_parser = growth_subparsers.add_parser(
+        "report", help="Rank folders by growth over a window, with the volume remainder."
+    )
+    growth_report_parser.add_argument("--window", choices=("1d", "7d"), default="1d")
+    growth_report_parser.add_argument("--json", action="store_true", help="Machine-readable.")
 
     auto_clean_parser = subparsers.add_parser(
         "auto-clean",
@@ -1188,6 +1246,9 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     # Imports deferred to inside the function, same reasoning as `_run_serve`'s deferred uvicorn
     # import: `reclaim.notifications` is only needed for this one subcommand, so `scan`/`apply`/
     # `undo`/etc. never pay its (small, but non-zero) import cost.
+    import dataclasses
+
+    from reclaim import growth_alerts
     from reclaim.notifications import (
         DEFAULT_STATE_PATH,
         apply_snooze,
@@ -1209,18 +1270,150 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
         )
         return 0
 
+    growth_db: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
+    # Snapshot first so the toast's explanation reads fresh data. Never raises; with
+    # `[growth] enabled = false` there is no growth IO at all.
+    growth_note = ""
+    if config.growth.enabled:
+        status = _scheduled_growth_snapshot(config, args.config, growth_db)
+        growth_note = f" growth_snapshot={status}"
+
     result = check_disk_space(config.notifications, state_path=state_path)
     toast_note = ""
     if result.should_notify:
+        if config.growth.enabled:
+            line = growth_alerts.recent_growth_line(
+                config, growth_db, time.time(), growth_alerts.system_volume()
+            )
+            result = dataclasses.replace(result, growth_line=line)
         # Debounce only once Windows accepted the toast: a refused one retries on the next run.
         if send_disk_space_toast(result):
             record_notified(state_path)
             toast_note = " toast=sent"
         else:
             toast_note = " toast=not_delivered"
+    if config.growth.enabled:
+        # Its own debounce state; never raises (spec 1.5).
+        growth_note += (
+            f" growth_toast={growth_alerts.maybe_send_growth_toast(config, growth_db, state_path)}"
+        )
     print(  # noqa: T201
         f"reclaim check-disk-space: status={result.status} reason={result.reason} "
-        f"percent_used={result.percent_used} threshold={result.threshold_percent}{toast_note}"
+        f"percent_used={result.percent_used} threshold={result.threshold_percent}"
+        f"{toast_note}{growth_note}"
+    )
+    return 0
+
+
+def _scheduled_growth_snapshot(config: Config, config_path: Path, store_path: Path) -> str:
+    """The 4-hourly task's growth snapshot (spec 1.1): never raises, see `growth_alerts`. Any
+    failure on the growth path, including resolving the index location, is logged and contained:
+    the disk-space check that called this carries on."""
+    import structlog
+
+    from reclaim import growth_alerts
+
+    logger = structlog.get_logger(__name__)
+    index_path: Path | None
+    try:
+        index_path = resolve_index_db(None, config_path)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        index_path = None
+    except Exception:  # a growth failure must never break the disk-space check
+        logger.warning("growth.index_location_failed", exc_info=True)
+        index_path = None  # still take the snapshot, without the opaque keys
+    try:
+        return growth_alerts.scheduled_snapshot(config, store_path, index_path=index_path)
+    except Exception:  # scheduled_snapshot contains its own; this is the last line
+        logger.warning("growth.scheduled_snapshot_failed", exc_info=True)
+        return "failed"
+
+
+def _run_growth(args: argparse.Namespace) -> int:
+    # Deferred import, same reasoning as `_run_check_disk_space`: only this subcommand needs it.
+    import dataclasses
+
+    from reclaim import growth
+
+    config = _load_config_or_none("growth", args.config)
+    if config is None:
+        return 1
+    db_path: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
+    assert_not_real_profile_under_pytest(db_path, operation="write the growth store at")
+    with growth.GrowthStore(db_path) as store:
+        if args.growth_action == "snapshot":
+            return _growth_snapshot(args, config, store)
+        window_s = {"1d": 86400.0, "7d": 7 * 86400.0}[args.window]
+        report = growth.growth_report(
+            growth.hide_excluded(store.load_series(), exclusion_patterns(config)),
+            window_s,
+            time.time(),
+            config.growth.max_start_slack_h * 3600.0,
+            # the view limit, not the alert's `max_end_age_h`: this is not an alert
+            config.growth.view_max_end_age_h * 3600.0,
+        )
+    if args.json:
+        print(json.dumps(dataclasses.asdict(report), indent=2))  # noqa: T201
+        return 0
+    print(f"reclaim growth report: window={args.window}")  # noqa: T201
+    for vol in report.volumes:
+        as_of = (
+            ""
+            if vol.as_of is None
+            else f" (as of {time.strftime('%H:%M', time.localtime(vol.as_of))})"
+        )
+        if vol.status != "ok":
+            print(f"  {vol.volume} insufficient data for this window{as_of}")  # noqa: T201
+            continue
+        print(  # noqa: T201
+            f"  {vol.volume} used {growth.fmt_gib(vol.delta)}; attributed "
+            f"{growth.fmt_gib(vol.attributed)}; not attributed {growth.fmt_gib(vol.not_attributed)}"
+            f"{as_of}"
+        )
+    for row in report.rows[:15]:
+        print(f"  {growth.fmt_gib(row.growth):>12}  {row.label}  ({row.path})")  # noqa: T201
+    if not report.rows:
+        print("  no growth data yet (needs two snapshots spanning the window)")  # noqa: T201
+    return 0
+
+
+def _open_growth_index(index_path: Path | None) -> ScanIndex | None:
+    """The scan index for the opaque aggregates, read-only; None (no opaque keys) when it is
+    absent or cannot be opened."""
+    from reclaim import growth_alerts
+
+    if index_path is None or not index_path.is_file():
+        return None
+    return growth_alerts.open_index_read_only(index_path)
+
+
+def _growth_snapshot(args: argparse.Namespace, config: Config, store: GrowthStore) -> int:
+    from reclaim import growth
+
+    env = growth.environment_from_config(config, args.volume)
+    index_path: Path | None = args.index
+    if index_path is None:
+        try:
+            index_path = resolve_index_db(None, args.config)
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            index_path = None
+    index = _open_growth_index(index_path)
+    try:
+        snap = growth.collect_snapshot(
+            env,
+            last_seen=store.last_seen(),
+            index=index,
+            budget_s=args.budget_seconds or config.growth.budget_seconds,
+            budget_entries=config.growth.budget_entries,
+        )
+    finally:
+        if index is not None:
+            index.close()
+    store.write(snap)
+    partial = sum(1 for m in snap.sizes if m.partial)
+    print(  # noqa: T201
+        f"reclaim growth snapshot: keys={len(snap.sizes)} partial={partial} "
+        f"complete={snap.complete}"
     )
     return 0
 
@@ -1876,6 +2069,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_recover(args)
     if args.command == "check-disk-space":
         return _run_check_disk_space(args)
+    if args.command == "growth":
+        return _run_growth(args)
     if args.command == "auto-clean":
         if args.reconcile_task:
             return _run_reconcile_autoclean_task(args)
