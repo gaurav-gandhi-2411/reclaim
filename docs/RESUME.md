@@ -198,6 +198,16 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     - Gate 3 fails on size, so it goes to the release PR.
   - **Eval:** too thin to rank the detector. 30.77 h of fragments; detector 1/5 vs threshold baseline 2/5; per-week numbers not meaningful. Needs >= 4 weeks of snapshots from the shipped feature.
   - **Next:** install build 13 when it ends; full-profile scan time, warm-up and D5 on it; wave 1; full verify of #233, #229 and #230; RC checklist.
+- 12:15 IST checkpoint 27 (1 Nov).
+  - **Build 13 installed** (`519a9c9`, integration = main + #199's content): 4 h 20 min build, rc 0; safe smoke 14 PASS, serve smoke 13 PASS; silent in-place upgrade from build 12, only the exe hash changed. Rollback: `D:\reclaim-build\installer-e53c40b.exe`.
+  - **Merged:** #235 (frozen smoke suite: cold-cache 409 contract, explicit `--config`, current task name; `ac4bbbb`, main CI green). On build 13: 10 PASS / 3 BLOCKED / 0 FAIL (was 8 / 4 / 1).
+  - **Measured on the installed build:** full-profile scan 2,303,858 entries in 628.03 s (build 12: 4,827.34 s); warm-up 699 s, peak RSS 958 MB; **2-hour soak PASS**, private bytes −0.02 MB/h (95% CI −0.21..0.17).
+  - **Agent Leftovers:** the frozen `apply <path>` refuses itself (rule W5 counted its own command line), fixed in draft **#236** (`964b5a5`, CI 6/6, delete-path gate 4, so the release PR). Waves 1 and 2 applied through build 13's source: 4 items, 16,291,235 bytes in the vault; **restore proven with the frozen `reclaim.exe undo`** (422 files SHA-256 identical). Safe mode back at 08:21:34.
+  - **#229 (D5) real-index A/B:** same 5,999 candidates, 0 looser; but the index hard-link estimate overclaims `uv\cache` by 25.15 GB (46.45 vs 21.30 GB), because opaque trees (`.venv`, `site-packages`) record no files, so uv's links into venvs are invisible. With the live estimate the speed-up is within noise (291-302 s vs 300-304 s; two runs per arm). Posted on #229 with three options; GG's call; its verify and screenshot are parked.
+  - **#230:** integration merged in; full verify 1 failed / 3,252 passed: a MAX_PATH test-only issue, fixed in `90739c3` (file 25/25); screenshot added (`e486350`). CI on the new head pending at this checkpoint.
+  - **#233** full verify rc 0, 2,423 passed.
+  - **RC checklist** `docs/RELEASE-1.4.0-CHECKLIST.md`: not releasable as built (rows 1 and 3 by construction until #199 and #225 land, row 15 needs #236 or a known limit, row 13 is GG's).
+  - **Next:** #230's CI on `e486350`; cleanup (`aa13x`, `bt*`, `shot230*`, `ReclaimJob-*` tasks); §4 hardening.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
