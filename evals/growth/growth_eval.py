@@ -7,9 +7,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import random
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -135,7 +136,7 @@ def _alert(
     return Alert(t, scope, vol, key, growth, window_h, named, start_t, end[0] if end else start_t)
 
 
-def replay(ds: Dataset, method: str) -> list[Alert]:
+def replay(ds: Dataset, method: str, cfg: g.AnomalyConfig | None = None) -> list[Alert]:
     keys = key_series(ds)
     used = {v: ds.series.get(f"volume:{v}:used", []) for v in ("C", "D")}
     out: list[Alert] = []
@@ -161,7 +162,7 @@ def replay(ds: Dataset, method: str) -> list[Alert]:
             continue
         for vol in ("C", "D"):
             found = g.detect_anomalies(
-                keys if vol == "C" else {}, f"{vol}:\\", used[vol], ds.totals[vol], now
+                keys if vol == "C" else {}, f"{vol}:\\", used[vol], ds.totals[vol], now, cfg
             )
             for a in found:
                 pts = used[vol] if a.scope == "volume" else keys[a.path].points
@@ -370,10 +371,11 @@ def diagnose(ds: Dataset, events: list[Res]) -> Res:
 # ---------------------------------------------------------------- steady-growth control
 
 
-# Alerts at snapshots before this index use the no-history fallback (volume z is None, floor
-# alone), which keeps a fresh install from going quiet: the 72 h window starts 18 snapshots back
-# and needs >= 6 thinned intervals (min_ref_intervals) before that.
-WARMUP_SNAPSHOTS = 24
+# Alerts at snapshots before this index use the no-history fallback (no volume baseline, floor
+# alone), which keeps a fresh install from going quiet: the baseline needs >= 6 daily intervals
+# (min_ref_intervals) before the window start and the 72 h window starts 3 days back, so the
+# fallback can alert until about day 9 (snapshot 54); 60 = day 10.
+WARMUP_SNAPSHOTS = 60
 
 
 def steady_growth_control(
@@ -384,6 +386,7 @@ def steady_growth_control(
     construction. With surge_gib > 0 that much extra growth is spread over one day (6 snapshots)
     ending 1 day before the series ends: the volume rule must still fire on it."""
     base, total = 100 * GIB, 500 * GIB
+    # (14 days = 84 snapshots: the surge sits at snapshots 72-77, after the warm-up)
     n = days * 24 // every_h
     per_day = 24 // every_h
     surge_from = n - 2 * per_day  # first snapshot of the surge day
@@ -408,9 +411,128 @@ def steady_growth_control(
     }
 
 
+def _volume_alert_idx(pts: list[Point], total: int) -> list[int]:
+    """Indices of the snapshots at which the detector raises a volume alert (prefix replay)."""
+    return [
+        i
+        for i, (t, _) in enumerate(pts)
+        if any(a.scope == "volume" for a in g.detect_anomalies({}, "C:\\", pts[: i + 1], total, t))
+    ]
+
+
+def bursty_steady_control(rate_gib_day: float, days: int = 30) -> Res:
+    """Synthetic: the same steady growth as the smooth control, but arriving as one step a day
+    (snapshot 0 of each day), flat in between. No event: every alert after the warm-up is a false
+    alarm by construction. A dispersion-scaled gate cannot pass this (per-interval MAD is 0)."""
+    value, pts = 100 * GIB, []
+    for i in range(days * 6):
+        if i % 6 == 0:
+            value += int(rate_gib_day * GIB)
+        pts.append((i * 4 * 3600.0, value))
+    fired = _volume_alert_idx(pts, 500 * GIB)
+    return {
+        "rate_gib_per_day": rate_gib_day,
+        "snapshots": len(pts),
+        "alerting_snapshots": len(fired),
+        "alerting_after_warmup": sum(i >= WARMUP_SNAPSHOTS for i in fired),
+    }
+
+
+def noisy_surge_control(sd_gib: float, surge_gib: int = 40, days: int = 20) -> Res:
+    """Synthetic, seed 42: random-walk volume (sd_gib per 4 h snapshot), optionally plus surge_gib
+    spread over day 14 (6 snapshots). Reports the first alert after the surge starts, with and
+    without the surge, so a surge alert can be told from noise. Noise on its own alerts too (the
+    5 GiB floor is far below the walk's 24 h spread when sd is large); the rule must not hide the
+    surge, and must not alert more often than the floor alone."""
+    start = 14 * 6
+    out: Res = {"sd_gib_per_4h": sd_gib, "surge_gib": surge_gib}
+    for label, surge in (("with_surge", surge_gib), ("noise_only", 0)):
+        rng = random.Random(42)  # noqa: S311 -- deterministic synthetic data, not security
+        value, pts = 400 * GIB, []
+        for i in range(days * 6):
+            value += rng.gauss(0, sd_gib * GIB)
+            if surge and start <= i < start + 6:
+                value += surge * GIB / 6
+            pts.append((i * 4 * 3600.0, int(value)))
+        fired = [i for i in _volume_alert_idx(pts, 500 * GIB) if i >= start]
+        out[f"{label}_alerts"] = len(fired)
+        out[f"{label}_first_alert_h"] = (fired[0] - start) * 4 if fired else None
+    return out
+
+
+def sustained_leak_control(gib_per_day: float = 10.0, quiet_days: int = 14, days: int = 34) -> Res:
+    """Synthetic, seed 42: flat (tiny noise) for quiet_days, then a constant leak. Reports how
+    long the detector alerts before the 14-day history absorbs the leak as 'usual'. Not a
+    pass/fail: the 80%-full check (R5) is the backstop and does not fire below its threshold."""
+    rng = random.Random(42)  # noqa: S311 -- deterministic synthetic data, not security
+    start = quiet_days * 6
+    value, pts = 400 * GIB, []
+    for i in range(days * 6):
+        value += rng.gauss(0, 0.05 * GIB) + (gib_per_day * GIB / 6 if i >= start else 0)
+        pts.append((i * 4 * 3600.0, int(value)))
+    fired = [i for i in _volume_alert_idx(pts, 2000 * GIB) if i >= start]
+    return {
+        "gib_per_day": gib_per_day,
+        "alerting_snapshots": len(fired),
+        "first_alert_h_after_start": (fired[0] - start) * 4 if fired else None,
+        "last_alert_h_after_start": (fired[-1] - start) * 4 if fired else None,
+        "days_alerting": round((fired[-1] - fired[0] + 1) / 6, 1) if fired else 0,
+    }
+
+
+def dropped_alerts(ds: Dataset, events: list[Res], now_alerts: list[Alert]) -> Res:
+    """Alert episodes of the pre-fix volume rule (floor alone: history_s = 0 leaves the baseline
+    undefined, which is exactly the old behaviour) that the current detector no longer raises.
+    A dropped alert is listed, not counted as a win: no documented event is not a verified
+    non-event."""
+    old = replay(ds, "detector", replace(g.AnomalyConfig(), history_s=0.0))
+    kept = {(a.t, a.scope, a.volume, a.key) for a in now_alerts}
+    reference = [
+        e
+        for e in events
+        if e["kind"] == "growth"
+        and e["attribution_status"] != "unproven"
+        and float(str(e["size_gib"])) >= 5
+    ]
+    dropped: list[Res] = []
+    for ep in episodes(old):
+        if any((a.t, a.scope, a.volume, a.key) in kept for a in ep.alerts):
+            continue
+        hit = [str(ev["id"]) for ev in reference if any(covers(a, ev) for a in ep.alerts)]
+        dropped.append(
+            {
+                **describe(ep.first),
+                "alerts": len(ep.alerts),
+                "max_growth_gib": round(max(a.growth for a in ep.alerts) / GIB, 1),
+                "covers_documented_event": hit,
+            }
+        )
+    dropped.sort(key=lambda d: -float(d["max_growth_gib"]))
+    legacy = score(events, episodes(old))
+    cfg = g.AnomalyConfig()
+    with_baseline = sum(
+        g.volume_baseline_rate_h(ds.series.get(f"volume:{a.volume}:used", []), a.start_t, cfg)
+        is not None
+        for a in old
+        if a.scope == "volume"
+    )
+    return {
+        "prefix_rule_alerts": len(old),
+        "prefix_rule_alerts_with_a_baseline": with_baseline,
+        "prefix_rule_episodes": legacy["episodes"],
+        "prefix_rule_false_alarm_episodes": legacy["false_alarm_episodes"],
+        "prefix_rule_recall": legacy["recall"],
+        "dropped_episodes": dropped,
+    }
+
+
 # ---------------------------------------------------------------- report
 
 VARIANTS = ("detector", "detector_literal", "baseline", "baseline_literal")
+FALSE_ALARM_CAVEAT = (
+    'A "false alarm" here means no documented event covers the episode, not a verified '
+    "non-event: the docs do not list every real write."
+)
 # Events added to events.json AFTER the first replay had shown a D: alert (see the honesty
 # section). A detection of one of these is not independent of the replay that motivated it.
 POST_HOC_EVENTS = ("pagefile-to-d-2026-10-09", "hf-copy-to-d-2026-10-09")
@@ -475,6 +597,11 @@ def evaluate() -> Res:
         "c_used_drift": c_used_drift(ds),
         "steady_growth_control": [steady_growth_control(r) for r in (1.0, 1.5, 2.0, 3.0)],
         "surge_on_steady_control": [steady_growth_control(2.0, surge_gib=20)],
+        "bursty_steady_control": [bursty_steady_control(r) for r in (2.0, 3.0)],
+        "noisy_surge_control": [noisy_surge_control(3.0)],
+        "sustained_leak_control": sustained_leak_control(),
+        "false_alarm_definition": FALSE_ALARM_CAVEAT,
+        "dropped_alerts": dropped_alerts(ds, events, replay(ds, "detector")),
     }
 
 
@@ -543,8 +670,10 @@ BEFORE = {  # variant -> (recall, alert episodes, false-alarm episodes, precisio
 FIX_SHA = "4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e"  # fix(growth): fresh start and end samples
 
 
-def change_log(m: Res, steady: list[Res], surge: list[Res]) -> list[str]:
+def change_log(res: Res) -> list[str]:
     """Before/after of the detector for each fix (same fixtures and thresholds)."""
+    m: Res = res["methods"]
+    steady: list[Res] = res["steady_growth_control"]
     lines = [
         "## Change log",
         "",
@@ -567,10 +696,17 @@ def change_log(m: Res, steady: list[Res], surge: list[Res]) -> list[str]:
         "Read the drop in recall with the honesty section: it is the two census-time detections "
         "that rested on a 52 h old C: sample.",
         "",
-        f"- Detector fix, volume rule needs a robust z (steady growth): before = code "
-        f"`{Z_BEFORE_CODE_SHA}` (report `{Z_BEFORE_REPORT_SHA}`), after = `{Z_FIX_SHA}`. "
-        "Fixtures, abs_floor, share_floor, z_min, windows and the key rule unchanged; the "
-        "baseline is unchanged (it does not call the detector).",
+        f"- Detector fix, volume rule alerts on growth in excess of the volume's own daily "
+        f"baseline (steady growth): before = code `{Z_BEFORE_CODE_SHA}` (report "
+        f"`{Z_BEFORE_REPORT_SHA}`), after = `{Z_FIX_SHA}`. Fixtures, abs_floor, share_floor, "
+        "z_min, windows and the key rule unchanged; the baseline is unchanged (it does not call "
+        "the detector). A first attempt at this fix (`44c8a5d`, volume rate robust z >= z_min) "
+        "was rejected by a falsifying verifier before merge: it compared a window-average rate "
+        "with per-interval rate dispersion, so on a noisy volume a real +40 GiB / 24 h surge was "
+        "suppressed (0 alerts where `e1c40b0` gave 32 on the same series) and bursty steady "
+        "growth (+2 or +3 GiB once a day) still alarmed on every snapshot (MAD 0, z dominated by "
+        "eps). The rule now subtracts the median daily-step rate of the previous 14 days times "
+        "the window length and alerts if the excess is >= abs_floor; no new threshold.",
         "",
         "| detector variant | recall before -> after | alert episodes | false-alarm episodes | "
         "precision (lower bound) |",
@@ -582,29 +718,95 @@ def change_log(m: Res, steady: list[Res], surge: list[Res]) -> list[str]:
             f"| {v} | {rec} -> {a['recall']} | {eps} -> {a['episodes']} | "
             f"{fa} -> {a['false_alarm_episodes']} | {prec} -> {a['precision']} |"
         )
+    lines += ["", FALSE_ALARM_CAVEAT, ""]
     lines += [
+        f"Synthetic controls (seed 42; `e1c40b0` and the rejected `44c8a5d` measured by running "
+        f"the same control functions on the exported code, constants below; warm-up = first "
+        f"{WARMUP_SNAPSHOTS} snapshots):",
         "",
-        "Steady-growth control, alerting snapshots of 84 (before -> after; the after alerts are "
-        "all in the first 24 snapshots, before the volume has 6 intervals of history):",
-        "",
-        "| growth (GiB/day) | alerting snapshots | alerting after warm-up |",
-        "|---|---|---|",
+        "| control | `e1c40b0` (before) | `44c8a5d` (rejected) | after |",
+        "|---|---|---|---|",
     ]
     for c in steady:
-        b = Z_BEFORE_STEADY[c["rate_gib_per_day"]]
+        b, r = Z_BEFORE_STEADY[c["rate_gib_per_day"]], Z_REJECTED_STEADY[c["rate_gib_per_day"]]
         lines.append(
-            f"| {c['rate_gib_per_day']} | {b[0]} -> {c['alerting_snapshots']} | "
-            f"{b[1]} -> {c['alerting_after_warmup']} |"
+            f"| steady {c['rate_gib_per_day']} GiB/day, 84 snapshots: alerting (after warm-up) | "
+            f"{b[0]} ({b[1]}) | {r[0]} ({r[1]}) | "
+            f"{c['alerting_snapshots']} ({c['alerting_after_warmup']}) |"
         )
-    s = surge[0]
+    for c in res["bursty_steady_control"]:
+        b, r = Z_BEFORE_BURSTY, Z_REJECTED_BURSTY
+        lines.append(
+            f"| bursty steady {c['rate_gib_per_day']} GiB once a day, {c['snapshots']} snapshots: "
+            f"alerting (after warm-up) | {b[0]} ({b[1]}) | {r[0]} ({r[1]}) | "
+            f"{c['alerting_snapshots']} ({c['alerting_after_warmup']}) |"
+        )
+    s = res["surge_on_steady_control"][0]
+    lines.append(
+        f"| {s['rate_gib_per_day']} GiB/day + {s['surge_gib']} GiB in one day: alerting from the "
+        f"surge day on | {Z_BEFORE_SURGE[1]} | {Z_REJECTED_SURGE} | "
+        f"{s['alerting_from_surge_start']} |"
+    )
+    n = res["noisy_surge_control"][0]
+    lines.append(
+        f"| random walk sd {n['sd_gib_per_4h']} GiB / 4 h + {n['surge_gib']} GiB over a day: "
+        "alerts from the surge start (first alert, h after start) | "
+        f"{Z_BEFORE_NOISY[0]} ({Z_BEFORE_NOISY[1]} h) | {Z_REJECTED_NOISY[0]} | "
+        f"{n['with_surge_alerts']} ({n['with_surge_first_alert_h']} h) |"
+    )
+    lines.append(
+        f"| the same walk without the surge: alerts | {Z_BEFORE_NOISY[2]} | "
+        f"{Z_REJECTED_NOISY[1]} | {n['noise_only_alerts']} |"
+    )
     lines += [
         "",
-        f"Surge control ({s['rate_gib_per_day']} GiB/day plus {s['surge_gib']} GiB in one day): "
-        f"alerting snapshots {Z_BEFORE_SURGE[0]} -> {s['alerting_snapshots']}, of which from the "
-        f"surge day on {Z_BEFORE_SURGE[1]} -> {s['alerting_from_surge_start']}. The rule still "
-        "fires on the surge; it no longer fires on the steady growth underneath it.",
+        "The rule still fires on a surge on top of steady growth and on a noisy volume; it no "
+        "longer fires on the steady growth underneath. On the noisy walk the 5 GiB floor is far "
+        "below the walk's own 24 h spread, so noise alone still alerts (row above): this rule "
+        "cannot tell a surge from noise there, but it does not suppress the surge, which a zero "
+        "would have meant (the rejected attempt's result).",
         "",
     ]
+    lines += dropped_section(res["dropped_alerts"])
+    return lines
+
+
+def dropped_section(d: Res) -> list[str]:
+    """The alert episodes of the pre-fix volume rule that the current rule no longer raises,
+    listed from the replay, never counted as wins."""
+    lines = [
+        f"Alert episodes the pre-fix volume rule raised on the real fixtures: "
+        f"{d['prefix_rule_episodes']} ({d['prefix_rule_false_alarm_episodes']} false-alarm, recall "
+        f"{d['prefix_rule_recall']}); the rule no longer raises {len(d['dropped_episodes'])} of "
+        "them. Any dropped alert is DROPPED AND UNVERIFIED, not a win: " + FALSE_ALARM_CAVEAT,
+        "",
+        f"Of the pre-fix rule's {d['prefix_rule_alerts']} alerts on these fixtures, "
+        f"{d['prefix_rule_alerts_with_a_baseline']} had >= 6 daily intervals of history before "
+        "their window; the rest fall back to the floor alone.",
+        "",
+    ]
+    if d["dropped_episodes"]:
+        lines += [
+            "| first alert (UTC) | volume | growth (GiB, largest in episode) | window (h) | "
+            "alerts | documented event covered |",
+            "|---|---|---|---|---|---|",
+        ]
+    for e in d["dropped_episodes"]:
+        ev = ", ".join(e["covers_documented_event"]) or "none (unverified)"
+        lines.append(
+            f"| {e['t']} | {e['volume']} | {e['max_growth_gib']} | {e['window_h']} | "
+            f"{e['alerts']} | {ev} |"
+        )
+    if d["dropped_episodes"]:
+        big = d["dropped_episodes"][0]
+        lines += [
+            "",
+            f"The largest dropped alert is {big['max_growth_gib']} GiB on {big['volume']} (episode "
+            f"starting {big['t']}, first alert on a {big['window_h']} h window). It is not "
+            "counted as a false alarm avoided: whether it was a real, undocumented write is not "
+            "known.",
+        ]
+    lines.append("")
     return lines
 
 
@@ -612,27 +814,37 @@ def change_log(m: Res, steady: list[Res], surge: list[Res]) -> list[str]:
 # at e1c40b0 is identical). Constants: the old detector no longer exists.
 Z_BEFORE_CODE_SHA = "e1c40b0847ac11d6455f8205a0fa6534859e69c9"
 Z_BEFORE_REPORT_SHA = "c768b927cedabc339bbb61be76ca352b0f260086"
-Z_FIX_SHA = "c21cc05aef6cfbf5660c9b425753e520b423c89d"  # fix(growth): volume rule robust z
+Z_FIX_SHA = "53efd8563fd40c38d80d3d3aa847309dcb6995d6"  # fix(growth): excess over daily baseline
 Z_BEFORE = {  # variant -> (recall, alert episodes, false-alarm episodes, precision)
     "detector": ("1/5", 5, 4, 0.2),
     "detector_literal": ("1/5", 3, 2, 0.333),
 }
-Z_BEFORE_STEADY = {1.0: (0, 0), 1.5: (0, 0), 2.0: (66, 60), 3.0: (66, 60)}  # rate -> (all, warm)
+# Control results of e1c40b0 and of the rejected 44c8a5d, from running this file's control
+# functions with that growth.py exported (git show <sha>:src/reclaim/growth.py) first on the path.
+Z_BEFORE_STEADY = {1.0: (0, 0), 1.5: (0, 0), 2.0: (66, 24), 3.0: (66, 24)}  # rate -> (all, warm)
+Z_REJECTED_STEADY = {1.0: (0, 0), 1.5: (0, 0), 2.0: (6, 0), 3.0: (6, 0)}
 Z_BEFORE_SURGE = (66, 12)  # alerting snapshots, of which from the surge day on
+Z_REJECTED_SURGE = 11
+Z_BEFORE_BURSTY = (162, 120)  # 30 days of one step a day (2 or 3 GiB): all, after warm-up
+Z_REJECTED_BURSTY = (162, 120)
+Z_BEFORE_NOISY = (32, 4, 27)  # sd 3: surge alerts, first alert (h), noise-only alerts
+Z_REJECTED_NOISY = (0, 0)  # surge alerts, noise-only alerts (the surge was suppressed)
 
 OPEN_ISSUE = [
     "## Steady growth and the 3-day volume rule (FIXED)",
     "",
     "Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) used to trip the volume rule and keep it "
     "tripped for as long as the growth lasted (2.0 and 3.0 GiB/day alerted on 66 of 84 "
-    "snapshots). Fixed as applied in the change log: the volume rule now also computes the "
-    "volume rate's robust z with `key_z` (same estimator, history and thinning as the key rule) "
-    "and skips a window whose z is below `z_min`. With fewer than 6 thinned intervals of "
-    "history z is None and the floor alone still alerts, so a fresh install does not go quiet "
-    "(the remaining control alerts are all in that warm-up). No threshold was changed and the "
-    "fix was decided on the synthetic control, not tuned on the 5 evaluable events. Steady "
-    "growth that fills a disk is still covered by the 80%-full notification (R5), not by this "
-    "rule.",
+    "snapshots). Fixed as applied in the change log: the volume rule now subtracts the "
+    "volume's usual growth (the median of its day-to-day rates over the previous 14 days, times "
+    "the window length) and alerts only if the excess is >= abs_floor. With fewer than 6 daily "
+    "intervals of history there is no baseline and the floor alone still alerts, so a fresh "
+    "install does not go quiet (the remaining control alerts are all in that warm-up). No "
+    "threshold was changed and the fix was decided on synthetic controls, not tuned on the 5 "
+    "evaluable events. Limits: a sustained leak is absorbed into the baseline once it fills "
+    "half of the 14-day history (control below), and on a noisy volume noise alone still "
+    "crosses the floor. Steady growth that fills a disk is still covered by the 80%-full "
+    "notification (R5), not by this rule; R5 does not fire below its threshold.",
     "",
 ]
 
@@ -688,7 +900,9 @@ def render_markdown(res: Res, sha: str) -> str:
     lines.append("| false-alarm episodes per week of data | " + " | ".join(per_week) + " |")
     lines += [
         "",
-        *change_log(m, res["steady_growth_control"], res["surge_on_steady_control"]),
+        FALSE_ALARM_CAVEAT,
+        "",
+        *change_log(res),
         "## Coverage (hours of data per source)",
         "",
     ]
@@ -751,7 +965,8 @@ def render_markdown(res: Res, sha: str) -> str:
         "Arithmetic: a steady rate r crosses the 5 GiB / 72 h floor once 3r >= 5, "
         "i.e. r >= 1.67 GiB/day. Before the volume-z fix it then stayed tripped for as long as "
         f"the growth lasted. Now only the warm-up (the first {WARMUP_SNAPSHOTS} snapshots, "
-        "while the volume has < 6 intervals of history and z is None) can alert.",
+        "while the volume has < 6 daily intervals before the window and no baseline exists) can "
+        "alert.",
         "",
         "Surge on top of steady growth (the fix must not blind the rule): same series, plus "
         "extra growth spread over one day ending 1 day before the end.",
@@ -766,6 +981,34 @@ def render_markdown(res: Res, sha: str) -> str:
             f" {c['alerting_after_warmup']} | {c['alerting_from_surge_start']} |"
         )
     lines += [
+        "",
+        "Bursty steady growth (one step a day, flat in between; 30 days, no event):",
+        "",
+        "| step (GiB/day) | snapshots | alerting snapshots | alerting after warm-up |",
+        "|---|---|---|---|",
+    ]
+    for c in res["bursty_steady_control"]:
+        lines.append(
+            f"| {c['rate_gib_per_day']} | {c['snapshots']} | {c['alerting_snapshots']} |"
+            f" {c['alerting_after_warmup']} |"
+        )
+    n = res["noisy_surge_control"][0]
+    lk = res["sustained_leak_control"]
+    lines += [
+        "",
+        f"Noisy volume (seed 42, random walk sd {n['sd_gib_per_4h']} GiB per 4 h, 20 days): "
+        f"with a {n['surge_gib']} GiB surge over day 14 the detector alerts on "
+        f"{n['with_surge_alerts']} snapshots from the surge start, the first "
+        f"{n['with_surge_first_alert_h']} h after it; the same walk without the surge alerts on "
+        f"{n['noise_only_alerts']} (first {n['noise_only_first_alert_h']} h after day 14).",
+        "",
+        f"Sustained leak (no pass/fail): {lk['gib_per_day']} GiB/day after 14 quiet days. The "
+        f"detector alerts on {lk['alerting_snapshots']} snapshots, from "
+        f"{lk['first_alert_h_after_start']} h to {lk['last_alert_h_after_start']} h after the "
+        f"leak starts ({lk['days_alerting']} days between first and last), then the 14-day "
+        "history absorbs it as usual. The 80%-full notification (R5) is the backstop for a leak "
+        "that goes on; it does not fire below its threshold, so a leak that stays under 80% "
+        "full is silent after that point.",
         "",
         "Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cannot be "
         "measured on it. Net C: used change per continuous stretch of >= 2 h:",
@@ -784,7 +1027,8 @@ def render_markdown(res: Res, sha: str) -> str:
         f"Of the {m['detector']['false_alarm_episodes']} as-replayed detector false-alarm "
         "episodes, "
         f"{len(stale)} rest on a start sample older than 72 h or a newest sample older than 1 h "
-        "(gap artifacts); the rest are in the JSON (`methods.detector_literal`).",
+        "(gap artifacts); the rest are in the JSON (`methods.detector_literal`). "
+        + FALSE_ALARM_CAVEAT,
         "",
         *OPEN_ISSUE,
         HONESTY.format(
