@@ -1077,6 +1077,17 @@ def _path_excluded(env: PatternView, *paths: Path) -> bool:
     return False
 
 
+def _subtree_excluded(env: AgentEnv, path: Path) -> bool:
+    """`path` is, or holds anywhere beneath it, an excluded project (the name-only subtree walk the
+    W7/C7 proofs use). Run BEFORE any git command in `path`: `git status` lists every untracked
+    file, so it would read inside an excluded project the path itself does not name. A walk that
+    fails counts as a hit (fail closed)."""
+    try:
+        return env.exclusion_match(path, True) is not None
+    except OSError:
+        return True
+
+
 def _slug_excluded(env: AgentEnv, name: str) -> bool:
     """The exclusion globs against a Claude project slug (every non-alphanumeric is `-` there, so
     an excluded `my_proj` appears as `my-proj`); the patterns get the same rewrite."""
@@ -1109,8 +1120,10 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
     # Exclusions first, from the path strings alone: an excluded project's worktree or repository
     # is not touched at all (no git runs in it), not merely refused later.
     pointer_file = (path / ".git").is_file()  # anything else is refused visibly by W1 below
-    if _path_excluded(env, path, repo) or (
-        pointer_file and _nested_git_excluded(env, path / ".git")
+    if (
+        _path_excluded(env, path, repo)
+        or (pointer_file and _nested_git_excluded(env, path / ".git"))
+        or _subtree_excluded(env, path)
     ):
         # The pointer's admin dir can name an excluded common dir (A3b review, N4/F5h).
         return _excluded("worktree", path, project, repo)
@@ -1165,8 +1178,13 @@ def matches_clone_name(env: AgentEnv, path: Path) -> bool:
 def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
     held: list[str] = []
     project = path.name
-    if _path_excluded(env, path) or _gitdir_excluded(env, path / ".git"):
-        # e.g. `clone --shared` of an excluded project reads its objects (A3b review, N4/F5g)
+    if (
+        _path_excluded(env, path)
+        or _gitdir_excluded(env, path / ".git")
+        or _subtree_excluded(env, path)
+    ):
+        # e.g. `clone --shared` of an excluded project reads its objects (A3b review, N4/F5g), or
+        # an excluded project sits INSIDE it: git status would list its files
         return _excluded("clone", path, project, path)
     try:
         if not matches_clone_name(env, path):
