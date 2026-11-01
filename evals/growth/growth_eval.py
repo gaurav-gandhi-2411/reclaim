@@ -205,6 +205,14 @@ def episodes(alerts: list[Alert]) -> list[Episode]:
 # ---------------------------------------------------------------- scoring
 
 
+def cite_label(cite: Res) -> str:
+    """Report label for a citation: the doc plus the line it sat on when the truth was written.
+
+    The line is provenance only (RESUME.md keeps shifting); the test anchors on the quote.
+    """
+    return f"{cite['doc']}:{cite['line_at_8fc9bc6']}"
+
+
 def load_events() -> Res:
     data: Res = json.loads((FIXTURES / "events.json").read_text())
     return data
@@ -647,7 +655,8 @@ def render_markdown(res: Res, sha: str) -> str:
     for ev in load_events()["events"]:
         if not ev["evaluable"]:
             lines.append(f"- `{ev['id']}` ({ev['kind']}, {ev['size_gib']} GiB, "
-                         f"{', '.join(ev['citation'])}): {ev['evaluable_reason']}")  # fmt: skip
+                         f"{', '.join(map(cite_label, ev['citation']))}): "
+                         f"{ev['evaluable_reason']}")  # fmt: skip
     lines += ["", "## The 3-day volume rule on steady growth", ""]
     lines += [
         "Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots): "

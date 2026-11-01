@@ -35,17 +35,25 @@ def test_fixtures_never_name_an_excluded_project() -> None:
 
 
 def test_every_event_is_cited_to_an_existing_doc_line() -> None:
-    events = ge.load_events()["events"]
-    assert events
-    for ev in events:
+    # Citations anchor on a verbatim QUOTE, not a line number: docs/RESUME.md is a living
+    # checkpoint whose lines shift every session (the old line-number check passed on lines that
+    # had drifted to unrelated text). `line_at_8fc9bc6` is provenance only.
+    events = ge.load_events()
+    cites = [c for ev in events["events"] for c in ev["citation"]]
+    cites += [c for ev in events["not_events"] for c in ev["citation"]]
+    assert events["events"]
+    docs: dict[str, str] = {}
+    for ev in events["events"]:
         assert ev["citation"], ev["id"]
-        for cite in ev["citation"]:
-            doc, _, line = cite.rpartition(":")
-            lines = (ROOT / doc).read_text(encoding="utf-8").splitlines()
-            assert re.fullmatch(r"\d+", line), cite
-            assert 1 <= int(line) <= len(lines) and lines[int(line) - 1].strip(), cite
         assert ev["kind"] in ("growth", "shrink")
         assert ev["evaluable_reason"], ev["id"]
+    for cite in cites:
+        assert isinstance(cite["line_at_8fc9bc6"], int), cite
+        assert 8 <= len(cite["quote"]) <= 130, cite
+        text = docs.setdefault(
+            cite["doc"], (ROOT / cite["doc"]).read_text(encoding="utf-8").replace("\r\n", "\n")
+        )
+        assert text.count(cite["quote"]) == 1, cite
 
 
 def test_evaluable_flag_agrees_with_fixture_coverage() -> None:
