@@ -628,6 +628,45 @@ def test_key_rule_needs_history_but_volume_rule_still_names_the_cause() -> None:
     assert found[0].attributed == "C:\\new"
 
 
+def _steady_volume(gib_per_day: float, days: int = 14, surge_gib: int = 0) -> list[growth.Point]:
+    """4-hourly volume series growing steadily, a deterministic wobble, optionally a surge of
+    `surge_gib` spread over the last 24 h (6 samples)."""
+    out, v = [], 400 * GIB
+    for i in range(days * 6):
+        v += int(gib_per_day * GIB / 6) + (i % 3) * 1024**2
+        if surge_gib and i >= days * 6 - 6:
+            v += surge_gib * GIB // 6
+        out.append((i * 4 * _H, v))
+    return out
+
+
+def _volume_anomalies_at(vol: list[growth.Point], i: int) -> list[growth.Anomaly]:
+    return detect_anomalies({}, "C:\\", vol[: i + 1], 1000 * GIB, vol[i][0])
+
+
+@pytest.mark.parametrize("rate", [2.0, 3.0])
+def test_steady_volume_growth_is_not_flagged_once_history_exists(rate: float) -> None:
+    vol = _steady_volume(rate)
+    # The 72 h window starts 18 samples back; it needs >= 6 intervals before that start.
+    flagged = [i for i in range(24, len(vol)) if _volume_anomalies_at(vol, i)]
+    assert flagged == []
+
+
+def test_volume_surge_on_top_of_steady_growth_is_still_flagged() -> None:
+    vol = _steady_volume(2.0, surge_gib=20)
+    found = _volume_anomalies_at(vol, len(vol) - 1)
+    assert [a.scope for a in found] == ["volume"]
+    assert (found[0].z or 0) >= 4
+
+
+def test_volume_rule_without_history_alerts_on_the_floor_alone() -> None:
+    # 6 GiB in 24 h; only 5 intervals precede the window start, below min_ref_intervals
+    vol = [(i * 4 * _H, 100 * GIB + i * GIB) for i in range(12)]
+    found = detect_anomalies({}, "C:\\", vol, 1000 * GIB, vol[-1][0])
+    assert [a.scope for a in found] == ["volume"]
+    assert found[0].z is None
+
+
 def test_drill_down_prefers_the_specific_folder_over_its_ancestor() -> None:
     rows = [
         growth.GrowthRow("C:\\Users\\g", "toplevel", "g", "", "", 20 * GIB, 0),

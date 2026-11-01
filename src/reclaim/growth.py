@@ -859,14 +859,17 @@ def detect_anomalies(
                 found.append(Anomaly("key", row.path, row.growth, window_h, z, where.path, text))
         vres = window_growth(volume_used, now, window_s, slack_s, end_age_s)
         if vres is not None and vres[0] >= cfg.abs_floor:
+            # Same estimator as the key rule: steady growth is not an anomaly. Steady growth that
+            # fills a disk is still caught by the 80%-full notification (notifications.py, R5).
+            vz = key_z(volume_used, vres[1][0], vres[0] / window_h, cfg)
+            if vz is not None and vz < cfg.z_min:
+                continue  # usual for this volume; a longer window may still be unusual
             top = contributors(rows, 2)
             days = window_h / 24
             parts = "; ".join(f"{fmt_gib(r.growth)} from {r.label}" for r in top)
             text = f"{vol_name} grew {fmt_gib(vres[0])} in {days:g} days"
             explanation = f"{text} — {parts}" if parts else f"{text} — not attributed"
             attributed = top[0].path if top else None
-            found.append(
-                Anomaly("volume", volume, vres[0], window_h, None, attributed, explanation)
-            )
+            found.append(Anomaly("volume", volume, vres[0], window_h, vz, attributed, explanation))
             break  # the shortest qualifying window is the one worth reporting
     return found
