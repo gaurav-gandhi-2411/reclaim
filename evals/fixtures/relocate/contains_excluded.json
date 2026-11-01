@@ -1,0 +1,1 @@
+{"case": "contains_excluded", "why": "A folder that contains an excluded project must stay.", "files": [{"path": "x/y-zzexclproj-z/f.bin", "size": 10}], "action": "move", "expect": "refused", "reason": "excluded project"}

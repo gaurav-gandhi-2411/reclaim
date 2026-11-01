@@ -467,6 +467,23 @@ class ArchivePairsConfig(BaseModel):
     retention_days: int | None = 30
 
 
+class AgentArtifactsConfig(BaseModel):
+    """Stale AI-agent leftovers (docs/specs/agent-artifacts.md): finished git worktrees,
+    throwaway verify clones and idle agent scratch. Other tools' data, not Reclaim's caches, so
+    OFF until the owner enables it; forced off in SAFE mode (`models.SAFE_MODE_FORCED_OFF_
+    CATEGORY_GROUPS`) because removal is a vault move. Always Tier B (the user clicks)."""
+
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    enabled: bool = False
+    # Vault retention. Always an int: these are never permanently deleted on apply.
+    retention_days: int = Field(default=14, ge=1)
+    # Scratch must be idle this long (newest content mtime) and so must a session transcript.
+    idle_days: float = Field(default=7.0, ge=1.0)
+    # Directory-name globs (case-insensitive) of standalone throwaway clones.
+    clone_name_patterns: list[str] = Field(default_factory=lambda: ["*-verify*", "_verify*"])
+
+
 class DuplicatesConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -541,6 +558,7 @@ class CategoriesConfig(BaseModel):
     # clusters" — resolved the same way as every other category: Tier-A-capable, default off,
     # so by default duplicates land in Tier B exactly as that example describes.
     duplicates: DuplicatesConfig = Field(default_factory=DuplicatesConfig)
+    agent_artifacts: AgentArtifactsConfig = Field(default_factory=AgentArtifactsConfig)
 
 
 class UpdateCheckConfig(BaseModel):

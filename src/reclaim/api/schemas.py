@@ -35,6 +35,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "archive_pairs": "Extracted Archive Pairs",
     "large_logs": "Large Stale Logs",
     "duplicates": "Exact Duplicates",
+    "agent_artifacts": "Agent Leftovers (worktrees, clones, scratch)",
     "other": "Uncategorized",
     # ADR-0025: the category_group `apply_selection` assigns to an explicitly-named path that
     # wasn't already a deterministic candidate (the common case for an AI-suggestion apply) --
@@ -95,6 +96,10 @@ _PLAIN_LANGUAGE_CATEGORY: dict[str, tuple[str, str | None]] = {
     ),
     "large_logs": ("Large log files", None),
     "duplicates": ("Duplicate copies", "One copy is always kept."),
+    "agent_artifacts": (
+        "Finished AI-agent worktrees, clones and scratch",
+        "Each one is proven pushed and unused, then moved to the vault so you can undo it.",
+    ),
 }
 
 

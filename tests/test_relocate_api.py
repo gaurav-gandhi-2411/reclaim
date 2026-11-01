@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+import reclaim.api.relocate_routes as routes
+import reclaim.relocate as relocate
+from reclaim.api import security
+from reclaim.api.app import create_app
+from reclaim.config import Config, ExclusionsConfig
+
+_HOST, _PORT = "127.0.0.1", 8420
+
+
+@pytest.fixture
+def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Path, Path]:
+    app_dir = tmp_path / "app"
+    app = create_app(
+        db_path=app_dir / "index.sqlite3",
+        config=Config(exclusions=ExclusionsConfig(project_names=["zzexclproj"])),
+        config_path=app_dir / "config.toml",
+        vault_dir=app_dir / "data" / "quarantine",
+        manifest_path=app_dir / "data" / "quarantine" / "manifest.jsonl",
+        mode_log_path=app_dir / "mode_log.jsonl",
+        first_run_state_path=app_dir / "first_run_state.json",
+        log_path=app_dir / "reclaim.log",
+        host=_HOST,
+        port=_PORT,
+    )
+    d = tmp_path / "D"
+    d.mkdir()
+    d_key = relocate._key(d)
+    # One test volume: the tmp "D" folder stands in for a second fixed drive.
+    monkeypatch.setattr(
+        relocate, "_volume_serial", lambda p: 2 if relocate._key(p).startswith(d_key) else 1
+    )
+    monkeypatch.setattr(routes, "_target_drives", lambda _anchor: [d])
+    client = TestClient(
+        app,
+        base_url=f"http://{_HOST}:{_PORT}",
+        headers={security.CSRF_HEADER_NAME: app.state.reclaim.csrf_token},
+    )
+    source = tmp_path / "models"
+    source.mkdir()
+    (source / "w.bin").write_bytes(b"w" * 1000)
+    return client, source, d
+
+
+def _wait(client: TestClient) -> dict[str, object]:
+    for _ in range(200):
+        job = client.get("/api/relocate/status").json()
+        if job["status"] != "running":
+            return job
+        time.sleep(0.05)
+    raise AssertionError("the job never finished")
+
+
+def test_plan_then_move_then_roll_back(setup: tuple[TestClient, Path, Path]) -> None:
+    client, source, d = setup
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    assert plan["ok"], plan
+    assert plan["bytes"] == 1000
+    assert Path(plan["target"]).is_relative_to(d / "reclaim-relocated")
+
+    started = client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert started.status_code == 202
+    job = _wait(client)
+    assert job["status"] == "done", job
+    assert relocate._is_reparse(str(source))
+
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    assert move["stage"] == "done"
+    assert move["delete_old_allowed_at"] == pytest.approx(
+        move["swapped_at"] + relocate.KEEP_OLD_COPY_DAYS * 86400
+    )
+    assert client.post(f"/api/relocate/{move['id']}/rollback").status_code == 202
+    assert _wait(client)["status"] == "done"
+    assert not relocate._is_reparse(str(source))
+    assert (source / "w.bin").read_bytes() == b"w" * 1000
+
+
+def test_a_move_needs_the_token_of_the_plan_the_user_saw(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    (source / "more.bin").write_bytes(b"m" * 10)  # the folder changed after the review
+    stale = client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert stale.status_code == 409
+    assert "changed since you reviewed it" in stale.json()["detail"]
+    forged = client.post(
+        "/api/relocate/move",
+        json={"source": plan["source"], "target": plan["target"], "confirm_token": "0" * 64},
+    )
+    assert forged.status_code == 409
+    assert not relocate._is_reparse(str(source))
+
+
+def test_without_the_csrf_token_nothing_starts(setup: tuple[TestClient, Path, Path]) -> None:
+    client, source, _d = setup
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    response = client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+        headers={security.CSRF_HEADER_NAME: "wrong"},
+    )
+    assert response.status_code == 403
+    assert not relocate._is_reparse(str(source))
+
+
+def test_only_folders_in_the_profile_and_targets_on_another_drive(
+    setup: tuple[TestClient, Path, Path], tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    client, source, _d = setup
+    outside = Path(tmp_path_factory.getbasetemp().anchor) / "Windows"
+    assert client.post("/api/relocate/plan", json={"source": str(outside)}).status_code == 400
+    same_drive = source.parent / "elsewhere"
+    response = client.post(
+        "/api/relocate/plan", json={"source": str(source), "target": str(same_drive)}
+    )
+    assert response.status_code == 400
+    assert "another fixed drive" in response.json()["detail"]
+
+
+def test_an_excluded_project_is_refused_with_its_reason(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    excluded = source.parent / "zzexclproj" / "cache"
+    excluded.mkdir(parents=True)
+    (excluded / "f").write_bytes(b"x")
+    plan = client.post("/api/relocate/plan", json={"source": str(excluded)}).json()
+    assert not plan["ok"]
+    assert plan["confirm_token"] is None
+    assert any("excluded project" in r for r in plan["reasons"])
+
+
+def test_candidates_are_read_only(setup: tuple[TestClient, Path, Path]) -> None:
+    client, _source, d = setup
+    data = client.get("/api/relocate/candidates").json()
+    assert data["target_drive"] == str(d)
+    assert isinstance(data["candidates"], list)
+    assert client.get("/api/relocate/moves").json() == {"moves": []}
+
+
+def test_one_job_at_a_time_and_unknown_ids(setup: tuple[TestClient, Path, Path]) -> None:
+    client, _source, _d = setup
+    assert client.post("/api/relocate/nope/rollback").status_code == 404
+    assert client.post("/api/relocate/..%2F..%2Fx/rollback").status_code in {400, 404}
+    assert client.get("/api/relocate/status").json()["status"] == "idle"
+
+
+def test_rollback_with_the_old_copy_and_the_kept_flag(setup: tuple[TestClient, Path, Path]) -> None:
+    client, source, _d = setup
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    (source / "w.bin").write_bytes(b"edited through the junction")
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    assert move["old_copy_kept"] is True
+    assert client.post(f"/api/relocate/{move['id']}/rollback?use_old_copy=true").status_code == 202
+    assert _wait(client)["status"] == "done"
+    assert (source / "w.bin").read_bytes() == b"w" * 1000  # the copy from before the move
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    assert move["stage"] == "rolled_back" and move["old_copy_kept"] is False
+    assert Path(plan["target"], "w.bin").read_bytes() == b"edited through the junction"
+
+
+def _moved(client: TestClient, source: Path) -> dict[str, object]:
+    (source / "laterexcl").mkdir()
+    (source / "laterexcl" / "main.py").write_text("print(1)\n", encoding="utf-8")
+    plan = client.post("/api/relocate/plan", json={"source": str(source)}).json()
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    (move,) = client.get("/api/relocate/moves").json()["moves"]
+    return move
+
+
+def test_delete_old_never_deletes_an_old_copy_holding_an_excluded_project(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B7 M3 at the API: the dashboard's delete-old passes the exclusion policy too. The name
+    becomes excluded after the move, as in the review's CLI probe."""
+    client, source, _d = setup
+    move = _moved(client, source)
+    state = client.app.state.reclaim  # type: ignore[attr-defined]
+    state.config = Config(exclusions=ExclusionsConfig(project_names=["zzexclproj", "laterexcl"]))
+    response = client.post(f"/api/relocate/{move['id']}/delete-old", json={"confirm": True})
+    assert response.status_code == 202
+    job = _wait(client)
+    assert job["status"] == "failed"
+    assert "exclu" in str(job["error"])
+    assert Path(str(move["moved"]), "laterexcl", "main.py").is_file()
+
+
+def test_delete_old_removes_the_old_copy_when_nothing_is_excluded(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    move = _moved(client, source)
+    response = client.post(f"/api/relocate/{move['id']}/delete-old", json={"confirm": True})
+    assert response.status_code == 202
+    assert _wait(client)["status"] == "done"
+    assert not Path(str(move["moved"])).exists()
+    assert (source / "laterexcl" / "main.py").is_file()  # the live folder, through the junction
+
+
+def test_an_unreadable_journal_is_reported_not_hidden(setup: tuple[TestClient, Path, Path]) -> None:
+    client, _source, _d = setup
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    journals.mkdir(parents=True, exist_ok=True)
+    (journals / "relocate-abc123.json").write_text("{not json", encoding="utf-8")
+    response = client.get("/api/relocate/moves")
+    assert response.status_code == 500
+    assert "relocate-abc123.json" in response.json()["detail"]
+
+
+def _run_move(client: TestClient, source: Path, target: Path | None = None) -> dict[str, object]:
+    body = {"source": str(source), **({"target": str(target)} if target else {})}
+    plan = client.post("/api/relocate/plan", json=body).json()
+    assert plan["ok"], plan
+    client.post(
+        "/api/relocate/move",
+        json={
+            "source": plan["source"],
+            "target": plan["target"],
+            "confirm_token": plan["confirm_token"],
+        },
+    )
+    assert _wait(client)["status"] == "done"
+    return plan
+
+
+def _rows(client: TestClient) -> dict[str, dict[str, object]]:
+    return {m["id"]: m for m in client.get("/api/relocate/moves").json()["moves"]}
+
+
+def test_old_copy_kept_is_false_for_a_deleted_old_journal_of_an_undone_move(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B8 BELIEVED 3. After rollback + delete-old the journal is inert, but a LATER move's old
+    copy sits at the same path with the first journal's restored-folder ID, so the identity
+    check alone said the first move still kept an old copy."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (first,) = _rows(client).values()
+    client.post(f"/api/relocate/{first['id']}/rollback")
+    assert _wait(client)["status"] == "done"
+    client.post(f"/api/relocate/{first['id']}/delete-old", json={"confirm": True})
+    assert _wait(client)["status"] == "done"
+    _run_move(client, source)
+    rows = _rows(client)
+    assert rows[str(first["id"])]["stage"] == "deleted_old"
+    assert rows[str(first["id"])]["old_copy_kept"] is False
+    (second,) = [m for i, m in rows.items() if i != first["id"]]
+    assert second["stage"] == "done" and second["old_copy_kept"] is True
+
+
+def test_old_copy_kept_is_false_for_a_rolled_back_journal_a_later_move_superseded(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """A use_old_copy rollback puts the old copy back at the path; the next move freezes that
+    folder to `<name>.reclaim-moved`, where it carries the first journal's folder ID again."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (first,) = _rows(client).values()
+    client.post(f"/api/relocate/{first['id']}/rollback?use_old_copy=true")
+    assert _wait(client)["status"] == "done"
+    assert _rows(client)[str(first["id"])]["old_copy_kept"] is False  # nothing kept yet
+    # The first move's target still holds the moved folder, so the next one needs its own.
+    _run_move(client, source, _d / "reclaim-relocated" / "second")
+    rows = _rows(client)
+    assert rows[str(first["id"])]["old_copy_kept"] is False
+    (second,) = [m for i, m in rows.items() if i != first["id"]]
+    assert second["old_copy_kept"] is True
+
+
+def test_delete_old_allowed_at_counts_from_when_the_old_copy_started_being_kept(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    """B8 BELIEVED 2. A swap a kill interrupted has no `swapped_at`; the engine counts the 7
+    days from the SWAPPING entry (`_kept_since`), and so must the page."""
+    client, source, _d = setup
+    _run_move(client, source)
+    (move,) = _rows(client).values()
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    path = journals / f"relocate-{move['id']}.json"
+    journal = relocate.Journal.load(path)
+    swapping = [float(s[0]) for s in journal.history if s[1] == "swapping"]  # type: ignore[arg-type]
+    assert swapping and journal.swapped_at
+    journal.swapped_at = 0.0
+    journal.save()
+    row = _rows(client)[str(move["id"])]
+    assert row["delete_old_allowed_at"] == pytest.approx(
+        max(swapping) + relocate.KEEP_OLD_COPY_DAYS * 86400
+    )
+    assert row["delete_old_allowed_at"] == pytest.approx(
+        relocate._kept_since(relocate.Journal.load(path)) + relocate.KEEP_OLD_COPY_DAYS * 86400
+    )
+
+
+def test_delete_old_allowed_at_is_none_before_the_swap(
+    setup: tuple[TestClient, Path, Path],
+) -> None:
+    client, source, _d = setup
+    _run_move(client, source)
+    (move,) = _rows(client).values()
+    journals = routes.journal_dir(client.app.state.reclaim)  # type: ignore[attr-defined]
+    journal = relocate.Journal.load(journals / f"relocate-{move['id']}.json")
+    journal.swapped_at, journal.junction_attempted = 0.0, False
+    journal.save()
+    assert _rows(client)[str(move["id"])]["delete_old_allowed_at"] is None

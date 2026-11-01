@@ -116,3 +116,91 @@ unless you set `[regenerable] pytest_temp = true`.
   both scheduled tasks and the Windows notification identity; the dialog path with Yes/Yes removes the whole folder, data, config,
   tasks and identity. Reinstalling puts the tasks back. An index you moved with `index_dir` (6c) is on another drive and is
   **not** removed by either path; delete that folder by hand.
+
+
+## 8. Use Reclaim from Claude or Codex (your own AI assistant)
+Reclaim can be driven from Claude Desktop, Claude Code or Codex CLI on this machine. The assistant talks to
+`reclaim.exe mcp-serve` over a local pipe: nothing goes over the network, and Reclaim itself calls no AI service
+for this.
+
+What the assistant can do:
+- scan a folder in your profile and list what Reclaim found;
+- plan how to free a given amount (`plan_free_space`), using Reclaim's own categories only;
+- list the large folders that could move to another drive, with their size and why one cannot
+  (`list_relocation_options`, the same list as the **Move to Another Drive** page);
+- ask to clean a selection.
+
+What it cannot do:
+- name a file or folder to delete;
+- approve anything. Every clean shows a card in Reclaim's own window, and nothing happens until you click
+  **Approve**. Everything it cleans goes to the vault or the Recycle Bin, so it can be restored.
+- move folders to another drive. It can only list the options; you start a move yourself, on the
+  **Move to Another Drive** page.
+
+Keep Reclaim's window open while you use it: without the window there is nobody to approve, and a clean is refused.
+
+Set it up (once). The exact text for your machine is on **Settings > Use Reclaim from your AI assistant**, with a copy
+button. The formats below are from each client's documentation as I know it; they were not checked against a live install
+(BELIEVED):
+- **Claude Desktop:** add to `%APPDATA%\Claude\claude_desktop_config.json`:
+  ```json
+  {"mcpServers": {"reclaim": {"command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Reclaim\\reclaim.exe",
+                              "args": ["mcp-serve"]}}}
+  ```
+  Then restart Claude Desktop.
+- **Claude Code:**
+  ```
+  claude mcp add --scope user reclaim -- "C:\Users\<you>\AppData\Local\Programs\Reclaim\reclaim.exe" mcp-serve
+  ```
+- **Codex CLI:** add to `%USERPROFILE%\.codex\config.toml`:
+  ```toml
+  [mcp_servers.reclaim]
+  command = 'C:\Users\<you>\AppData\Local\Programs\Reclaim\reclaim.exe'
+  args = ["mcp-serve"]
+  ```
+
+Reclaim never edits these files for you.
+
+Things to ask: "free 20 GB, keep my projects, rebuildable things only", "what is using my disk?", "plan 50 GB but no
+duplicates". A plan says when the number cannot be reached under what you asked (`reaches_target: false` with the
+shortfall), rather than quietly including more.
+
+## 9. Move a big folder to another drive (tab: **Move to Another Drive**)
+For folders programs still need, so deleting is not an option: model caches, browser builds for tests and the like.
+Reclaim copies the folder to your other fixed drive, checks every file (SHA-256), and leaves a link (a junction) at the
+old place, so every program still finds it there. Available once #199 is merged and a build with it is installed.
+
+1. The tab lists the usual large folders and sorts them: those it can move first, then the rest, each with the reason.
+   - **Moved with their own steps:** Docker's disk image and WSL. Reclaim shows their size and the steps (Docker's
+     settings, `wsl --export`/`--import`), and never moves them itself.
+   - **Refused:**
+     - a folder holding one of your protected project names;
+     - a folder with hardlinks inside (a copy would split them);
+     - a folder reached through a link;
+     - a name too long to move safely (over 239 characters), a short "8.3" name, and a network path.
+2. **Check this move** runs a dry run and shows where it goes, the folder's size and file count, the free space on
+   the target, and anything in the way. Nothing changes yet.
+3. **Move it** does the move. The original stays next to the link as `<name>.reclaim-moved`, unchanged, so nothing is
+   lost if you change your mind.
+4. Each move is listed under **Moves**:
+   - **Move it back** copies the folder, as it is now, back to its own place and removes the link;
+   - **Delete the original copy** frees the space on the first drive. It checks every file of the kept copy against the
+     moved one first and deletes nothing if any differs. Before 7 days have passed it warns you first.
+
+From a terminal: `reclaim relocate list`, `plan`, `move`, `status`, `rollback <id>`, `delete-old <id>`. If a move was
+interrupted (a crash, a power cut), `reclaim relocate recover <id>` finishes it or puts it back.
+`rollback <id> --use-old-copy` puts back the copy from before the move instead of the moved folder; the page does not
+offer that.
+
+## 10. Finished AI-agent leftovers (category: **Agent Leftovers**)
+Coding agents leave git worktrees, throwaway clones and scratch folders behind. Reclaim can offer the finished ones for
+cleanup. Available once #199 is merged and a build with it is installed.
+- **Off until you turn it on,** and always off in safe mode: switch to power mode, then turn **Agent Leftovers** on in
+  **Settings**.
+- **What is offered:** an item is offered only if it is proven finished. All its work is pushed. Nothing is left
+  hidden (untracked files, stashes, git filters that change what a commit stores). No program is using it. It is not one of your
+  protected projects. Anything that cannot be proven is kept, and the report says why.
+- **You choose each one.** It goes to the vault (**Quarantine & Restore**), never straight to deletion, and comes back
+  with **Restore**. For a worktree, git's link to it comes back too.
+- **To look without changing anything:** `reclaim agent-artifacts` prints what would be offered and why the rest is
+  kept.

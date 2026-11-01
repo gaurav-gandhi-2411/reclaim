@@ -391,8 +391,16 @@ if (-not (Test-Path $regPath)) {
 
 # --- Check 5: Task Scheduler entry -----------------------------------------------------------
 
-$taskName = 'Reclaim Disk Space Check'
+# The installer registers a per-user name, 'Reclaim Disk Space Check (<username>)'
+# (packaging/reclaim.iss, DiskSpaceTaskName), and only removes the legacy unsuffixed name. This
+# check used to query only the legacy name, so it reported BLOCKED ("no installer has registered
+# it") on every current install. Prefer the per-user name; fall back to the legacy one.
+$taskName = "Reclaim Disk Space Check ($env:USERNAME)"
 $queryBefore = & schtasks.exe /query /tn $taskName /fo LIST /v 2>&1
+if ($LASTEXITCODE -ne 0) {
+    $taskName = 'Reclaim Disk Space Check'
+    $queryBefore = & schtasks.exe /query /tn $taskName /fo LIST /v 2>&1
+}
 $queryExit = $LASTEXITCODE
 if ($queryExit -ne 0) {
     Add-Result -Id '5-task-scheduler' -Name "Scheduled task '$taskName'" -Result 'BLOCKED' `
@@ -467,8 +475,13 @@ New-Item -ItemType Directory -Force -Path (Join-Path $serverDataDir 'logs') | Ou
 
 $serverProc = $null
 try {
+    # `--config` is explicit: a frozen build's default config path is next to the installed exe
+    # (index_location.default_config_path), not the working directory, so without it this server
+    # silently read the REAL installed config.toml (large_logs off) and check 7's seeded log was
+    # never proposed (found on build 13, 1 Nov).
     $serverProc = Invoke-FrozenExeBackground -WorkingDirectory $serverScratch -ArgumentList @(
         'serve', '--port', "$Port",
+        '--config', (Join-Path $serverScratch 'config.toml'),
         '--db', (Join-Path $serverDataDir 'reclaim_index.sqlite3'),
         '--vault-dir', (Join-Path $serverDataDir 'quarantine'),
         '--manifest', (Join-Path $serverDataDir 'quarantine\manifest.jsonl'),
