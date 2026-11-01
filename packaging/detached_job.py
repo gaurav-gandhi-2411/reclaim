@@ -24,8 +24,10 @@ The job keeps its own watchdog instead:
 
 Usage (venv python; see packaging/DETACHED_JOBS.md):
   detached_job.py launch --name NAME --expect-file PATH|--expect-line TEXT [options] -- COMMAND...
-  detached_job.py status NAME   # exit 0 done, 1 failed/aborted/suspect, 2 waiting/running, 3 stale
-  detached_job.py forget NAME   # deletes the finished job's scheduled task (not its logs)
+  detached_job.py status NAME   # exit 0 done, 1 failed/aborted/suspect/orphaned (recorded),
+                                # 2 waiting/running, 3 stale, 4 orphaned (proved just now)
+  detached_job.py forget NAME   # deletes a finished or proved-orphaned job's scheduled task (not
+                                # its logs); an orphan is first recorded as state=orphaned
 Each job writes to JOBS_ROOT\\NAME\\: spec.json, status.json (state + heartbeat), runner.log
 (gate, samples, abort, END line), output.log (the command's stdout and stderr).
 """
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import ctypes
 import datetime as dt
 import hashlib
@@ -52,7 +55,7 @@ from typing import Any
 JOBS_ROOT = Path(r"D:\reclaim-build\jobs")
 CLEANUP_ROOT = Path(r"D:\reclaim-build")
 TASK_PREFIX = "ReclaimJob-"
-TERMINAL = ("done", "failed", "aborted", "gave_up", "error", "suspect")
+TERMINAL = ("done", "failed", "aborted", "gave_up", "error", "suspect", "orphaned")
 ABORT_RAM_MIN_GB = 0.5  # below this the abort would fire only after the machine is starved
 # Lowest allowed start gate per declared job kind. A build or full verify peaks at several GB, so
 # 8 GB is its floor. A soak runs the app (under 1 GB resident in every soak so far) and nothing
@@ -79,6 +82,13 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87  # OpenProcess's answer for a pid that does not exist
+# `schtasks /Query /V` Status values (English) that prove the task is not running. Anything else,
+# including a localized or unknown string, is "cannot tell" and so never proves an orphan.
+_TASK_NOT_RUNNING = ("ready", "disabled", "could not start")
 
 
 def _now() -> dt.datetime:
@@ -783,9 +793,17 @@ def status(a: argparse.Namespace) -> int:
     st = json.loads(path.read_text(encoding="utf-8"))
     age = (_now() - dt.datetime.fromisoformat(st["heartbeat"])).total_seconds()
     st["heartbeat_age_s"] = round(age)
+    live_orphan = False
     if st["state"] not in TERMINAL and age > stale_after_s(a.name):
         st["state"] = "stale"  # the runner stopped sampling: killed, logged off, rebooted
+        live_orphan, facts = orphan_verdict(a.name, json.loads(path.read_text(encoding="utf-8")))
+        if live_orphan:  # the stored state is untouched; only forget records it
+            st["state"], st["orphan_proof"] = "orphaned", facts
+        else:
+            st["orphan_unproven"] = facts
     _say(json.dumps(st, indent=1))
+    if live_orphan:
+        return 4
     if st["state"] in TERMINAL:
         return 0 if st["state"] == "done" else 1
     return 3 if st["state"] == "stale" else 2
@@ -797,14 +815,129 @@ def stale_after_s(name: str) -> float:
     return 3 * float(max(spec["gate_seconds"], spec["sample_seconds"])) + 60
 
 
+def pid_alive(pid: int) -> bool | None:
+    """Is a process with this pid running? True/False, or None when it cannot be told. Opens a
+    query-only handle (PROCESS_QUERY_LIMITED_INFORMATION); it never signals or ends anything. A
+    reused pid reads as alive, which is the conservative answer."""
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        err = ctypes.GetLastError()
+        if err == _ERROR_INVALID_PARAMETER:
+            return False
+        return True if err == _ERROR_ACCESS_DENIED else None  # denied = it exists
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+            return None
+        return code.value == _STILL_ACTIVE
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def task_running(task: str) -> bool | None:
+    """True if the scheduled task is Running, False if its status proves it is not, None when the
+    query fails or its output cannot be parsed or recognized (never guessed)."""
+    try:
+        r = subprocess.run(  # noqa: S603 -- fixed system binary, our own task name
+            [SCHTASKS, "/Query", "/TN", task, "/FO", "CSV", "/NH", "/V"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return None
+        rows = [row for row in csv.reader(r.stdout.splitlines()) if row]
+    except (OSError, subprocess.SubprocessError, csv.Error):
+        return None
+    # /V columns: HostName, TaskName, Next Run Time, Status, ... ; only our task's own row counts.
+    ours = [row for row in rows if len(row) > 3 and row[1].lstrip("\\").lower() == task.lower()]
+    if len(ours) != 1:
+        return None
+    state = ours[0][3].strip().lower()
+    if state == "running":
+        return True
+    return False if state in _TASK_NOT_RUNNING else None
+
+
+def orphan_verdict(name: str, st: dict[str, Any]) -> tuple[bool, str]:
+    """(True, the facts that prove it) only when the stored state is non-terminal, the heartbeat
+    is older than stale_after_s, the runner pid is not alive and the task is not Running. Every
+    other answer, including any check that cannot be made, is (False, why): fail closed."""
+    state = st.get("state")
+    if not isinstance(state, str) or state in TERMINAL:
+        return False, f"stored state {state!r} is not a non-terminal state"
+    try:
+        age = (_now() - dt.datetime.fromisoformat(st["heartbeat"])).total_seconds()
+        limit = stale_after_s(name)
+    except (KeyError, TypeError, ValueError, OSError) as e:
+        return False, f"heartbeat or spec unreadable ({type(e).__name__}); cannot tell"
+    if age <= limit:
+        return False, f"heartbeat is {round(age)} s old, within the {round(limit)} s limit"
+    pid = st.get("runner_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False, f"no usable runner_pid in status.json ({pid!r}); cannot tell"
+    alive = pid_alive(pid)
+    if alive is None:
+        return False, f"could not tell whether runner pid {pid} is alive"
+    if alive:
+        return False, f"runner pid {pid} is alive (a reused pid also counts as alive)"
+    running = task_running(TASK_PREFIX + name)
+    if running is None:
+        return False, f"could not tell whether task {TASK_PREFIX + name} is running"
+    if running:
+        return False, f"task {TASK_PREFIX + name} is Running"
+    return True, (
+        f"stored state {state!r} is non-terminal; heartbeat {round(age)} s old (limit"
+        f" {round(limit)} s); runner pid {pid} is not alive; task {TASK_PREFIX + name} is not"
+        " Running"
+    )
+
+
+def record_orphan(name: str, st: dict[str, Any], facts: str) -> bool:
+    """Write the orphaned job as terminal into status.json (old fields kept, old heartbeat kept as
+    evidence) and an END line into runner.log. False, with nothing logged as done, if the status
+    write fails: the caller must then not delete the task."""
+    job_dir = JOBS_ROOT / name
+    ended = _now().isoformat()
+    new = {**st, "orphaned_from": st.get("state"), "state": "orphaned", "reason": facts}
+    new["ended"] = ended
+    tmp = job_dir / "status.json.tmp"
+    try:
+        tmp.unlink(missing_ok=True)  # as Runner.save: never write through a link at this name
+        tmp.write_text(json.dumps(new, indent=1), encoding="utf-8")
+        tmp.replace(job_dir / "status.json")
+    except OSError as e:
+        _say(f"error: could not record the orphaned state: {e}", err=True)
+        return False
+    with (
+        contextlib.suppress(OSError),
+        (job_dir / "runner.log").open("a", encoding="utf-8") as f,
+    ):
+        f.write(f"{ended} END state=orphaned rc=- reason={facts}\n")
+    return True
+
+
 def forget(a: argparse.Namespace) -> int:
     if not valid_name(a.name):
         return 2
     path = JOBS_ROOT / a.name / "status.json"
     st = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if st.get("state") not in TERMINAL:
-        _say(f"refusing: job {a.name} is not finished (state={st.get('state')})", err=True)
-        return 1
+        orphaned, facts = orphan_verdict(a.name, st)
+        if not orphaned:
+            _say(
+                f"refusing: job {a.name} is not finished (state={st.get('state')}); not proved"
+                f" orphaned: {facts}",
+                err=True,
+            )
+            return 1
+        if not record_orphan(a.name, st, facts):
+            return 1
+        _say(f"job {a.name} recorded as orphaned: {facts}")
     r = subprocess.run(  # noqa: S603 -- fixed system binary, our own task name
         [SCHTASKS, "/Delete", "/TN", TASK_PREFIX + a.name, "/F"],
         capture_output=True,

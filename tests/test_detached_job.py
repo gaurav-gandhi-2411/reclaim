@@ -977,3 +977,225 @@ def test_status_and_forget_refuse_a_name_that_is_a_path(
     monkeypatch.setattr(dj, "JOBS_ROOT", tmp_path / "jobs")
     monkeypatch.setattr(dj.subprocess, "run", lambda *_a, **_k: pytest.fail("ran schtasks"))
     assert dj.main([cmd, r"..\outside"]) == 2
+
+
+# ---- orphaned jobs: a runner that died leaving a non-terminal status.json ----------------------
+
+
+def _orphan_job(tmp_path: Path, **status: object) -> Path:
+    """A job dir whose status says running, heartbeat 10 min old (stale), runner_pid 4242."""
+    job = tmp_path / "jobs" / "t"
+    job.mkdir(parents=True)
+    (job / "spec.json").write_text(json.dumps(_spec(tmp_path)), encoding="utf-8")
+    old = (dj._now() - dt.timedelta(minutes=10)).isoformat()
+    st: dict[str, object] = {
+        "name": "t",
+        "state": "running",
+        "heartbeat": old,
+        "runner_pid": 4242,
+        "child_pid": 77,
+        "free_ram_gb": 5.5,
+    }
+    st.update(status)
+    st = {k: v for k, v in st.items() if v is not None}  # a None override drops that key
+    (job / "status.json").write_text(json.dumps(st), encoding="utf-8")
+    (job / "runner.log").write_text("earlier line\n", encoding="utf-8")
+    return job
+
+
+class _Facts:
+    """Injected answers for the two checks, and a spy on the task deletion."""
+
+    def __init__(self, job: Path) -> None:
+        self.job = job
+        self.deleted: list[list[str]] = []
+        self.state_at_delete: object = None
+
+    def install(
+        self, monkeypatch: pytest.MonkeyPatch, *, alive: bool | None, running: bool | None
+    ) -> None:
+        monkeypatch.setattr(dj, "pid_alive", lambda _pid: alive)
+        monkeypatch.setattr(dj, "task_running", lambda _task: running)
+        real = dj.subprocess.run
+
+        def run(cmd: list[str], *a: object, **k: object) -> object:
+            if cmd and cmd[0] == dj.SCHTASKS:
+                assert cmd[1] == "/Delete", f"only /Delete may run, got {cmd}"
+                self.deleted.append(cmd)
+                self.state_at_delete = json.loads((self.job / "status.json").read_text())["state"]
+                return subprocess.CompletedProcess(cmd, 0, "SUCCESS", "")
+            return real(cmd, *a, **k)
+
+        monkeypatch.setattr(dj.subprocess, "run", run)
+
+
+def test_orphaned_job_status_says_orphaned_with_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = _orphan_job(tmp_path)
+    _Facts(job).install(monkeypatch, alive=False, running=False)
+    assert dj.main(["status", "t"]) == 4
+    out = json.loads(capsys.readouterr().out)
+    assert out["state"] == "orphaned" and "pid 4242 is not alive" in out["orphan_proof"]
+    assert json.loads((job / "status.json").read_text())["state"] == "running"
+
+
+def test_forget_records_the_orphan_before_deleting_the_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _orphan_job(tmp_path)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    assert dj.main(["forget", "t"]) == 0
+    assert facts.deleted == [[dj.SCHTASKS, "/Delete", "/TN", "ReclaimJob-t", "/F"]]
+    assert facts.state_at_delete == "orphaned"  # terminal on disk BEFORE the delete ran
+    st = json.loads((job / "status.json").read_text())
+    assert st["state"] == "orphaned" and st["orphaned_from"] == "running"
+    assert st["runner_pid"] == 4242 and st["child_pid"] == 77 and st["free_ram_gb"] == 5.5
+    assert st["ended"] and "not alive" in st["reason"]
+    log = (job / "runner.log").read_text()
+    assert log.startswith("earlier line\n") and "END state=orphaned" in log
+    assert (job / "spec.json").exists()  # logs and spec are never deleted
+    assert dj.main(["status", "t"]) == 1  # now a recorded terminal state
+    assert dj.main(["forget", "t"]) == 0  # and forgetting again needs no proof
+
+
+@pytest.mark.parametrize(
+    ("alive", "running", "needle"),
+    [
+        (True, False, "is alive"),
+        (False, True, "is Running"),
+        (None, False, "could not tell whether runner pid"),
+        (False, None, "could not tell whether task"),
+    ],
+)
+def test_forget_refuses_unless_every_check_proves_the_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    alive: bool | None,
+    running: bool | None,
+    needle: str,
+) -> None:
+    job = _orphan_job(tmp_path)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=alive, running=running)
+    before = (job / "status.json").read_text()
+    assert dj.main(["forget", "t"]) == 1
+    assert needle in capsys.readouterr().err
+    assert facts.deleted == [] and (job / "status.json").read_text() == before
+    assert dj.main(["status", "t"]) == 3  # stale, not orphaned
+    assert json.loads(capsys.readouterr().out)["state"] == "stale"
+
+
+def test_forget_refuses_a_fresh_heartbeat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    job = _orphan_job(tmp_path, heartbeat=dj._now().isoformat())
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+    assert dj.main(["status", "t"]) == 2
+
+
+@pytest.mark.parametrize("pid", [None, 0, -5, "4242", True, 1.5])
+def test_forget_refuses_a_missing_or_bad_runner_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: object
+) -> None:
+    job = _orphan_job(tmp_path, runner_pid=pid)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+    assert dj.main(["status", "t"]) == 3
+
+
+@pytest.mark.parametrize("hb", [None, "garbage", "2026-10-31T18:23:00"])
+def test_forget_refuses_an_unusable_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hb: str | None
+) -> None:
+    job = _orphan_job(tmp_path, heartbeat=hb)  # None drops the key; the last is timezone-naive
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+
+
+def test_forget_does_not_delete_when_the_terminal_state_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _orphan_job(tmp_path)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+
+    def denied(*_a: object, **_k: object) -> None:
+        raise OSError("denied")
+
+    monkeypatch.setattr(dj.Path, "write_text", denied)
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+
+
+@pytest.mark.parametrize("state", ["done", "failed", "aborted", "gave_up", "error", "suspect"])
+def test_terminal_jobs_are_unchanged_and_need_no_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    job = _orphan_job(tmp_path, state=state)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    monkeypatch.setattr(dj, "pid_alive", lambda _p: pytest.fail("checked a terminal job"))
+    monkeypatch.setattr(dj, "task_running", lambda _t: pytest.fail("checked a terminal job"))
+    before = (job / "status.json").read_text()
+    assert dj.main(["status", "t"]) == (0 if state == "done" else 1)
+    assert dj.main(["forget", "t"]) == 0 and len(facts.deleted) == 1
+    assert (job / "status.json").read_text() == before
+
+
+def _fake_query(monkeypatch: pytest.MonkeyPatch, out: str, rc: int = 0) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def run(cmd: list[str], *_a: object, **_k: object) -> object:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, rc, out, "")
+
+    monkeypatch.setattr(dj.subprocess, "run", run)
+    return calls
+
+
+def _row(status: str, task: str = "\\ReclaimJob-t") -> str:
+    return f'"HOST","{task}","N/A","{status}","Interactive only","11/1/2026"\n'
+
+
+@pytest.mark.parametrize(
+    ("out", "rc", "want"),
+    [
+        (_row("Running"), 0, True),
+        (_row("Ready"), 0, False),
+        (_row("Disabled"), 0, False),
+        (_row("Could not start"), 0, False),
+        (_row("Running"), 1, None),  # query failed (e.g. task not found)
+        ("", 0, None),
+        ("garbage, not csv \x00\n", 0, None),
+        ('"only","two"\n', 0, None),
+        (_row("Laufend"), 0, None),  # unrecognized (localized) status never proves "not running"
+        (_row("Ready", "\\ReclaimJob-other"), 0, None),  # a row for a different task
+        (_row("Ready") + _row("Running"), 0, None),  # ambiguous
+    ],
+)
+def test_task_running_parses_defensively(
+    monkeypatch: pytest.MonkeyPatch, out: str, rc: int, want: bool | None
+) -> None:
+    calls = _fake_query(monkeypatch, out, rc)
+    assert dj.task_running("ReclaimJob-t") is want
+    assert calls[0][:4] == [dj.SCHTASKS, "/Query", "/TN", "ReclaimJob-t"]
+
+
+def test_task_running_is_unknown_when_schtasks_cannot_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: object, **_k: object) -> object:
+        raise OSError("no schtasks")
+
+    monkeypatch.setattr(dj.subprocess, "run", boom)
+    assert dj.task_running("ReclaimJob-t") is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 API")
+def test_pid_alive_sees_this_process_and_a_finished_child() -> None:
+    assert dj.pid_alive(os.getpid()) is True
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()  # it exits by itself; our handle stays open so the pid cannot be reused yet
+    assert dj.pid_alive(p.pid) is False
