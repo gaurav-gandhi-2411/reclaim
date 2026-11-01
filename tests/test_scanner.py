@@ -189,7 +189,9 @@ def test_scan_tree_detects_clean_git_repo(tmp_path: Path) -> None:
     by_path = {r.path: r for r in inventory}
     tracked = by_path[repo / "tracked.txt"]
     assert tracked.git_repo_root == repo
-    assert tracked.git_repo_clean is True
+    # No verdict reads `git_repo_clean` outside `node_modules`, so the scan no longer asks git
+    # for this record (tests/test_scan_git_clean_scope.py covers the clean/dirty answers).
+    assert tracked.git_repo_clean is False
 
     (repo / "untracked.txt").write_text("dirty\n", encoding="utf-8")
     with ScanIndex(tmp_path / "index.sqlite3") as index:
