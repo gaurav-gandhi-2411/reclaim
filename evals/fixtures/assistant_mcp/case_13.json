@@ -1,0 +1,143 @@
+{
+ "allowed_total_bytes": 126586153728,
+ "best_possible_bytes": 34973070320,
+ "case": "case_13",
+ "constraints": {
+  "max_tier": "both"
+ },
+ "feasible": true,
+ "gold_planned_bytes": 37715136177,
+ "kind": "feasible",
+ "machine": "machine1",
+ "selections": [
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine1/proj/A/windows_temp-0",
+    "C:/Users/u/machine1/proj/A/windows_temp-1",
+    "C:/Users/u/machine1/cache/A/windows_temp-2",
+    "C:/Users/u/machine1/dl/A/windows_temp-3",
+    "C:/Users/u/machine1/cache/A/windows_temp-4"
+   ],
+   "rule": "windows_temp",
+   "sizes": [
+    9153861151,
+    876815851,
+    4724050255,
+    718818654,
+    7363065779
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine1/dl/B/windows_temp-0",
+    "C:/Users/u/machine1/keepme/B/windows_temp-1",
+    "C:/Users/u/machine1/proj/B/windows_temp-2",
+    "C:/Users/u/machine1/keepme/B/windows_temp-3",
+    "C:/Users/u/machine1/proj/B/windows_temp-4",
+    "C:/Users/u/machine1/dl/B/windows_temp-5"
+   ],
+   "rule": "windows_temp",
+   "sizes": [
+    3642254134,
+    8698968841,
+    4392464090,
+    2436057392,
+    668975271,
+    255826105
+   ],
+   "tier": "B"
+  },
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine1/cache/A/browser_cache-0",
+    "C:/Users/u/machine1/keepme/A/browser_cache-1",
+    "C:/Users/u/machine1/proj/A/browser_cache-2",
+    "C:/Users/u/machine1/proj/A/browser_cache-3"
+   ],
+   "rule": "browser_cache",
+   "sizes": [
+    7813724619,
+    1883524335,
+    985191181,
+    4196084352
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "temp_and_browser_caches",
+   "paths": [
+    "C:/Users/u/machine1/cache/B/browser_cache-0",
+    "C:/Users/u/machine1/cache/B/browser_cache-1"
+   ],
+   "rule": "browser_cache",
+   "sizes": [
+    5207387461,
+    1400837469
+   ],
+   "tier": "B"
+  },
+  {
+   "group": "dev_artifacts",
+   "paths": [
+    "C:/Users/u/machine1/proj/A/dev_artifact_node_modules-0"
+   ],
+   "rule": "dev_artifact_node_modules",
+   "sizes": [
+    6320792560
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "package_caches",
+   "paths": [
+    "C:/Users/u/machine1/proj/A/npm_cache-0",
+    "C:/Users/u/machine1/keepme/A/npm_cache-1"
+   ],
+   "rule": "npm_cache",
+   "sizes": [
+    3959321849,
+    4679536349
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "archive_pairs",
+   "paths": [
+    "C:/Users/u/machine1/dl/A/archive_pair-0",
+    "C:/Users/u/machine1/proj/A/archive_pair-1",
+    "C:/Users/u/machine1/dl/A/archive_pair-2"
+   ],
+   "rule": "archive_pair",
+   "sizes": [
+    4118784515,
+    9253499400,
+    9619688510
+   ],
+   "tier": "A"
+  },
+  {
+   "group": "duplicates",
+   "paths": [
+    "C:/Users/u/machine1/proj/A/exact_duplicate-0",
+    "C:/Users/u/machine1/proj/A/exact_duplicate-1",
+    "C:/Users/u/machine1/dl/A/exact_duplicate-2",
+    "C:/Users/u/machine1/dl/A/exact_duplicate-3",
+    "C:/Users/u/machine1/dl/A/exact_duplicate-4"
+   ],
+   "rule": "exact_duplicate",
+   "sizes": [
+    4635619650,
+    8888987603,
+    5157803581,
+    600299245,
+    4933913526
+   ],
+   "tier": "A"
+  }
+ ],
+ "target_bytes": 33343724507
+}

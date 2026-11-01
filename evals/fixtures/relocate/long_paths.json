@@ -1,0 +1,1 @@
+{"case": "long_paths", "why": "LongPathsEnabled=0 on the owner machine: source and target paths over 260 characters.", "files": [{"path": "LONG/f.bin", "size": 1000}], "long": true, "action": "move_then_rollback", "expect": "rolled_back"}

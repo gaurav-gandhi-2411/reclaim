@@ -1,0 +1,10 @@
+This is an automated end-to-end test of the Reclaim MCP server. Use only the reclaim MCP tools; do not use any other tool, do not read or write files, and do not call delete.
+
+1. Call get_disk_status.
+2. Call list_exclusions.
+3. Call scan with path C:\Users\gaura\AppData\Local\Temp\claude\C--Users-gaura-ml-projects-reclaim\20261024\e2e\Users\sam and then call scan_status until its status is "completed"; note the scan_id.
+4. Call explain_disk_usage with that scan_id.
+5. Call plan_free_space with that scan_id and target_bytes 1000000.
+6. Call find_unused_models.
+
+Then reply with only one JSON object and nothing else, with these keys: "disk_drives" (the number of drives), "exclusions" (the project_names list), "scan_id", "largest_paths" (the paths of the largest entries, at most 3), "plan_reaches_target", "plan_selections" (each selection's rule_id_or_category), "frees_now_bytes", "models_found" (the number), "tools_called" (the list of tool names you called, in order).

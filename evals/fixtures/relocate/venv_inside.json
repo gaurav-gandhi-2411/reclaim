@@ -1,0 +1,1 @@
+{"case": "venv_inside", "why": "Environments hold hardlinks into package caches.", "files": [{"path": "proj/.venv/pyvenv.cfg", "size": 4}, {"path": "proj/main.py", "size": 4}], "action": "move", "expect": "refused", "reason": "Python environment"}

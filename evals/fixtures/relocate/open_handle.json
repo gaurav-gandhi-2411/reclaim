@@ -1,0 +1,1 @@
+{"case": "open_handle", "why": "A file held open under the source refuses the move and changes nothing.", "files": [{"path": "busy.bin", "size": 100}], "extras": ["open"], "action": "move", "expect": "refused", "reason": "in use"}
