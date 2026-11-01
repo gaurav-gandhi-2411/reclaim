@@ -39,7 +39,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -201,6 +201,15 @@ def is_real_remote_url(url: str) -> bool:
 
 
 # --- environment --------------------------------------------------------------------------
+
+
+class PatternView(Protocol):
+    """The one thing the git-dir exclusion proofs (`_path_excluded`, `_gitdir_excluded`,
+    `_nested_git_excluded`) need from the environment: a string-only exclusion match. `AgentEnv`
+    satisfies it; the scanner passes a minimal object, so one implementation decides both."""
+
+    @property
+    def pattern_match(self) -> Callable[[Path], str | None]: ...
 
 
 @dataclass
@@ -726,7 +735,7 @@ def _prove_nested(
     )
 
 
-def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
+def _nested_git_excluded(env: PatternView, entry: Path) -> bool:
     """A `.git` entry inside an artifact belongs to an excluded project: by its own path, or by
     what its git dir (the directory itself, or the admin dir a pointer FILE names) refers to
     (`_gitdir_excluded`). A pointer that cannot be read or parsed counts as excluded: nothing
@@ -826,7 +835,7 @@ def _url_repo_name(url: str) -> str:
     return tail[:-4] if tail.lower().endswith(".git") else tail
 
 
-def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
+def _gitdir_excluded(env: PatternView, gitdir: Path, depth: int = 0) -> bool:
     """Git run in `gitdir` would read an excluded project: the git dir itself, its common dir (a
     linked worktree's main repository), any object store it borrows through
     `objects/info/alternates` (`clone --shared`), or a `core.worktree` it names (A3b review, N4:
@@ -849,8 +858,12 @@ def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
             resolved = Path(os.path.normpath(gitdir / common.strip()))
             targets += [resolved, resolved.parent]
             deeper.append(resolved)
-        config = read(gitdir / "config")
-        if config is not None:
+        # `config.worktree` is read by git too when extensions.worktreeConfig is set (sparse
+        # checkout and submodule absorb turn it on), and can carry core.worktree or an include.
+        for config_name in ("config", "config.worktree"):
+            config = read(gitdir / config_name)
+            if config is None:
+                continue
             if _UNFOLLOWABLE_CONFIG.search(config):
                 return True
             for match in _CORE_WORKTREE.finditer(config):
@@ -1053,7 +1066,7 @@ def find_repo_of_worktree(path: Path) -> Path | None:
     return admin.parent.parent.parent
 
 
-def _path_excluded(env: AgentEnv, *paths: Path) -> bool:
+def _path_excluded(env: PatternView, *paths: Path) -> bool:
     """An excluded project, decided from path strings only: each path AND its real location (a
     junction or symlink alias of an excluded repository is the same repository)."""
     for path in paths:
@@ -1066,6 +1079,17 @@ def _path_excluded(env: AgentEnv, *paths: Path) -> bool:
         if env.pattern_match(real) is not None:
             return True
     return False
+
+
+def _subtree_excluded(env: AgentEnv, path: Path) -> bool:
+    """`path` is, or holds anywhere beneath it, an excluded project (the name-only subtree walk the
+    W7/C7 proofs use). Run BEFORE any git command in `path`: `git status` lists every untracked
+    file, so it would read inside an excluded project the path itself does not name. A walk that
+    fails counts as a hit (fail closed)."""
+    try:
+        return env.exclusion_match(path, True) is not None
+    except OSError:
+        return True
 
 
 def _slug_excluded(env: AgentEnv, name: str) -> bool:
@@ -1100,8 +1124,10 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
     # Exclusions first, from the path strings alone: an excluded project's worktree or repository
     # is not touched at all (no git runs in it), not merely refused later.
     pointer_file = (path / ".git").is_file()  # anything else is refused visibly by W1 below
-    if _path_excluded(env, path, repo) or (
-        pointer_file and _nested_git_excluded(env, path / ".git")
+    if (
+        _path_excluded(env, path, repo)
+        or (pointer_file and _nested_git_excluded(env, path / ".git"))
+        or _subtree_excluded(env, path)
     ):
         # The pointer's admin dir can name an excluded common dir (A3b review, N4/F5h).
         return _excluded("worktree", path, project, repo)
@@ -1156,8 +1182,13 @@ def matches_clone_name(env: AgentEnv, path: Path) -> bool:
 def evaluate_clone(env: AgentEnv, path: Path) -> ArtifactVerdict:
     held: list[str] = []
     project = path.name
-    if _path_excluded(env, path) or _gitdir_excluded(env, path / ".git"):
-        # e.g. `clone --shared` of an excluded project reads its objects (A3b review, N4/F5g)
+    if (
+        _path_excluded(env, path)
+        or _gitdir_excluded(env, path / ".git")
+        or _subtree_excluded(env, path)
+    ):
+        # e.g. `clone --shared` of an excluded project reads its objects (A3b review, N4/F5g), or
+        # an excluded project sits INSIDE it: git status would list its files
         return _excluded("clone", path, project, path)
     try:
         if not matches_clone_name(env, path):
