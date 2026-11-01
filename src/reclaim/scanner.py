@@ -18,7 +18,7 @@ from pathlib import Path, PureWindowsPath
 
 import structlog
 
-from reclaim.agent_artifacts import _nested_git_excluded
+from reclaim.agent_artifacts import _gitdir_excluded, _nested_git_excluded, _resolve_gitdir
 from reclaim.dirlist import (
     ListedEntry,
     ListingUnsupported,
@@ -545,6 +545,59 @@ class _PatternsOnly:
     pattern_match: Callable[[Path], str | None]
 
 
+# Submodule git dirs examined under one repo before the answer is "excluded" (fail closed): a repo
+# has a handful; a crafted tree could have thousands of nested name directories.
+_MODULES_ENTRY_BUDGET = 2000
+_MODULES_MAX_DEPTH = 8
+
+
+def _modules_excluded(view: _PatternsOnly, repo_root: Path) -> bool:
+    """True iff any git dir under the repo's `<gitdir>/modules/` (submodule git dirs, which nest:
+    `modules/a/modules/b`) leads into an excluded project, by the same proof as the repo's own
+    (`_gitdir_excluded`: core.worktree, includes, alternates, commondir, `config.worktree`).
+
+    The outer `git status` / `ls-files --recurse-submodules` read those git dirs and the work
+    trees their config names BEFORE the per-gitlink check could run, so this runs first. A name
+    that holds a slash (`modules/dir/sub`) makes plain container directories, which are walked
+    through. Fails closed: past the budget or depth, or on any read error, it answers True."""
+    dot_git = repo_root / ".git"
+    try:
+        if dot_git.is_dir():
+            gitdir = dot_git
+        else:
+            admin = _resolve_gitdir(
+                dot_git.read_text(encoding="utf-8", errors="replace").strip(), repo_root
+            )
+            if admin is None:
+                return True
+            gitdir = admin
+        budget = [_MODULES_ENTRY_BUDGET]
+
+        def walk(container: Path, depth: int) -> bool:
+            if depth > _MODULES_MAX_DEPTH:
+                return True
+            try:
+                children = [e for e in container.iterdir() if e.is_dir()]
+            except FileNotFoundError:
+                return False
+            for child in children:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return True
+                if (child / "HEAD").exists() or (child / "config").exists():
+                    if _gitdir_excluded(view, child):
+                        return True
+                    if walk(child / "modules", depth + 1):
+                        return True
+                elif walk(child, depth + 1):
+                    return True
+            return False
+
+        return walk(gitdir / "modules", 0)
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
 def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
     """True iff `repo_root` is, is inside, or CONTAINS something the user excluded. Fails closed:
     anything unreadable or unresolvable counts as excluded.
@@ -563,7 +616,7 @@ def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
         return False
     view = _PatternsOnly(lambda path: first_matching_pattern(path, patterns))
     try:
-        if _nested_git_excluded(view, repo_root / ".git"):
+        if _nested_git_excluded(view, repo_root / ".git") or _modules_excluded(view, repo_root):
             return True
         if subtree_exclusion_match(repo_root, patterns, match_junction_targets=True) is not None:
             return True

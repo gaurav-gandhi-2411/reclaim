@@ -317,6 +317,78 @@ def test_ordinary_config_worktree_still_gets_the_git_check(
     assert len(fake_git.cwds) == 3
 
 
+# --- D3: submodule git dirs are proved before the OUTER git runs -----------------------------
+
+
+def _module(container: Path, name: str, config: str) -> Path:
+    gitdir = container / name
+    gitdir.mkdir(parents=True)
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / "config").write_text(config, encoding="utf-8")
+    return gitdir
+
+
+def test_submodule_whose_core_worktree_names_a_protected_project_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    outer = _repo(tmp_path / "outer")
+    _module(outer / ".git" / "modules", "sub", f"[core]\n\tworktree = {main.as_posix()}\n")
+    assert GitRepoCache(_patterns()).is_clean(outer) is False
+    assert fake_git.cwds == []
+
+
+def test_nested_and_slashed_submodule_names_are_proved_too(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    outer = _repo(tmp_path / "outer")
+    mods = outer / ".git" / "modules"
+    # modules/a/modules/b  and  modules/dir/c (a submodule named "dir/c")
+    _module(mods, "a", "[core]\n\tbare = false\n")
+    _module(mods / "a" / "modules", "b", f"[core]\n\tworktree = {main.as_posix()}\n")
+    assert GitRepoCache(_patterns()).is_clean(outer) is False
+    assert fake_git.cwds == []
+    other = _repo(tmp_path / "other")
+    _module(other / ".git" / "modules" / "dir", "c", f"[core]\n\tworktree = {main.as_posix()}\n")
+    assert GitRepoCache(_patterns()).is_clean(other) is False
+    assert fake_git.cwds == []
+
+
+def test_submodule_borrowing_a_protected_repositorys_objects_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    outer = _repo(tmp_path / "outer")
+    module = _module(outer / ".git" / "modules", "sub", "[core]\n\tbare = false\n")
+    (module / "objects" / "info").mkdir(parents=True)
+    (module / "objects" / "info" / "alternates").write_text(
+        f"{main / '.git' / 'objects'}\n", encoding="utf-8"
+    )
+    assert GitRepoCache(_patterns()).is_clean(outer) is False
+    assert fake_git.cwds == []
+
+
+def test_ordinary_submodule_repository_still_gets_the_git_check(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    outer = _repo(tmp_path / "outer")
+    _module(outer / ".git" / "modules", "sub", "[core]\n\tworktree = ../../../sub\n")
+    assert GitRepoCache(_patterns()).is_clean(outer) is True
+    assert len(fake_git.cwds) == 3
+
+
+def test_a_submodule_tree_past_the_budget_fails_closed(
+    tmp_path: Path, fake_git: _FakeGit, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outer = _repo(tmp_path / "outer")
+    for n in range(4):
+        _module(outer / ".git" / "modules", f"m{n}", "[core]\n\tbare = false\n")
+    monkeypatch.setattr(scanner_module, "_MODULES_ENTRY_BUDGET", 3)
+    assert GitRepoCache(_patterns()).is_clean(outer) is False
+    assert fake_git.cwds == []
+
+
 # --- G1: a junction inside the repo that points into an excluded project ---------------------
 
 _Junction = Callable[[Path, Path], None]
