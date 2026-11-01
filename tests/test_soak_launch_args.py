@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "packaging" / "smoke" / "soak_serve.py"
 _PATH_FLAGS = (
     "--config",
@@ -47,10 +49,12 @@ def test_default_config_is_an_empty_file_in_out_dir(tmp_path: Path) -> None:
 
 def test_operator_config_is_passed_through_and_nothing_is_written(tmp_path: Path) -> None:
     operator = tmp_path / "elsewhere" / "mine.toml"
+    operator.parent.mkdir()
+    operator.write_text("# mine", encoding="utf-8")
     cfg = soak.resolve_soak_config(tmp_path, str(operator))
     assert cfg == operator
     assert not (tmp_path / "config.toml").exists()
-    assert not operator.exists()
+    assert operator.read_text(encoding="utf-8") == "# mine"  # untouched
 
 
 def test_command_pins_config_and_every_path_flag_under_out_dir(tmp_path: Path) -> None:
@@ -69,3 +73,27 @@ def test_command_passes_operator_config_and_exe_args(tmp_path: Path) -> None:
     cmd = soak.build_serve_command("python.exe", "-m reclaim", 9000, tmp_path / "data", operator)
     assert cmd[:6] == ["python.exe", "-m", "reclaim", "serve", "--port", "9000"]
     assert _flag_value(cmd, "--config") == str(operator)
+
+
+def test_missing_operator_config_is_refused(tmp_path: Path) -> None:
+    missing = tmp_path / "typo.toml"
+    with pytest.raises(FileNotFoundError, match="--config is not a file"):
+        soak.resolve_soak_config(tmp_path, str(missing))
+    with pytest.raises(FileNotFoundError):  # a directory is not a config file either
+        soak.resolve_soak_config(tmp_path, str(tmp_path))
+    assert not (tmp_path / "config.toml").exists()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="soak_serve.main is Windows-only")
+def test_main_exits_3_on_missing_config_before_launching_anything(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "out"
+    code = soak.main(
+        ["--exe", "reclaim-never-launched.exe", "--config", str(tmp_path / "nope.toml"),
+         "--out-dir", str(out)]
+    )  # fmt: skip
+    assert code == 3
+    assert "--config is not a file" in capsys.readouterr().err
+    assert not (out / "fixture").exists()  # refused before the fixture build
+    assert not (out / "server_stdout.log").exists()  # and before any server launch

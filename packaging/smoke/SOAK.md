@@ -28,10 +28,15 @@ Exit code: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 harness error.
 - Passes `--config <out-dir>\config.toml`, an EMPTY file, so the soak runs on built-in defaults.
   Without it a frozen build reads the real installed `config.toml` (default path is next to the
   exe), making the result depend on the operator's settings. To soak a specific config, pass
-  `--config <path>` to `soak_serve.py` (used as-is, not copied). Attach mode is unaffected.
+  `--config <path>` to `soak_serve.py` (used as-is, not copied; a path that is not a file exits 3). Attach mode is unaffected.
 - Not pinnable: `serve` has no flag for the AI-explanation cache (`data\ai_explanations`) or the
   Anthropic key file (`data\anthropic_key.bin`); both resolve under the exe's own directory in a
   frozen build. The soak workload never calls the AI endpoints, so they stay untouched in practice.
+  Also not pinnable: the regenerable-clean audit log (`data\regenerable_audit.jsonl`); neither a
+  `serve` flag nor a config key sets it. With `--include-regenerable-preview` every cycle calls
+  `POST /api/clean/regenerable {"apply": false}`, and the dry run still appends its lines to that
+  file, which in a frozen build is next to the exe (the INSTALL dir). Without that flag it is never
+  written.
 - Scans a generated, deterministic fixture (20,000 files of 64 B..4 KB, 200 dirs, ~10% duplicate
   content, seed 42) by default; `--scan-root C:\Users\gaura\ml-projects` scans a real tree
   instead. The scan is `POST /api/scan` (an outside-home root gets the single-use confirm token

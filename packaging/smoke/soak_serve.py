@@ -18,6 +18,10 @@ Everything the run writes (isolated data dir, fixture, server logs, CSV, report,
 --vault-dir / --manifest / --mode-log / --first-run-state / --log-path all overridden into that
 directory and --config pointing at an empty config.toml there (built-in defaults, unless the
 operator passes `--config`), so the installed app's index, vault and config are never touched.
+Not pinnable (no `serve` flag or config key): the AI-explanation cache, the Anthropic key file and
+the regenerable-clean audit log (`data\\regenerable_audit.jsonl`). With
+`--include-regenerable-preview` the dry-run `POST /api/clean/regenerable` still appends lines to
+that audit log, which in a frozen build sits next to the exe (the install dir).
 
 Exit codes: 0 PASS, 1 FAIL (leak signal), 2 INCONCLUSIVE (too little post-warm-up data, or the
 server died), 3 harness error.
@@ -815,9 +819,14 @@ def resolve_soak_config(out_dir: Path, operator_config: str | None) -> Path:
     """The `--config` the launched server gets. Without one, a frozen build reads the REAL
     installed config.toml (its default path is next to the exe), so the soak would depend on the
     operator's settings. Default: an empty config.toml under out_dir (all built-in defaults);
-    an operator-supplied path is passed through untouched."""
+    an operator-supplied path is passed through untouched, but must be an existing file: the
+    server's own loader treats a missing config as defaults, which would silently soak the wrong
+    configuration. Raises FileNotFoundError (the caller turns it into exit 3)."""
     if operator_config:
-        return Path(operator_config)
+        chosen = Path(operator_config)
+        if not chosen.is_file():
+            raise FileNotFoundError(f"--config is not a file: {operator_config}")
+        return chosen
     path = out_dir / "config.toml"
     path.write_text("", encoding="utf-8")
     return path
@@ -900,6 +909,14 @@ def main(argv: list[str] | None = None) -> int:
     (data / "quarantine").mkdir(parents=True, exist_ok=True)
     (data / "logs").mkdir(parents=True, exist_ok=True)
 
+    config_path: Path | None = None
+    if args.exe:  # fail before the (slow) fixture build if the operator config is unusable
+        try:
+            config_path = resolve_soak_config(out_dir, args.config)
+        except FileNotFoundError as exc:
+            print(f"[soak] {exc}", file=sys.stderr)  # noqa: T201
+            return 3
+
     scan_root = args.scan_root
     if not scan_root:
         scan_root = str(out_dir / "fixture")
@@ -914,7 +931,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.exe:
         port = args.port or _free_port()
         base = f"http://127.0.0.1:{port}"
-        config_path = resolve_soak_config(out_dir, args.config)
+        assert config_path is not None  # noqa: S101 -- narrows the type; set above when args.exe
         cmd = build_serve_command(args.exe, args.exe_args, port, data, config_path)
         # Files, not pipes: an undrained pipe would block a chatty server during a multi-hour run.
         logs = [
