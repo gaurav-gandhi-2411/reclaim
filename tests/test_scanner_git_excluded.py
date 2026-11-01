@@ -207,6 +207,84 @@ def test_no_production_site_builds_a_git_cache_without_exclusions() -> None:
     assert bare == []
 
 
+# --- G2: the repo's own `.git` leads into an excluded project -------------------------------
+
+
+def _protected_repo(tmp_path: Path) -> Path:
+    """A made-up excluded repository with a linked-worktree admin dir."""
+    main = _repo(tmp_path / f"{_NAME}-main")
+    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    (main / ".git" / "objects").mkdir()
+    return main
+
+
+def test_git_file_pointing_into_a_protected_project_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    wt = tmp_path / "wt-checkout"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n", encoding="utf-8")
+    assert GitRepoCache(_patterns()).is_clean(wt) is False
+    assert fake_git.cwds == []
+
+
+def test_nested_gitlink_whose_git_file_points_into_a_protected_project_runs_no_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main = _protected_repo(tmp_path)
+    outer = _repo(tmp_path / "outer")
+    (outer / "mod").mkdir()
+    (outer / "mod" / ".git").write_text(
+        f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n", encoding="utf-8"
+    )
+    fake = _FakeGit(gitlinks=("mod",))
+    monkeypatch.setattr(scanner_module.shutil, "which", lambda _name: "git")
+    monkeypatch.setattr(scanner_module.subprocess, "run", fake)
+    assert scanner_module._query_git_clean(outer, excluded_patterns=_patterns()) is False
+    assert set(fake.cwds) == {outer}  # the outer repo's own check ran; the gitlink's did not
+
+
+def test_commondir_naming_a_protected_repository_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    repo = _repo(tmp_path / "borrower")
+    (repo / ".git" / "commondir").write_text(f"{main / '.git'}\n", encoding="utf-8")
+    assert GitRepoCache(_patterns()).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+def test_alternates_naming_a_protected_repository_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    main = _protected_repo(tmp_path)
+    repo = _repo(tmp_path / "shared-clone")
+    info = repo / ".git" / "objects" / "info"
+    info.mkdir(parents=True)
+    (info / "alternates").write_text(f"{main / '.git' / 'objects'}\n", encoding="utf-8")
+    assert GitRepoCache(_patterns()).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+def test_unreadable_or_foreign_git_pointer_fails_closed_but_a_plain_one_is_checked(
+    tmp_path: Path, fake_git: _FakeGit
+) -> None:
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("not a pointer\n", encoding="utf-8")
+    assert GitRepoCache(_patterns()).is_clean(broken) is False
+    assert fake_git.cwds == []
+    # teeth: a pointer to an unrelated admin dir is allowed through to the normal check
+    other = _repo(tmp_path / "other-main")
+    (other / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    wt = tmp_path / "ordinary-wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {other / '.git' / 'worktrees' / 'wt'}\n", encoding="utf-8")
+    assert GitRepoCache(_patterns()).is_clean(wt) is True
+    assert len(fake_git.cwds) == 3
+
+
 # --- G1: a junction inside the repo that points into an excluded project ---------------------
 
 _Junction = Callable[[Path, Path], None]

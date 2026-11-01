@@ -39,7 +39,7 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import structlog
 
@@ -201,6 +201,15 @@ def is_real_remote_url(url: str) -> bool:
 
 
 # --- environment --------------------------------------------------------------------------
+
+
+class PatternView(Protocol):
+    """The one thing the git-dir exclusion proofs (`_path_excluded`, `_gitdir_excluded`,
+    `_nested_git_excluded`) need from the environment: a string-only exclusion match. `AgentEnv`
+    satisfies it; the scanner passes a minimal object, so one implementation decides both."""
+
+    @property
+    def pattern_match(self) -> Callable[[Path], str | None]: ...
 
 
 @dataclass
@@ -726,7 +735,7 @@ def _prove_nested(
     )
 
 
-def _nested_git_excluded(env: AgentEnv, entry: Path) -> bool:
+def _nested_git_excluded(env: PatternView, entry: Path) -> bool:
     """A `.git` entry inside an artifact belongs to an excluded project: by its own path, or by
     what its git dir (the directory itself, or the admin dir a pointer FILE names) refers to
     (`_gitdir_excluded`). A pointer that cannot be read or parsed counts as excluded: nothing
@@ -826,7 +835,7 @@ def _url_repo_name(url: str) -> str:
     return tail[:-4] if tail.lower().endswith(".git") else tail
 
 
-def _gitdir_excluded(env: AgentEnv, gitdir: Path, depth: int = 0) -> bool:
+def _gitdir_excluded(env: PatternView, gitdir: Path, depth: int = 0) -> bool:
     """Git run in `gitdir` would read an excluded project: the git dir itself, its common dir (a
     linked worktree's main repository), any object store it borrows through
     `objects/info/alternates` (`clone --shared`), or a `core.worktree` it names (A3b review, N4:
@@ -1053,7 +1062,7 @@ def find_repo_of_worktree(path: Path) -> Path | None:
     return admin.parent.parent.parent
 
 
-def _path_excluded(env: AgentEnv, *paths: Path) -> bool:
+def _path_excluded(env: PatternView, *paths: Path) -> bool:
     """An excluded project, decided from path strings only: each path AND its real location (a
     junction or symlink alias of an excluded repository is the same repository)."""
     for path in paths:

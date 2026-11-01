@@ -18,6 +18,7 @@ from pathlib import Path, PureWindowsPath
 
 import structlog
 
+from reclaim.agent_artifacts import _nested_git_excluded
 from reclaim.dirlist import (
     ListedEntry,
     ListingUnsupported,
@@ -33,7 +34,7 @@ from reclaim.models import (
     FileRecord,
     recorded_attributes,
 )
-from reclaim.safety import subtree_exclusion_match
+from reclaim.safety import first_matching_pattern, subtree_exclusion_match
 
 logger = structlog.get_logger(__name__)
 
@@ -537,6 +538,13 @@ _GIT_REPO_ENV = frozenset(
 _GIT_CLEAN_MAX_DEPTH = 8
 
 
+@dataclass(frozen=True, slots=True)
+class _PatternsOnly:
+    """The string-only exclusion match `agent_artifacts.PatternView` asks for."""
+
+    pattern_match: Callable[[Path], str | None]
+
+
 def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
     """True iff `repo_root` is, is inside, or CONTAINS something the user excluded. Fails closed:
     anything unreadable or unresolvable counts as excluded.
@@ -545,10 +553,18 @@ def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
     `ls-files --recurse-submodules` enters submodules, so it reads inside a nested excluded
     project even when the outer path itself matches nothing. Uses the same matching as the delete
     path (`first_matching_pattern`/`subtree_exclusion_match`), on the path as given and on its
-    resolved form (a junction into an excluded project)."""
+    resolved form (a junction into an excluded project), and through any junction met on the walk.
+
+    Also true when the repo's `.git` leads into an excluded project: a `.git` pointer file naming
+    an excluded admin dir (a linked worktree), a `commondir`, or `objects/info/alternates` naming
+    an excluded repository. That is the agent-artifacts proof (`_nested_git_excluded`), shared so
+    both decide the same way; a `.git` that is missing or cannot be read counts as excluded."""
     if not patterns:
         return False
+    view = _PatternsOnly(lambda path: first_matching_pattern(path, patterns))
     try:
+        if _nested_git_excluded(view, repo_root / ".git"):
+            return True
         if subtree_exclusion_match(repo_root, patterns, match_junction_targets=True) is not None:
             return True
         resolved = repo_root.resolve()
