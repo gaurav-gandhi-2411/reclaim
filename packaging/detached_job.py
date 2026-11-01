@@ -86,6 +86,7 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
 _ERROR_INVALID_PARAMETER = 87  # OpenProcess's answer for a pid that does not exist
+_MAX_PID = 0x7FFFFFFF  # a larger pid cannot be a real one and overflows the Win32 DWORD call
 # `schtasks /Query /V` Status values (English) that prove the task is not running. Anything else,
 # including a localized or unknown string, is "cannot tell" and so never proves an orphan.
 _TASK_NOT_RUNNING = ("ready", "disabled", "could not start")
@@ -851,7 +852,7 @@ def task_running(task: str) -> bool | None:
         if r.returncode != 0:
             return None
         rows = [row for row in csv.reader(r.stdout.splitlines()) if row]
-    except (OSError, subprocess.SubprocessError, csv.Error):
+    except (OSError, subprocess.SubprocessError, csv.Error, UnicodeError):  # text=True decode
         return None
     # /V columns: HostName, TaskName, Next Run Time, Status, ... ; only our task's own row counts.
     ours = [row for row in rows if len(row) > 3 and row[1].lstrip("\\").lower() == task.lower()]
@@ -878,7 +879,7 @@ def orphan_verdict(name: str, st: dict[str, Any]) -> tuple[bool, str]:
     if age <= limit:
         return False, f"heartbeat is {round(age)} s old, within the {round(limit)} s limit"
     pid = st.get("runner_pid")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid <= _MAX_PID:
         return False, f"no usable runner_pid in status.json ({pid!r}); cannot tell"
     alive = pid_alive(pid)
     if alive is None:
@@ -897,6 +898,20 @@ def orphan_verdict(name: str, st: dict[str, Any]) -> tuple[bool, str]:
     )
 
 
+_VERIFIED_KEYS = ("state", "heartbeat", "runner_pid")
+
+
+def _unchanged_since(path: Path, st: dict[str, Any]) -> bool:
+    """Re-read status.json and compare the fields the orphan proof rested on with the snapshot.
+    A runner that wrote again after the checks began changes at least its heartbeat, so any
+    difference, or an unreadable file, means the proof is stale: the caller must not overwrite."""
+    try:
+        now = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(now, dict) and all(now.get(k) == st.get(k) for k in _VERIFIED_KEYS)
+
+
 def record_orphan(name: str, st: dict[str, Any], facts: str) -> bool:
     """Write the orphaned job as terminal into status.json (old fields kept, old heartbeat kept as
     evidence) and an END line into runner.log. False, with nothing logged as done, if the status
@@ -909,6 +924,14 @@ def record_orphan(name: str, st: dict[str, Any], facts: str) -> bool:
     try:
         tmp.unlink(missing_ok=True)  # as Runner.save: never write through a link at this name
         tmp.write_text(json.dumps(new, indent=1), encoding="utf-8")
+        if not _unchanged_since(job_dir / "status.json", st):
+            tmp.unlink(missing_ok=True)
+            _say(
+                "error: status.json changed while the orphan checks ran (the runner may be"
+                " alive); not recorded, task not deleted",
+                err=True,
+            )
+            return False
         tmp.replace(job_dir / "status.json")
     except OSError as e:
         _say(f"error: could not record the orphaned state: {e}", err=True)

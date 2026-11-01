@@ -1199,3 +1199,87 @@ def test_pid_alive_sees_this_process_and_a_finished_child() -> None:
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()  # it exits by itself; our handle stays open so the pid cannot be reused yet
     assert dj.pid_alive(p.pid) is False
+
+
+def test_task_running_is_unknown_when_schtasks_output_cannot_be_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def undecodable(*_a: object, **_k: object) -> object:
+        # what text=True raises for a 0x81 byte under cp1252
+        raise UnicodeDecodeError("cp1252", b"\x81", 0, 1, "character maps to <undefined>")
+
+    monkeypatch.setattr(dj.subprocess, "run", undecodable)
+    assert dj.task_running("ReclaimJob-t") is None
+
+
+@pytest.mark.parametrize("pid", [0x7FFFFFFF + 1, 2**32, 2**64])
+def test_forget_refuses_a_pid_beyond_the_win32_range_without_calling_the_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: int
+) -> None:
+    job = _orphan_job(tmp_path, runner_pid=pid)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    monkeypatch.setattr(dj, "pid_alive", lambda _p: pytest.fail("called pid_alive"))
+    ok, why = dj.orphan_verdict("t", json.loads((job / "status.json").read_text()))
+    assert not ok and "no usable runner_pid" in why
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+
+
+def test_forget_accepts_the_largest_valid_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _orphan_job(tmp_path, runner_pid=0x7FFFFFFF)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    assert dj.main(["forget", "t"]) == 0 and len(facts.deleted) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"heartbeat": "2099-01-01T00:00:00+00:00"},  # the runner saved again
+        {"state": "done"},  # the runner finished
+        {"runner_pid": 9999},  # a new runner took over
+    ],
+)
+def test_forget_refuses_when_status_changes_between_the_checks_and_the_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: dict[str, object],
+) -> None:
+    job = _orphan_job(tmp_path)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+    written: list[str] = []
+
+    def runner_writes_late(_task: str) -> bool:
+        st = json.loads((job / "status.json").read_text())
+        st.update(change)
+        (job / "status.json").write_text(json.dumps(st), encoding="utf-8")
+        written.append((job / "status.json").read_text())
+        return False  # the last check still says "not running"
+
+    monkeypatch.setattr(dj, "task_running", runner_writes_late)
+    assert dj.main(["forget", "t"]) == 1
+    assert "changed while the orphan checks ran" in capsys.readouterr().err
+    assert facts.deleted == []  # task kept
+    assert (job / "status.json").read_text() == written[0]  # the runner's write survives
+    assert not (job / "status.json.tmp").exists()
+    assert (job / "runner.log").read_text() == "earlier line\n"  # no END line
+
+
+def test_forget_refuses_when_status_becomes_unreadable_before_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _orphan_job(tmp_path)
+    facts = _Facts(job)
+    facts.install(monkeypatch, alive=False, running=False)
+
+    def corrupts(_task: str) -> bool:
+        (job / "status.json").write_text("{not json", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(dj, "task_running", corrupts)
+    assert dj.main(["forget", "t"]) == 1 and facts.deleted == []
+    assert (job / "status.json").read_text() == "{not json"
