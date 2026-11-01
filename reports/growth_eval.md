@@ -1,6 +1,6 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `45c36aaf578961b231d83a2972034104239dd292` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `bf9fa67f1c08bc8dfbf545c3fdd655978e3a60dc` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
 with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
@@ -52,16 +52,24 @@ Synthetic controls (seed 42; `e1c40b0` and the rejected `44c8a5d` measured by ru
 | steady 3.0 GiB/day, 84 snapshots: alerting (after warm-up) | 66 (24) | 6 (0) | 36 (0) |
 | bursty steady 2.0 GiB once a day, 180 snapshots: alerting (after warm-up) | 162 (120) | 162 (120) | 36 (0) |
 | bursty steady 3.0 GiB once a day, 180 snapshots: alerting (after warm-up) | 162 (120) | 162 (120) | 36 (0) |
+| LIMIT: bursty 14.0 GiB every 7 days, 360 snapshots: alerting (after warm-up) | 144 (126) | 144 (126) | 144 (126) |
 | 2.0 GiB/day + 20 GiB in one day: alerting from the surge day on | 12 | 11 | 10 |
 | random walk sd 3.0 GiB / 4 h + 40 GiB over a day: alerts from the surge start (first alert, h after start) | 32 (4 h) | 0 | 29 (4 h) |
 | the same walk without the surge: alerts | 27 | 0 | 24 |
 
 The rule still fires on a surge on top of steady growth and on a noisy volume; it no longer fires on the steady growth underneath. On the noisy walk the 5 GiB floor is far below the walk's own 24 h spread, so noise alone still alerts (row above): this rule cannot tell a surge from noise there, but it does not suppress the surge, which a zero would have meant (the rejected attempt's result).
 
-Alert episodes the pre-fix volume rule raised on the real fixtures: 5 (4 false-alarm, recall 1/5); the rule no longer raises 0 of them. Any dropped alert is DROPPED AND UNVERIFIED, not a win: A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
+Alert episodes the pre-fix volume rule raised on the real fixtures: 5 (4 false-alarm, recall 1/5); the rule no longer raises 0 of them. Any dropped alert would be DROPPED AND UNVERIFIED, not a win. A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
 
-Of the pre-fix rule's 55 alerts on these fixtures, 0 had >= 6 daily intervals of history before their window; the rest fall back to the floor alone.
+Of the pre-fix rule's 55 alerts on these fixtures, 0 of its volume alerts had >= 6 daily intervals of history before their window; the rest fall back to the floor alone. 0 pre-fix volume alerts are not raised now, 0 of them without a baseline explanation (a baseline existed and the excess over it was under the floor). The pre-fix alert set is the floor-only volume decision re-implemented in this script plus the key alerts of the current rule, so the key rule is not switched off in the comparison.
 
+
+Disclosed limits of the volume rule (median daily-step baseline):
+
+- **Steady growth is absorbed only when it lands on at least about half of the days** (the median of 14 daily steps must be non-zero). Bursts every 3, 4, 5 or 7 days alert as before the fix. Measured here: 14.0 GiB every 7 days (a 2.0 GiB/day average) gives 144 alerting snapshots (126 after warm-up) over 360, the row marked LIMIT in the table above. Bursts every 2 days depend on their phase relative to the daily thinning: 0 to 24 alerts over 80 days in the verifier's probes (not reproduced by this script).
+- **Random-walk noise can delay the first alert by one or two snapshots (4-8 h)** against the pre-fix rule: 35 of 400 cases in the verifier's probe. No surge was missed. With iid level noise the alert is never later. (Verifier's probe, not reproduced here.)
+- **A surge of up to baseline + 5 GiB is hidden for about a week after a busy period**, while the busy days sit in the 14-day history. A sustained leak goes silent around day 10 while the volume is under 80% full; R5 is the backstop and does not fire below its threshold. (Verifier's probes; the leak control above is this script's own measurement.)
+- **"6 daily intervals" can be 6 samples two or more days apart.** Daily thinning keeps one sample per >= 24 h, so with gaps in the series the history can span far more than 6 days and the baseline then rests on sparse, widely spaced rates.
 
 ## Coverage (hours of data per source)
 
@@ -109,7 +117,7 @@ moved off C: 9 Oct 15:47-18:59, so a rise on top is invisible to the 5 GiB volum
 
 ## The 3-day volume rule on steady growth
 
-Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots): every volume alert is a false alarm by construction.
+Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots). In this first table only (steady growth, no surge) every volume alert is a false alarm by construction; the surge tables further down have a real event.
 
 | growth (GiB/day) | snapshots | alerting snapshots | alerting after warm-up | first alert (day) |
 |---|---|---|---|---|

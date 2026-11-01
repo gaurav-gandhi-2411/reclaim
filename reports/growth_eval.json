@@ -3,14 +3,28 @@
   {
    "alerting_after_warmup": 0,
    "alerting_snapshots": 36,
+   "every_days": 1,
    "rate_gib_per_day": 2.0,
-   "snapshots": 180
+   "snapshots": 180,
+   "step_gib": 2.0
   },
   {
    "alerting_after_warmup": 0,
    "alerting_snapshots": 36,
+   "every_days": 1,
    "rate_gib_per_day": 3.0,
-   "snapshots": 180
+   "snapshots": 180,
+   "step_gib": 3.0
+  }
+ ],
+ "bursty_weekly_control": [
+  {
+   "alerting_after_warmup": 126,
+   "alerting_snapshots": 144,
+   "every_days": 7,
+   "rate_gib_per_day": 2.0,
+   "snapshots": 360,
+   "step_gib": 14.0
   }
  ],
  "c_used_drift": [
@@ -45,7 +59,7 @@
    "start": "2026-10-31T22:49:51"
   }
  ],
- "commit": "45c36aaf578961b231d83a2972034104239dd292",
+ "commit": "bf9fa67f1c08bc8dfbf545c3fdd655978e3a60dc",
  "continuous_hours_needed": 672,
  "coverage": {
   "all_sources": {
@@ -90,7 +104,9 @@
   "prefix_rule_alerts_with_a_baseline": 0,
   "prefix_rule_episodes": 5,
   "prefix_rule_false_alarm_episodes": 4,
-  "prefix_rule_recall": "1/5"
+  "prefix_rule_recall": "1/5",
+  "prefix_rule_volume_alerts_not_raised": 0,
+  "prefix_rule_volume_alerts_not_raised_unexplained": 0
  },
  "event_diagnostics": {
   "build-c-drop-2026-10-10": {
