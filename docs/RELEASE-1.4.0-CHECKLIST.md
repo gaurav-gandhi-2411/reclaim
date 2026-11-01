@@ -23,7 +23,7 @@ command or file is named next to it.
 | 9 | In-place upgrade from build 12 preserves state | PASS |
 | 10 | Full-profile scan on the installed build | PASS (628.03 s) |
 | 11 | Candidates warm-up on the installed build | PASS (699 s, with a caveat) |
-| 12 | Two-hour soak of the installed exe | PENDING |
+| 12 | Two-hour soak of the installed exe | PASS (−0.02 MB/h) |
 | 13 | Clean machine or VM install, first run, uninstall | NOT RUN (no VM; owner only) |
 | 14 | README and CHANGELOG numbers re-measured | PASS for what is measurable; 1 not re-measured |
 | 15 | Agent Leftovers apply through the CLI by path | **FAIL** (fix in draft #236) |
@@ -156,9 +156,27 @@ and near_dup_document_and_version_chain (MiniLM) ran; no ImportError.
   entries. From one run each, the per-entry cost cannot be told apart. #229 (D5, not in build
   13) is meant to cut this; this run is its "before".
 
-## 12. Two-hour soak of the installed exe — PENDING
+## 12. Two-hour soak of the installed exe — PASS
 
-(filled in from `D:\reclaim-build\soak13\soak_report.md` when job `soak13-2h` ends)
+- Detached job `soak13-2h` (`packaging/smoke/soak_serve.py --exe <installed reclaim.exe>
+  --duration-minutes 120 --out-dir D:\reclaim-build\soak13`, `--kind soak`), 08:22-10:22,
+  `END state=done rc=0`; report `D:\reclaim-build\soak13\soak_report.md`: **Verdict: PASS**.
+- 12 scan cycles, 132 samples, 109 post-scan-idle after the 15-minute warm-up; the server never
+  exited.
+
+| Metric | Build 13 | Build 12 (31 Oct) | Fails at |
+|---|---:|---:|---:|
+| private bytes slope | −0.02 MB/h (95% CI −0.21..0.17) | +0.77 MB/h (0.45..1.09) | > 5 |
+| longest rising cycle-floor run | 2 cycles | 2 cycles | >= 5 |
+| handle slope | −0.9 /h | −0.8 /h | > 25 |
+| thread slope | −0.0 /h | −0.1 /h | > 5 |
+
+- Non-200 answers: 12 `POST /api/scan` 403s, each followed by a 202. That is the single-use
+  confirmation step for a scan root outside the home folder, and build 12 had the same 12.
+  `GET /api/clean/one-click-summary` answered 409 twice (build 12: 0); BELIEVED to be the
+  cold-cache `candidates_not_warm` contract while a scan cycle invalidates the cache. The log
+  has no bodies to confirm it. The other endpoints' non-200 counts are within one of build 12's.
+- Caveat (the report's own): a PASS means no growth at this sensitivity, window and workload.
 
 ## 13. Clean machine or VM — NOT RUN
 
