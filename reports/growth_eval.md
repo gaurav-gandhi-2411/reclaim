@@ -1,6 +1,6 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `c768b927cedabc339bbb61be76ca352b0f260086` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `bf9fa67f1c08bc8dfbf545c3fdd655978e3a60dc` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
 with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
@@ -20,6 +20,8 @@ when any key's growth over
 | precision (lower bound) | 0.2 | 0.333 | 0.5 | 0.0 |
 | false-alarm episodes per week of data | 21.84 (not meaningful) | 10.92 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) |
 
+A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
+
 ## Change log
 
 - Detector fix, window freshness (spec 1.5): before = code `4435381165df666cb67b5c5d5bea8b56e31e13b9` (report `60028742245f969a6aebf0d62d666687711f7e80`), after = `4d497dea65ff4ecdaf0d80a6f9feb7091fabc33e`. Fixtures, abs_floor, share_floor and z thresholds unchanged; the baseline is unchanged (it passes no freshness limits).
@@ -30,6 +32,44 @@ when any key's growth over
 | detector_literal | 1/5 -> 1/5 | 10 -> 3 | 9 -> 2 | 0.1 -> 0.333 |
 
 Read the drop in recall with the honesty section: it is the two census-time detections that rested on a 52 h old C: sample.
+
+- Detector fix, volume rule alerts on growth in excess of the volume's own daily baseline (steady growth): before = code `e1c40b0847ac11d6455f8205a0fa6534859e69c9` (report `c768b927cedabc339bbb61be76ca352b0f260086`), after = `53efd8563fd40c38d80d3d3aa847309dcb6995d6`. Fixtures, abs_floor, share_floor, z_min, windows and the key rule unchanged; the baseline is unchanged (it does not call the detector). A first attempt at this fix (`44c8a5d`, volume rate robust z >= z_min) was rejected by a falsifying verifier before merge: it compared a window-average rate with per-interval rate dispersion, so on a noisy volume a real +40 GiB / 24 h surge was suppressed (0 alerts where `e1c40b0` gave 32 on the same series) and bursty steady growth (+2 or +3 GiB once a day) still alarmed on every snapshot (MAD 0, z dominated by eps). The rule now subtracts the median daily-step rate of the previous 14 days times the window length and alerts if the excess is >= abs_floor; no new threshold.
+
+| detector variant | recall before -> after | alert episodes | false-alarm episodes | precision (lower bound) |
+|---|---|---|---|---|
+| detector | 1/5 -> 1/5 | 5 -> 5 | 4 -> 4 | 0.2 -> 0.2 |
+| detector_literal | 1/5 -> 1/5 | 3 -> 3 | 2 -> 2 | 0.333 -> 0.333 |
+
+A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
+
+Synthetic controls (seed 42; `e1c40b0` and the rejected `44c8a5d` measured by running the same control functions on the exported code, constants below; warm-up = first 60 snapshots):
+
+| control | `e1c40b0` (before) | `44c8a5d` (rejected) | after |
+|---|---|---|---|
+| steady 1.0 GiB/day, 84 snapshots: alerting (after warm-up) | 0 (0) | 0 (0) | 0 (0) |
+| steady 1.5 GiB/day, 84 snapshots: alerting (after warm-up) | 0 (0) | 0 (0) | 0 (0) |
+| steady 2.0 GiB/day, 84 snapshots: alerting (after warm-up) | 66 (24) | 6 (0) | 36 (0) |
+| steady 3.0 GiB/day, 84 snapshots: alerting (after warm-up) | 66 (24) | 6 (0) | 36 (0) |
+| bursty steady 2.0 GiB once a day, 180 snapshots: alerting (after warm-up) | 162 (120) | 162 (120) | 36 (0) |
+| bursty steady 3.0 GiB once a day, 180 snapshots: alerting (after warm-up) | 162 (120) | 162 (120) | 36 (0) |
+| LIMIT: bursty 14.0 GiB every 7 days, 360 snapshots: alerting (after warm-up) | 144 (126) | 144 (126) | 144 (126) |
+| 2.0 GiB/day + 20 GiB in one day: alerting from the surge day on | 12 | 11 | 10 |
+| random walk sd 3.0 GiB / 4 h + 40 GiB over a day: alerts from the surge start (first alert, h after start) | 32 (4 h) | 0 | 29 (4 h) |
+| the same walk without the surge: alerts | 27 | 0 | 24 |
+
+The rule still fires on a surge on top of steady growth and on a noisy volume; it no longer fires on the steady growth underneath. On the noisy walk the 5 GiB floor is far below the walk's own 24 h spread, so noise alone still alerts (row above): this rule cannot tell a surge from noise there, but it does not suppress the surge, which a zero would have meant (the rejected attempt's result).
+
+Alert episodes the pre-fix volume rule raised on the real fixtures: 5 (4 false-alarm, recall 1/5); the rule no longer raises 0 of them. Any dropped alert would be DROPPED AND UNVERIFIED, not a win. A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
+
+Of the pre-fix rule's 55 alerts on these fixtures, 0 of its volume alerts had >= 6 daily intervals of history before their window; the rest fall back to the floor alone. 0 pre-fix volume alerts are not raised now, 0 of them without a baseline explanation (a baseline existed and the excess over it was under the floor). The pre-fix alert set is the floor-only volume decision re-implemented in this script plus the key alerts of the current rule, so the key rule is not switched off in the comparison.
+
+
+Disclosed limits of the volume rule (median daily-step baseline):
+
+- **Steady growth is absorbed only when it lands on at least about half of the days** (the median of 14 daily steps must be non-zero). Bursts every 3, 4, 5 or 7 days alert as before the fix. Measured here: 14.0 GiB every 7 days (a 2.0 GiB/day average) gives 144 alerting snapshots (126 after warm-up) over 360, the row marked LIMIT in the table above. Bursts every 2 days depend on their phase relative to the daily thinning: 0 to 24 alerts over 80 days in the verifier's probes (not reproduced by this script).
+- **Random-walk noise can delay the first alert by one or two snapshots (4-8 h)** against the pre-fix rule: 35 of 400 cases in the verifier's probe. No surge was missed. With iid level noise the alert is never later. (Verifier's probe, not reproduced here.)
+- **A surge of up to baseline + 5 GiB is hidden for about a week after a busy period**, while the busy days sit in the 14-day history. A sustained leak goes silent around day 10 while the volume is under 80% full; R5 is the backstop and does not fire below its threshold. (Verifier's probes; the leak control above is this script's own measurement.)
+- **"6 daily intervals" can be 6 samples two or more days apart.** Daily thinning keeps one sample per >= 24 h, so with gaps in the series the history can span far more than 6 days and the baseline then rests on sparse, widely spaced rates.
 
 ## Coverage (hours of data per source)
 
@@ -77,16 +117,33 @@ moved off C: 9 Oct 15:47-18:59, so a rise on top is invisible to the 5 GiB volum
 
 ## The 3-day volume rule on steady growth
 
-Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots): every volume alert is a false alarm by construction.
+Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots). In this first table only (steady growth, no surge) every volume alert is a false alarm by construction; the surge tables further down have a real event.
 
-| growth (GiB/day) | snapshots | alerting snapshots | first alert (day) |
+| growth (GiB/day) | snapshots | alerting snapshots | alerting after warm-up | first alert (day) |
+|---|---|---|---|---|
+| 1.0 | 84 | 0 | 0 | None |
+| 1.5 | 84 | 0 | 0 | None |
+| 2.0 | 84 | 36 | 0 | 3.0 |
+| 3.0 | 84 | 36 | 0 | 3.0 |
+
+Arithmetic: a steady rate r crosses the 5 GiB / 72 h floor once 3r >= 5, i.e. r >= 1.67 GiB/day. Before the volume-z fix it then stayed tripped for as long as the growth lasted. Now only the warm-up (the first 60 snapshots, while the volume has < 6 daily intervals before the window and no baseline exists) can alert.
+
+Surge on top of steady growth (the fix must not blind the rule): same series, plus extra growth spread over one day ending 1 day before the end.
+
+| growth (GiB/day) | surge (GiB) | alerting snapshots | alerting after warm-up | alerting from surge day on |
+|---|---|---|---|---|
+| 2.0 | 20 | 46 | 10 | 10 |
+
+Bursty steady growth (one step a day, flat in between; 30 days, no event):
+
+| step (GiB/day) | snapshots | alerting snapshots | alerting after warm-up |
 |---|---|---|---|
-| 1.0 | 84 | 0 | None |
-| 1.5 | 84 | 0 | None |
-| 2.0 | 84 | 66 | 3.0 |
-| 3.0 | 84 | 66 | 3.0 |
+| 2.0 | 180 | 36 | 0 |
+| 3.0 | 180 | 36 | 0 |
 
-Arithmetic: a steady rate r trips the 5 GiB / 72 h rule once 3r >= 5, i.e. r >= 1.67 GiB/day; after that it stays tripped for as long as the growth lasts.
+Noisy volume (seed 42, random walk sd 3.0 GiB per 4 h, 20 days): with a 40 GiB surge over day 14 the detector alerts on 29 snapshots from the surge start, the first 4 h after it; the same walk without the surge alerts on 24 (first 24 h after day 14).
+
+Sustained leak (no pass/fail): 10.0 GiB/day after 14 quiet days. The detector alerts on 62 snapshots, from 8 h to 252 h after the leak starts (10.3 days between first and last), then the 14-day history absorbs it as usual. The 80%-full notification (R5) is the backstop for a leak that goes on; it does not fire below its threshold, so a leak that stays under 80% full is silent after that point.
 
 Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cannot be measured on it. Net C: used change per continuous stretch of >= 2 h:
 
@@ -96,11 +153,11 @@ Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cann
 - 2026-10-31T13:49:19: 4.5 h, -5.7 GiB net, -30.4 GiB/day
 - 2026-10-31T22:49:51: 2.6 h, 3.9 GiB net, 35.7 GiB/day
 
-Of the 4 as-replayed detector false-alarm episodes, 2 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`).
+Of the 4 as-replayed detector false-alarm episodes, 2 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`). A "false alarm" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.
 
-## Open design issue: steady growth trips the 3-day volume rule (NOT fixed)
+## Steady growth and the 3-day volume rule (FIXED)
 
-Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) trips the volume rule and keeps it tripped for as long as the growth lasts (synthetic control above: 2.0 and 3.0 GiB/day alert on 66 of 84 snapshots). The key rule does not have this problem because it needs a high robust z-score. Candidate fix, not built: also require the volume rate's own robust z-score once >= 6 intervals of history exist (same estimator as `key_z`, applied to the volume's used-space series). Not applied here: the control is synthetic and the fix must not be tuned on the 5 evaluable events.
+Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) used to trip the volume rule and keep it tripped for as long as the growth lasted (2.0 and 3.0 GiB/day alerted on 66 of 84 snapshots). Fixed as applied in the change log: the volume rule now subtracts the volume's usual growth (the median of its day-to-day rates over the previous 14 days, times the window length) and alerts only if the excess is >= abs_floor. With fewer than 6 daily intervals of history there is no baseline and the floor alone still alerts, so a fresh install does not go quiet (the remaining control alerts are all in that warm-up). No threshold was changed and the fix was decided on synthetic controls, not tuned on the 5 evaluable events. Limits: a sustained leak is absorbed into the baseline once it fills half of the 14-day history (control below), and on a noisy volume noise alone still crosses the floor. Steady growth that fills a disk is still covered by the 80%-full notification (R5), not by this rule; R5 does not fire below its threshold.
 
 ## Honesty section
 
