@@ -25,7 +25,7 @@ command or file is named next to it.
 | 11 | Candidates warm-up on the installed build | PASS (699 s, with a caveat) |
 | 12 | Two-hour soak of the installed exe | PASS (−0.02 MB/h) |
 | 13 | Clean machine or VM install, first run, uninstall | NOT RUN (no VM; owner only) |
-| 14 | README and CHANGELOG numbers re-measured | PASS for what is measurable; 1 not re-measured |
+| 14 | README and CHANGELOG numbers re-measured | PASS for what is measurable; 2 N/A, 1 not re-measured |
 | 15 | Agent Leftovers apply through the CLI by path | **FAIL** (fix in draft #236) |
 | 16 | Apply and restore on the installed build | PASS (apply via build 13 source) |
 
@@ -38,10 +38,12 @@ the owner's.
 - The checklist wants the build from the merged `main` SHA. Build 13 is from
   `integration/run-2026-10` at `519a9c9`, because #199 (integration into main) is not merged.
   `main` alone does not have the 1.4.0 features.
-- `519a9c9` = merge of main `9178ede` (#231) into integration. Main after `9178ede` is docs only:
+- `519a9c9` = merge of main `9178ede` (#231) into integration. Since `9178ede`, main has added
+  docs and #235, and #235 touches only the frozen smoke harness and its test:
   `git diff --name-only 9178ede origin/main -- src packaging tests evals pyproject.toml uv.lock`
-  lists 0 files. So build 13 holds main's code plus #199's, which is the 1.4.0 code without #225's
-  version bump.
+  lists `packaging/smoke/http_probe.py`, `packaging/smoke/run_frozen_smoke_suite.ps1` and
+  `tests/test_frozen_http_probe.py`, and nothing under `src`. So build 13's product code is main's plus
+  #199's, which is the 1.4.0 code without #225's version bump.
 - Release build still to do: after #199 and #225 merge, build from that main SHA and repeat
   rows 2-12 on it.
 
@@ -49,10 +51,12 @@ the owner's.
 
 - Job `build13-519a9c9` (`D:\reclaim-build\jobs\build13-519a9c9\`), `END state=done rc=0`. Child
   started 00:32:05, ended 04:52:04: **4 h 20 min**. Defender exclusions were skipped (no admin).
-- Dist folder 796.0 MB (834,659,834 bytes); installer **292.9 MB** (307,170,479 bytes).
+- Dist folder 796.0 MiB (834,659,834 bytes); installer **292.9 MiB** (307,170,479 bytes). The
+  build tool prints MiB as "MB"; the runbook's figures below use the same unit.
 - Source sidecar `reclaim-setup.exe.buildsha` = `519a9c9ea4f1262910d01fc299bb2c49ac34a6ad`.
 - C compile: 2,493 `.o` files, 0 ccache hits; scipy 59.1 min (24.6 %) and onnxruntime 28.8 min are
-  the largest (`packaging\build\compile_breakdown\summary.md`).
+  the largest (the build's `compile_breakdown\summary.md`, kept as
+  `D:\reclaim-build\tmp\b13_compile_summary.md`; the build clone is deleted).
 
 ## 3. `--version` — FAIL (expected)
 
@@ -66,7 +70,7 @@ the owner's.
 
 | File | Bytes | README says |
 |---|---:|---|
-| `reclaim/ai/models/clip_vision_fp16.onnx` | 175,784,030 | 175,784,030 bytes |
+| `reclaim/ai/models/clip_vision_fp16.onnx` | 175,784,030 | 175.8 MB (the exact byte count is in #225's README) |
 | `reclaim/ai/models/minilm_int8.onnx` | 23,643,136 | 23.6 MB |
 | total | 199,427,166 | 199.4 MB |
 
@@ -132,8 +136,10 @@ and near_dup_document_and_version_chain (MiniLM) ran; no ImportError.
 | 12 (31 Oct) | 4,827.34 s | job `scan12` |
 | **13** | **628.03 s** | job `scan13` |
 
-- The build-12 slowdown is gone on the installed build. #231 (git status only where it is read)
-  is in build 13.
+- The build-12 slowdown did not recur on the installed build. #231 (git status only where it is
+  read) is in build 13. The two runs are not like for like: build 12 wrote 364,504 rows and pruned
+  213,430; build 13 wrote 194,524 and pruned 20,720. So this run alone does not isolate #231's
+  share; #231's own A/B (`AppData`, fresh db each, 709.7 s -> 436.6 s) does.
 - Caveats:
   - The index was warm from earlier scans (2,109,334 entries unchanged), as it was for build 12.
   - This is one run, not a distribution.
@@ -144,8 +150,9 @@ and near_dup_document_and_version_chain (MiniLM) ran; no ImportError.
   serve`, index from config), `END state=done rc=0`, log `D:\reclaim-build\warm_installed13.log`.
 - **Ready in 699 s, peak server RSS 958 MB** (47 samples, 15 s apart). Then `/api/summary`
   answered in 0.10 s, 0.07 s and 0.08 s. The script stopped its own server by PID afterwards.
-- Build 12's installed warm-up never finished. Claude Code's memory reaper stopped it at 272 s,
-  so there is no build-12 figure. Running it as a detached job is what made this run possible.
+- Build 12's installed warm-up never finished: its log ends at `elapsed=272s`, still computing.
+  BELIEVED cause: Claude Code's low-memory reaper (the log does not say why it stopped). So there
+  is no build-12 figure. Running it as a detached job is what made this run possible.
 
 | Build | Warm-up | Peak RSS | Index entries |
 |---|---:|---:|---:|
@@ -201,20 +208,20 @@ Source: `docs/release/README_NUMBERS_AUDIT.md` on #225, which lists every number
 
 | Claim | Where | Re-measured on build 13 | Result |
 |---|---|---|---|
-| CLIP fp16 175,784,030 bytes (175.8 MB) | README | 175,784,030 bytes in the dist (row 4) | PASS |
+| CLIP fp16 175.8 MB (the exact 175,784,030 bytes only in #225's README) | README | 175,784,030 bytes in the dist (row 4) | PASS |
 | MiniLM int8 23.6 MB | README | 23,643,136 bytes (row 4) | PASS |
 | 199.4 MB total model payload | README | 199,427,166 bytes (row 4) | PASS |
 | ~1,028 MB delta of the old torch `[ai]` extra | README | not re-measurable: that dependency set no longer ships (2026-07-30 measurement, labelled historical) | N/A |
 | ~$9.99/month signing price | README | a vendor price quoted in ADR-0031, not a Reclaim measurement | N/A |
 | 7-day ages, Sunday 10:00, 30-day retention | README | code constants, cited by the audit; unchanged at `519a9c9` | PASS (constants) |
-| planner optimal on 31 of 31, 0 unsafe | CHANGELOG known limits | `pytest -s evals/test_assistant_planner_eval.py` on `519a9c9`: "optimal vs brute force 31/31 [0.89, 1.00] ... unsafe selections 0"; baseline largest-first 4/41 within 5 %, 120 unsafe; 62 passed | PASS |
+| planner optimal on 31 of 31, 0 unsafe | CHANGELOG known limits | `pytest -s evals/test_assistant_planner_eval.py` on integration `be232f2` (`src` and `evals` identical to `519a9c9`), log `D:\reclaim-build\tmp\planner_eval_be232f2.log`: "optimal vs brute force 31/31 [0.89, 1.00] ... unsafe selections 0"; baseline largest-first 4/41 within 5 %, 120 unsafe; 62 passed | PASS |
 | about 90k junction-reached pnpm listings | CHANGELOG known limits | from #190's real-machine dry run (`dryrun190-ce79f43`); not repeated here | NOT RE-MEASURED |
 
 - The CHANGELOG's 1.4.0 section makes no other measured claim; each feature line points to its PR.
 - `packaging/RELEASE_RUNBOOK.md`'s "Expected numbers" table is stale against build 13, and the
   release build should update it with that build's SHA:
-  - dist 884.1 MB (now 796.0 MB);
-  - installer 309.3 MB (now 292.9 MB);
+  - dist 884.1 MB (now 796.0 MiB; both MiB);
+  - installer 309.3 MB (now 292.9 MiB; both MiB);
   - CLIP "167.6 MB" (the same file in MiB: 175,784,030 / 1,048,576 = 167.6).
 
 ## 15. Agent Leftovers apply through the CLI — FAIL on build 13 (fix in draft #236)
@@ -239,8 +246,8 @@ Source: `docs/release/README_NUMBERS_AUDIT.md` on #225, which lists every number
 - **Restore used the frozen installed exe:** `reclaim.exe undo` restored
   `batch_1793497865_1013d7d1` (job `aa13-w1-undo`): 1 of 1, 4,725,332 bytes. All 422 files
   SHA-256 identical before and after (`D:\reclaim-build\tmp\aa13x\wt_before.sha256` vs
-  `wt_after_undo.sha256`, 540 paths); `git worktree list` showed it registered again and
-  `git status` clean.
+  `wt_after_undo.sha256`, 422 lines each, `diff` empty). I saw `git worktree list` show it
+  registered again and `git status` clean in the session; no artifact of that was saved.
 - Applied this round (all in the vault, restorable, nothing purged; 30-day retention):
 
 | Item | Batch | Bytes |
