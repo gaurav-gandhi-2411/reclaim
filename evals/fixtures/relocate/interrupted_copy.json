@@ -1,0 +1,1 @@
+{"case": "interrupted_copy", "why": "Killed mid-copy: recovery restores the original.", "files": [{"path": "a.bin", "size": 1000}, {"path": "b.bin", "size": 1000}, {"path": "c.bin", "size": 1000}], "action": "crash:copy_file", "expect": "rolled_back"}

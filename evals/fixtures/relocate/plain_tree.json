@@ -1,0 +1,1 @@
+{"case": "plain_tree", "why": "A mixed tree moves with zero hash differences and a working junction.", "files": [{"path": "a.bin", "size": 200000}, {"path": "sub/b.txt", "size": 5}, {"path": "sub/deep/c [1].txt", "size": 9}, {"path": "zero.bin", "size": 0}], "action": "move", "expect": "done"}

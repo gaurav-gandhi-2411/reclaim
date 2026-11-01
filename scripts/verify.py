@@ -114,6 +114,12 @@ _JUNIT_PATH = "pytest-results.xml"
 # every category that defaults to `enabled=True`. No [ai] extra, no network -- same "no excuse to
 # skip" bar as every file above. Confirmed to have teeth: fails against the pre-PR-#76 detector
 # code (verified this session by swapping in that commit's `detectors.py` and re-running).
+#
+# test_relocate_gate.py added 2026-10-24 (run spec Phase B, docs/specs/relocate.md): the
+# relocate move's zero-data-loss gate -- one fixture per case in evals/fixtures/relocate/ (links,
+# hardlinks, long paths, open handles, read-only and ACL-denied files, kills at every step, too
+# little target space, excluded projects, a corrupted copy) plus one real process kill, each
+# checked against "every original byte is still at its original path". Stdlib and icacls only.
 _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_safety_gate.py",
     "evals/test_safety_adversarial.py",
@@ -128,11 +134,13 @@ _SAFETY_GATE_FILES: tuple[str, ...] = (
     "evals/test_cache_reclaimable_bytes_gate.py",
     "evals/test_apply_identity_reverify.py",
     "evals/test_apply_opaque_reverify.py",
+    "evals/test_agent_artifacts_gate.py",
     "evals/test_r2_llm_env_var_gate.py",
     "evals/test_scan_scope_gate.py",
     "evals/test_config_env_var_normalization_gate.py",
     "evals/test_data_path_cwd_independence_gate.py",
     "evals/test_default_enabled_category_floor_gate.py",
+    "evals/test_relocate_gate.py",
 )
 
 _STEPS: tuple[tuple[str, Sequence[str]], ...] = (

@@ -1,0 +1,66 @@
+{
+ "what": "Claude Code (Max plan, claude 2.1.309) as the MCP client of reclaim mcp-serve, against a fixture profile; read and plan tools only, delete disallowed",
+ "commit": "a8a1390",
+ "runs": [
+  {
+   "mode": "safe mode",
+   "is_error": false,
+   "num_turns": 9,
+   "duration_ms": 15491,
+   "result": {
+    "disk_drives": 2,
+    "exclusions": [],
+    "scan_id": "scan-1",
+    "largest_paths": [
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/Projects",
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/AppData",
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/Documents"
+    ],
+    "plan_reaches_target": false,
+    "plan_selections": [],
+    "frees_now_bytes": 0,
+    "models_found": 0,
+    "tools_called": [
+     "get_disk_status",
+     "list_exclusions",
+     "scan",
+     "scan_status",
+     "explain_disk_usage",
+     "plan_free_space",
+     "find_unused_models"
+    ]
+   }
+  },
+  {
+   "mode": "power mode",
+   "is_error": false,
+   "num_turns": 9,
+   "duration_ms": 15647,
+   "result": {
+    "disk_drives": 2,
+    "exclusions": [],
+    "scan_id": "scan-1",
+    "largest_paths": [
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/Projects",
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/AppData",
+     "C:/Users/gaura/AppData/Local/Temp/claude/C--Users-gaura-ml-projects-reclaim/20261024/e2e/Users/sam/Documents"
+    ],
+    "plan_reaches_target": true,
+    "plan_selections": [
+     "dev_artifact_node_modules"
+    ],
+    "frees_now_bytes": 0,
+    "models_found": 0,
+    "tools_called": [
+     "get_disk_status",
+     "list_exclusions",
+     "scan",
+     "scan_status",
+     "explain_disk_usage",
+     "plan_free_space",
+     "find_unused_models"
+    ]
+   }
+  }
+ ]
+}
