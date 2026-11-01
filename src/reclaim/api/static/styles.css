@@ -1407,6 +1407,15 @@ html[data-mode="simple"] #simple-view {
   margin: var(--rc-space-4) auto 0;
 }
 
+/* One-line disk-growth summary under the buttons; the reserved height keeps the page from jumping
+   when the figure replaces the "Checking" text. */
+.rc-simple-growth {
+  min-height: 1.5em;
+  margin: var(--rc-space-4) 0 0;
+  text-align: center;
+  color: var(--rc-text-muted);
+}
+
 .rc-simple-summary-line {
   margin: 0 0 var(--rc-space-4);
 }

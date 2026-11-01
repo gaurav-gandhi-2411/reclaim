@@ -722,6 +722,55 @@ function initGrowthPanel() {
   }
 }
 
+// --- SIMPLE mode: one-line disk-growth summary (same GET /api/growth data as the panel above) -----
+//
+// One line under the Clean My Computer buttons, e.g. "C: grew 6.2 GB this week, mostly Docker".
+// It is read-only and never blocks or breaks the page: a failed request just hides the line.
+// Only the row `label` is ever named (never `path`), and an excluded project can only appear as
+// the aggregate's own label (the server never itemises one, this also guards the client side).
+
+const SIMPLE_GROWTH_STEADY_BYTES = 0.05 * 1024 ** 3; // below this the one-decimal GB would read 0.0
+
+// The text for GET /api/growth?window=7d, or null when there is no figure to show yet.
+function simpleGrowthLineText(data) {
+  if (!data || data.status !== "ok") return null;
+  const ok = (data.volumes ?? []).filter((v) => v.status === "ok");
+  if (ok.length === 0) return null;
+  // The system drive when it has data, else whichever volume changed most.
+  const vol =
+    ok.find((v) => /^c:/i.test(v.volume)) ??
+    ok.reduce((a, b) => (Math.abs(b.change_bytes) > Math.abs(a.change_bytes) ? b : a));
+  const name = vol.volume.replace(/[\\/]+$/, "");
+  if (Math.abs(vol.change_bytes) < SIMPLE_GROWTH_STEADY_BYTES) {
+    return `${name} held steady this week.`;
+  }
+  if (vol.change_bytes < 0) {
+    return `${name} shrank ${formatFromBytes(-vol.change_bytes)} this week.`;
+  }
+  const growing = (data.rows ?? []).filter((r) => r.growth_bytes > 0);
+  const top = growing.reduce((a, b) => (a && a.growth_bytes >= b.growth_bytes ? a : b), null);
+  let line = `${name} grew ${formatFromBytes(vol.change_bytes)} this week`;
+  if (top) {
+    const who = top.kind === "excluded" ? data.excluded_aggregate.label : top.label;
+    line += top.growth_bytes * 2 >= vol.change_bytes ? `, mostly ${who}` : `, biggest: ${who}`;
+  }
+  return `${line}.`;
+}
+
+async function loadSimpleGrowthLine(el) {
+  el.hidden = false;
+  el.textContent = "Checking disk growth…";
+  try {
+    const data = await api("/api/growth?window=7d");
+    if (!el.isConnected) return; // the idle screen was replaced while the request ran
+    el.textContent = simpleGrowthLineText(data) ?? "Disk growth: not enough snapshots yet.";
+  } catch {
+    if (!el.isConnected) return;
+    el.textContent = "";
+    el.hidden = true; // quiet: a missing summary is never worth an error on the Simple page
+  }
+}
+
 function renderSummaryStats(summary) {
   const row = document.getElementById("stat-row");
   row.innerHTML = "";
@@ -1220,6 +1269,14 @@ function renderSimpleIdle() {
     note.textContent = `Last cleaned this session: ${simpleLastCleanedNote}.`;
     container.appendChild(note);
   }
+
+  // Last, so nothing above it (the buttons) can shift when the figure arrives.
+  const growthLine = document.createElement("p");
+  growthLine.id = "simple-growth-line";
+  growthLine.className = "rc-scan-status rc-simple-growth";
+  growthLine.setAttribute("aria-live", "polite");
+  container.appendChild(growthLine);
+  loadSimpleGrowthLine(growthLine);
 }
 
 // Human wording per regenerable item status. "Skipped" outcomes are surfaced, never hidden: a
@@ -2158,6 +2215,7 @@ export {
   loadOverview,
   loadGrowthPanel,
   initGrowthPanel,
+  simpleGrowthLineText,
   reviewFilterFromLink,
   loadQuickClean,
   loadTreemapView,
