@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import subprocess
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import reclaim.scanner as scanner_module
 from reclaim.cli import main
 from reclaim.config import Config, ExclusionsConfig, exclusion_patterns
 from reclaim.index import ScanIndex
+from reclaim.safety import subtree_exclusion_match
 from reclaim.scanner import GitRepoCache
 
 _NAME = "zqexcl"
@@ -130,7 +132,7 @@ def test_an_unresolvable_path_fails_closed(
 ) -> None:
     repo = _repo(tmp_path / "ordinary")
 
-    def boom(_path: object, _patterns: object) -> str | None:
+    def boom(_path: object, _patterns: object, **_kw: object) -> str | None:
         raise OSError("unreadable")
 
     monkeypatch.setattr(scanner_module, "subtree_exclusion_match", boom)
@@ -203,3 +205,66 @@ def test_no_production_site_builds_a_git_cache_without_exclusions() -> None:
             ):
                 bare.append(f"{path.relative_to(_SRC)}:{node.lineno}")
     assert bare == []
+
+
+# --- G1: a junction inside the repo that points into an excluded project ---------------------
+
+_Junction = Callable[[Path, Path], None]
+
+
+@pytest.fixture
+def junction() -> Iterator[_Junction]:
+    """`make(link, target)`: an NTFS junction made with the stdlib (no subprocess, which the git
+    fixture replaces), removed as a link first (`os.rmdir`) so the target is never touched."""
+    winapi = pytest.importorskip("_winapi")
+    made: list[Path] = []
+
+    def make(link: Path, target: Path) -> None:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        winapi.CreateJunction(str(target), str(link))
+        made.append(link)
+
+    yield make
+    for link in reversed(made):
+        if link.is_junction():
+            link.rmdir()
+
+
+def test_junction_inside_the_repo_into_a_protected_project_runs_no_git(
+    tmp_path: Path, fake_git: _FakeGit, junction: _Junction
+) -> None:
+    # The target's contents are not named like the pattern: only its real path is.
+    target = tmp_path / f"{_NAME}-real"
+    (target / "data").mkdir(parents=True)
+    (target / "data" / "f1.txt").write_text("x\n", encoding="utf-8")
+    repo = _repo(tmp_path / "outer")
+    junction(repo / "node_modules" / "lnk", target)
+
+    assert GitRepoCache(_patterns()).is_clean(repo) is False
+    assert fake_git.cwds == []
+
+
+def test_junction_to_an_unprotected_place_still_gets_the_git_check(
+    tmp_path: Path, fake_git: _FakeGit, junction: _Junction
+) -> None:
+    target = tmp_path / "somewhere-else"
+    target.mkdir()
+    repo = _repo(tmp_path / "outer")
+    junction(repo / "node_modules" / "lnk", target)
+    assert GitRepoCache(_patterns()).is_clean(repo) is True
+    assert len(fake_git.cwds) == 3
+
+
+def test_the_delete_path_walk_default_is_unchanged_by_the_junction_option(
+    tmp_path: Path, junction: _Junction
+) -> None:
+    """`subtree_exclusion_match` keeps matching only text under the junction path unless asked."""
+    target = tmp_path / f"{_NAME}-real"
+    (target / "data").mkdir(parents=True)
+    root = tmp_path / "outer"
+    root.mkdir()
+    junction(root / "lnk", target)
+    patterns = _patterns()
+    assert subtree_exclusion_match(root, patterns) is None
+    assert subtree_exclusion_match(root, patterns, match_junction_targets=False) is None
+    assert subtree_exclusion_match(root, patterns, match_junction_targets=True) is not None

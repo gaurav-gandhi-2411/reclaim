@@ -549,11 +549,11 @@ def _git_target_excluded(repo_root: Path, patterns: Sequence[str]) -> bool:
     if not patterns:
         return False
     try:
-        if subtree_exclusion_match(repo_root, patterns) is not None:
+        if subtree_exclusion_match(repo_root, patterns, match_junction_targets=True) is not None:
             return True
         resolved = repo_root.resolve()
         return str(resolved) != str(repo_root) and (
-            subtree_exclusion_match(resolved, patterns) is not None
+            subtree_exclusion_match(resolved, patterns, match_junction_targets=True) is not None
         )
     except (OSError, RuntimeError, ValueError):
         return True
