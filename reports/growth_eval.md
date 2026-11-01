@@ -1,6 +1,6 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `8fc9bc6f5f8489516780d2e884cb1778ba7b4e4f` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `c768b927cedabc339bbb61be76ca352b0f260086` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
 with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
@@ -157,7 +157,7 @@ to be tested honestly.
 
 - `attrib.csv`: `e2cf6034ee47598e49f66bd85b5906d506503d97b55ea5fc4e7d21ed07e7a8df`
 - `census.csv`: `9af4404d540dfabcc3ef8a6ec320aa1db0b4e655d172cee78b2ad8e1dcf309b1`
-- `events.json`: `a230eda99b7dd1fccd30516a6d759067525137e2cb3ff3438fcf9bb2de4d2de4`
+- `events.json`: `71e2a9d10fe58db3002260cf3d5929c55e2dc68d12476a5de74d841bf182c437`
 - `jobs.csv`: `73ea0cb7aaf1098c7643496900992e4c522d1c76510bae7e6f4b5ccaa872ab2d`
 - `meta.json`: `ff2d25040604c86252c4dfd76b64a772b325b179ec19d954dd4e3b1234b21863`
 - `watchdog.csv`: `083c456a735fa186d0c04a3db6c55466a19793e7a2460e153f19beae22d9758f`
