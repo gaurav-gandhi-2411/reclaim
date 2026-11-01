@@ -1,6 +1,6 @@
 # Disk growth attribution: eval on this machine's real logs
 
-Produced by `python evals/growth/growth_eval.py` at commit `c768b927cedabc339bbb61be76ca352b0f260086` (code and fixtures);
+Produced by `python evals/growth/growth_eval.py` at commit `e01df51d6b52aeeb48ae38d6d517721622d3dd5e` (code and fixtures);
 machine-readable twin: `reports/growth_eval.json`. Ground truth:
 `evals/fixtures/growth/events.json` (5 evaluable of 12 documented events). Detector = `reclaim.growth.detect_anomalies`
 with spec defaults (window freshness 6 h / 1 h), replayed unchanged; baseline = alert
@@ -15,10 +15,10 @@ when any key's growth over
 |---|---|---|---|---|
 | recall (evaluable events detected) | 1/5 | 1/5 | 2/5 | 0/5 |
 | top-1 attribution (detected events with a known folder) | 0/0 | 0/0 | 0/2 | 0/0 |
-| alert episodes | 5 | 3 | 2 | 1 |
-| false-alarm episodes | 4 | 2 | 1 | 1 |
-| precision (lower bound) | 0.2 | 0.333 | 0.5 | 0.0 |
-| false-alarm episodes per week of data | 21.84 (not meaningful) | 10.92 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) |
+| alert episodes | 2 | 2 | 2 | 1 |
+| false-alarm episodes | 1 | 1 | 1 | 1 |
+| precision (lower bound) | 0.5 | 0.5 | 0.5 | 0.0 |
+| false-alarm episodes per week of data | 5.46 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) | 5.46 (not meaningful) |
 
 ## Change log
 
@@ -26,10 +26,28 @@ when any key's growth over
 
 | detector variant | recall before -> after | alert episodes | false-alarm episodes | precision (lower bound) |
 |---|---|---|---|---|
-| detector | 3/5 -> 1/5 | 16 -> 5 | 14 -> 4 | 0.125 -> 0.2 |
-| detector_literal | 1/5 -> 1/5 | 10 -> 3 | 9 -> 2 | 0.1 -> 0.333 |
+| detector | 3/5 -> 1/5 | 16 -> 2 | 14 -> 1 | 0.125 -> 0.5 |
+| detector_literal | 1/5 -> 1/5 | 10 -> 2 | 9 -> 1 | 0.1 -> 0.5 |
 
 Read the drop in recall with the honesty section: it is the two census-time detections that rested on a 52 h old C: sample.
+
+- Detector fix, volume rule needs a robust z (steady growth): before = code `e1c40b0847ac11d6455f8205a0fa6534859e69c9` (report `c768b927cedabc339bbb61be76ca352b0f260086`), after = `c21cc05aef6cfbf5660c9b425753e520b423c89d`. Fixtures, abs_floor, share_floor, z_min, windows and the key rule unchanged; the baseline is unchanged (it does not call the detector).
+
+| detector variant | recall before -> after | alert episodes | false-alarm episodes | precision (lower bound) |
+|---|---|---|---|---|
+| detector | 1/5 -> 1/5 | 5 -> 2 | 4 -> 1 | 0.2 -> 0.5 |
+| detector_literal | 1/5 -> 1/5 | 3 -> 2 | 2 -> 1 | 0.333 -> 0.5 |
+
+Steady-growth control, alerting snapshots of 84 (before -> after; the after alerts are all in the first 24 snapshots, before the volume has 6 intervals of history):
+
+| growth (GiB/day) | alerting snapshots | alerting after warm-up |
+|---|---|---|
+| 1.0 | 0 -> 0 | 0 -> 0 |
+| 1.5 | 0 -> 0 | 0 -> 0 |
+| 2.0 | 66 -> 6 | 60 -> 0 |
+| 3.0 | 66 -> 6 | 60 -> 0 |
+
+Surge control (2.0 GiB/day plus 20 GiB in one day): alerting snapshots 66 -> 17, of which from the surge day on 12 -> 11. The rule still fires on the surge; it no longer fires on the steady growth underneath it.
 
 ## Coverage (hours of data per source)
 
@@ -79,14 +97,20 @@ moved off C: 9 Oct 15:47-18:59, so a rise on top is invisible to the 5 GiB volum
 
 Synthetic control (deterministic, no noise, 14 days, 4-hourly snapshots): every volume alert is a false alarm by construction.
 
-| growth (GiB/day) | snapshots | alerting snapshots | first alert (day) |
-|---|---|---|---|
-| 1.0 | 84 | 0 | None |
-| 1.5 | 84 | 0 | None |
-| 2.0 | 84 | 66 | 3.0 |
-| 3.0 | 84 | 66 | 3.0 |
+| growth (GiB/day) | snapshots | alerting snapshots | alerting after warm-up | first alert (day) |
+|---|---|---|---|---|
+| 1.0 | 84 | 0 | 0 | None |
+| 1.5 | 84 | 0 | 0 | None |
+| 2.0 | 84 | 6 | 0 | 3.0 |
+| 3.0 | 84 | 6 | 0 | 3.0 |
 
-Arithmetic: a steady rate r trips the 5 GiB / 72 h rule once 3r >= 5, i.e. r >= 1.67 GiB/day; after that it stays tripped for as long as the growth lasts.
+Arithmetic: a steady rate r crosses the 5 GiB / 72 h floor once 3r >= 5, i.e. r >= 1.67 GiB/day. Before the volume-z fix it then stayed tripped for as long as the growth lasted. Now only the warm-up (the first 24 snapshots, while the volume has < 6 intervals of history and z is None) can alert.
+
+Surge on top of steady growth (the fix must not blind the rule): same series, plus extra growth spread over one day ending 1 day before the end.
+
+| growth (GiB/day) | surge (GiB) | alerting snapshots | alerting after warm-up | alerting from surge day on |
+|---|---|---|---|---|
+| 2.0 | 20 | 17 | 11 | 11 |
 
 Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cannot be measured on it. Net C: used change per continuous stretch of >= 2 h:
 
@@ -96,11 +120,11 @@ Real data: no continuous stretch reaches 72 h, so steady growth over 3 days cann
 - 2026-10-31T13:49:19: 4.5 h, -5.7 GiB net, -30.4 GiB/day
 - 2026-10-31T22:49:51: 2.6 h, 3.9 GiB net, 35.7 GiB/day
 
-Of the 4 as-replayed detector false-alarm episodes, 2 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`).
+Of the 1 as-replayed detector false-alarm episodes, 0 rest on a start sample older than 72 h or a newest sample older than 1 h (gap artifacts); the rest are in the JSON (`methods.detector_literal`).
 
-## Open design issue: steady growth trips the 3-day volume rule (NOT fixed)
+## Steady growth and the 3-day volume rule (FIXED)
 
-Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) trips the volume rule and keeps it tripped for as long as the growth lasts (synthetic control above: 2.0 and 3.0 GiB/day alert on 66 of 84 snapshots). The key rule does not have this problem because it needs a high robust z-score. Candidate fix, not built: also require the volume rate's own robust z-score once >= 6 intervals of history exist (same estimator as `key_z`, applied to the volume's used-space series). Not applied here: the control is synthetic and the fix must not be tuned on the 5 evaluable events.
+Steady growth of >= 1.67 GiB/day (5 GiB / 3 days) used to trip the volume rule and keep it tripped for as long as the growth lasted (2.0 and 3.0 GiB/day alerted on 66 of 84 snapshots). Fixed as applied in the change log: the volume rule now also computes the volume rate's robust z with `key_z` (same estimator, history and thinning as the key rule) and skips a window whose z is below `z_min`. With fewer than 6 thinned intervals of history z is None and the floor alone still alerts, so a fresh install does not go quiet (the remaining control alerts are all in that warm-up). No threshold was changed and the fix was decided on the synthetic control, not tuned on the 5 evaluable events. Steady growth that fills a disk is still covered by the 80%-full notification (R5), not by this rule.
 
 ## Honesty section
 
