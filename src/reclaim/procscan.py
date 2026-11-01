@@ -100,6 +100,7 @@ class ProcessScan:
         if not wanted:
             return ["empty path"]
         patterns = [re.compile(re.escape(w) + r"(?=$|[\\\s\"';,)])") for w in wanted]
+        own_pid = current_pid()
         for proc in self.processes:
             cwd_forms = (
                 [normalize_path(proc.cwd), resolve_path(proc.cwd)] if proc.cwd is not None else []
@@ -107,7 +108,12 @@ class ProcessScan:
             if any(_inside(form, w) for form in cwd_forms for w in wanted):
                 reasons.append(f"{proc.name} (pid {proc.pid}) has its working directory inside")
                 continue
-            if proc.cmdline is None:
+            # The process doing the check names its own target: `reclaim apply <worktree>` has
+            # the path on its command line. Counting that as "in use" refused every path given
+            # to apply as its root (found on build 13, 1 Nov: 0/0 eligible). Only the command
+            # line is skipped for our own pid; a cwd inside the path still counts (above). A
+            # wrapper parent such as `cmd /c reclaim apply <path>` still refuses: fail-closed.
+            if proc.cmdline is None or proc.pid == own_pid:
                 continue
             cmd = normalize_path(proc.cmdline, expand_short=False)
             if any(pat.search(cmd) is not None for pat in patterns) or any(
