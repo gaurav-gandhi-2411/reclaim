@@ -16,6 +16,7 @@ from reclaim.config import (
     Config,
     DevArtifactsConfig,
     DuplicatesConfig,
+    GrowthConfig,
     LargeLogsConfig,
     SafetyConfig,
 )
@@ -2625,6 +2626,123 @@ def test_post_settings_notifications_without_csrf_token_is_rejected(tmp_path: Pa
     bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
 
     response = bare_client.post("/api/settings/notifications", json={"enabled": True})
+
+    assert response.status_code == 403
+    assert not config_path.exists()
+
+
+# --- Opt-in growth-anomaly alert (owner decision 2026-11-02): /api/settings/growth-alert --------
+
+
+def test_get_settings_growth_alert_default_is_off_with_collection_on(tmp_path: Path) -> None:
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=tmp_path / "config.toml"
+    )
+
+    response = client.get("/api/settings/growth-alert")
+
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False, "collection_enabled": True}
+
+
+def test_post_settings_growth_alert_persists_to_disk_and_memory_and_keeps_collection(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/growth-alert", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert response.json() == {"enabled": True, "collection_enabled": True}
+
+    from reclaim.config import load_config
+
+    on_disk = load_config(config_path)
+    assert on_disk.growth.alert_enabled is True
+    assert on_disk.growth.enabled is True  # the collection flag is never written by this toggle
+    assert client.get("/api/settings/growth-alert").json()["enabled"] is True
+
+    off = client.post("/api/settings/growth-alert", json={"enabled": False}).json()
+    assert off["enabled"] is False
+    assert load_config(config_path).growth.alert_enabled is False
+
+
+def test_get_settings_growth_alert_reports_collection_off(tmp_path: Path) -> None:
+    config = _config(tmp_path / "tree").model_copy(update={"growth": GrowthConfig(enabled=False)})
+    client = _make_app_with_config_path(tmp_path, config=config, config_path=tmp_path / "c.toml")
+
+    assert client.get("/api/settings/growth-alert").json() == {
+        "enabled": False,
+        "collection_enabled": False,
+    }
+
+
+def test_post_settings_growth_alert_rejects_unknown_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post(
+        "/api/settings/growth-alert", json={"enabled": True, "collection_enabled": False}
+    )
+
+    assert response.status_code == 422
+    assert not config_path.exists()
+
+
+@pytest.mark.parametrize("value", ["yes", "true", 1])
+def test_post_settings_growth_alert_requires_a_real_boolean(tmp_path: Path, value: object) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/growth-alert", json={"enabled": value})
+
+    assert response.status_code == 422
+    assert not config_path.exists()
+
+
+def test_post_settings_growth_alert_is_409_and_leaves_a_config_it_cannot_patch(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    original = "growth = {enabled = true}\n"
+    config_path.write_text(original, encoding="utf-8")
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/growth-alert", json={"enabled": True})
+
+    assert response.status_code == 409
+    assert "by hand" in response.json()["detail"]
+    assert config_path.read_text(encoding="utf-8") == original
+    assert client.get("/api/settings/growth-alert").json()["enabled"] is False
+
+
+def test_post_settings_growth_alert_without_csrf_token_is_rejected(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    mode_log = tmp_path / "mode_log.jsonl"
+    switch_to_power_mode(REQUIRED_POWER_MODE_CONFIRMATION, log_path=mode_log)
+    app = create_app(
+        db_path=tmp_path / "index.sqlite3",
+        config=_config(tmp_path / "tree"),
+        config_path=config_path,
+        vault_dir=tmp_path / "vault",
+        manifest_path=tmp_path / "manifest.jsonl",
+        mode_log_path=mode_log,
+        log_path=tmp_path / "reclaim.log",
+        host=_TEST_HOST,
+        port=_TEST_PORT,
+    )
+    bare_client = WarmingTestClient(app, base_url=f"http://{_TEST_HOST}:{_TEST_PORT}")
+
+    response = bare_client.post("/api/settings/growth-alert", json={"enabled": True})
 
     assert response.status_code == 403
     assert not config_path.exists()

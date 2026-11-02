@@ -60,8 +60,10 @@ nothing is tagged or published yet.
 - **What changed on disk** (#233, ADR-0046): a read-only growth history (a bounded walk
   every 4 h into `data/growth.sqlite3`), a "What changed" panel in Advanced mode, a
   one-line weekly summary in Simple mode ("C: grew 6.2 GB this week, mostly Docker"),
-  and an anomaly toast. Excluded projects appear only as one "Excluded projects" total.
-  `[growth] enabled = false` stops all growth IO.
+  and an anomaly toast that is opt-in and off by default (a "Disk growth alert" toggle in
+  Settings, `[growth] alert_enabled`; history collection stays on either way). Excluded
+  projects appear only as one "Excluded projects" total. `[growth] enabled = false` stops
+  all growth IO.
 - A generated ADR index checked by a test (#210), ADR-0045 (#208).
 - Release prep: this changelog, a security policy, issue and PR templates, a release checklist.
 

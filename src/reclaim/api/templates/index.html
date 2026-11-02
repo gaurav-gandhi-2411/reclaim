@@ -352,6 +352,27 @@
         <p id="notifications-status" class="rc-settings-card-status" role="status" aria-live="polite"></p>
       </section>
 
+      <!-- Opt-in growth-anomaly alert (ADR-0046 addendum 2026-11-02). Same states as the
+           low-space panel above: loading (checkbox disabled until the GET returns), error
+           (could-not-load / could-not-save, toggle rolled back), and a note when collection of the
+           history it reads is off. Settings is an Advanced-mode tab; Simple mode has no tabs. -->
+      <section class="rc-settings-panel" aria-labelledby="growth-alert-heading">
+        <h2 id="growth-alert-heading">Disk growth alert</h2>
+        <p>A native Windows notification when a drive grows unusually fast: 5 GB or more within 1 to 3 days. Off by default. It is experimental and still being evaluated on real history, so it may be wrong in both directions.</p>
+        <ul>
+          <li>Normal heavy use can trigger it: steady growth of about 1.7 GB a day or more, or one big copy, and it can keep alerting while that lasts.</li>
+          <li>Growth slower than that never triggers it. The low disk space alert at 80% full is the backstop.</li>
+          <li>A drive with very noisy usage can alert on noise alone.</li>
+        </ul>
+        <label class="rc-checkbox-row">
+          <input id="growth-alert-enabled-checkbox" type="checkbox" disabled aria-label="Turn the disk growth alert on or off" />
+          <span id="growth-alert-enabled-text">Off</span>
+        </label>
+        <p class="rc-meta">The history behind "What changed" is collected whether or not this alert is on. It reads folder sizes only and never leaves this computer.</p>
+        <p id="growth-alert-collection-note" class="rc-meta"></p>
+        <p id="growth-alert-status" class="rc-settings-card-status" role="status" aria-live="polite"></p>
+      </section>
+
       <!-- ADR-0034: weekly auto-clean of the regenerable safe tier (package-manager caches, old
            temp files, crash dumps, closed-browser caches). States: loading ("Checking…" until the
            task query returns), error (could-not-load / could-not-save, toggle rolled back), empty

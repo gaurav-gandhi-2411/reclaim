@@ -2222,6 +2222,7 @@ export {
   openRelocateDialog,
   confirmRelocate,
   loadAssistantSetup,
+  loadGrowthAlertSettings,
   renderClusterTable,
   renderAISuggestionCard,
   formatEtaSeconds,
@@ -2861,6 +2862,7 @@ async function loadSettingsView() {
   // -- fire-and-forget, same "non-fatal status refresh" posture as loadModeStatus elsewhere.
   loadAnthropicKeyStatus();
   loadNotificationsSettings();
+  loadGrowthAlertSettings();
   loadAssistantSetup();
   loadAutoCleanSettings();
 }
@@ -2906,6 +2908,62 @@ async function updateNotificationsSetting(checkbox, toggleText, statusEl) {
   statusEl.textContent = "Saving…";
   try {
     await api("/api/settings/notifications", {
+      method: "POST",
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    statusEl.textContent = "";
+  } catch (err) {
+    checkbox.checked = !nextEnabled;
+    toggleText.textContent = checkbox.checked ? "On" : "Off";
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not save: ${err.message}`;
+  } finally {
+    checkbox.disabled = false;
+  }
+}
+
+// --- Opt-in growth-anomaly alert (ADR-0046 addendum 2026-11-02). Same fetch/render/toggle-with-
+// rollback shape as the notifications toggle above; the GET also says whether history collection
+// ([growth] enabled) is on, because the alert cannot fire without it. ---------------------------
+
+async function loadGrowthAlertSettings() {
+  const checkbox = document.getElementById("growth-alert-enabled-checkbox");
+  const toggleText = document.getElementById("growth-alert-enabled-text");
+  const collectionNote = document.getElementById("growth-alert-collection-note");
+  const statusEl = document.getElementById("growth-alert-status");
+  if (!checkbox) return;
+  try {
+    const data = await api("/api/settings/growth-alert");
+    checkbox.checked = data.enabled;
+    toggleText.textContent = data.enabled ? "On" : "Off";
+    collectionNote.textContent = data.collection_enabled
+      ? ""
+      : "Collection of folder sizes is turned off in config.toml, so this alert cannot fire.";
+    statusEl.className = "rc-settings-card-status";
+    statusEl.textContent = "";
+    checkbox.disabled = false;
+  } catch (err) {
+    statusEl.className = "rc-settings-card-status rc-form-error";
+    statusEl.textContent = `Could not load: ${err.message}`;
+  }
+  // Static markup re-used on every Settings activation: attach the listener once (see
+  // loadNotificationsSettings for why a dataset flag and not `{once: true}`).
+  if (!checkbox.dataset.listenerAttached) {
+    checkbox.dataset.listenerAttached = "true";
+    checkbox.addEventListener("change", () => {
+      toggleText.textContent = checkbox.checked ? "On" : "Off";
+      updateGrowthAlertSetting(checkbox, toggleText, statusEl);
+    });
+  }
+}
+
+async function updateGrowthAlertSetting(checkbox, toggleText, statusEl) {
+  const nextEnabled = checkbox.checked;
+  checkbox.disabled = true;
+  statusEl.className = "rc-settings-card-status";
+  statusEl.textContent = "Saving…";
+  try {
+    await api("/api/settings/growth-alert", {
       method: "POST",
       body: JSON.stringify({ enabled: nextEnabled }),
     });
