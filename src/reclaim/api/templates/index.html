@@ -360,8 +360,8 @@
         <h2 id="growth-alert-heading">Disk growth alert</h2>
         <p>A native Windows notification when a drive grows unusually fast: 5 GB or more within 1 to 3 days. Off by default. It is experimental and still being evaluated on real history, so it may be wrong in both directions.</p>
         <ul>
-          <li>Steady growth that arrives in bursts every few days, or one big copy, can trigger it.</li>
-          <li>A slow leak can go quiet after about 10 days. The low disk space alert at 80% full is the backstop.</li>
+          <li>Normal heavy use can trigger it: steady growth of about 1.7 GB a day or more, or one big copy, and it can keep alerting while that lasts.</li>
+          <li>Growth slower than that never triggers it. The low disk space alert at 80% full is the backstop.</li>
           <li>A drive with very noisy usage can alert on noise alone.</li>
         </ul>
         <label class="rc-checkbox-row">

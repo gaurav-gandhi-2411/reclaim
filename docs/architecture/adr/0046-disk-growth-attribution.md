@@ -60,8 +60,11 @@ alert"). Snapshot collection (`[growth] enabled = true`) is unchanged, so real h
 accruing for the "What changed" view and for evaluating the alert. The toggle is the explicit
 opt-in, so the toast no longer also requires `[notifications] enabled` (the separate low disk
 space alert); the snooze and the toast's own debounce still apply. The Settings text states the
-known limits: bursty growth or one big copy can trigger it, a slow leak can go quiet after
-about 10 days (the 80% alert is the backstop), and a very noisy drive can alert on noise.
+known limits of the rule as shipped: steady growth of about 1.7 GB a day or more, or one big
+copy, triggers it and can keep it alerting; growth slower than that never triggers it (the 80%
+alert is the backstop); and a very noisy drive can alert on noise. If the volume-baseline change
+(#244) lands, it changes these limits (bursts every few days still alert, and a sustained leak
+goes quiet after about 10 days), and must update this text in the same PR.
 
 Revisit trigger: around early December 2026, with about 4 weeks of real snapshot history,
 measure precision, recall and the false-alarm rate against the logged events. Only then
