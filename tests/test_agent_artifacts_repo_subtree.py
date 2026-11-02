@@ -190,6 +190,38 @@ def test_the_bookkeeping_guard_lets_a_clean_repository_through(tmp_path: Path) -
     assert guard(repo) is True
 
 
+def test_the_bookkeeping_guard_blocks_when_its_walk_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #247 verifier mutant M5: a guard that answered "free" on a walk error survived.
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    repo = make_repo(tmp_path, "proj")
+
+    def failing_walk(*args: object, **kwargs: object) -> str | None:
+        raise PermissionError("walk failed")
+
+    monkeypatch.setattr(world.safety, "exclusion_match", failing_walk)
+
+    assert aa.repo_guard(world.safety)(repo) is True
+
+
+def test_the_walk_cache_is_per_repository(tmp_path: Path) -> None:
+    # #247 verifier mutant M10: one cached answer shared by every repository survived. In one env,
+    # a clean repository and one holding a protected project must each get their own answer,
+    # in either order.
+    clean = make_repo(tmp_path / "a", "proj")
+    held = make_repo(tmp_path / "b", "proj")
+    (held / "vendor" / f"{_NAME}-copy").mkdir(parents=True)
+    wt_clean = add_worktree(clean, "proj-wt-a", "feat-a")
+    wt_held = add_worktree(held, "proj-wt-b", "feat-b")
+
+    for order in ((wt_clean, clean), (wt_held, held)), ((wt_held, held), (wt_clean, clean)):
+        env = make_world(tmp_path, exclusions=(_NAME,)).env
+        verdicts = {repo: aa.evaluate_worktree(env, wt, repo) for wt, repo in order}
+        assert not verdicts[clean].excluded
+        assert verdicts[held].excluded
+
+
 # Git for Windows lists a junction's content as the repository's own (checked 2026-11-03:
 # `git status -uall` in a repo with `link` -> a directory printed `link/secret.txt`), so a
 # junction whose TARGET is the protected directory must count, though no name under it matches.
