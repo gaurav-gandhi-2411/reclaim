@@ -317,6 +317,20 @@ def test_a_process_that_appears_after_detection_blocks_the_apply(
     assert setup.wt.exists()
 
 
+def test_the_apply_process_naming_the_worktree_does_not_hide_it(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Build 13 (1 Nov): `reclaim.exe apply <worktree>` reported 0/0 eligible because the
+    process scan saw the apply process's OWN command line name the worktree (rule W5)."""
+    cmd = f"reclaim.exe apply {setup.wt} --tier B"
+    own = fake_scan([ProcessSnapshot(os.getpid(), "reclaim.exe", str(setup.root), cmd)])
+    monkeypatch.setattr(aa, "scan_processes", lambda: own)
+    assert aa.CAT_WORKTREE in _detect(setup)
+    other = fake_scan([ProcessSnapshot(os.getpid() + 1, "reclaim.exe", str(setup.root), cmd)])
+    monkeypatch.setattr(aa, "scan_processes", lambda: other)
+    assert aa.CAT_WORKTREE not in _detect(setup)
+
+
 def test_an_exclusion_added_after_detection_refuses_the_whole_batch(setup: Setup) -> None:
     found = _detect(setup)
     stricter = SafetyValidator(

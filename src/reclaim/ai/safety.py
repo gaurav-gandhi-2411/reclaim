@@ -32,7 +32,7 @@ def filter_paths_through_safety_validator(
     discipline `executor._reverify_direct_delete_candidates` already applies before a real
     delete, applied here before a path is even allowed into the review queue.
     """
-    git_cache = GitRepoCache()
+    git_cache = GitRepoCache(safety.exclusion_patterns)
     eligible: list[Path] = []
     for path in paths:
         record = build_record_for_path(path, git_cache)

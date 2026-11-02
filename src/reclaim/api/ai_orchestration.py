@@ -255,7 +255,10 @@ def _fallback_order(clusters: list[AICluster]) -> list[AICluster]:
 
 
 def _apply_clutter_ranker_ordering(
-    result: AIAnalysisResult, *, clutter_ranker_model_path: Path
+    result: AIAnalysisResult,
+    *,
+    clutter_ranker_model_path: Path,
+    excluded_patterns: Sequence[str] = (),
 ) -> None:
     if not result.clusters:
         return
@@ -274,7 +277,7 @@ def _apply_clutter_ranker_ordering(
         return
 
     now = time.time()
-    git_cache = GitRepoCache()
+    git_cache = GitRepoCache(excluded_patterns)
     scored: list[tuple[float, int, AICluster]] = []
     for original_index, cluster in enumerate(result.clusters):
         member = _representative_member(cluster)
@@ -367,5 +370,9 @@ def run_ai_analysis(
     )
     result.clusters.extend(screenshots)
 
-    _apply_clutter_ranker_ordering(result, clutter_ranker_model_path=clutter_ranker_model_path)
+    _apply_clutter_ranker_ordering(
+        result,
+        clutter_ranker_model_path=clutter_ranker_model_path,
+        excluded_patterns=safety.exclusion_patterns,
+    )
     return result

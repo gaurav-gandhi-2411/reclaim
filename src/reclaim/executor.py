@@ -1194,7 +1194,7 @@ def _reverify_direct_delete_candidates(
     if not direct_delete:
         return
 
-    git_cache = GitRepoCache()
+    git_cache = GitRepoCache(safety.exclusion_patterns)
     blocked: list[str] = []
     for candidate in direct_delete:
         fresh_record = build_record_for_path(candidate.path, git_cache)

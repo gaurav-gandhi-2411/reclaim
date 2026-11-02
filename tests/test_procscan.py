@@ -220,6 +220,35 @@ def test_set_aside_processes_do_not_block() -> None:
     assert scan.in_use("C:" + BS + "anything") == []
 
 
+# --- the checking process names its own target (build 13 finding, 1 Nov) -----------------------
+
+
+def test_our_own_command_line_naming_the_path_is_not_a_use(tmp_path: Path) -> None:
+    """`reclaim apply <worktree>` has the worktree on its own command line; that used to make
+    every apply root refuse itself (0/0 eligible)."""
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    cmd = "reclaim.exe apply " + str(wt) + " --tier B"
+    own = fake_scan([ProcessSnapshot(os.getpid(), "reclaim.exe", str(tmp_path), cmd)])
+    assert own.in_use(wt) == []
+
+
+def test_another_process_with_the_same_command_line_still_blocks(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    cmd = "reclaim.exe apply " + str(wt) + " --tier B"
+    other_pid = os.getpid() + 1
+    other = fake_scan([ProcessSnapshot(other_pid, "reclaim.exe", str(tmp_path), cmd)])
+    assert other.in_use(wt) == [f"reclaim.exe (pid {other_pid}) has the path in its command line"]
+
+
+def test_our_own_working_directory_inside_the_path_still_blocks(tmp_path: Path) -> None:
+    wt = tmp_path / "proj-wt-feat"
+    wt.mkdir()
+    own = fake_scan([ProcessSnapshot(os.getpid(), "reclaim.exe", str(wt), "reclaim.exe apply .")])
+    assert own.in_use(wt) == [f"reclaim.exe (pid {os.getpid()}) has its working directory inside"]
+
+
 # --- spellings of a path that string matching alone missed (independent review, finding F1) ------
 
 

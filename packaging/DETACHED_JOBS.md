@@ -124,9 +124,10 @@ From the repo root, with the venv's Python (the runner itself uses only the stan
 & .venv\Scripts\python.exe packaging\detached_job.py forget verify-bff0752   # after it ends
 ```
 
-`status` exits 0 for `done`, 1 for `failed`/`aborted`/`gave_up`/`error`/`suspect`, 2 while
-waiting or running, and 3 for `stale` (the runner stopped sampling: no heartbeat for 3 periods
-plus a minute, or no status at all that long after launch). Everything is under
+`status` exits 0 for `done`, 1 for `failed`/`aborted`/`gave_up`/`error`/`suspect`/`orphaned`
+(a recorded end state), 2 while waiting or running, 3 for `stale` (the runner stopped sampling:
+no heartbeat for 3 periods plus a minute, or no status at all that long after launch) and 4 for
+`orphaned` proved just now (below). Everything is under
 `D:\reclaim-build\jobs\<name>\`:
 
 | file | content |
@@ -138,6 +139,37 @@ plus a minute, or no status at all that long after launch). Everything is under
 
 A session polls `status` or the log files; it never waits on the job from a background shell
 (the waiter could be reaped, though the job would not). A `--name` can be used once.
+
+## Orphaned jobs (runner died, status.json still says running)
+
+A killed runner (logoff, reboot, the time limit, an end-task) leaves `status.json` non-terminal
+forever, and `forget` used to refuse it, so its scheduled task could never be removed with the
+tool (job `scanfresh12`, 31 Oct 2026: state `running`, runner and child dead, last heartbeat
+18:23). A job is **orphaned** only when ALL of these hold:
+
+1. the stored state is non-terminal;
+2. the heartbeat is older than the stale limit (3 periods plus a minute);
+3. `runner_pid` from `status.json` is not alive (Win32 `OpenProcess` with query-only access +
+   `GetExitCodeProcess` != STILL_ACTIVE; nothing is signalled or ended);
+4. the task `ReclaimJob-<name>` is not Running (`schtasks /Query /TN ... /FO CSV /NH /V`, the
+   Status column; only an English `Ready`/`Disabled`/`Could not start` row for exactly that task
+   proves "not running").
+
+It fails closed: a missing or non-integer `runner_pid`, an unreadable heartbeat or spec, a failed
+or garbled query, an unrecognized (e.g. localized) status, or an access error other than
+"denied" all mean "cannot tell", which is **not orphaned**. **PID reuse:** if Windows has given
+the dead runner's pid to another process, the pid reads as alive and the job is treated as not
+orphaned. That is deliberate (the check never compares process identity), so such a job stays
+`stale` until the pid is free; the cost is a refusal, never a wrong removal.
+
+- `status NAME` prints `state: "orphaned"` plus `orphan_proof` (the facts) and exits 4 instead of
+  3. A stale job that is not proved prints `stale` and `orphan_unproven` (why). It writes nothing.
+- `forget NAME` on an orphan first rewrites `status.json` as terminal (`state: "orphaned"`,
+  `orphaned_from`, `reason` = the proof, `ended`; every old field and the old heartbeat kept),
+  appends `END state=orphaned` to `runner.log`, and only then deletes the task. If the status
+  write fails the task is not deleted. A non-orphaned non-terminal job is still refused, with the
+  reason. Afterwards `status` shows the recorded `orphaned` (exit 1).
+- Nothing is killed and no job file is deleted; the child of a dead runner is not looked for.
 
 ## Proof (2026-10-30, on GG's machine)
 
