@@ -46,7 +46,7 @@ import structlog
 from reclaim.app_paths import data_root
 from reclaim.models import Candidate, FileRecord, Tier
 from reclaim.models import Verdict as SafetyVerdict
-from reclaim.procscan import ProcessScan, normalize_path, scan_processes
+from reclaim.procscan import ProcessScan, current_pid, normalize_path, scan_processes
 from reclaim.safety import first_matching_pattern
 from reclaim.safety_env import assert_not_real_profile_under_pytest
 
@@ -939,9 +939,17 @@ def _prove_not_excluded(env: AgentEnv, path: Path, held: list[str], rule: str) -
 
 def _prove_unused(env: AgentEnv, path: Path, held: list[str], rule: str, *extra: str) -> None:
     reasons = env.procs.in_use(path)
+    # Our own pid is skipped for the token check, as `ProcessScan.in_use` skips it for the path
+    # (#236): `reclaim apply <session-dir>` names the session UUID on its own command line, so S4
+    # refused every scratch apply by path. The pid is the live process doing this check, so it
+    # matches exactly one process (the frozen build is one process); a parent or wrapper such as
+    # `cmd /c reclaim apply <path>` is not skipped and still refuses (fail-closed).
+    own_pid = current_pid()
     for token in extra:
         needle = token.casefold()
         for proc in env.procs.processes:
+            if proc.pid == own_pid:
+                continue
             if proc.cmdline and needle in proc.cmdline.casefold():
                 reasons.append(f"{proc.name} (pid {proc.pid}) mentions {token}")
     if reasons:

@@ -532,6 +532,48 @@ def test_scratch_with_a_live_process_by_path_or_by_session_id_is_refused(tmp_pat
         _refused(aa.evaluate_scratch(w.env, session), "S4")
 
 
+def test_scratch_apply_by_path_does_not_refuse_itself_but_a_wrapper_still_does(
+    tmp_path: Path,
+) -> None:
+    # Like W5 in #236: `reclaim apply <session-dir>` names the session UUID on its OWN command
+    # line, which S4's token check counted as a live use, so every scratch apply by path refused
+    # itself. Only our own pid is skipped; any other process naming it still refuses.
+    world = make_world(tmp_path)
+    session = make_session(world, age_days=20)
+    cmd = f"reclaim.exe apply {session} --include-categories agent_scratch"
+    own = fake_scan([ProcessSnapshot(os.getpid(), "reclaim.exe", "C:" + chr(92) + "w", cmd)])
+    assert aa.evaluate_scratch(make_world(tmp_path, procs=own).env, session).offered
+
+    # A wrapper naming the path, and ANOTHER reclaim.exe naming only the session id (so only the
+    # token check can catch it): the skip is by pid, never by image name.
+    others = (
+        ProcessSnapshot(os.getpid() + 1, "cmd.exe", "C:" + chr(92) + "w", f"cmd /c {cmd}"),
+        ProcessSnapshot(
+            os.getpid() + 2, "reclaim.exe", "C:" + chr(92) + "w", f"reclaim.exe x {session.name}"
+        ),
+        # Our real parent (the `cmd /c` wrapper case): the skip must not widen to it (#246 M3).
+        # (id only, so the path check in `in_use` cannot be what refuses it).
+        ProcessSnapshot(
+            os.getppid(), "cmd.exe", "C:" + chr(92) + "w", f"cmd /c reclaim.exe x {session.name}"
+        ),
+    )
+    for snap in others:
+        world_other = make_world(tmp_path, procs=fake_scan([snap]))
+        _refused(aa.evaluate_scratch(world_other.env, session), "S4")
+
+    # A second process with exactly our command line is still someone else (#246 M4).
+    # The id only (no path), so only the token check can tell the two apart.
+    id_cmd = f"reclaim.exe x {session.name}"
+    twin = ProcessSnapshot(os.getpid() + 3, "reclaim.exe", "C:" + chr(92) + "w", id_cmd)
+    own_proc = ProcessSnapshot(os.getpid(), "reclaim.exe", "C:" + chr(92) + "w", id_cmd)
+    world_twin = make_world(tmp_path, procs=fake_scan([own_proc, twin]))
+    _refused(aa.evaluate_scratch(world_twin.env, session), "S4")
+
+    # Our own cwd inside the session still blocks (the skip is for command lines only).
+    inside = fake_scan([ProcessSnapshot(os.getpid(), "reclaim.exe", str(session), cmd)])
+    _refused(aa.evaluate_scratch(make_world(tmp_path, procs=inside).env, session), "S4")
+
+
 def test_scratch_with_a_junction_inside_is_refused_and_its_target_untouched(tmp_path: Path) -> None:
     world = make_world(tmp_path)
     session = make_session(world, age_days=20)
