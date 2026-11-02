@@ -11,6 +11,15 @@ default for every fresh install in every release below. One exception from 1.4.0
 clean and the weekly cache clean (ADR-0034) run each tool's own cleaning command on the
 regenerable-cache list, in safe mode, without a review step and not through the Recycle Bin.
 
+## Unreleased
+
+### Security
+
+- Agent Leftovers walks a worktree's main repository for excluded projects too, before any
+  git command runs in it (#239 walked only the worktree). The walk is answered once per
+  repository per run, fails closed, and also guards the git bookkeeping after a vault move and
+  after an undo.
+
 ## [1.4.0] - unreleased
 
 1.4.0 is everything merged to `main` since v1.3.0, including PR #199 (merged 1 Nov 2026:
