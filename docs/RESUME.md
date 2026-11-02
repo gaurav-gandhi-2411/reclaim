@@ -208,6 +208,22 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
   - **#233** full verify rc 0, 2,423 passed.
   - **RC checklist** `docs/RELEASE-1.4.0-CHECKLIST.md`: not releasable as built (rows 1 and 3 by construction until #199 and #225 land, row 15 needs #236 or a known limit, row 13 is GG's).
   - **Next:** #230's CI on `e486350`; cleanup (`aa13x`, `bt*`, `shot230*`, `ReclaimJob-*` tasks); §4 hardening.
+- 3 Nov checkpoint 28 (GG's 2 Nov decisions round; detail in the run log, 2-3 Nov).
+  - **1.4.0 is complete on main.**
+    - GG merged release PR #240 (main `ccb0614`; #225, #230, #233, #236, #237 and #239 all MERGED); main CI green.
+    - Self-merged after a falsifying verifier and the merge gate: #241 `a785fc0`, #243 `80d213c`, #242 `7c7cb53` and **#245 `e14a42e`**. #245 makes the growth anomaly toast opt-in; main CI green on each.
+  - **#245, the growth alert opt-in** (owner decision, DECISIONS 19):
+    - `[growth] alert_enabled = false` on every machine, with a Settings toggle whose text states the limits; collection stays on.
+    - The verifier found two issues, both fixed before merge: the limits text described #244's rule, not the shipped one; and the toggle writer appended a duplicate `[growth]` table when the header had a comment. Every toggle writer is now fail-closed (`ConfigEditError`, 409).
+    - Full verify `6c929d7`: 3,482 passed.
+  - **Build 14** from main `e14a42e`: clone `%TEMP%\claude\reclaim\20261103\b14` (real ONNX copied after their SHA-256 matched the LFS pointers), job `build14-e14a42e`. Then install in place (G3) and re-run `docs/RELEASE-1.4.0-CHECKLIST.md`.
+  - **Next release PR candidates** (each a delete-path guard change, gate 4):
+    - #244: the growth volume baseline, retargeted to main and merged up, `17179f2`. It must also update the Settings limits text and the ADR-0046 addendum.
+    - #246: S4 skips only our own pid (DECISIONS 22).
+    - #247: no git in a worktree's main repository holding an excluded project, plus junction targets (DECISIONS 21). This corrects 1.4.0's "including through a junction" claim for Agent Leftovers: Git for Windows reads through junctions.
+  - **Scheduled: around early December 2026, re-evaluate the growth alert rule on about 4 weeks of real snapshot history** from `data\growth.sqlite3` on GG's machine.
+    - Measure precision, recall and the false-alarm rate against the events in the logs, with #244's rule and main's rule side by side.
+    - Only then propose making the alert on by default. Until then it stays off (ADR-0046 addendum 2026-11-02).
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
