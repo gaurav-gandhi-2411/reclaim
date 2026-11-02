@@ -862,3 +862,11 @@ def test_set_growth_alert_enabled_creates_section_and_file(tmp_path: Path) -> No
     config = load_config(config_path)
     assert config.growth.alert_enabled is True
     assert config.growth.enabled is True
+
+
+@pytest.mark.parametrize("name", ["config.example.toml", "packaging/config.default.toml"])
+def test_shipped_config_templates_keep_growth_alert_off_and_collection_on(name: str) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    config = load_config(repo_root / name)
+    assert config.growth.alert_enabled is False
+    assert config.growth.enabled is True

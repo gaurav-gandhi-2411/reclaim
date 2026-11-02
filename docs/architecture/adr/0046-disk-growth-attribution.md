@@ -51,3 +51,18 @@ serves the only access path).
 
 Diffing successive index scans (too rare, cannot explain an overnight drop); USN journal
 (needs admin); per-process write counters (writes are not growth, no folder attribution).
+
+## Addendum 2026-11-02: the anomaly toast is opt-in
+
+Owner decision for release 1.4.0: the growth-anomaly toast is **off by default on every
+machine** (`[growth] alert_enabled = false`) and is switched on from Settings ("Disk growth
+alert"). Snapshot collection (`[growth] enabled = true`) is unchanged, so real history keeps
+accruing for the "What changed" view and for evaluating the alert. The toggle is the explicit
+opt-in, so the toast no longer also requires `[notifications] enabled` (the separate low disk
+space alert); the snooze and the toast's own debounce still apply. The Settings text states the
+known limits: bursty growth or one big copy can trigger it, a slow leak can go quiet after
+about 10 days (the 80% alert is the backstop), and a very noisy drive can alert on noise.
+
+Revisit trigger: around early December 2026, with about 4 weeks of real snapshot history,
+measure precision, recall and the false-alarm rate against the logged events. Only then
+propose default-on; until then the default stays off.

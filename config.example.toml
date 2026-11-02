@@ -128,6 +128,15 @@ enabled = false
 # threshold.
 disk_threshold_percent = 80.0
 
+# ADR-0046: disk growth attribution. `enabled` = the read-only background snapshot of folder
+# sizes behind the "What changed" view (on by default; false stops all growth IO).
+# `alert_enabled` = the "your disk is growing fast" toast: opt-in, off by default, because it is
+# experimental and not yet evaluated on real history. The Settings tab ("Disk growth alert")
+# writes it; it needs `enabled = true` and does not need [notifications].
+[growth]
+enabled = true
+alert_enabled = false
+
 # ADR-0034: weekly auto-clean of the regenerable safe tier only (package-manager caches, old
 # temp files, crash dumps, closed-browser caches). Off by default; the Settings tab toggle writes
 # this flag AND registers/removes the per-account Task Scheduler entry -- edit it by hand only if
