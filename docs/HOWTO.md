@@ -3,7 +3,10 @@
 Written for the owner. Sections 1-6b were checked against earlier builds (2026-10-08 and 2026-10-09);
 section 6c is about the build installed on 2026-10-17 (main `a446853`, installer SHA-256
 `65d1501e6ca5e2bd51d52e9bb967b3031cd23b7782c0ef204765ee91978c208a`). Things I could not see on screen are
-marked **not seen**.
+marked **not seen**. For the 1.4.0 release prep, the button, tab and setting names and the `reclaim relocate` and
+`reclaim agent-artifacts` options in sections 4 and 7-10 were re-checked against the code and dashboard page of that
+branch (not against an installed 1.4.0 build, which did not exist yet); the measured numbers in sections 2-6c describe
+the builds named there, not 1.4.0.
 
 ## 1. Start it
 Start Menu -> **Reclaim**. Your browser opens the dashboard at `http://127.0.0.1:<port>` (it only listens on your own
@@ -34,7 +37,7 @@ progress bar shows it). Afterwards Reclaim quietly prepares duplicate detection 
 
 ## 4. Advanced mode (button: **Switch to Advanced**, top right)
 Tabs: **Overview** (totals + Quick Clean), **Storage Treemap**, **Review Queue** (every candidate with the reason it was
-proposed), **AI Suggestions** (recommend-only, never deletes by itself), **Quarantine & Restore**, **Settings**.
+proposed), **AI Suggestions** (recommend-only, never deletes by itself), **Quarantine & Restore**, **Move to Another Drive** (section 9), **Settings**.
 "Safe mode" (top bar) is on by default: everything goes to the Recycle Bin and nothing is applied automatically.
 "Power mode" needs you to type a confirmation phrase and unlocks permanent delete for rebuildable caches; you can go back
 to safe mode any time without a phrase.
@@ -168,7 +171,7 @@ shortfall), rather than quietly including more.
 ## 9. Move a big folder to another drive (tab: **Move to Another Drive**)
 For folders programs still need, so deleting is not an option: model caches, browser builds for tests and the like.
 Reclaim copies the folder to your other fixed drive, checks every file (SHA-256), and leaves a link (a junction) at the
-old place, so every program still finds it there. Available once #199 is merged and a build with it is installed.
+old place, so every program still finds it there. New in 1.4.0: it needs a build of 1.4.0 or later.
 
 1. The tab lists the usual large folders and sorts them: those it can move first, then the rest, each with the reason.
    - **Moved with their own steps:** Docker's disk image and WSL. Reclaim shows their size and the steps (Docker's
@@ -194,7 +197,7 @@ offer that.
 
 ## 10. Finished AI-agent leftovers (category: **Agent Leftovers**)
 Coding agents leave git worktrees, throwaway clones and scratch folders behind. Reclaim can offer the finished ones for
-cleanup. Available once #199 is merged and a build with it is installed.
+cleanup. New in 1.4.0: it needs a build of 1.4.0 or later.
 - **Off until you turn it on,** and always off in safe mode: switch to power mode, then turn **Agent Leftovers** on in
   **Settings**.
 - **What is offered:** an item is offered only if it is proven finished. All its work is pushed. Nothing is left

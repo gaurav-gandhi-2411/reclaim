@@ -46,7 +46,7 @@
        is nothing to answer (the empty state); cards carry their own sending/error states. See
        docs/specs/assistant-mcp.md section 5 and initMcpApprovals in app.js. -->
   <section id="mcp-approvals" class="rc-approvals" aria-labelledby="mcp-approvals-title" hidden>
-    <h2 id="mcp-approvals-title" class="rc-approvals-title">An AI assistant is asking to clean your disk</h2>
+    <h2 id="mcp-approvals-title" class="rc-approvals-title">An AI assistant is asking to change your disk</h2>
     <div id="mcp-approvals-list"></div>
   </section>
   <p id="mcp-approvals-status" class="rc-visually-hidden" role="status" aria-live="polite"></p>
@@ -127,6 +127,25 @@
         <h2>Categories</h2>
         <div id="category-grid" class="rc-card-grid"></div>
       </div>
+
+      <!-- "What changed": read-only view of GET /api/growth (ADR-0046). Independent of the scan
+           above: it reads the growth store, so it shows even before the first scan. -->
+      <section id="growth-panel" class="rc-growth" aria-labelledby="growth-heading">
+        <div class="rc-growth-head">
+          <h2 id="growth-heading">What changed</h2>
+          <div class="rc-growth-toggle" role="group" aria-label="Time window">
+            <button type="button" class="rc-btn rc-btn-secondary" data-window="1d" aria-pressed="true">Last day</button>
+            <button type="button" class="rc-btn rc-btn-secondary" data-window="7d" aria-pressed="false">Last 7 days</button>
+          </div>
+        </div>
+        <p class="rc-growth-note">Which folders grew, from Reclaim's own periodic size snapshots. Nothing here deletes or changes a file.</p>
+        <div id="growth-state"></div>
+        <div id="growth-content" hidden>
+          <ul id="growth-volumes" class="rc-growth-volumes" aria-label="Drive change"></ul>
+          <ol id="growth-rows" class="rc-growth-rows" aria-label="Folders that grew"></ol>
+          <p id="growth-excluded" class="rc-scan-status"></p>
+        </div>
+      </section>
     </section>
 
     <!-- Storage treemap -->

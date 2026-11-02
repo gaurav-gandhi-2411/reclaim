@@ -1,0 +1,244 @@
+{
+ "schema": "Ground truth = events already attributed (or explicitly called unattributed) in docs/RESUME.md and docs/run-log-2026-10.md. Nothing here was labelled by hand from the fixture data; windows come from the quoted doc text, or (build drops) from the watchdog file the doc names.",
+ "scope_rule": "The detector is growth-only. An event where a move or deletion FREES space (kind=shrink) is out of scope for detection and is listed as not evaluable. Growth events are evaluable only when the fixtures hold a sample of the event's volume within 1 h of both ends of its window (and, for an attributed key, a series of the fixture_key).",
+ "match_rule": "An alert episode on the event's volume whose first alert falls in [start, end + 6 h] detects the event. Attribution is correct when the first such alert names fixture_key or a folder below it; naming an ancestor is reported as coarse, not correct.",
+ "events": [
+  {
+   "id": "hf-move-2026-10-09",
+   "kind": "shrink",
+   "volume": "C",
+   "start": "2026-10-09T15:47:00",
+   "end": "2026-10-09T18:59:00",
+   "size_gib": 189.4,
+   "attributed_key": "C:\\Users\\gaura\\.cache\\huggingface",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 464, "quote": "17.10 (10-09 15:47) -> 206.5 (18:59, after the HF move)"}
+   ],
+   "doc_quote": "C: free (GiB): 17.10 (10-09 15:47) -> 206.5 (18:59, after the HF move)",
+   "evaluable": false,
+   "evaluable_reason": "shrink: a move frees space, the growth-only detector has nothing to detect"
+  },
+  {
+   "id": "pagefile-left-c-2026-10-09",
+   "kind": "shrink",
+   "volume": "C",
+   "start": "2026-10-09T13:02:00",
+   "end": "2026-10-09T13:02:00",
+   "size_gib": 17.0,
+   "attributed_key": "C:\\pagefile.sys",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 581, "quote": "C: free went 3.9 GB -> 24.8 GB (the 17 GB pagefile left C:)"}
+   ],
+   "doc_quote": "Boot 2026-10-09 13:02. Pagefile is D:\\pagefile.sys (16 GB...). C: free went 3.9 GB -> 24.8 GB (the 17 GB pagefile left C:)",
+   "evaluable": false,
+   "evaluable_reason": "shrink on C: (the matching +16 GiB on D: is not quantified in the docs), and no fixture sample near the 13:02 boot"
+  },
+  {
+   "id": "pagefile-to-d-2026-10-09",
+   "kind": "growth",
+   "volume": "D",
+   "start": "2026-10-09T13:02:00",
+   "end": "2026-10-09T13:02:00",
+   "size_gib": 16.0,
+   "attributed_key": "D:\\pagefile.sys",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 581, "quote": "Pagefile is `D:\\pagefile.sys` (16 GB, system-managed)"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 533, "quote": "Pagefile unchanged: `D:\\pagefile.sys` 16,384 MB"}
+   ],
+   "doc_quote": "Boot 2026-10-09 13:02. Pagefile is D:\\pagefile.sys (16 GB, system-managed) ... D:\\pagefile.sys 16,384 MB",
+   "evaluable": false,
+   "evaluable_reason": "no D: sample within 1 h of the 13:02 boot (last before: 10-08 11:42, first after: 10-09 15:21:54). Added after the first replay showed a D: volume alert of exactly 16.0 GiB at 15:21:54; the doc entry is independent of it, but it turns that alert from a false alarm into a match"
+  },
+  {
+   "id": "hf-copy-to-d-2026-10-09",
+   "kind": "growth",
+   "volume": "D",
+   "start": "2026-10-09T15:21:54",
+   "end": "2026-10-09T20:04:58",
+   "size_gib": 185.2,
+   "attributed_key": "D:\\relocated\\huggingface",
+   "fixture_key": null,
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 528, "quote": "the D: peak is dominated by my concurrent 185 GiB HF copy"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 549, "quote": "HF cache moved to D: (GG approval"}
+   ],
+   "doc_quote": "the D: peak is dominated by my concurrent 185 GiB HF copy",
+   "evaluable": true,
+   "evaluable_reason": "watchdog.csv holds D: free for the whole watchdog2 run (window = that run, ~15:22 -> ~20:00 per the doc); no D: folder series exists, so only detection is scored, not attribution. Added after the first replay, for the same reason as pagefile-to-d-2026-10-09"
+  },
+  {
+   "id": "c-drop-2026-10-09-1522",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-09T15:22:00",
+   "end": "2026-10-09T15:36:00",
+   "size_gib": 8.6,
+   "attributed_key": null,
+   "fixture_key": null,
+   "attribution_status": "unattributed",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 555, "quote": "The 15:22-15:36 C: drop (25.7 -> 17.1 GB) remains UNDETERMINED"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 473, "quote": "USN-journal read for the 15:22-15:36 C: drop on 10-09"}
+   ],
+   "doc_quote": "The 15:22-15:36 C: drop (25.7 -> 17.1 GB) remains UNDETERMINED",
+   "evaluable": true,
+   "evaluable_reason": "watchdog.csv covers the whole window (C: free 24.55 -> 17.25 GiB, 15:21:54 -> 15:36:59)"
+  },
+  {
+   "id": "overnight-drop-2026-10-10",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-10T01:06:00",
+   "end": "2026-10-10T08:35:00",
+   "size_gib": 58.5,
+   "attributed_key": "%TEMP%\\claude\\...gg-portfolio",
+   "fixture_key": null,
+   "attribution_status": "believed",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 465, "quote": "UNATTRIBUTED: C: fell 58.5 GiB between 01:06 and 08:35 on 10-10."},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 472, "quote": "the unattributed 58.5 GiB overnight C: loss (gg-portfolio scratch +43 GiB)"}
+   ],
+   "doc_quote": "UNATTRIBUTED: C: fell 58.5 GiB between 01:06 and 08:35 on 10-10. Largest clean path growth ... gg-portfolio +43.0 GiB ... BELIEVED, not proven",
+   "evaluable": false,
+   "evaluable_reason": "no fixture sample of C: within 1 h of 08:35 (nearest: 10-10 01:38 before the window, 16:47 after it); the 10-09/10 sampler that held the gg-portfolio series no longer exists"
+  },
+  {
+   "id": "build-c-drop-2026-10-10",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-10T16:47:28",
+   "end": "2026-10-10T17:31:47",
+   "size_gib": 9.97,
+   "attributed_key": null,
+   "fixture_key": null,
+   "attribution_status": "unattributed",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 466, "quote": "Build peak C: drop 9.97 GB (watchdog5.csv)"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 472, "quote": "the unattributed 58.5 GiB overnight C: loss (gg-portfolio scratch +43 GiB)"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 450, "quote": "peak_C_drop=9.97GB peak_D_drop=0.80GB"}
+   ],
+   "doc_quote": "Build peak C: drop 9.97 GB (watchdog5.csv) ... UNATTRIBUTED",
+   "evaluable": true,
+   "evaluable_reason": "watchdog.csv holds the whole watchdog5 run (window = first sample to the minimum-free sample; C: free 139.27 -> 129.31 GiB)"
+  },
+  {
+   "id": "temp-growth-2026-10-09-to-12",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-09T15:34:25",
+   "end": "2026-10-12T21:31:43",
+   "size_gib": 59.6,
+   "attributed_key": "%TEMP%\\claude\\...gg-portfolio (81.5 GiB on 10-12; other sessions' scratch)",
+   "fixture_key": "C:\\Users\\gaura\\AppData\\Local\\Temp",
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 430, "quote": "`%TEMP%` +59.6 GiB, almost all other sessions' scratch"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 371, "quote": "`%TEMP%\\claude\\...gg-portfolio` scratch (81.5 GiB on 10-12)"}
+   ],
+   "doc_quote": "C: attribution 10-09 -> 10-12: %TEMP% +59.6 GiB, almost all other sessions' scratch (claude\\...gg-portfolio 81.5 GiB ...)",
+   "evaluable": true,
+   "evaluable_reason": "census.csv holds Temp at both ends; the census is too shallow to hold the scratch folder itself, so Temp is the finest fixture key. No C: volume sample near 10-12 21:31"
+  },
+  {
+   "id": "ml-projects-growth-2026-10-09-to-12",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-09T15:34:25",
+   "end": "2026-10-12T21:31:43",
+   "size_gib": 46.0,
+   "attributed_key": "C:\\Users\\gaura\\ml-projects (18 gg-portfolio worktrees, verify copies)",
+   "fixture_key": "C:\\Users\\gaura\\ml-projects",
+   "attribution_status": "documented",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 430, "quote": "`ml-projects` +46 (18 gg-portfolio worktrees, verify copies)"}
+   ],
+   "doc_quote": "ml-projects +46 (18 gg-portfolio worktrees, verify copies)",
+   "evaluable": true,
+   "evaluable_reason": "census.csv holds ml-projects at both ends"
+  },
+  {
+   "id": "swing-2026-10-08",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-08T10:50:00",
+   "end": "2026-10-08T13:10:00",
+   "size_gib": 7.5,
+   "attributed_key": null,
+   "fixture_key": null,
+   "attribution_status": "unattributed",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 619, "quote": "Swing attribution, 10-08 10:50 -> 13:10"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 620, "quote": "C: free ranged 2.44-9.93 GB"}
+   ],
+   "doc_quote": "C: free ranged 2.44-9.93 GB ... no single path explains it and ~2.5 GB is unattributed",
+   "evaluable": false,
+   "evaluable_reason": "watchdog.csv for 10-08 ends 11:42:20 (the watchdog aborted the build at C: 3.93 GiB), 88 min before the window end"
+  },
+  {
+   "id": "uv-growth-c_attrib6-2026-10-13",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-13T03:55:59",
+   "end": "2026-10-13T04:34:00",
+   "size_gib": 20.2,
+   "attributed_key": "AppData\\Local\\uv",
+   "fixture_key": "attrib:uv",
+   "attribution_status": "unproven",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 386, "quote": "`AppData\\Local\\uv` read 0.58 GiB at the first directory sample and 20.8 GiB"}
+   ],
+   "doc_quote": "AppData\\Local\\uv read 0.58 GiB at the first directory sample and 20.8 GiB at the last: BELIEVED another session's uv activity ..., but the sampler's directory walk had an 8 s budget, so the first value may be a truncated walk: UNPROVEN",
+   "evaluable": false,
+   "evaluable_reason": "the doc itself calls it UNPROVEN and the uv cache is ~30 GB elsewhere in the docs (RESUME.md:659, 904): a truncated first walk, not a ground-truth growth"
+  },
+  {
+   "id": "ollama-setup-c_attrib6-2026-10-13",
+   "kind": "growth",
+   "volume": "C",
+   "start": "2026-10-13T03:55:59",
+   "end": "2026-10-13T04:34:00",
+   "size_gib": 4.3,
+   "attributed_key": null,
+   "fixture_key": null,
+   "attribution_status": "unattributed",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 386, "quote": "C: free 61.5 -> 57.2 GiB"}
+   ],
+   "doc_quote": "C: free 61.5 -> 57.2 GiB ... Top process writers ... ollama.exe, OllamaSetup.tmp",
+   "evaluable": false,
+   "evaluable_reason": "4.3 GiB is below the 5 GiB floor and the docs name only processes, never a folder"
+  }
+ ],
+ "not_events": [
+  {
+   "text": "Pagefile location statements (C: or D:, 16-25.6 GB, system-managed)",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 236, "quote": "Pagefile is on `C:\\pagefile.sys` again"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 258, "quote": "NOT on D: any more"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 278, "quote": "Pagefile is on C: again"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 291, "quote": "The pagefile is on **D:** again"},
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 429, "quote": "the file is `C:\\pagefile.sys` (18 GB, written at the 17:19 boot)"}
+   ],
+   "reason": "states of the machine at a time, with no window and no change size; the 10-09 move is the only dated one (pagefile-left-c-2026-10-09)"
+  },
+  {
+   "text": "uv=5.44G -> 17.42G (c_attrib7) and 8.01G -> 21.92G (c_attrib8) inside single 28-37 min windows",
+   "citation": [],
+   "reason": "present in the data, mentioned nowhere in the docs: not ground truth. Same truncated-walk pattern as uv-growth-c_attrib6 (RESUME.md:386)"
+  },
+  {
+   "text": "C: free 44.1 -> ~42 GB during build 7 while other sessions ran",
+   "citation": [
+    {"doc": "docs/RESUME.md", "line_at_8fc9bc6": 350, "quote": "C: free moved 44.1 -> ~42 GB while other sessions ran"}
+   ],
+   "reason": "about 2 GiB, below the 5 GiB floor; the doc says it was not analysed"
+  }
+ ]
+}

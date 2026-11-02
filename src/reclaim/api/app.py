@@ -67,6 +67,7 @@ def create_app(
     log_path: Path | None = None,
     anthropic_key_path: Path | None = None,
     ai_explanation_cache_dir: Path | None = None,
+    growth_db_path: Path | None = None,
     host: str = _DEFAULT_HOST,
     port: int = _DEFAULT_PORT,
 ) -> FastAPI:
@@ -154,6 +155,7 @@ def create_app(
             if ai_explanation_cache_dir is not None
             else DEFAULT_AI_EXPLANATION_CACHE_DIR
         ),
+        growth_db_path=growth_db_path,
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     app.include_router(router)

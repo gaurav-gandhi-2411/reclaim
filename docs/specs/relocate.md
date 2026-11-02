@@ -53,6 +53,9 @@ Rank by GB recovered, then by risk (fewest holders, no protected owner). Show fo
 - A target with `[ ]` in its name swaps correctly.
 - The freed-space figure equals the volume free-space delta.
 
+## 6a. Assistant-initiated moves (2026-10-31)
+The same move can be requested by the user's AI assistant over MCP, but only behind a click on an approval card in Reclaim's own window, and only for a folder and drive named by opaque ids from the listing (`docs/specs/assistant-mcp.md` section 4a). Safety rules 1-13 apply unchanged: the plan is rebuilt after the click (rules 5-8 re-checked live, with the handle probe on) and refused as stale if it differs from what the user was shown; `.reclaim-moved` is kept (rule 10); `delete-old` (rule 11) and `rollback` are not reachable from MCP.
+
 ## 7. Open items
 - Bring the logic into the app (Python, with the same stages), keep the script as the reference.
 - Link-preserving copy for trees that contain links.

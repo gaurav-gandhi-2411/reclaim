@@ -665,6 +665,34 @@ class ExclusionsConfig(BaseModel):
         return cleaned
 
 
+class GrowthConfig(BaseModel):
+    model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
+
+    # Disk growth attribution (ADR-0046): a read-only, budgeted sampler of folder sizes that
+    # explains what grew. `enabled` gates only the background snapshot; the CLI report still
+    # works on whatever has been stored.
+    enabled: bool = True
+    # One shared IO budget per snapshot: wall seconds and listed directory entries.
+    budget_seconds: float = Field(default=120.0, gt=0)
+    budget_entries: int = Field(default=3_000_000, gt=0)
+    min_interval_hours: float = Field(default=3.0, gt=0)
+    # Anomaly floors: a window must grow at least this many GiB AND this percent of the volume.
+    abs_floor_gib: float = Field(default=5.0, gt=0)
+    share_floor_pct: float = Field(default=2.0, ge=0)
+    # Window freshness (spec 1.5): a window's start sample may be at most window + max_start_slack_h
+    # old (6 h = 1.5x the 4-hourly snapshot cadence) and the newest sample at most max_end_age_h
+    # old; otherwise that window reports "insufficient data" instead of growth over a gap.
+    max_start_slack_h: float = Field(default=6.0, ge=0)
+    max_end_age_h: float = Field(default=1.0, ge=0)
+    # The same newest-sample limit for the "what changed" VIEW (API, CLI report, panel), which is
+    # not an alert. 6 h = the 4-hourly snapshot cadence + 2 h of slack: with max_end_age_h = 1 h
+    # the view would say "insufficient data" for about 3 of every 4 hours between snapshots. The
+    # view shows the data's as-of time, so an older figure is never passed off as current.
+    view_max_end_age_h: float = Field(default=6.0, ge=0)
+    # One level below each of these is sized as "top-level folders"; "~" is expanded at use.
+    project_roots: list[str] = Field(default_factory=lambda: ["~/ml-projects"])
+
+
 class StorageConfig(BaseModel):
     model_config = SettingsConfigDict(extra="ignore")  # ADR-0027: see module docstring above
 
@@ -708,6 +736,7 @@ class Config(BaseSettings):
     regenerable: RegenerableConfig = Field(default_factory=RegenerableConfig)
     exclusions: ExclusionsConfig = Field(default_factory=ExclusionsConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    growth: GrowthConfig = Field(default_factory=GrowthConfig)
     # Stage 2: resolved by `load_config` from `reclaim.mode.current_mode()` (the mode-change
     # log), never read from config.toml directly — a hand-edited config file must never be the
     # thing that silently disables the safety boundary. Defaults to `Mode.SAFE` here too (not

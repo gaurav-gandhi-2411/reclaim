@@ -38,6 +38,9 @@ APPROVED_CLAIM_TTL_SECONDS = 120.0
 # not stay `executing` forever, burning the user's click: after this lease it ends `failed`. Long
 # enough for a large vault batch (ADR-0026: ~8 ms/item), short enough to recover from a crash.
 EXECUTING_LEASE_SECONDS = 900.0
+# A relocation copies and hashes whole folders (the first real run: 153 GiB in 16 minutes, then a
+# re-hash), so the 15-minute lease would call a healthy move "failed" while it still runs.
+RELOCATE_EXECUTING_LEASE_SECONDS = 6 * 3600.0
 # A runaway agent must not be able to bury the user's window in requests.
 MAX_PENDING = 5
 _KEEP_FINISHED = 20  # decided/finished records kept for the window's "recent" list
@@ -134,6 +137,12 @@ class Approval:
     # from Windows' Recycle Bin). Never a permanent delete (invariant I7).
     method: str = "vault"
     reversible_until_days: int | None = None
+    # "clean" is the vault/Recycle Bin delete above. "relocate" moves one folder to another drive
+    # behind a junction (docs/specs/assistant-mcp.md section 4a): `relocation` then carries what
+    # the window shows (source, destination, how to undo); the shared fields hold the plan hash
+    # (`selection_hash`), file count (`item_count`) and bytes (`bytes_total`).
+    kind: str = "clean"
+    relocation: dict[str, Any] | None = None
     decided_at: float | None = None
     decision_channel: dict[str, str] = field(default_factory=dict)
     result: dict[str, Any] | None = None
@@ -167,6 +176,8 @@ class ApprovalBroker:
         protected_names: list[str],
         reversible_until_days: int | None,
         method: str = "vault",
+        kind: str = "clean",
+        relocation: dict[str, Any] | None = None,
     ) -> Approval:
         now = self._clock()
         with self._lock:
@@ -175,11 +186,12 @@ class ApprovalBroker:
             # same selection (and an already-approved one is handed back so the click is used).
             for existing in self._items.values():
                 if existing.status in ("pending", "approved") and (
+                    existing.kind,
                     existing.scan_id,
                     existing.tier,
                     existing.rule_id_or_category,
                     existing.selection_hash,
-                ) == (scan_id, tier, rule_id_or_category, selection_hash):
+                ) == (kind, scan_id, tier, rule_id_or_category, selection_hash):
                     return existing
             pending = [a for a in self._items.values() if a.status == "pending"]
             if len(pending) >= MAX_PENDING:
@@ -203,6 +215,8 @@ class ApprovalBroker:
                 protected_names=list(protected_names),
                 reversible_until_days=reversible_until_days,
                 method=method,
+                kind=kind,
+                relocation=relocation,
             )
             self._items[approval.id] = approval
             return approval
@@ -220,7 +234,12 @@ class ApprovalBroker:
             if approval is None or approval.status != "approved":
                 return False
             approval.status = "executing"
-            approval.claim_deadline = self._clock() + EXECUTING_LEASE_SECONDS
+            lease = (
+                RELOCATE_EXECUTING_LEASE_SECONDS
+                if approval.kind == "relocate"
+                else EXECUTING_LEASE_SECONDS
+            )
+            approval.claim_deadline = self._clock() + lease
             return True
 
     def finish(

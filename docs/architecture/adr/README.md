@@ -52,3 +52,4 @@ it. These numbers are used by more than one ADR: 0032.
 | 0043 | [reversible cleanup of finished AI-agent worktrees, throwaway clones and idle scratch](0043-agent-artifacts-cleanup.md) |
 | 0044 | [Relocate a folder to another drive behind a junction](0044-relocate-behind-a-junction.md) |
 | 0045 | [keep `idx_files_path_lower` -- it is not a duplicate of the primary key](0045-keep-path-lower-index.md) |
+| 0046 | [Disk growth attribution](0046-disk-growth-attribution.md) |

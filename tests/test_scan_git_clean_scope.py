@@ -56,9 +56,9 @@ def test_git_runs_only_for_repos_with_a_record_a_verdict_can_read(
     asked: list[Path] = []
     real = scanner_module._query_git_clean
 
-    def counting(repo_root: Path, _depth: int = 0) -> bool:
+    def counting(repo_root: Path, _depth: int = 0, excluded_patterns: object = ()) -> bool:
         asked.append(repo_root)
-        return real(repo_root, _depth)
+        return real(repo_root, _depth, excluded_patterns)  # type: ignore[arg-type]
 
     monkeypatch.setattr(scanner_module, "_query_git_clean", counting)
     records = _scan(root, tmp_path / "idx.sqlite3")

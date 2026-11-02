@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from reclaim.api.state import AppState
 from reclaim.approvals import Approval, BrokerFullError
@@ -32,6 +32,19 @@ _SHORT = 200
 _PATH = 1024
 
 
+class RelocationDetail(BaseModel):
+    """What the window shows for a relocation request. Display text from the creator; the
+    executing side re-plans live and refuses if source, destination or figures differ."""
+
+    option_id: str = Field(max_length=_SHORT)
+    drive_id: str = Field(max_length=_SHORT)
+    source: str = Field(max_length=_PATH)
+    target: str = Field(max_length=_PATH)
+    moved: str = Field(max_length=_PATH)
+    rollback_hint: str = Field(max_length=_PATH)
+    target_free_bytes: int = Field(ge=0)
+
+
 class ApprovalCreate(BaseModel):
     client_id: str | None = Field(default=None, max_length=_SHORT)
     scan_id: str = Field(max_length=_SHORT)
@@ -48,6 +61,14 @@ class ApprovalCreate(BaseModel):
     )
     reversible_until_days: int | None = None
     method: Literal["vault", "recycle_bin"] = "vault"
+    kind: Literal["clean", "relocate"] = "clean"
+    relocation: RelocationDetail | None = None
+
+    @model_validator(mode="after")
+    def _kind_matches_detail(self) -> ApprovalCreate:
+        if (self.kind == "relocate") != (self.relocation is not None):
+            raise ValueError("a relocate request needs `relocation`, and only it may carry one")
+        return self
 
 
 _MAX_RESULT_BYTES = 20_000
@@ -95,6 +116,7 @@ def channel_create(body: ApprovalCreate, request: Request) -> dict[str, Any]:
         "mcp.approval_requested",
         approval_id=approval.id,
         client_id=approval.client_id,
+        kind=approval.kind,
         item_count=approval.item_count,
         bytes_total=approval.bytes_total,
         rule_id_or_category=approval.rule_id_or_category,

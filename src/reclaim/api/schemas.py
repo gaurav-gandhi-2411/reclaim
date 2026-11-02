@@ -832,6 +832,74 @@ class DiagnosticsResponse(BaseModel):
     log_tail: str
 
 
+# --- Disk growth attribution (ADR-0046) ---------------------------------------------------------
+
+
+class GrowthVolumeOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    volume: str
+    change_bytes: int
+    attributed_bytes: int
+    not_attributed_bytes: int
+    status: str  # "ok" | "insufficient data"
+    # ISO time of the newest snapshot sample the figures rest on (for "insufficient data": the
+    # newest sample there is, None when there is none). With a 4-hourly snapshot it can be hours
+    # old, so the view shows it.
+    as_of: str | None = None
+
+
+class GrowthRowOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    label: str
+    kind: str
+    project: str
+    session: str
+    growth_bytes: int
+    # True when the key's newest stored measurement was cut off by the snapshot budget: the figure
+    # then lags (growth is only ever computed from complete samples).
+    partial: bool
+    # Relative URL of the existing review-queue query for this row's category, or None when no
+    # category owns the folder. There is no per-path filter and no deep-linkable review route.
+    review_link: str | None
+
+
+class GrowthExcludedOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    bytes: int
+
+
+class GrowthAnomalyOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str  # "key" | "volume"
+    path: str
+    growth_bytes: int
+    window_h: int
+    z: float | None
+    attributed: str | None
+    explanation: str
+
+
+class GrowthResponse(BaseModel):
+    """`GET /api/growth`: read-only "what changed" from the growth store. Excluded projects are
+    one aggregate line and never named (spec 1.3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    window: str
+    generated_at: str
+    status: str  # "ok" if at least one volume has data for the window, else "insufficient data"
+    volumes: list[GrowthVolumeOut]
+    rows: list[GrowthRowOut]
+    excluded_aggregate: GrowthExcludedOut
+    anomalies: list[GrowthAnomalyOut]
+
+
 # --- R2: Anthropic API key settings + per-category LLM explanations ----------------------------
 #
 # PRIVACY (non-negotiable, matching DiagnosticsResponse's own posture above): no response shape

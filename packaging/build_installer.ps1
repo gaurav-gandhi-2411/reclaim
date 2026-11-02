@@ -438,7 +438,7 @@ $nuitkaArgs = @(
     # package -- hence a named list plus a mechanical import check instead of guessing, and the
     # frozen serve/scan/AI smoke test (packaging/test_packaged_serve.ps1) for the .pyd-level
     # imports that no static Python-source check can see.
-    "--company-name=Gaurav Gandhi", "--product-name=Reclaim", "--product-version=1.3.0",
+    "--company-name=Gaurav Gandhi", "--product-name=Reclaim", "--product-version=1.4.0",
     "--windows-icon-from-ico=packaging/reclaim.ico",
     "--windows-console-mode=attach",
     "--include-package=reclaim", "--include-package=uvicorn", "--include-package=fastapi",

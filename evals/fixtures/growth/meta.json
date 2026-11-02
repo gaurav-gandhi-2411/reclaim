@@ -1,0 +1,407 @@
+{
+ "attrib_dates": {
+  "c_attrib6.csv": "2026-10-13",
+  "c_attrib7.csv": "2026-10-15",
+  "c_attrib8.csv": "2026-10-15"
+ },
+ "census_time_rule": "source file mtime (the walk ends when the file is last written)",
+ "dropped": "process names, per-process writes, c_delta, files/hardlinked_bytes, swap_used",
+ "excluded_projects": "rows naming an excluded project -> `Excluded projects`",
+ "jobs": {
+  "conflicting_duplicates": 0,
+  "samples_read": 3952
+ },
+ "rows": {
+  "attrib": 1006,
+  "census": 748,
+  "jobs": 412,
+  "watchdog": 1168
+ },
+ "schema": "ts (local ISO, no offset), key, bytes; volume series are `volume:<drive>:used`",
+ "sources": {
+  "attrib": [
+   {
+    "bytes": 31371,
+    "file": "c_attrib6.csv",
+    "mtime": "2026-10-13T04:34:00",
+    "sha256": "e24189599a5ed2b4887d35d095b31ec9b09961548e57df9e8a686950d4250a07"
+   },
+   {
+    "bytes": 32647,
+    "file": "c_attrib7.csv",
+    "mtime": "2026-10-15T12:01:24",
+    "sha256": "258c3306265dd13541c8e1db32628554de361939256c18947ad26b0cf94349f1"
+   },
+   {
+    "bytes": 37842,
+    "file": "c_attrib8.csv",
+    "mtime": "2026-10-15T13:36:07",
+    "sha256": "1686e25f1805671add4dd8e14f8f99aff100640edc22c19aa5624f25b3d67dc5"
+   }
+  ],
+  "census": [
+   {
+    "bytes": 21692,
+    "file": "c_census.csv",
+    "mtime": "2026-10-09T15:34:25",
+    "sha256": "2fb1b2757c6e8f3f3340bf8db4ae61fcf62ab7d0d755734fab9d203064f61393"
+   },
+   {
+    "bytes": 25633,
+    "file": "c_census_20261012.csv",
+    "mtime": "2026-10-12T21:31:43",
+    "sha256": "b9247ffbbf56e6838791a8b7060440e2c0535e88ab32126c9b99ec37374a7944"
+   }
+  ],
+  "jobs": [
+   {
+    "bytes": 2843,
+    "file": "aa5-probe/runner.log",
+    "mtime": "2026-10-31T16:20:40",
+    "sha256": "194bdf2409099aebabd5c803a8919af57ef108e87f28ac6441bba835b2a5354d"
+   },
+   {
+    "bytes": 5029,
+    "file": "aa5-probe2/runner.log",
+    "mtime": "2026-10-31T16:35:06",
+    "sha256": "324a7730dd53858621e3f85ce8fa18716226a8e31c352abffe49dc1ea5e3b306"
+   },
+   {
+    "bytes": 5397,
+    "file": "aa5-w1-dry-wt/runner.log",
+    "mtime": "2026-10-31T16:12:14",
+    "sha256": "6ffc7477f7dc4c2455d076e6f6afd6d76ccd9e8154513150d25d868262aa04d7"
+   },
+   {
+    "bytes": 5145,
+    "file": "aa5-w1-dry-wt2/runner.log",
+    "mtime": "2026-10-31T16:48:43",
+    "sha256": "1786e256d89a3a2a7f154d18f70107557b48614e370d9515a5756e185288ed87"
+   },
+   {
+    "bytes": 3051,
+    "file": "aadry-build12/runner.log",
+    "mtime": "2026-10-31T06:41:51",
+    "sha256": "615b7b5bcc11a4ba0ea4a58e61d3af889c82a6fba01e893c815723715fe62cf4"
+   },
+   {
+    "bytes": 3388,
+    "file": "aadry-final-1d66ea9/runner.log",
+    "mtime": "2026-10-31T06:50:05",
+    "sha256": "a43d2344cdc74c1429c133d17e833663b28d1b3b8a1a99014ffcfbae800c4333"
+   },
+   {
+    "bytes": 3749,
+    "file": "aadry-final2-1d66ea9/runner.log",
+    "mtime": "2026-10-31T06:59:21",
+    "sha256": "39e4199fe5ffecfcdde3b17d41a11b66e2c87c55ff62077ce4ea5da43aae125b"
+   },
+   {
+    "bytes": 3537,
+    "file": "aadry-final3-6aae0bc/runner.log",
+    "mtime": "2026-10-31T15:57:18",
+    "sha256": "5641a93554114dfeaf035d0fe57cf496142fc5503994d350c4dfefa8d0fbec4a"
+   },
+   {
+    "bytes": 6990,
+    "file": "build12-e53c40b/runner.log",
+    "mtime": "2026-10-30T22:12:00",
+    "sha256": "df87d3c80d1d8bff9cce8965240d333116526d9bdf1afc95c10f9c9bb9f25870"
+   },
+   {
+    "bytes": 85660,
+    "file": "build12-e53c40b-r2/runner.log",
+    "mtime": "2026-10-31T02:26:16",
+    "sha256": "5eab8cbafe5fb951516205da4d7de985dc96af6e2f3e4bb9c0ecc8ee35f37918"
+   },
+   {
+    "bytes": 19494,
+    "file": "build13-519a9c9/runner.log",
+    "mtime": "2026-11-01T01:27:37",
+    "sha256": "cf4199e3f75f16a1a4a02a12f6b389b5631b895012cf8b84f1a2d0dac64fb659"
+   },
+   {
+    "bytes": 781,
+    "file": "djcheck-done/runner.log",
+    "mtime": "2026-10-31T02:38:55",
+    "sha256": "3a9390e3a129c03f9faf82bfb336394b1e450207b9c96a737fda8b459b734bc9"
+   },
+   {
+    "bytes": 1125,
+    "file": "djcheck-suspect/runner.log",
+    "mtime": "2026-10-31T02:38:55",
+    "sha256": "0d8664d5829c503fe6ad70d470d3de663d5f52701e8d23e1ae2cb1092c1d4bab"
+   },
+   {
+    "bytes": 1042,
+    "file": "djcheck2-file/runner.log",
+    "mtime": "2026-10-31T02:48:29",
+    "sha256": "4f059b3309d5504ded2d0b571b21f6d9169c4cc3b0b4f8d1730df19fbf6a611b"
+   },
+   {
+    "bytes": 1028,
+    "file": "djcheck2-stale/runner.log",
+    "mtime": "2026-10-31T02:48:30",
+    "sha256": "3713f2d4f4cbc7dbaeb3d4e2d55f923087df88e69898cf92883bf5f65957386a"
+   },
+   {
+    "bytes": 5044,
+    "file": "dryrun190-ce79f43/runner.log",
+    "mtime": "2026-10-31T05:06:33",
+    "sha256": "abf2f493aac6ecf966df9204306761ff04634564a4191dff17de8c23470a8bf4"
+   },
+   {
+    "bytes": 1579,
+    "file": "gitbench-real/runner.log",
+    "mtime": "2026-10-31T13:57:31",
+    "sha256": "d9241993294c8b8714cb1a4cc1a67cf4ae3eb8851b6b04a98086ba7c84441114"
+   },
+   {
+    "bytes": 2346,
+    "file": "mutate-504cfca/runner.log",
+    "mtime": "2026-10-30T19:36:13",
+    "sha256": "3200b2861ea7889c1f230ac25b0626334ae11739af506801d0c5f40e6ede59bf"
+   },
+   {
+    "bytes": 1286,
+    "file": "proof1-survive/runner.log",
+    "mtime": "2026-10-30T17:58:49",
+    "sha256": "5feeb05946040cf3478687cc904118f13a1f8b49d4e31ea0db41e5a8015fb60d"
+   },
+   {
+    "bytes": 7806,
+    "file": "proof1b-survive/runner.log",
+    "mtime": "2026-10-30T18:53:52",
+    "sha256": "43a12110cfb391a21d7c2c65e20a7f8e29050ec810cbc31c6c6c0c249ef1f362"
+   },
+   {
+    "bytes": 3729,
+    "file": "proof2-running/runner.log",
+    "mtime": "2026-10-30T19:00:05",
+    "sha256": "04579f4aad2a51c6635b9020b29b9984c5a8a5fc53866e9ae378b968b330b4f9"
+   },
+   {
+    "bytes": 7641,
+    "file": "proof2v3-shellkill/runner.log",
+    "mtime": "2026-10-30T19:29:48",
+    "sha256": "64eea26cc0d1e3a985c6cafdbf5bb7f5d5638146946233b8637a7dc7085c92fc"
+   },
+   {
+    "bytes": 1866,
+    "file": "proof3-diskabort/runner.log",
+    "mtime": "2026-10-30T19:01:02",
+    "sha256": "44fe313fbcc539ccb5bc90e6d57f66f7d29ba8f3b29c81bc4584f8a6f21c545c"
+   },
+   {
+    "bytes": 1676,
+    "file": "proof3v3-diskabort/runner.log",
+    "mtime": "2026-10-30T19:17:02",
+    "sha256": "8c9c9072eae8b3ba665834b55b428120d1ca452a9892bdd8cb5baa57cc1d245e"
+   },
+   {
+    "bytes": 969,
+    "file": "proof4-junction/runner.log",
+    "mtime": "2026-10-30T19:01:36",
+    "sha256": "06ccba4ac0a0ca01165d6ddc6af175ec75fd37db076f578add7ad657deeb0f15"
+   },
+   {
+    "bytes": 1873,
+    "file": "proof4b-junction/runner.log",
+    "mtime": "2026-10-30T19:02:51",
+    "sha256": "058b1b837046124284bd1bf849244fd851ac5c9cf05167aca2bca89bcf101600"
+   },
+   {
+    "bytes": 1770,
+    "file": "proof4v3-junction/runner.log",
+    "mtime": "2026-10-30T19:17:56",
+    "sha256": "fad5e0f566995ef49e219faffabb171d2b24b45faf3710e74b045e1e7241a783"
+   },
+   {
+    "bytes": 27548,
+    "file": "scan12/runner.log",
+    "mtime": "2026-10-31T03:50:33",
+    "sha256": "ff0ffdacc92967f0dc3f20f9e1db8847abc7476dee602863792699a1c3c8305c"
+   },
+   {
+    "bytes": 27744,
+    "file": "scanfresh12/runner.log",
+    "mtime": "2026-10-31T18:23:42",
+    "sha256": "9a0f4899467ef6415cd1217b534af704028fc06cfb6222204f3894dfb192a88d"
+   },
+   {
+    "bytes": 50543,
+    "file": "soak12-2h/runner.log",
+    "mtime": "2026-10-31T10:17:12",
+    "sha256": "661f2ea9bbe30d81e358990bcaa43581140c48562a232d474f4d6dda106324a6"
+   },
+   {
+    "bytes": 41615,
+    "file": "soak12-2h-r2/runner.log",
+    "mtime": "2026-10-31T15:49:15",
+    "sha256": "d2b7866594b55ebf13a1afe7f282b2048c03b89e98c853fe08c6d2d4584dcd90"
+   },
+   {
+    "bytes": 5190,
+    "file": "splitscan12/runner.log",
+    "mtime": "2026-10-31T17:02:01",
+    "sha256": "7125836554a5dd59e572f45bf24d42e6b43cca643f892494a56f4721b7f0c982"
+   },
+   {
+    "bytes": 5467,
+    "file": "stackscan-appdata/runner.log",
+    "mtime": "2026-10-31T23:02:51",
+    "sha256": "f7187897ac4d7fbc48a1c786ddb051aabc502ce5acc2f3982df27daebaf2a03f"
+   },
+   {
+    "bytes": 2453,
+    "file": "stackscan-appdata-fix/runner.log",
+    "mtime": "2026-10-31T23:08:35",
+    "sha256": "7b5e4ba84d42d66e49b7c26d6d32fbbec788c6f29dcb57ef0660a86cdbc4f966"
+   },
+   {
+    "bytes": 3524,
+    "file": "timescan-appdata-fix/runner.log",
+    "mtime": "2026-10-31T23:17:24",
+    "sha256": "38e309a7f943d880b78d88b2cc32cb20206c0ffd4b35e7843ee15eedceacf03c"
+   },
+   {
+    "bytes": 5019,
+    "file": "timescan-appdata-main/runner.log",
+    "mtime": "2026-10-31T23:30:20",
+    "sha256": "d5983de4bdf4a88c34d3dbebcc2def3fdfdf66c8d7103be943c36de60cbe1750"
+   },
+   {
+    "bytes": 11258,
+    "file": "verdictdiff-gitscope/runner.log",
+    "mtime": "2026-11-01T00:02:26",
+    "sha256": "4f1e28a774b4051b9885ee1c75268fb8dff2a23f813e7357b6bb932a03e1aa4e"
+   },
+   {
+    "bytes": 3502,
+    "file": "verify-137c1b9/runner.log",
+    "mtime": "2026-10-30T19:13:41",
+    "sha256": "2b9907eb387cd86ed4bb20a4b4cbb3e2d0982497028fa9bf854da06fc81ef046"
+   },
+   {
+    "bytes": 3589,
+    "file": "verify-504cfca/runner.log",
+    "mtime": "2026-10-30T19:28:21",
+    "sha256": "037aedb4e6a81410fcfc54db74a97b56a0c91aa03067fe887ff26e10fe32ec30"
+   },
+   {
+    "bytes": 3824,
+    "file": "verify-gitscope-ec25033/runner.log",
+    "mtime": "2026-11-01T00:15:34",
+    "sha256": "ceffb90f854a2306c1a32b33ee35ea962c35c12c1e397ba5f2e36b364f98d7e3"
+   },
+   {
+    "bytes": 3353,
+    "file": "verify190-3382a7e/runner.log",
+    "mtime": "2026-10-31T05:17:11",
+    "sha256": "c5b93a55cb25646eb0f8f9ca3b671cb3033fbe85738ebca38f730c315b3a113a"
+   },
+   {
+    "bytes": 15029,
+    "file": "verify199-1d66ea9/runner.log",
+    "mtime": "2026-10-31T06:30:05",
+    "sha256": "c68ad61841af3fc8cad620bccda7d3e7f4983ad2820da6838e7f18f2ece7a6c2"
+   },
+   {
+    "bytes": 16704,
+    "file": "verify199-e53c40b/runner.log",
+    "mtime": "2026-10-30T20:47:54",
+    "sha256": "9e0a9060a4824ae0bc0cd6aad8108af2dd23171327c85e3bb6ece453f16f1836"
+   },
+   {
+    "bytes": 19293,
+    "file": "verify199-e53c40b-r2/runner.log",
+    "mtime": "2026-10-30T21:48:02",
+    "sha256": "6d92d7b3e06e6701153794091d45df5cfb0ca9f5358f4953ddb93daa5f2362fb"
+   },
+   {
+    "bytes": 15019,
+    "file": "verify199-eaf9c61/runner.log",
+    "mtime": "2026-10-31T04:51:21",
+    "sha256": "6f248e81f4dc0aeca4d58b6854e0a70d6aa91811751266e044e37027d6f60986"
+   }
+  ],
+  "watchdog": [
+   {
+    "bytes": 4721,
+    "file": "watchdog.csv",
+    "mtime": "2026-10-08T11:42:20",
+    "sha256": "0a0cb05fb3047e2925d43e7240f74529b640e7275d0d4c10fe5c7ae08f24d1a2"
+   },
+   {
+    "bytes": 171,
+    "file": "watchdog10.csv",
+    "mtime": "2026-10-17T04:07:08",
+    "sha256": "9e9c80877edeb2ee395e7fd81fbe44595a9d389858276627cc6759ec2b4ba177"
+   },
+   {
+    "bytes": 5071,
+    "file": "watchdog11.csv",
+    "mtime": "2026-10-19T23:58:52",
+    "sha256": "f111e12623aaa8341c3ae18d053f227d0d7c492d647fd6b8fbbbc0a612318b17"
+   },
+   {
+    "bytes": 462,
+    "file": "watchdog12.csv",
+    "mtime": "2026-10-24T09:01:58",
+    "sha256": "b3375f4b7cc7edaca2b290716135f36c2030aa524e60f27acf24f4f8ee9fe63d"
+   },
+   {
+    "bytes": 26762,
+    "file": "watchdog2.csv",
+    "mtime": "2026-10-09T20:05:28",
+    "sha256": "6f9fc2d53a7c1b30781a6874f78ef80d47784a4d8ecca11847964960abdbcc5f"
+   },
+   {
+    "bytes": 303,
+    "file": "watchdog3.csv",
+    "mtime": "2026-10-10T01:40:53",
+    "sha256": "4a4f5d536b9ff9ce9907201ade11f4b591b8f803678271e2d32306309e52e443"
+   },
+   {
+    "bytes": 4383,
+    "file": "watchdog5.csv",
+    "mtime": "2026-10-10T17:32:48",
+    "sha256": "5bfffdf3d46f279c2f115a78c61023cc0bef3b8ad84936d4774d267d9f03fc3a"
+   },
+   {
+    "bytes": 3602,
+    "file": "watchdog6.csv",
+    "mtime": "2026-10-13T04:33:37",
+    "sha256": "15df58c9739133229cd56ee85b7bfaa5c905c3bdbb149c23f9adf194fd4ae181"
+   },
+   {
+    "bytes": 2788,
+    "file": "watchdog7.csv",
+    "mtime": "2026-10-15T12:01:27",
+    "sha256": "39c020dba6e6c9ab0e21c0609f396076fbaf7e8240df5f1ba1928e93acd14dbd"
+   },
+   {
+    "bytes": 3493,
+    "file": "watchdog8.csv",
+    "mtime": "2026-10-15T13:36:04",
+    "sha256": "d60590377a5bd8d47cef361c2bfd27ec180d80f8556425b262e3c0a92a099a47"
+   },
+   {
+    "bytes": 4260,
+    "file": "watchdog9.csv",
+    "mtime": "2026-10-17T00:44:41",
+    "sha256": "184e911e1c8d7b65e9a48c6c9831c5f5f4b5effaa83dd31fc0969c58fd3b1742"
+   }
+  ]
+ },
+ "thinning_min_gap_s": {
+  "attrib": 60,
+  "jobs": 300,
+  "watchdog": 60
+ },
+ "volume_totals_bytes": {
+  "C": 1021821579264,
+  "D": 2000381014016
+ },
+ "volume_totals_note": "read once from shutil.disk_usage at extraction; assumed constant"
+}
