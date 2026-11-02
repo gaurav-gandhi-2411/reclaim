@@ -46,6 +46,7 @@ from reclaim.api.schemas import (
     DuplicateMemberOut,
     FirstRunStatusResponse,
     FixedDrivesResponse,
+    GrowthAlertSettingOut,
     ItemApplyResultOut,
     ModeStatusResponse,
     NotificationsSettingOut,
@@ -93,6 +94,7 @@ from reclaim.config import (
     CategoriesConfig,
     set_autoclean_enabled,
     set_category_enabled,
+    set_growth_alert_enabled,
     set_notifications_enabled,
 )
 from reclaim.dedup import (
@@ -2733,6 +2735,23 @@ def update_notifications_setting(state: AppState, *, enabled: bool) -> Notificat
         updated_notifications = state.config.notifications.model_copy(update={"enabled": enabled})
         state.config = state.config.model_copy(update={"notifications": updated_notifications})
     return notifications_settings(state)
+
+
+def growth_alert_settings(state: AppState) -> GrowthAlertSettingOut:
+    with state.lock:
+        growth = state.config.growth
+    return GrowthAlertSettingOut(enabled=growth.alert_enabled, collection_enabled=growth.enabled)
+
+
+def update_growth_alert_setting(state: AppState, *, enabled: bool) -> GrowthAlertSettingOut:
+    """Toggles `[growth] alert_enabled` (the opt-in anomaly toast), on disk (what the
+    Task-Scheduler-invoked `reclaim check-disk-space` reads) and in memory, same two-write
+    posture as `update_notifications_setting`. Never touches `[growth] enabled`."""
+    set_growth_alert_enabled(state.config_path, enabled=enabled)
+    with state.lock:
+        updated_growth = state.config.growth.model_copy(update={"alert_enabled": enabled})
+        state.config = state.config.model_copy(update={"growth": updated_growth})
+    return growth_alert_settings(state)
 
 
 def first_run_status(state: AppState) -> FirstRunStatusResponse:

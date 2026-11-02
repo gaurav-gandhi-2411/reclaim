@@ -26,6 +26,7 @@ from reclaim.api.schemas import (
     FixedDrivesResponse,
     FullDriveScanConfirmIntentResponse,
     FullDriveScanRequest,
+    GrowthAlertSettingOut,
     GrowthResponse,
     ModeStatusResponse,
     NotificationsSettingOut,
@@ -50,6 +51,7 @@ from reclaim.api.schemas import (
     UpdateAutoCleanSettingRequest,
     UpdateCategorySettingRequest,
     UpdateCheckResponse,
+    UpdateGrowthAlertSettingRequest,
     UpdateNotificationsSettingRequest,
 )
 from reclaim.api.state import (
@@ -781,6 +783,18 @@ def update_notifications_setting(
     payload: UpdateNotificationsSettingRequest, request: Request
 ) -> NotificationsSettingOut:
     return service.update_notifications_setting(get_state(request), enabled=payload.enabled)
+
+
+@router.get("/settings/growth-alert", response_model=GrowthAlertSettingOut)
+def growth_alert_settings(request: Request) -> GrowthAlertSettingOut:
+    return service.growth_alert_settings(get_state(request))
+
+
+@router.post("/settings/growth-alert", response_model=GrowthAlertSettingOut)
+def update_growth_alert_setting(
+    payload: UpdateGrowthAlertSettingRequest, request: Request
+) -> GrowthAlertSettingOut:
+    return service.update_growth_alert_setting(get_state(request), enabled=payload.enabled)
 
 
 # ADR-0034: weekly auto-clean of the regenerable tier (config flag + per-account scheduled task).

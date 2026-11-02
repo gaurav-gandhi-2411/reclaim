@@ -765,6 +765,22 @@ class UpdateNotificationsSettingRequest(BaseModel):
     enabled: bool
 
 
+# Opt-in growth-anomaly alert (ADR-0046 addendum 2026-11-02). `collection_enabled` is
+# `[growth] enabled`: read-only here, so the UI can say the alert cannot fire while the
+# history it reads is not being collected.
+class GrowthAlertSettingOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    collection_enabled: bool
+
+
+class UpdateGrowthAlertSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+
 # ADR-0034: the weekly auto-clean toggle. The task fields come from a live typed ScheduledTasks
 # query, not from config -- `enabled` (what the user chose) and `task_registered` (what
 # Windows actually has) can disagree, and the UI shows both. Times are ISO-8601 strings
