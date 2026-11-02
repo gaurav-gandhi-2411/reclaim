@@ -864,6 +864,77 @@ def test_set_growth_alert_enabled_creates_section_and_file(tmp_path: Path) -> No
     assert config.growth.enabled is True
 
 
+def test_toggle_writer_finds_a_section_header_with_a_trailing_comment(tmp_path: Path) -> None:
+    # #245 verifier: `[growth] # snapshots` was not recognised as the header, so the writer
+    # appended a second [growth] table and the file stopped loading (duplicate table).
+    from reclaim.config import set_growth_alert_enabled, set_notifications_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[growth] # snapshots\nenabled = true\n\n[notifications]  # toasts\nenabled = false\n",
+        encoding="utf-8",
+    )
+    set_growth_alert_enabled(config_path, enabled=True)
+    set_notifications_enabled(config_path, enabled=True)
+
+    text = config_path.read_text(encoding="utf-8")
+    assert text.count("[growth]") == 1 and text.count("[notifications]") == 1
+    config = load_config(config_path)
+    assert config.growth.alert_enabled is True
+    assert config.growth.enabled is True
+    assert config.notifications.enabled is True
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        "growth.alert_enabled = false\n",  # dotted keys at the top level
+        "growth = {enabled = true}\n",  # an inline table
+        "[growth\nenabled = true\n",  # not valid TOML to begin with
+    ],
+)
+def test_toggle_writer_refuses_and_leaves_the_file_untouched_when_it_cannot_patch_safely(
+    tmp_path: Path, original: str
+) -> None:
+    from reclaim.config import ConfigEditError, set_growth_alert_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(original.encode("utf-8"))
+
+    with pytest.raises(ConfigEditError):
+        set_growth_alert_enabled(config_path, enabled=True)
+
+    assert config_path.read_bytes() == original.encode("utf-8")
+
+
+def test_every_toggle_writer_is_fail_closed(tmp_path: Path) -> None:
+    # The same check guards the older toggles (the class, not just the new key).
+    from reclaim.config import (
+        CategoriesConfig,
+        ConfigEditError,
+        set_autoclean_enabled,
+        set_category_enabled,
+        set_notifications_enabled,
+    )
+
+    category = next(iter(CategoriesConfig.model_fields))
+    original = (
+        "notifications = {enabled = false}\nautoclean = {enabled = false}\n"
+        f"categories = {{{category} = {{enabled = true}}}}\n"
+    )
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(original, encoding="utf-8")
+
+    for write in (
+        lambda: set_notifications_enabled(config_path, enabled=True),
+        lambda: set_autoclean_enabled(config_path, enabled=True),
+        lambda: set_category_enabled(config_path, category, enabled=False),
+    ):
+        with pytest.raises(ConfigEditError):
+            write()
+    assert config_path.read_text(encoding="utf-8") == original
+
+
 @pytest.mark.parametrize("name", ["config.example.toml", "packaging/config.default.toml"])
 def test_shipped_config_templates_keep_growth_alert_off_and_collection_on(name: str) -> None:
     repo_root = Path(__file__).resolve().parent.parent

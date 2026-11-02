@@ -933,6 +933,50 @@ def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Con
 _ENABLED_LINE_RE = re.compile(r"^[ \t]*enabled[ \t]*=[ \t]*(?:true|false)[ \t]*(#.*)?$")
 
 
+class ConfigEditError(ValueError):
+    """A Settings toggle refused to write config.toml because the text patch would not have
+    produced exactly the one intended change (e.g. a hand-edited file that defines the section
+    as an inline table or dotted keys). The file is left untouched."""
+
+
+def _is_header(line: str, header: str) -> bool:
+    """`[section]` with optional surrounding whitespace and an optional trailing `# comment`
+    (a bare table header cannot contain `#`, so splitting on the first one is exact)."""
+    return line.split("#", 1)[0].strip() == header
+
+
+def _checked_toggle_text(old: str, new: str, table: tuple[str, ...], key: str, value: bool) -> str:
+    """Fail closed: `new` must parse, and parse to exactly `old` with `table.key = value` set.
+    Anything else (an unparsable original, a duplicated section, a key that landed elsewhere)
+    raises `ConfigEditError` instead of writing a config that would stop Reclaim loading it."""
+    try:
+        expected = tomllib.loads(old)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigEditError(
+            f"config.toml is not valid TOML, so it was not changed ({exc}); fix it by hand"
+        ) from exc
+    node: dict[str, Any] = expected
+    for part in table:
+        child = node.setdefault(part, {})
+        if not isinstance(child, dict):
+            raise ConfigEditError(f"config.toml defines {'.'.join(table)} in an unexpected form")
+        node = child
+    node[key] = value
+    try:
+        actual = tomllib.loads(new)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigEditError(
+            f"config.toml could not be updated safely ({exc}); set "
+            f"[{'.'.join(table)}] {key} = {str(value).lower()} by hand"
+        ) from exc
+    if actual != expected:
+        raise ConfigEditError(
+            f"config.toml could not be updated safely; set "
+            f"[{'.'.join(table)}] {key} = {str(value).lower()} by hand"
+        )
+    return new
+
+
 def _bool_key_line_re(key: str) -> re.Pattern[str]:
     """`_ENABLED_LINE_RE` for an arbitrary key: anchored at the line start, so a longer key
     that merely ends in `key` (`alert_enabled` vs `enabled`) never matches."""
@@ -948,7 +992,7 @@ def _set_category_enabled_in_toml_text(text: str, category: str, *, enabled: boo
     enabled_line = f"enabled = {value_literal}\n"
 
     lines = text.splitlines(keepends=True)
-    start_idx = next((i for i, line in enumerate(lines) if line.strip() == section_header), None)
+    start_idx = next((i for i, line in enumerate(lines) if _is_header(line, section_header)), None)
 
     if start_idx is None:
         # Section doesn't exist yet -- append a fresh one at EOF, on its own blank-line-separated
@@ -982,7 +1026,13 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
     if category not in CategoriesConfig.model_fields:
         raise ValueError(f"unknown category {category!r}")
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    new_text = _set_category_enabled_in_toml_text(text, category, enabled=enabled)
+    new_text = _checked_toggle_text(
+        text,
+        _set_category_enabled_in_toml_text(text, category, enabled=enabled),
+        ("categories", category),
+        "enabled",
+        enabled,
+    )
     assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
@@ -1015,7 +1065,7 @@ def _set_section_enabled_in_toml_text(
     key_re = _ENABLED_LINE_RE if key == "enabled" else _bool_key_line_re(key)
 
     lines = text.splitlines(keepends=True)
-    start_idx = next((i for i, line in enumerate(lines) if line.strip() == section_header), None)
+    start_idx = next((i for i, line in enumerate(lines) if _is_header(line, section_header)), None)
 
     if start_idx is None:
         if not text:
@@ -1047,7 +1097,13 @@ def set_notifications_enabled(config_path: Path, *, enabled: bool) -> None:
     text, creating the file (and its parent directory) if it doesn't exist yet -- the write side
     of the Settings-tab notifications toggle (BH5)."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    new_text = _set_notifications_enabled_in_toml_text(text, enabled=enabled)
+    new_text = _checked_toggle_text(
+        text,
+        _set_notifications_enabled_in_toml_text(text, enabled=enabled),
+        ("notifications",),
+        "enabled",
+        enabled,
+    )
     assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
@@ -1059,7 +1115,13 @@ def set_autoclean_enabled(config_path: Path, *, enabled: bool) -> None:
     Settings-tab weekly auto-clean toggle (ADR-0034), built exactly like
     `set_notifications_enabled`."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    new_text = _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled)
+    new_text = _checked_toggle_text(
+        text,
+        _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled),
+        ("autoclean",),
+        "enabled",
+        enabled,
+    )
     assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
@@ -1070,8 +1132,12 @@ def set_growth_alert_enabled(config_path: Path, *, enabled: bool) -> None:
     on-disk TOML text, creating the file if needed. Writes only the `alert_enabled` key: the
     `[growth] enabled` snapshot-collection flag is never touched."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    new_text = _set_section_enabled_in_toml_text(
-        text, "growth", enabled=enabled, key="alert_enabled"
+    new_text = _checked_toggle_text(
+        text,
+        _set_section_enabled_in_toml_text(text, "growth", enabled=enabled, key="alert_enabled"),
+        ("growth",),
+        "alert_enabled",
+        enabled,
     )
     assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)

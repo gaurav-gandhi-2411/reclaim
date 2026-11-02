@@ -776,7 +776,8 @@ class GrowthAlertSettingOut(BaseModel):
 
 
 class UpdateGrowthAlertSettingRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # strict: an opt-in must be a real JSON boolean, never "yes" or 1 coerced to True
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     enabled: bool
 

@@ -2694,6 +2694,37 @@ def test_post_settings_growth_alert_rejects_unknown_fields(tmp_path: Path) -> No
     assert not config_path.exists()
 
 
+@pytest.mark.parametrize("value", ["yes", "true", 1])
+def test_post_settings_growth_alert_requires_a_real_boolean(tmp_path: Path, value: object) -> None:
+    config_path = tmp_path / "config.toml"
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/growth-alert", json={"enabled": value})
+
+    assert response.status_code == 422
+    assert not config_path.exists()
+
+
+def test_post_settings_growth_alert_is_409_and_leaves_a_config_it_cannot_patch(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    original = "growth = {enabled = true}\n"
+    config_path.write_text(original, encoding="utf-8")
+    client = _make_app_with_config_path(
+        tmp_path, config=_config(tmp_path / "tree"), config_path=config_path
+    )
+
+    response = client.post("/api/settings/growth-alert", json={"enabled": True})
+
+    assert response.status_code == 409
+    assert "by hand" in response.json()["detail"]
+    assert config_path.read_text(encoding="utf-8") == original
+    assert client.get("/api/settings/growth-alert").json()["enabled"] is False
+
+
 def test_post_settings_growth_alert_without_csrf_token_is_rejected(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     mode_log = tmp_path / "mode_log.jsonl"

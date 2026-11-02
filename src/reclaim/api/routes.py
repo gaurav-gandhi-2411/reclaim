@@ -62,6 +62,7 @@ from reclaim.api.state import (
     ScanStatus,
 )
 from reclaim.autoclean_schedule import AutoCleanScheduleError
+from reclaim.config import ConfigEditError
 from reclaim.dedup import DedupAborted
 from reclaim.drives import NoFixedDrivesFoundError
 from reclaim.executor import (
@@ -765,6 +766,8 @@ def update_category_setting(
         return service.update_category_setting(
             get_state(request), category, enabled=payload.enabled
         )
+    except ConfigEditError as exc:  # before ValueError: it is one, but not an unknown category
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -782,7 +785,10 @@ def notifications_settings(request: Request) -> NotificationsSettingOut:
 def update_notifications_setting(
     payload: UpdateNotificationsSettingRequest, request: Request
 ) -> NotificationsSettingOut:
-    return service.update_notifications_setting(get_state(request), enabled=payload.enabled)
+    try:
+        return service.update_notifications_setting(get_state(request), enabled=payload.enabled)
+    except ConfigEditError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/settings/growth-alert", response_model=GrowthAlertSettingOut)
@@ -794,7 +800,10 @@ def growth_alert_settings(request: Request) -> GrowthAlertSettingOut:
 def update_growth_alert_setting(
     payload: UpdateGrowthAlertSettingRequest, request: Request
 ) -> GrowthAlertSettingOut:
-    return service.update_growth_alert_setting(get_state(request), enabled=payload.enabled)
+    try:
+        return service.update_growth_alert_setting(get_state(request), enabled=payload.enabled)
+    except ConfigEditError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 # ADR-0034: weekly auto-clean of the regenerable tier (config flag + per-account scheduled task).
@@ -819,7 +828,7 @@ def update_autoclean_setting(
     audit_logger.info("api.autoclean_setting", enabled=payload.enabled)
     try:
         return service.update_autoclean_setting(get_state(request), enabled=payload.enabled)
-    except AutoCleanScheduleError as exc:
+    except (AutoCleanScheduleError, ConfigEditError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
