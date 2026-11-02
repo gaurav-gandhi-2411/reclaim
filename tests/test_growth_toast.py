@@ -58,6 +58,9 @@ def write_store(path: Path, now: float, *, step_age_h: float = 40.0) -> None:
 
 
 def cfg(**growth_kw: object) -> Config:
+    # The anomaly toast is opt-in (`[growth] alert_enabled`, default off): these tests exercise
+    # the alert itself, so they switch it on explicitly. `cfg(alert_enabled=False)` overrides.
+    growth_kw.setdefault("alert_enabled", True)
     return Config.model_validate(
         {
             "notifications": {"enabled": True, "renotify_after_hours": 24.0},
@@ -145,15 +148,80 @@ def test_growth_toast_not_delivered_is_not_debounced(tmp_path: Path) -> None:
     assert not (tmp_path / "growth_alert_state.json").exists()
 
 
-def test_growth_toast_respects_snooze_and_notifications_off(tmp_path: Path) -> None:
+def test_growth_toast_respects_snooze(tmp_path: Path) -> None:
     store = tmp_path / "g.sqlite3"
     write_store(store, NOW)
     state = tmp_path / "notification_state.json"
     apply_snooze(state, snooze_days=7, now=NOW)
-    snoozed = maybe_send_growth_toast(cfg(), store, state, now=NOW, send=lambda _t: True)
+    sent: list[str] = []
+    snoozed = maybe_send_growth_toast(
+        cfg(), store, state, now=NOW, volume=VOL, send=lambda t: sent.append(t) or True
+    )
     assert snoozed == "snoozed"
-    off = Config.model_validate({"notifications": {"enabled": False}})
-    assert maybe_send_growth_toast(off, store, state, now=NOW, send=lambda _t: True) == "disabled"
+    assert sent == []
+
+
+def test_growth_toast_is_disabled_by_default_even_with_an_anomaly_and_notifications_on(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "g.sqlite3"
+    write_store(store, NOW)
+    default = Config.model_validate(
+        {"notifications": {"enabled": True}, "exclusions": {"project_names": ["secretproj"]}}
+    )
+    assert default.growth.alert_enabled is False
+    assert growth_anomaly_text(default, store, NOW, VOL) == EXPECTED_ANOMALY  # anomaly present
+    sent: list[str] = []
+    result = maybe_send_growth_toast(
+        default,
+        store,
+        tmp_path / "s.json",
+        now=NOW,
+        volume=VOL,
+        send=lambda t: sent.append(t) or True,
+    )
+    assert result == "disabled"
+    assert sent == []
+    assert not (tmp_path / "growth_alert_state.json").exists()
+
+
+def test_growth_toast_fires_when_alert_on_even_if_low_space_notifications_are_off(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "g.sqlite3"
+    write_store(store, NOW)
+    config = Config.model_validate(
+        {
+            "notifications": {"enabled": False},
+            "exclusions": {"project_names": ["secretproj"]},
+            "growth": {"alert_enabled": True},
+        }
+    )
+    sent: list[str] = []
+    result = maybe_send_growth_toast(
+        config,
+        store,
+        tmp_path / "s.json",
+        now=NOW,
+        volume=VOL,
+        send=lambda t: sent.append(t) or True,
+    )
+    assert result == "sent"
+    assert sent == [EXPECTED_ANOMALY]
+
+
+def test_growth_toast_is_disabled_when_alert_on_but_collection_off(tmp_path: Path) -> None:
+    store = tmp_path / "g.sqlite3"
+    write_store(store, NOW)
+    result = maybe_send_growth_toast(
+        cfg(enabled=False, alert_enabled=True),
+        store,
+        tmp_path / "s.json",
+        now=NOW,
+        volume=VOL,
+        send=lambda _t: True,
+    )
+    assert result == "disabled"
 
 
 def test_growth_toast_contains_a_failing_sender(tmp_path: Path) -> None:
@@ -190,6 +258,7 @@ def test_check_disk_space_cli_adds_the_line_and_sends_the_separate_growth_toast(
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         "[notifications]\nenabled = true\ndisk_threshold_percent = 1.0\n"
+        "[growth]\nalert_enabled = true\n"
         '[exclusions]\nproject_names = ["secretproj"]\n',
         encoding="utf-8",
     )
@@ -222,3 +291,37 @@ def test_check_disk_space_cli_adds_the_line_and_sends_the_separate_growth_toast(
     assert main(argv) == 0
     assert "growth_toast=debounced" in capsys.readouterr().out
     assert len(growth_texts) == 1
+
+
+def test_check_disk_space_cli_reports_growth_toast_disabled_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reclaim.cli import main
+
+    store = tmp_path / "g.sqlite3"
+    write_store(store, time.time())
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[notifications]\nenabled = true\ndisk_threshold_percent = 1.0\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("SYSTEMDRIVE", "C:")
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", lambda *a, **k: "not_due")
+    monkeypatch.setattr("reclaim.notifications.send_disk_space_toast", lambda r: True)
+    growth_texts: list[str] = []
+    monkeypatch.setattr(
+        "reclaim.notifications.send_growth_toast", lambda t: growth_texts.append(t) or True
+    )
+    argv = [
+        "check-disk-space",
+        "--config",
+        str(config_path),
+        "--state",
+        str(tmp_path / "notification_state.json"),
+        "--growth-db",
+        str(store),
+    ]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "growth_snapshot=not_due" in out  # collection is unchanged
+    assert "growth_toast=disabled" in out
+    assert growth_texts == []

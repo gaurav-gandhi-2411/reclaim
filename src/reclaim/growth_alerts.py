@@ -198,12 +198,16 @@ def maybe_send_growth_toast(
 ) -> str:
     """The growth-anomaly toast (spec §1.5), with its own debounce file beside `state_path`.
     Returns "disabled" | "snoozed" | "debounced" | "none" | "sent" | "not_delivered" | "failed".
-    Gated by `[growth] enabled` AND `[notifications] enabled` (a toast the user never opted into
-    would be a surprise); the 80% toast's snooze is honoured, its debounce is not shared. As for
-    the 80% toast, the debounce is only recorded once Windows accepted the toast. Never raises."""
+    Opt-in and off by default (owner decision 2026-11-02): gated by `[growth] enabled` (the
+    history it reads) AND `[growth] alert_enabled` (the Settings toggle). `[notifications] enabled`
+    is deliberately NOT required: that is the separate low-disk-space alert, and the explicit
+    opt-in here is the user's consent, so turning this toggle on must not silently do nothing
+    because the other alert is off. The 80% toast's snooze is honoured, its debounce is not
+    shared. As for the 80% toast, the debounce is only recorded once Windows accepted the toast.
+    Never raises."""
     from reclaim import notifications
 
-    if not (config.growth.enabled and config.notifications.enabled):
+    if not (config.growth.enabled and config.growth.alert_enabled):
         return "disabled"
     try:
         current = time.time() if now is None else now
