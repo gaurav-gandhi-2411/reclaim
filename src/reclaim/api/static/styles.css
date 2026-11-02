@@ -631,7 +631,8 @@ a:active {
   font-size: var(--rc-text-lg);
 }
 
-.rc-settings-panel > p {
+.rc-settings-panel > p,
+.rc-settings-panel > ul {
   color: var(--rc-text-muted);
   font-size: var(--rc-text-sm);
   margin: 0 0 var(--rc-space-3);
