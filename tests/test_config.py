@@ -795,3 +795,70 @@ def test_dedup_warm_after_scan_can_be_turned_off_in_toml(tmp_path: Path) -> None
 def test_shipped_config_templates_enable_dedup_warm_after_scan(name: str) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     assert load_config(repo_root / name).dedup.warm_after_scan is True
+
+
+# --- Opt-in growth-anomaly alert (owner decision 2026-11-02): `[growth] alert_enabled` ----------
+
+
+def test_growth_alert_is_off_by_default_and_collection_on() -> None:
+    config = Config()
+    assert config.growth.alert_enabled is False
+    assert config.growth.enabled is True
+
+
+def test_set_growth_alert_enabled_leaves_collection_flag_intact_both_directions(
+    tmp_path: Path,
+) -> None:
+    from reclaim.config import set_growth_alert_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[growth]\nenabled = false  # collection off\nalert_enabled = false\nabs_floor_gib = 7.0\n",
+        encoding="utf-8",
+    )
+
+    set_growth_alert_enabled(config_path, enabled=True)
+    config = load_config(config_path)
+    assert config.growth.alert_enabled is True
+    assert config.growth.enabled is False
+    assert config.growth.abs_floor_gib == 7.0
+    assert "enabled = false  # collection off" in config_path.read_text(encoding="utf-8")
+
+    set_growth_alert_enabled(config_path, enabled=False)
+    config = load_config(config_path)
+    assert config.growth.alert_enabled is False
+    assert config.growth.enabled is False
+
+
+def test_set_growth_alert_enabled_does_not_match_enabled_when_key_missing(
+    tmp_path: Path,
+) -> None:
+    from reclaim.config import set_growth_alert_enabled
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[growth]\nenabled = true\n", encoding="utf-8")
+
+    set_growth_alert_enabled(config_path, enabled=True)
+
+    config = load_config(config_path)
+    assert config.growth.enabled is True
+    assert config.growth.alert_enabled is True
+
+
+def test_set_notifications_enabled_does_not_touch_alert_enabled_key(tmp_path: Path) -> None:
+    from reclaim.config import _set_section_enabled_in_toml_text
+
+    text = "[growth]\nalert_enabled = true\nenabled = true\n"
+    out = _set_section_enabled_in_toml_text(text, "growth", enabled=False)
+    assert "alert_enabled = true" in out
+    assert "enabled = false" in out
+
+
+def test_set_growth_alert_enabled_creates_section_and_file(tmp_path: Path) -> None:
+    from reclaim.config import set_growth_alert_enabled
+
+    config_path = tmp_path / "sub" / "config.toml"
+    set_growth_alert_enabled(config_path, enabled=True)
+    config = load_config(config_path)
+    assert config.growth.alert_enabled is True
+    assert config.growth.enabled is True

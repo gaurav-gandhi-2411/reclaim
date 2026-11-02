@@ -672,6 +672,11 @@ class GrowthConfig(BaseModel):
     # explains what grew. `enabled` gates only the background snapshot; the CLI report still
     # works on whatever has been stored.
     enabled: bool = True
+    # The anomaly TOAST ("your disk is growing fast") is opt-in, off on every machine (owner
+    # decision 2026-11-02): it is experimental and has not been evaluated on real snapshot history.
+    # Collection (`enabled`) stays on so that history accrues; the alert is re-evaluated on ~4 weeks
+    # of it before any default-on proposal (ADR-0046 addendum).
+    alert_enabled: bool = False
     # One shared IO budget per snapshot: wall seconds and listed directory entries.
     budget_seconds: float = Field(default=120.0, gt=0)
     budget_entries: int = Field(default=3_000_000, gt=0)
@@ -928,6 +933,12 @@ def load_effective_config(path: Path | None, *, mode: Mode | None = None) -> Con
 _ENABLED_LINE_RE = re.compile(r"^[ \t]*enabled[ \t]*=[ \t]*(?:true|false)[ \t]*(#.*)?$")
 
 
+def _bool_key_line_re(key: str) -> re.Pattern[str]:
+    """`_ENABLED_LINE_RE` for an arbitrary key: anchored at the line start, so a longer key
+    that merely ends in `key` (`alert_enabled` vs `enabled`) never matches."""
+    return re.compile(rf"^[ \t]*{re.escape(key)}[ \t]*=[ \t]*(?:true|false)[ \t]*(#.*)?$")
+
+
 def _set_category_enabled_in_toml_text(text: str, category: str, *, enabled: bool) -> str:
     """Pure text transform -- no file I/O, no schema validation (callers validate `category`
     against `CategoriesConfig.model_fields` themselves; see `set_category_enabled` below) -- so
@@ -991,12 +1002,17 @@ def set_category_enabled(config_path: Path, category: str, *, enabled: bool) -> 
 # Generalised to `_set_section_enabled_in_toml_text` when the third call site (the weekly
 # auto-clean toggle, ADR-0034) arrived -- the "abstract on the third occurrence" threshold. The
 # per-category variant above is left as-is (it addresses a nested `[categories.<name>]` header).
-def _set_section_enabled_in_toml_text(text: str, section: str, *, enabled: bool) -> str:
+def _set_section_enabled_in_toml_text(
+    text: str, section: str, *, enabled: bool, key: str = "enabled"
+) -> str:
     """Pure text transform -- same shape as `_set_category_enabled_in_toml_text`, applied to one
-    top-level `[<section>]` (notifications, autoclean) instead of a per-category one."""
+    top-level `[<section>]` (notifications, autoclean, growth) instead of a per-category one.
+    `key` is the boolean key to write (default `enabled`); it is matched exactly, so `enabled`
+    and `alert_enabled` in one section never match each other."""
     section_header = f"[{section}]"
     value_literal = "true" if enabled else "false"
-    enabled_line = f"enabled = {value_literal}\n"
+    enabled_line = f"{key} = {value_literal}\n"
+    key_re = _ENABLED_LINE_RE if key == "enabled" else _bool_key_line_re(key)
 
     lines = text.splitlines(keepends=True)
     start_idx = next((i for i, line in enumerate(lines) if line.strip() == section_header), None)
@@ -1012,7 +1028,7 @@ def _set_section_enabled_in_toml_text(text: str, section: str, *, enabled: bool)
         len(lines),
     )
     for i in range(start_idx + 1, end_idx):
-        if _ENABLED_LINE_RE.match(lines[i]):
+        if key_re.match(lines[i]):
             lines[i] = enabled_line
             return "".join(lines)
 
@@ -1044,6 +1060,19 @@ def set_autoclean_enabled(config_path: Path, *, enabled: bool) -> None:
     `set_notifications_enabled`."""
     text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     new_text = _set_section_enabled_in_toml_text(text, "autoclean", enabled=enabled)
+    assert_not_real_profile_under_pytest(config_path, operation="write the config")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(new_text, encoding="utf-8")
+
+
+def set_growth_alert_enabled(config_path: Path, *, enabled: bool) -> None:
+    """Persists `[growth] alert_enabled` (the opt-in growth-anomaly toast) to `config_path`'s
+    on-disk TOML text, creating the file if needed. Writes only the `alert_enabled` key: the
+    `[growth] enabled` snapshot-collection flag is never touched."""
+    text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    new_text = _set_section_enabled_in_toml_text(
+        text, "growth", enabled=enabled, key="alert_enabled"
+    )
     assert_not_real_profile_under_pytest(config_path, operation="write the config")
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(new_text, encoding="utf-8")
