@@ -1092,6 +1092,45 @@ def _subtree_excluded(env: AgentEnv, path: Path) -> bool:
         return True
 
 
+def _repo_subtree_excluded(env: AgentEnv, repo: Path) -> bool:
+    """`_subtree_excluded` for a worktree's MAIN repository, answered once per repository per
+    `AgentEnv`. A main repository can hold an excluded project anywhere beneath it while the
+    worktree's own path and subtree say nothing, and many worktrees share one repository, so the
+    (possibly large) walk is cached on the env. The cache lives and dies with the env: detection
+    and every apply-time re-proof build their own, so nothing is trusted across runs."""
+    key = f"repo-subtree:{normalize_path(repo)}"
+    cached = env.cache.get(key)
+    if isinstance(cached, bool):
+        return cached
+    result = _subtree_excluded(env, repo)
+    env.cache[key] = result
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class _Patterns:
+    pattern_match: Callable[[Path], str | None]
+
+
+def repo_guard(safety: SafetyValidator) -> Callable[[Path], bool]:
+    """For code that has no `AgentEnv` (the vault bookkeeping after a move or a restore): returns
+    `blocked(repo)`, True when git must NOT be started in `repo` because the repository is, is
+    inside, or holds anywhere beneath it an excluded project. Path strings (and the real
+    location) first, then the name-only subtree walk; a walk that fails counts as blocked."""
+    patterns = safety.exclusion_patterns
+
+    def blocked(repo: Path) -> bool:
+        view = _Patterns(lambda p: first_matching_pattern(p, patterns))
+        if _path_excluded(view, repo):
+            return True
+        try:
+            return safety.exclusion_match(repo, is_dir=True) is not None
+        except OSError:
+            return True
+
+    return blocked
+
+
 def _slug_excluded(env: AgentEnv, name: str) -> bool:
     """The exclusion globs against a Claude project slug (every non-alphanumeric is `-` there, so
     an excluded `my_proj` appears as `my-proj`); the patterns get the same rewrite."""
@@ -1128,6 +1167,9 @@ def evaluate_worktree(env: AgentEnv, path: Path, repo: Path) -> ArtifactVerdict:
         _path_excluded(env, path, repo)
         or (pointer_file and _nested_git_excluded(env, path / ".git"))
         or _subtree_excluded(env, path)
+        # `git worktree list` runs in the MAIN repository: an excluded project anywhere beneath it
+        # is read-adjacent there even though the worktree's own tree is clean.
+        or _repo_subtree_excluded(env, repo)
     ):
         # The pointer's admin dir can name an excluded common dir (A3b review, N4/F5h).
         return _excluded("worktree", path, project, repo)
@@ -1361,14 +1403,27 @@ def _admin_tips_not_on_a_remote(admin: Path, repo: Path, run: GitRunner) -> str 
     return None
 
 
-def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git) -> str | None:
+_REPO_EXCLUDED_NOTE = (
+    "the main repository is, is inside or holds an excluded project, so git was not run there "
+    "and nothing was changed in it"
+)
+
+
+def after_vault_move(
+    original: Path,
+    vault_path: Path,
+    run: GitRunner = run_git,
+    *,
+    repo_excluded: Callable[[Path], bool],
+) -> str | None:
     """A worktree was just moved into the vault. Keep a copy of its git admin dir inside the
     vaulted directory, then remove EXACTLY that one admin entry so the repository stops listing a
     missing directory. (`git worktree prune` is deliberately NOT used: it drops the entry of every
     prunable worktree, including ones the user never asked to touch and whose directory is merely
     on an offline drive; an independent review reproduced losing a staged index and a detached
     unpushed commit that way.) Returns None on success or a message; never raises: the item IS
-    vaulted."""
+    vaulted. `repo_excluded` (see `repo_guard`) is required: git is never started in, and nothing
+    is written into, a main repository that is or holds an excluded project."""
     assert_not_real_profile_under_pytest(vault_path, operation="write a git admin backup into")
     try:
         text = (vault_path / ".git").read_text(encoding="utf-8", errors="replace").strip()
@@ -1380,6 +1435,8 @@ def after_vault_move(original: Path, vault_path: Path, run: GitRunner = run_git)
         ):
             return "the .git pointer does not name a worktree admin dir; nothing was removed"
         repo = admin.parent.parent.parent
+        if repo_excluded(repo):
+            return _REPO_EXCLUDED_NOTE
         if not _admin_owned_by(admin, original):
             return "that admin dir belongs to another path; nothing was removed"
         if (admin / "locked").exists():
@@ -1437,11 +1494,15 @@ def _detach_pointer(restored: Path) -> str:
     return f". Its .git pointer was renamed to {DETACHED_POINTER} so git does not use it"
 
 
-def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
+def after_restore(
+    restored: Path, run: GitRunner = run_git, *, repo_excluded: Callable[[Path], bool]
+) -> str | None:
     """A vaulted worktree is back at its original path: put its git admin dir back, drop our
     backup folder and run `git worktree repair`. None on success. If the repository is no longer
     where it was, or a DIFFERENT repository now sits at that path, nothing is written into it and
-    the saved admin data stays in the restored directory for a manual `git worktree repair`."""
+    the saved admin data stays in the restored directory for a manual `git worktree repair`.
+    `repo_excluded` (see `repo_guard`) is required: no git runs in, and nothing is written into, a
+    repository that is or holds an excluded project (`meta.json` is untrusted input)."""
     assert_not_real_profile_under_pytest(restored, operation="restore git admin data into")
     backup = restored / ADMIN_BACKUP_DIR
     meta_file = backup / "meta.json"
@@ -1452,6 +1513,11 @@ def after_restore(restored: Path, run: GitRunner = run_git) -> str | None:
         repo = Path(meta["repo_root"])
         admin = Path(meta["admin"])
         saved_roots = set(meta.get("root_commits", []))
+        if repo_excluded(repo):
+            return (
+                f"restored, but {_REPO_EXCLUDED_NOTE}; the saved admin data stays in "
+                f"{ADMIN_BACKUP_DIR}\\ for a manual `git worktree repair`"
+            )
         if not (repo / ".git").is_dir():
             return (
                 f"restored, but the repository is no longer at {repo}; the saved admin data stays "
