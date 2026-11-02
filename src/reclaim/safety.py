@@ -483,7 +483,12 @@ class SafetyValidator:
         return tuple(self._user_exclusions)
 
     def exclusion_match(
-        self, path: Path, *, is_dir: bool = False, lexical: bool = False
+        self,
+        path: Path,
+        *,
+        is_dir: bool = False,
+        lexical: bool = False,
+        match_junction_targets: bool = False,
     ) -> str | None:
         """The user deny/exclusion pattern `path` matches (canonicalised first, like
         `evaluate`), or -- for a directory -- one matched by anything beneath it; else None.
@@ -493,19 +498,27 @@ class SafetyValidator:
         `lexical=True` matches the path text exactly as given, without `resolve()`: a junction
         stays the name the user excluded instead of turning into its target (relocate's
         original path is a junction after a move, B8 M-B). Default off: every other caller
-        keeps the canonicalised behaviour."""
+        keeps the canonicalised behaviour.
+
+        `match_junction_targets=True` also matches the real path of every junction met on the
+        walk (see `subtree_exclusion_match`): for callers about to run git there, because git for
+        Windows lists a junction's content as the repository's own. Default off."""
         patterns = self._user_exclusions
         if not patterns:
             return None
         canonical = path if lexical else _canonical_path(path)
         hit = first_matching_pattern(canonical, patterns, is_dir=is_dir)
         if hit is None and is_dir:
-            hit = subtree_exclusion_match(canonical, patterns)
+            hit = subtree_exclusion_match(
+                canonical, patterns, match_junction_targets=match_junction_targets
+            )
             # resolve() parses through Win32, which strips a trailing space/dot: for `sp ` it
             # can name a clean sibling `sp` while the deleter (exact name) acts on `sp `. Walk
             # the exact path too whenever the two differ (#190 verifier pass 4, pre-existing).
             if hit is None and str(path) != str(canonical):
-                hit = subtree_exclusion_match(path, patterns)
+                hit = subtree_exclusion_match(
+                    path, patterns, match_junction_targets=match_junction_targets
+                )
         return hit
 
     def evaluate(self, record: FileRecord) -> SafetyResult:

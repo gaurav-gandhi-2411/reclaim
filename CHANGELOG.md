@@ -19,6 +19,11 @@ regenerable-cache list, in safe mode, without a review step and not through the 
   git command runs in it (#239 walked only the worktree). The walk is answered once per
   repository per run, fails closed, and also guards the git bookkeeping after a vault move and
   after an undo.
+- Agent Leftovers' exclusion walk now also matches the real target of every junction it meets.
+  Git for Windows lists a junction's content as the repository's own, so a junction pointing
+  straight at an excluded project (no excluded name under the junction itself) let git read
+  it. 1.4.0's "including through a junction" (#239) held for the scanner, but in Agent
+  Leftovers only when an excluded name appeared inside the junction's target.
 
 ## [1.4.0] - unreleased
 

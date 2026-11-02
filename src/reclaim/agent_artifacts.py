@@ -1124,7 +1124,9 @@ def repo_guard(safety: SafetyValidator) -> Callable[[Path], bool]:
         if _path_excluded(view, repo):
             return True
         try:
-            return safety.exclusion_match(repo, is_dir=True) is not None
+            return (
+                safety.exclusion_match(repo, is_dir=True, match_junction_targets=True) is not None
+            )
         except OSError:
             return True
 
@@ -1633,7 +1635,11 @@ def build_env(
     return AgentEnv(
         procs=procs if procs is not None else scan_processes(),
         now=now if now is not None else time.time(),
-        exclusion_match=lambda p, is_dir: safety.exclusion_match(p, is_dir=is_dir),
+        # Junction targets too: git (status, worktree list) reads through a junction, so a
+        # junction straight to an excluded project must count as holding it (#239 residual).
+        exclusion_match=lambda p, is_dir: safety.exclusion_match(
+            p, is_dir=is_dir, match_junction_targets=True
+        ),
         pattern_match=lambda p: first_matching_pattern(p, safety.exclusion_patterns),
         builtin_block=_builtin_blocker(safety),
         vault_dir=vault_dir if vault_dir is not None else default_vault_dir(),

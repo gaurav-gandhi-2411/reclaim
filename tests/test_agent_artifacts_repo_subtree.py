@@ -190,12 +190,9 @@ def test_the_bookkeeping_guard_lets_a_clean_repository_through(tmp_path: Path) -
     assert guard(repo) is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="KNOWN GAP (also true of the worktree's own tree since #239): `exclusion_match` "
-    "does not set `match_junction_targets`, so a junction whose TARGET is the protected "
-    "directory is invisible to the walk (the scanner's own check does set it). Flip when fixed.",
-)
+# Git for Windows lists a junction's content as the repository's own (checked 2026-11-03:
+# `git status -uall` in a repo with `link` -> a directory printed `link/secret.txt`), so a
+# junction whose TARGET is the protected directory must count, though no name under it matches.
 def test_main_repo_junction_straight_to_a_protected_directory(tmp_path: Path) -> None:
     repo = make_repo(tmp_path, "proj")
     wt = add_worktree(repo, "proj-wt-feat", "feat")
@@ -203,10 +200,34 @@ def test_main_repo_junction_straight_to_a_protected_directory(tmp_path: Path) ->
     target.mkdir()
     (target / "src.txt").write_text("x\n", encoding="utf-8")
     make_junction(repo / "link", target)
-    world = make_world(tmp_path, exclusions=(_NAME,))
+    run = _Counting()
+    world = make_world(tmp_path, exclusions=(_NAME,), run=run)
     try:
         verdict = aa.evaluate_worktree(world.env, wt, repo)
+        guarded = aa.repo_guard(world.safety)(repo)
     finally:
         (repo / "link").rmdir()  # removes the junction only, never its target
 
-    assert verdict.excluded
+    assert verdict.excluded and verdict.failed_rule == "W7"
+    assert run.calls == []
+    assert guarded is True
+    assert (target / "src.txt").is_file()
+
+
+def test_worktree_junction_straight_to_a_protected_directory(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, "proj")
+    wt = add_worktree(repo, "proj-wt-feat", "feat")
+    target = tmp_path / f"{_NAME}-proj"
+    target.mkdir()
+    (target / "src.txt").write_text("x\n", encoding="utf-8")
+    make_junction(wt / "link", target)
+    run = _Counting()
+    world = make_world(tmp_path, exclusions=(_NAME,), run=run)
+    try:
+        verdict = aa.evaluate_worktree(world.env, wt, repo)
+    finally:
+        (wt / "link").rmdir()  # removes the junction only, never its target
+
+    assert verdict.excluded and verdict.failed_rule == "W7"
+    assert run.calls == []  # excluded BEFORE any git: git status would read through the link
+    assert (target / "src.txt").is_file()
