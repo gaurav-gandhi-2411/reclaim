@@ -1,4 +1,32 @@
 {
+ "bursty_steady_control": [
+  {
+   "alerting_after_warmup": 0,
+   "alerting_snapshots": 36,
+   "every_days": 1,
+   "rate_gib_per_day": 2.0,
+   "snapshots": 180,
+   "step_gib": 2.0
+  },
+  {
+   "alerting_after_warmup": 0,
+   "alerting_snapshots": 36,
+   "every_days": 1,
+   "rate_gib_per_day": 3.0,
+   "snapshots": 180,
+   "step_gib": 3.0
+  }
+ ],
+ "bursty_weekly_control": [
+  {
+   "alerting_after_warmup": 126,
+   "alerting_snapshots": 144,
+   "every_days": 7,
+   "rate_gib_per_day": 2.0,
+   "snapshots": 360,
+   "step_gib": 14.0
+  }
+ ],
  "c_used_drift": [
   {
    "gib_per_day": -967.6,
@@ -31,7 +59,7 @@
    "start": "2026-10-31T22:49:51"
   }
  ],
- "commit": "c768b927cedabc339bbb61be76ca352b0f260086",
+ "commit": "bf9fa67f1c08bc8dfbf545c3fdd655978e3a60dc",
  "continuous_hours_needed": 672,
  "coverage": {
   "all_sources": {
@@ -70,6 +98,16 @@
    "stretches": 11
   }
  },
+ "dropped_alerts": {
+  "dropped_episodes": [],
+  "prefix_rule_alerts": 55,
+  "prefix_rule_alerts_with_a_baseline": 0,
+  "prefix_rule_episodes": 5,
+  "prefix_rule_false_alarm_episodes": 4,
+  "prefix_rule_recall": "1/5",
+  "prefix_rule_volume_alerts_not_raised": 0,
+  "prefix_rule_volume_alerts_not_raised_unexplained": 0
+ },
  "event_diagnostics": {
   "build-c-drop-2026-10-10": {
    "volume_growth_24h_gib": -106.5,
@@ -100,6 +138,7 @@
  },
  "events_evaluable": 5,
  "events_total": 12,
+ "false_alarm_definition": "A \"false alarm\" here means no documented event covers the episode, not a verified non-event: the docs do not list every real write.",
  "fixtures_sha256": {
   "attrib.csv": "e2cf6034ee47598e49f66bd85b5906d506503d97b55ea5fc4e7d21ed07e7a8df",
   "census.csv": "9af4404d540dfabcc3ef8a6ec320aa1db0b4e655d172cee78b2ad8e1dcf309b1",
@@ -438,30 +477,70 @@
    "top1": "0/0"
   }
  },
+ "noisy_surge_control": [
+  {
+   "noise_only_alerts": 24,
+   "noise_only_first_alert_h": 24,
+   "sd_gib_per_4h": 3.0,
+   "surge_gib": 40,
+   "with_surge_alerts": 29,
+   "with_surge_first_alert_h": 4
+  }
+ ],
  "steady_growth_control": [
   {
+   "alerting_after_warmup": 0,
+   "alerting_from_surge_start": 0,
    "alerting_snapshots": 0,
    "first_alert_day": null,
    "rate_gib_per_day": 1.0,
-   "snapshots": 84
+   "snapshots": 84,
+   "surge_gib": 0
   },
   {
+   "alerting_after_warmup": 0,
+   "alerting_from_surge_start": 0,
    "alerting_snapshots": 0,
    "first_alert_day": null,
    "rate_gib_per_day": 1.5,
-   "snapshots": 84
+   "snapshots": 84,
+   "surge_gib": 0
   },
   {
-   "alerting_snapshots": 66,
+   "alerting_after_warmup": 0,
+   "alerting_from_surge_start": 0,
+   "alerting_snapshots": 36,
    "first_alert_day": 3.0,
    "rate_gib_per_day": 2.0,
-   "snapshots": 84
+   "snapshots": 84,
+   "surge_gib": 0
   },
   {
-   "alerting_snapshots": 66,
+   "alerting_after_warmup": 0,
+   "alerting_from_surge_start": 0,
+   "alerting_snapshots": 36,
    "first_alert_day": 3.0,
    "rate_gib_per_day": 3.0,
-   "snapshots": 84
+   "snapshots": 84,
+   "surge_gib": 0
   }
- ]
+ ],
+ "surge_on_steady_control": [
+  {
+   "alerting_after_warmup": 10,
+   "alerting_from_surge_start": 10,
+   "alerting_snapshots": 46,
+   "first_alert_day": 3.0,
+   "rate_gib_per_day": 2.0,
+   "snapshots": 84,
+   "surge_gib": 20
+  }
+ ],
+ "sustained_leak_control": {
+  "alerting_snapshots": 62,
+  "days_alerting": 10.3,
+  "first_alert_h_after_start": 8,
+  "gib_per_day": 10.0,
+  "last_alert_h_after_start": 252
+ }
 }

@@ -101,9 +101,45 @@ def test_replay_is_fast_and_deterministic() -> None:
 
 
 def test_steady_growth_control_matches_the_arithmetic() -> None:
-    # 3 days of r GiB/day cross 5 GiB iff r >= 1.67: below it never alerts, above it does.
+    # 3 days of r GiB/day cross 5 GiB iff r >= 1.67: below it never alerts; above it only the
+    # no-history warm-up alerts (volume z is None), never once the volume has history.
     assert ge.steady_growth_control(1.0)["alerting_snapshots"] == 0
-    assert ge.steady_growth_control(3.0)["alerting_snapshots"] > 0
+    steady = ge.steady_growth_control(3.0)
+    assert steady["alerting_snapshots"] > 0
+    assert steady["alerting_after_warmup"] == 0
+
+
+def test_surge_on_steady_growth_still_alerts() -> None:
+    surge = ge.steady_growth_control(2.0, surge_gib=20)
+    assert surge["alerting_from_surge_start"] > 0
+
+
+@pytest.mark.parametrize("rate", [2.0, 3.0])
+def test_bursty_steady_growth_never_alerts_after_the_warmup(rate: float) -> None:
+    assert ge.bursty_steady_control(rate)["alerting_after_warmup"] == 0
+
+
+def test_a_surge_on_a_noisy_volume_is_not_hidden() -> None:
+    n = ge.noisy_surge_control(3.0)
+    assert n["with_surge_first_alert_h"] is not None and n["with_surge_first_alert_h"] <= 8
+    # the walk alone is silent over the same first 8 h, so that alert is the surge's
+    assert n["noise_only_first_alert_h"] is None or n["noise_only_first_alert_h"] > 8
+
+
+def test_sustained_leak_is_reported_and_eventually_absorbed() -> None:
+    leak = ge.sustained_leak_control()
+    assert leak["alerting_snapshots"] > 0
+    assert leak["last_alert_h_after_start"] < 20 * 24  # the 14-day history absorbs it
+
+
+def test_dropped_alerts_are_listed_with_the_false_alarm_caveat(result: ge.Res) -> None:
+    dropped = result["dropped_alerts"]["dropped_episodes"]
+    assert all("covers_documented_event" in d for d in dropped)
+    text = ge.render_markdown(result, "0" * 40)
+    assert text.count(ge.FALSE_ALARM_CAVEAT) >= 3
+    assert ("DROPPED AND UNVERIFIED" in text) and ("not counted as a false alarm" in text) == bool(
+        dropped
+    )
 
 
 def _alert(t: float, key: str = "k", growth: int = 6 * ge.GIB) -> ge.Alert:
