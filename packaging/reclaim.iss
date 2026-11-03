@@ -372,7 +372,7 @@ begin
     '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
     '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
     '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' + #13#10 +
-    '    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>' + #13#10 +
+    '    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>' + #13#10 +
     '  </Settings>' + #13#10 +
     '  <Actions Context="Author">' + #13#10 +
     '    <Exec>' + #13#10 +
