@@ -216,14 +216,92 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     - `[growth] alert_enabled = false` on every machine, with a Settings toggle whose text states the limits; collection stays on.
     - The verifier found two issues, both fixed before merge: the limits text described #244's rule, not the shipped one; and the toggle writer appended a duplicate `[growth]` table when the header had a comment. Every toggle writer is now fail-closed (`ConfigEditError`, 409).
     - Full verify `6c929d7`: 3,482 passed.
-  - **Build 14** from main `e14a42e`: clone `%TEMP%\claude\reclaim\20261103\b14` (real ONNX copied after their SHA-256 matched the LFS pointers), job `build14-e14a42e`. Then install in place (G3) and re-run `docs/RELEASE-1.4.0-CHECKLIST.md`.
+  - **Build 14** from main `e14a42e` (job `build14-e14a42e`, 4 h 31 min, rc 0).
+    - Installer SHA-256 `b8bd52da...9097`, 307,382,826 bytes, kept as `D:\reclaim-build\installer-e14a42e.exe`.
+    - Installed in place (G3). Re-ran `docs/RELEASE-1.4.0-CHECKLIST.md` (build 14 table at the top):
+      - rows 1-9 PASS, including `--version` 1.4.0 and an upgrade that kept config, tasks and handlers;
+      - 9a PASS: the growth alert is off on GG's machine and collection is on;
+      - row 15 PASS (dry run): `1/1` kept, where build 13 gave `0/0`.
+    - **Row 9b FAIL, a real 1.4.0 defect, fixed by #248 (merged `e2246cf`):**
+      - the disk-space task's limit was PT2M;
+      - `check-disk-space` took 157.1 s with the real config, because the growth snapshot ran first;
+      - the observed task run ended `0x41306` (terminated).
+      So the 80 % alert and the snapshot never completed on this machine, and the growth store held no scheduled snapshot since 1 Nov.
+    - #249 fixes the frozen suite's check 3. It timed out at 20 s, and it wrote the real growth store.
+    - Rows 10-12 (scan, warm-up, soak) are deferred to build 15, the build that can ship.
+    - The b14 clone has been deleted (check first, then the delete).
+  - **Next:** build 15 from main once #249 has merged. Install it, then re-run every row, 10-12 included.
   - **Next release PR candidates** (each a delete-path guard change, gate 4):
     - #244: the growth volume baseline, retargeted to main and merged up, `17179f2`. It must also update the Settings limits text and the ADR-0046 addendum.
     - #246: S4 skips only our own pid (DECISIONS 22).
     - #247: no git in a worktree's main repository holding an excluded project, plus junction targets (DECISIONS 21). This corrects 1.4.0's "including through a junction" claim for Agent Leftovers: Git for Windows reads through junctions.
   - **Scheduled: around early December 2026, re-evaluate the growth alert rule on about 4 weeks of real snapshot history** from `data\growth.sqlite3` on GG's machine.
+    - Real history only starts accruing once a build with #248 is installed; until then the task is killed mid-snapshot (row 9b). The 4 weeks count from that install. If build 15 is installed in early November, the date holds.
+    - The store's one snapshot before that (3 Nov 06:52, partial) came from my repro with a scratch config. Leave it out of the evaluation.
     - Measure precision, recall and the false-alarm rate against the events in the logs, with #244's rule and main's rule side by side.
     - Only then propose making the alert on by default. Until then it stays off (ADR-0046 addendum 2026-11-02).
+  - **WHEN GG HAS TIME (3 Nov), in order:**
+    1. **Read the 1.4.0 RC status.** Build 14 cannot ship because of row 9b. #248 is merged; build 15 is next and needs nothing from you.
+    2. **Decide whether 1.4.0 waits for #247.** 1.4.0's CHANGELOG says Agent Leftovers never runs git in a repo holding an excluded project "including through a junction". That is true of the scanner only. Agent Leftovers did not match a junction pointing straight at an excluded project, and Git for Windows reads through junctions. The choices: ship with #247, or correct the CHANGELOG line.
+    3. **Review the drafts for the next weekly release PR:** #244 (growth volume baseline), #246 (S4 own pid) and #247. Each is a delete-path guard change (gate 4).
+    4. **Row 13, the isolated-profile install (steps below).**
+    5. **Optional cleanup** that the permission layer kept from me:
+       - `%TEMP%\claude\reclaim\20261103\tree\` holds 50 dirs and 0 links, all made by the #247 executor. Delete only `tree\`: that parent folder also holds scratch I still use.
+       - Verifier scratch `v245`, `v246` and `v247` in this session's scratchpad.
+
+    **Row 13 steps:**
+
+      **Row 13: isolated-profile install as `ReclaimSmokeTest`** (about 45 min). It is a local non-admin account on this PC. Windows Home has no Sandbox or Hyper-V, so this is the closest to a clean machine. Its profile still holds Reclaim state from August, so step B removes it first.
+
+      Build 14 has one known defect for this run: the disk-space task's 2-minute limit (#248). The "Low disk space alert" tick in D still works, because it only checks the task is registered. If build 15 exists when you get to this, I will have swapped its installer and hash in here; use whichever this list names.
+
+      A. **Prepare (as yourself).** The installers are copied to a folder every account can read:
+         - build 14: `C:\Users\Public\Downloads\reclaim-setup-1.4.0-e14a42e.exe`, SHA-256 `b8bd52dab4ea2b880c59cddaf5399c833d5a19e5a6fd605806799941967f9097` (307,382,826 bytes);
+         - v1.3.0 from the GitHub release: `C:\Users\Public\Downloads\reclaim-setup-1.3.0.exe`, SHA-256 `7f02ab7b488e51212e7bde0e686c742b448d90073df103da9ce2885f6460d7c3`.
+         - Check in PowerShell before running either: `Get-FileHash <file> -Algorithm SHA256`.
+
+      B. **Sign in as `ReclaimSmokeTest`** (Win+L → Other user, or Start → your account icon → ReclaimSmokeTest). Then reset its old Reclaim state, in this order:
+         1. If a Reclaim window or tray item is open, close it. In Task Manager → Details, end any `reclaim.exe` owned by ReclaimSmokeTest.
+         2. Uninstall the old build: Settings → Apps → Installed apps → **Reclaim** → Uninstall. When it asks "Also delete this data folder now?", choose **Yes** (a test account, nothing to keep). If Reclaim is not listed, skip to step 3.
+         3. Open **PowerShell** (not as admin). First run this check and read what it prints:
+            ```powershell
+            Test-Path "$env:LOCALAPPDATA\Programs\Reclaim"
+            Get-ScheduledTask | Where-Object TaskName -like 'Reclaim*' | Select-Object TaskName, State
+            Test-Path 'HKCU:\Software\Classes\reclaim-notify'
+            Test-Path 'HKCU:\Software\Classes\AppUserModelId\Reclaim.DiskCleanup'
+            Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Filter 'Reclaim*' -ErrorAction SilentlyContinue
+            ```
+         4. Then, as a **separate** step, remove only what step 3 showed:
+            - the folder: `Remove-Item -LiteralPath "$env:LOCALAPPDATA\Programs\Reclaim" -Recurse -Force`
+            - each task: `Unregister-ScheduledTask -TaskName '<name from step 3>' -Confirm:$false`. The usual names are `Reclaim Disk Space Check (ReclaimSmokeTest)`, `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)`, and the old `Reclaim Disk Space Check`.
+            - the keys: `Remove-Item 'HKCU:\Software\Classes\reclaim-notify' -Recurse` and `Remove-Item 'HKCU:\Software\Classes\AppUserModelId\Reclaim.DiskCleanup' -Recurse`
+            - the Start menu entry: `Remove-Item -LiteralPath "<path from step 3>" -Recurse`
+         5. Run step 3 again. Every line should print `False` or nothing. That is the clean starting point.
+         - Keep the account itself: it is the only one here with the 8.3 short-name TEMP path that the TEMP-cache tests depend on.
+
+      C. **Upgrade path first** (checklist: "the upgrade from 1.3.0"):
+         1. Run `reclaim-setup-1.3.0.exe`. Note whether a UAC prompt appears; it should not.
+         2. Open it once, then close it.
+         3. Run `reclaim-setup-1.4.0-e14a42e.exe` over it. Expect: no UAC prompt, and `& "$env:LOCALAPPDATA\Programs\Reclaim\reclaim.exe" --version` (PowerShell) prints 1.4.0, and your 1.3.0 settings are kept.
+
+      D. **First run and the 1.4.0 checks**, ticking each one:
+         - [ ] The first-run overlay shows on the first open. Safe mode is shown in the header.
+         - [ ] Switch to Advanced: seven tabs.
+         - [ ] Agent Leftovers is off in safe mode (its category is not offered).
+         - [ ] Move to Another Drive works on a throwaway folder. Create `C:\Users\ReclaimSmokeTest\Documents\movetest` with a few files, move it to `D:`, open it through the junction, then roll back.
+         - [ ] Settings → assistant setup text is shown and copyable.
+         - [ ] Settings → **Low disk space alert** on: a task `Reclaim Disk Space Check (ReclaimSmokeTest)` appears in Task Scheduler. Turn it off: it stays registered (the growth snapshots use it), and `config.toml` shows `[notifications] enabled = false`.
+         - [ ] Settings → **Weekly cache clean** on: a `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)` task appears. Off: it is removed.
+         - [ ] Settings → **Disk growth alert** shows **Off** by default with the limits text. Turn it on, then off; `config.toml` gains `[growth] alert_enabled = true`, then `false`.
+         - [ ] Overview: run a scan, apply one small Recycle Bin item (safe mode), then **Undo/restore** it. The file is back.
+         - [ ] "What changed" (Advanced) and the one-line summary (Simple) show either data or a plain "not enough history yet" state, not an error.
+
+      E. **Uninstall:** Settings → Apps → Reclaim → Uninstall, and answer **No** to "Also delete this data folder now?" (the default). Expect:
+         - `%LOCALAPPDATA%\Programs\Reclaim\data` and `config.toml` remain;
+         - both scheduled tasks are gone (step B3's `Get-ScheduledTask` line shows nothing);
+         - the `reclaim-notify` key is gone.
+
+      F. Sign out, back to your account. Send me the ticks and anything that looked wrong. A screenshot of anything odd helps. I'll fill row 13 of the checklist.
 <!-- AUTONOMOUS-RUN-END -->
 
 ## CHECKPOINT 2026-10-20 (PAUSED BY THE OWNER; RESUME AFTER 2026-10-23) -- superseded for open work by the AUTONOMOUS RUN section above
