@@ -1271,13 +1271,13 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
         return 0
 
     growth_db: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
-    # Snapshot first so the toast's explanation reads fresh data. Never raises; with
+    # The low-disk check and its toast run BEFORE the growth snapshot: the 80 % alert is the
+    # documented backstop and must never wait on growth IO, because the scheduler's time limit
+    # can kill this process mid-snapshot (measured 157 s against the old 2 min limit; a killed
+    # snapshot is never stored, so the next run is due and can be killed again). The toast's
+    # growth line reads the
+    # history already stored, at most one interval stale. The snapshot never raises; with
     # `[growth] enabled = false` there is no growth IO at all.
-    growth_note = ""
-    if config.growth.enabled:
-        status = _scheduled_growth_snapshot(config, args.config, growth_db)
-        growth_note = f" growth_snapshot={status}"
-
     result = check_disk_space(config.notifications, state_path=state_path)
     toast_note = ""
     if result.should_notify:
@@ -1292,7 +1292,10 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
             toast_note = " toast=sent"
         else:
             toast_note = " toast=not_delivered"
+    growth_note = ""
     if config.growth.enabled:
+        status = _scheduled_growth_snapshot(config, args.config, growth_db)
+        growth_note = f" growth_snapshot={status}"
         # Its own debounce state; never raises (spec 1.5).
         growth_note += (
             f" growth_toast={growth_alerts.maybe_send_growth_toast(config, growth_db, state_path)}"

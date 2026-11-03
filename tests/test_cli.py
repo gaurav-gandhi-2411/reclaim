@@ -1111,3 +1111,44 @@ def test_check_disk_space_carries_on_when_the_growth_path_raises(
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "growth_snapshot=failed" in out and "percent_used=" in out
+
+
+def test_check_disk_space_toasts_before_the_growth_snapshot_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scheduler's time limit once killed the task mid-snapshot, so the 80 % alert never ran.
+    The toast must already be out when the snapshot starts, and a kill during it (simulated with
+    KeyboardInterrupt, which `except Exception` does not contain) must not undo it."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[notifications]\nenabled = true\ndisk_threshold_percent = 10.0\n", encoding="utf-8"
+    )
+    state_path = tmp_path / "state.json"
+    calls: list[str] = []
+
+    def toast(result: object) -> bool:
+        calls.append("toast")
+        return True
+
+    def killed_snapshot(*_a: object, **_k: object) -> str:
+        calls.append("snapshot")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("reclaim.notifications.send_disk_space_toast", toast)
+    monkeypatch.setattr("reclaim.growth_alerts.scheduled_snapshot", killed_snapshot)
+
+    with pytest.raises(KeyboardInterrupt):
+        main(
+            [
+                "check-disk-space",
+                "--config",
+                str(config_path),
+                "--state",
+                str(state_path),
+                "--growth-db",
+                str(tmp_path / "g.sqlite3"),
+            ]
+        )
+
+    assert calls == ["toast", "snapshot"]
+    assert state_path.exists()  # record_notified ran before the kill
