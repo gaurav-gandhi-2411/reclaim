@@ -92,6 +92,11 @@ nothing is tagged or published yet.
 
 ### Fixed
 
+- The 4-hourly disk-space task could be stopped by its 2-minute limit while taking the growth
+  snapshot, so the 80 % low-disk alert and the snapshot never ran (measured on a real machine: the
+  command took 157 s and the task ended with 0x41306, terminated, on every run). The check and
+  its toast now run first, and the task's time limit is 10 minutes. A test fails if the limit
+  ever drops below the snapshot budget plus 5 minutes.
 - Apply skips a file whose size or mtime changed since the scan and re-stats before every
   regenerable unlink (#122, ADR-0036); identity re-verification at mutation time (#45); a
   pre-flight check for live processes and hardlink-shared active installs (#36); an ownership
