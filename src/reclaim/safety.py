@@ -148,6 +148,10 @@ UNREADABLE_PREFIX = "<unreadable directory: "
 # junction before it stops and fails closed. A real pnpm node_modules (~1,000 packages, 4
 # dependents, 10 directories each) needs ~40k; crafted junction meshes grow without bound.
 _JUNCTION_WALK_BUDGET = 100_000
+# Most path texts one directory is matched under (match_junction_targets): its own path plus one
+# real target per junction above it. Real trees have 1-3; past 8 the walk fails closed rather
+# than multiply the per-entry matching work on a pathological junction chain.
+_MAX_PATH_ALIASES = 8
 
 
 def _io_path(path: str) -> str:
@@ -220,7 +224,9 @@ def subtree_exclusion_match(
     the REAL path of each junction met on the walk. A tool that reads through junctions (git lists
     a junction's content as the repository's own) reads the target project even when no name
     under the junction path matches. Used by the scanner's "no git inside an excluded project"
-    check."""
+    check. Below a junction the content is matched under BOTH the junction's own path text and
+    the target's real text (a user pattern may name either), so this mode matches a superset of
+    the default mode."""
     if not patterns:
         return None
     hit = first_matching_pattern(root, patterns, is_dir=True)
@@ -237,35 +243,38 @@ def subtree_exclusion_match(
         root_real = os.path.normcase(os.path.normpath(root_text))
     cover_once = all(_one_component_only(p) for p in ordered)
     covered_set = {root_real}
-    # (text, io, real, entered): entered = the junction targets on this walk path (the full
-    # mode's cycle guard; unused by cover-once). The root is deliberately NOT in it: a junction
-    # back to the root gets its one lap, as one to any directory below it does, because that
-    # lap's text names real content inside the candidate (#190 verifier pass 7).
-    stack: list[tuple[str, str, str, frozenset[str]]] = [
-        (root_text, root_io, root_real, frozenset())
+    # (texts, io, real, entered): texts = the path texts the directory is matched under (one,
+    # except in match_junction_targets mode below a junction); entered = the junction targets on
+    # this walk path (the full mode's cycle guard; unused by cover-once). The root is
+    # deliberately NOT in it: a junction back to the root gets its one lap, as one to any
+    # directory below it does, because that lap's text names real content inside the candidate
+    # (#190 verifier pass 7).
+    stack: list[tuple[tuple[str, ...], str, str, frozenset[str]]] = [
+        ((root_text,), root_io, root_real, frozenset())
     ]
     budget = _JUNCTION_WALK_BUDGET
     # The rest of the tree is still walked after an unreadable directory, so a real match
     # elsewhere is reported as itself; the marker is returned only when nothing else matched.
     unreadable: str | None = None
     while stack:
-        current, current_io, current_real, entered = stack.pop()
+        texts, current_io, current_real, entered = stack.pop()
+        current = texts[0]
         if not cover_once and entered:  # listed through a junction
             budget -= 1
             if budget < 0:
                 unreadable = unreadable or f"{UNREADABLE_PREFIX}{current} (too many junctions)>"
                 continue
-        prefix = _child_text_prefix(current)
+        prefixes = [_child_text_prefix(t) for t in texts]
         try:
             with os.scandir(current_io) as it:
                 for entry in it:
-                    text = prefix + entry.name
-                    hit = _first_hit(ordered, text)
-                    if hit is not None:
-                        return hit
+                    for prefix in prefixes:
+                        hit = _first_hit(ordered, prefix + entry.name)
+                        if hit is not None:
+                            return hit
                     if not entry.is_dir(follow_symlinks=False):
                         continue
-                    child_text = os.path.join(current, entry.name)  # noqa: PTH118 -- = entry.path
+                    child_texts = [os.path.join(t, entry.name) for t in texts]  # noqa: PTH118
                     child_io = os.path.join(current_io, entry.name)  # noqa: PTH118
                     child_entered = entered
                     if entry.is_junction():
@@ -281,17 +290,24 @@ def subtree_exclusion_match(
                                 _real_path_text(entry.path) if match_junction_targets else ""
                             )
                         except OSError:
-                            unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_text}>"
+                            unreadable = unreadable or f"{UNREADABLE_PREFIX}{child_texts[0]}>"
                             continue
                         if target_text:
                             # The target as it really is, also as `target/` (a path-shaped
                             # `*/proj/*` needs the separator), and from here on its content under
-                            # that real text, not under the junction's own name.
+                            # that real text AND the junction's own (a pattern may name either).
                             plain = _strip_candidate(Path(target_text))
                             hit = _first_hit(ordered, plain, plain + "/")
                             if hit is not None:
                                 return hit
-                            child_text = target_text
+                            if target_text not in child_texts:
+                                child_texts.append(target_text)
+                            if len(child_texts) > _MAX_PATH_ALIASES:
+                                unreadable = (
+                                    unreadable
+                                    or f"{UNREADABLE_PREFIX}{child_texts[0]} (too many aliases)>"
+                                )
+                                continue
                         if cover_once:
                             if _within(child_real, covered_set):
                                 continue  # listed at its real place (or fails closed there)
@@ -304,7 +320,7 @@ def subtree_exclusion_match(
                         child_real = os.path.join(current_real, os.path.normcase(entry.name))  # noqa: PTH118
                         if cover_once and child_real in covered_set:
                             continue  # back into a covered tree (e.g. via a junction above it)
-                    stack.append((child_text, child_io, child_real, child_entered))
+                    stack.append((tuple(child_texts), child_io, child_real, child_entered))
         except (FileNotFoundError, NotADirectoryError):
             # The ROOT missing or being a file (callers pass top-level temp/crash-dump FILES
             # too): nothing below it, its own path was already matched above, as before.
