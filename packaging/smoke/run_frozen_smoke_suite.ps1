@@ -304,13 +304,19 @@ disk_threshold_percent = 0.0
 "@
 Set-Content -Path (Join-Path $toastScratch 'config.toml') -Value $toastConfig -Encoding utf8
 
+# Since 1.4.0 the same command also takes a growth snapshot (budget 120 s plus index queries;
+# 157 s measured on the owner's machine with build 14), so 20 s timed out. 300 s covers it. The
+# snapshot goes to a store inside this scratch dir: without --growth-db it would write the
+# INSTALLED app's real growth history (data_root() is the exe's own folder when frozen).
+$toastTimeoutSeconds = 300
 try {
-    $toastRun = Invoke-FrozenExe -WorkingDirectory $toastScratch -TimeoutSeconds 20 -ArgumentList @(
-        'check-disk-space', '--config', 'config.toml', '--state', 'data\notification_state.json'
+    $toastRun = Invoke-FrozenExe -WorkingDirectory $toastScratch -TimeoutSeconds $toastTimeoutSeconds -ArgumentList @(
+        'check-disk-space', '--config', 'config.toml', '--state', 'data\notification_state.json',
+        '--growth-db', (Join-Path $toastScratch 'data\growth.sqlite3')
     )
     if ($toastRun.TimedOut) {
         Add-Result -Id '3-toast-codepath' -Name 'Disk-space toast (real code path)' -Result 'BLOCKED' `
-            -Detail "reclaim check-disk-space did not exit within 20s -- cannot determine outcome."
+            -Detail "reclaim check-disk-space did not exit within ${toastTimeoutSeconds}s -- cannot determine outcome."
     } elseif ($toastRun.ExitCode -ne 0) {
         Add-Result -Id '3-toast-codepath' -Name 'Disk-space toast (real code path)' -Result 'FAIL' `
             -Detail "reclaim check-disk-space exited $($toastRun.ExitCode) (expected 0 -- this command is documented to never raise). stderr: $($toastRun.StdErr.Substring(0, [Math]::Min(500, $toastRun.StdErr.Length)))"
