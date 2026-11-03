@@ -93,9 +93,10 @@ nothing is tagged or published yet.
 ### Fixed
 
 - The 4-hourly disk-space task could be stopped by its 2-minute limit while taking the growth
-  snapshot, so the 80 % low-disk alert and the snapshot never ran (on a real machine the command
-  took 157 s with that machine's config, the observed task run ended 0x41306, terminated, and the
-  growth store held no snapshot from the runs since the install). The check and
+  snapshot. A due snapshot is never stored, so every run after that was stopped before the 80 %
+  low-disk check (on a real machine the command took 157 s with that machine's config, and the
+  observed task run ended 0x41306, terminated). Found on a pre-release build; no released
+  version took this snapshot. The check and
   its toast now run first, and the task's time limit is 10 minutes. A test fails if the limit
   ever drops below the snapshot budget plus 5 minutes.
 - Apply skips a file whose size or mtime changed since the scan and re-stats before every
