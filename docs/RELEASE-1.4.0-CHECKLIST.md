@@ -30,8 +30,8 @@ Recorded 3 Nov 2026 (IST). Every number comes from a command run on this build, 
 | 15 | Agent Leftovers apply through the CLI by path | PASS (dry run) |
 | 16 | Apply and restore on the installed build | PASS via frozen suite check 7; the by-path apply was not repeated |
 
-**Verdict: not releasable as built.** Row 9b is a real defect in 1.4.0 (below): on this machine the
-low-disk alert and the growth snapshot never complete under Task Scheduler. #248 fixes it; build 15
+**Verdict: not releasable as built.** Row 9b is a real defect in 1.4.0 (below): whenever a growth snapshot
+is due, Task Scheduler kills the run before the low-disk check. #248 fixes it; build 15
 from main after #248 (and #249) must repeat rows 1-9b and run 10-12. Row 13 is the owner's.
 
 ## 1-2. Source and build — PASS
@@ -104,11 +104,15 @@ defaults apply (alert off, collection on), as the owner decided on 2 Nov.
 - VERIFIED: the installed command with the real config, a scratch `--state` and a scratch
   `--growth-db` took **157.1 s**; the snapshot hit its budget after 4 cache roots (`complete=0`).
 - VERIFIED: the task's observed run (06:51:46) ended `0x41306` (terminated by the time limit).
-- VERIFIED: the real growth store held no snapshot before 06:52 on 3 Nov; its one snapshot came
-  from my manual repro (scratch config), not from any scheduled run since build 13 was installed on
-  1 Nov 04:55. BELIEVED: every scheduled run since then was killed (Task Scheduler history is off).
-- Consequence: the low-disk backstop has not been running on this machine (C: is at 79.3 %), and no
-  growth history accrues for the December re-evaluation.
+- Scope (corrected by the fact-check): the defect is new in build 14. Build 13 (`519a9c9`) never took
+  a scheduled snapshot: `75a4cd9` (snapshot in the 4-hourly task) is not its ancestor. Its checks
+  ran on every slot: `data\logs\reclaim.log` has `notifications.check_no_notify` at each
+  03:30/07:30/11:30/15:30/19:30/23:30Z slot from 1 to 3 Nov. That is why the growth store was
+  empty before 06:52 on 3 Nov, not killed runs.
+- On build 14: the first run (06:51:46 IST) was due, killed, and logged no check. The 09:00 run was
+  `not_due` (my repro had stored a snapshot at 06:52) and completed (`0x0`, check logged 03:30Z).
+  From the 13:00 run on, every run is due again and is killed before the 80 % check, until a
+  build with #248 is installed. Installed build 14 is in that state now.
 - #248: the check and its toast run first, the limit is PT10M (re-registered on every install), and a
   test pins the limit at least 5 min above the snapshot budget. Verifier: no defect.
 

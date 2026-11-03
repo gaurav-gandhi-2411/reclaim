@@ -226,7 +226,7 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
       - the disk-space task's limit was PT2M;
       - `check-disk-space` took 157.1 s with the real config, because the growth snapshot ran first;
       - the observed task run ended `0x41306` (terminated).
-      So the 80 % alert and the snapshot never completed on this machine, and the growth store held no scheduled snapshot since 1 Nov.
+      The defect is new in build 14: build 13 never took a scheduled snapshot, and its checks ran on every slot. Build 14's first run was killed before the check. From the 13:00 run on, every due run is killed until build 15 (with #248) is installed.
     - #249 fixes the frozen suite's check 3. It timed out at 20 s, and it wrote the real growth store. Self-merged as `6742a84`.
     - Rows 10-12 (scan, warm-up, soak) are deferred to build 15, the build that can ship.
     - The b14 clone has been deleted (check first, then the delete).
@@ -236,11 +236,11 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     - Drafts for the next release PR: #244, #246 and #247.
   - **Next:** build 15 from main `6742a84`, launched as job `build15-6742a84`. Clone `%TEMP%\claude\reclaim\20261103\b15`; the real ONNX files were copied in after their SHA-256 matched the LFS oids. Then install it, re-run every row (10-12 included), and update the Row 13 installer and hash.
   - **Next release PR candidates** (each a delete-path guard change, gate 4):
-    - #244: the growth volume baseline, retargeted to main and merged up, `17179f2`. It must also update the Settings limits text and the ADR-0046 addendum.
+    - #244 (draft): the growth volume baseline, retargeted to main and merged up with it, head `17179f2`. It must also update the Settings limits text and the ADR-0046 addendum.
     - #246: S4 skips only our own pid (DECISIONS 22).
     - #247: no git in a worktree's main repository holding an excluded project, plus junction targets (DECISIONS 21). This corrects 1.4.0's "including through a junction" claim for Agent Leftovers: Git for Windows reads through junctions.
   - **Scheduled: around early December 2026, re-evaluate the growth alert rule on about 4 weeks of real snapshot history** from `data\growth.sqlite3` on GG's machine.
-    - Real history only starts accruing once a build with #248 is installed; until then the task is killed mid-snapshot (row 9b). The 4 weeks count from that install. If build 15 is installed in early November, the date holds.
+    - Real history only starts accruing once a build with #248 is installed. Build 13 took no scheduled snapshots, and build 14 kills every due one (row 9b). The 4 weeks count from that install. If build 15 is installed in early November, the date holds.
     - The store's one snapshot before that (3 Nov 06:52, partial) came from my repro with a scratch config. Leave it out of the evaluation.
     - Measure precision, recall and the false-alarm rate against the events in the logs, with #244's rule and main's rule side by side.
     - Only then propose making the alert on by default. Until then it stays off (ADR-0046 addendum 2026-11-02).
@@ -250,7 +250,7 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
     3. **Review the drafts for the next weekly release PR:** #244 (growth volume baseline), #246 (S4 own pid) and #247. Each is a delete-path guard change (gate 4).
     4. **Row 13, the isolated-profile install (steps below).**
     5. **Optional cleanup** that the permission layer kept from me:
-       - `%TEMP%\claude\reclaim\20261103\tree\` holds 50 dirs and 0 links, all made by the #247 executor. Delete only `tree\`: that parent folder also holds scratch I still use.
+       - `%TEMP%\claude\reclaim\20261103\tree\` holds 50 top-level dirs (550 dirs and 49,500 files in all) and 0 links, all made by the #247 executor. Delete only `tree\`: that parent folder also holds scratch I still use.
        - Verifier scratch `v245`, `v246` and `v247` in this session's scratchpad.
 
     **Row 13 steps:**
@@ -270,14 +270,14 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
          3. Open **PowerShell** (not as admin). First run this check and read what it prints:
             ```powershell
             Test-Path "$env:LOCALAPPDATA\Programs\Reclaim"
-            Get-ScheduledTask | Where-Object TaskName -like 'Reclaim*' | Select-Object TaskName, State
+            Get-ScheduledTask | Where-Object { $_.TaskName -like '*(ReclaimSmokeTest)' -or $_.TaskName -eq 'Reclaim Disk Space Check' } | Select-Object TaskName, State
             Test-Path 'HKCU:\Software\Classes\reclaim-notify'
             Test-Path 'HKCU:\Software\Classes\AppUserModelId\Reclaim.DiskCleanup'
             Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Filter 'Reclaim*' -ErrorAction SilentlyContinue
             ```
          4. Then, as a **separate** step, remove only what step 3 showed:
             - the folder: `Remove-Item -LiteralPath "$env:LOCALAPPDATA\Programs\Reclaim" -Recurse -Force`
-            - each task: `Unregister-ScheduledTask -TaskName '<name from step 3>' -Confirm:$false`. The usual names are `Reclaim Disk Space Check (ReclaimSmokeTest)`, `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)`, and the old `Reclaim Disk Space Check`.
+            - each task, by its exact name from step 3, and never a task ending in `(gaura)` or starting `ReclaimJob-`/`ReclaimAutoResume` (those are yours): `Unregister-ScheduledTask -TaskName '<name from step 3>' -Confirm:$false`. The usual names are `Reclaim Disk Space Check (ReclaimSmokeTest)`, `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)`, and the old `Reclaim Disk Space Check`.
             - the keys: `Remove-Item 'HKCU:\Software\Classes\reclaim-notify' -Recurse` and `Remove-Item 'HKCU:\Software\Classes\AppUserModelId\Reclaim.DiskCleanup' -Recurse`
             - the Start menu entry: `Remove-Item -LiteralPath "<path from step 3>" -Recurse`
          5. Run step 3 again. Every line should print `False` or nothing. That is the clean starting point.
@@ -294,11 +294,11 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
          - [ ] Agent Leftovers is off in safe mode (its category is not offered).
          - [ ] Move to Another Drive works on a throwaway folder. Create `C:\Users\ReclaimSmokeTest\Documents\movetest` with a few files, move it to `D:`, open it through the junction, then roll back.
          - [ ] Settings → assistant setup text is shown and copyable.
-         - [ ] Settings → **Low disk space alert** on: a task `Reclaim Disk Space Check (ReclaimSmokeTest)` appears in Task Scheduler. Turn it off: it stays registered (the growth snapshots use it), and `config.toml` shows `[notifications] enabled = false`.
-         - [ ] Settings → **Weekly cache clean** on: a `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)` task appears. Off: it is removed.
+         - [ ] A task `Reclaim Disk Space Check (ReclaimSmokeTest)` exists right after the install (the installer registers it, not the toggle). Settings → **Low disk space alert** off: the task stays registered (the growth snapshots use it), and `config.toml` shows `[notifications] enabled = false`; on again: `true`.
+         - [ ] Settings → **Weekly cache clean** ("Clean my regenerable caches weekly") on: a `Reclaim Weekly Auto-Clean (ReclaimSmokeTest)` task appears. Off: it is removed.
          - [ ] Settings → **Disk growth alert** shows **Off** by default with the limits text. Turn it on, then off; `config.toml` gains `[growth] alert_enabled = true`, then `false`.
          - [ ] Overview: run a scan, apply one small Recycle Bin item (safe mode), then **Undo/restore** it. The file is back.
-         - [ ] "What changed" (Advanced) and the one-line summary (Simple) show either data or a plain "not enough history yet" state, not an error.
+         - [ ] "What changed" (Advanced) and the one-line summary (Simple) show either data or "Not enough snapshots yet" (Simple: "Disk growth: not enough snapshots yet."), not an error.
 
       E. **Uninstall:** Settings → Apps → Reclaim → Uninstall, and answer **No** to "Also delete this data folder now?" (the default). Expect:
          - `%LOCALAPPDATA%\Programs\Reclaim\data` and `config.toml` remain;
