@@ -227,10 +227,14 @@ Authority: `docs/specs/autonomous-run-2026-10.md` (below CLAUDE.md safety rules,
       - `check-disk-space` took 157.1 s with the real config, because the growth snapshot ran first;
       - the observed task run ended `0x41306` (terminated).
       So the 80 % alert and the snapshot never completed on this machine, and the growth store held no scheduled snapshot since 1 Nov.
-    - #249 fixes the frozen suite's check 3. It timed out at 20 s, and it wrote the real growth store.
+    - #249 fixes the frozen suite's check 3. It timed out at 20 s, and it wrote the real growth store. Self-merged as `6742a84`.
     - Rows 10-12 (scan, warm-up, soak) are deferred to build 15, the build that can ship.
     - The b14 clone has been deleted (check first, then the delete).
-  - **Next:** build 15 from main once #249 has merged. Install it, then re-run every row, 10-12 included.
+  - **MERGE LOG (2-3 Nov):**
+    - Self-merged: #241 `a785fc0`, #243 `80d213c`, #242 `7c7cb53`, #245 `e14a42e`, #248 `e2246cf` and #249 `6742a84`.
+    - GG merged #240 `ccb0614`.
+    - Drafts for the next release PR: #244, #246 and #247.
+  - **Next:** build 15 from main `6742a84`, launched as job `build15-6742a84`. Clone `%TEMP%\claude\reclaim\20261103\b15`; the real ONNX files were copied in after their SHA-256 matched the LFS oids. Then install it, re-run every row (10-12 included), and update the Row 13 installer and hash.
   - **Next release PR candidates** (each a delete-path guard change, gate 4):
     - #244: the growth volume baseline, retargeted to main and merged up, `17179f2`. It must also update the Settings limits text and the ADR-0046 addendum.
     - #246: S4 skips only our own pid (DECISIONS 22).
