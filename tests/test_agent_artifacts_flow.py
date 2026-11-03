@@ -259,7 +259,9 @@ def test_a_failed_prune_does_not_fail_the_vaulted_item(
         return real(args, cwd)  # type: ignore[arg-type]
 
     monkeypatch.setattr(aa, "run_git", run)
-    monkeypatch.setattr(aa, "after_vault_move", lambda o, v, r=run: _orig_after(o, v, r))
+    monkeypatch.setattr(
+        aa, "after_vault_move", lambda o, v, r=run, **kw: _orig_after(o, v, r, **kw)
+    )
     found = _detect(setup)
     report = _apply(setup, [found[aa.CAT_WORKTREE]])
     assert report.files_succeeded == 1
@@ -267,6 +269,10 @@ def test_a_failed_prune_does_not_fail_the_vaulted_item(
 
 
 _orig_after = aa.after_vault_move
+
+
+def _FREE(_repo: Path) -> bool:  # constant-like guard: no repository is excluded
+    return False
 
 
 # --- the scan-time verdict is never trusted ------------------------------------------------------
@@ -558,7 +564,7 @@ def test_review_a_a_pointer_to_someone_elses_admin_dir_is_not_removed(
     pointer.write_bytes(("gitdir: " + victim_admin.as_posix() + chr(10)).encode("utf-8"))
     vaulted = tmp_path / "vaulted-copy"
     shutil.copytree(setup.wt, vaulted)
-    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, vaulted)
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, vaulted, repo_excluded=_FREE)
     assert note is not None and "belongs to another path" in note
     assert victim_admin.is_dir()
 
@@ -621,7 +627,7 @@ def test_review_a_the_move_note_names_what_happened_when_prune_is_not_needed(set
     moved = setup.vault / "manual"
     moved.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(setup.wt), str(moved))
-    assert aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved) is None
+    assert aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, repo_excluded=_FREE) is None
     assert not worktree_listed(setup.repo, setup.wt)
 
 
@@ -634,7 +640,7 @@ def test_survivor_b11_after_restore_says_when_the_repository_is_no_longer_there(
     assert vaulted is not None
     shutil.move(str(vaulted), str(setup.wt))  # put the directory back by hand
     setup.repo.rename(setup.repo.parent / "proj-gone")
-    note = aa.after_restore(setup.wt)
+    note = aa.after_restore(setup.wt, repo_excluded=_FREE)
     assert note is not None and "no longer at" in note
     assert not setup.repo.exists()
 
@@ -655,7 +661,7 @@ def test_survivor_b17_after_vault_move_notices_if_git_still_lists_the_worktree(
     moved = setup.vault / "manual"
     moved.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(setup.wt), str(moved))
-    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, lying)
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, lying, repo_excluded=_FREE)
     assert note is not None and "still lists the worktree" in note
 
 
@@ -682,7 +688,7 @@ def test_review_a3_restore_never_takes_over_a_newer_worktree_that_reused_the_adm
     assert worktree_listed(setup.repo, newer)
     assert "A  staged.txt" in git(newer, "status", "--porcelain").stdout
     assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()  # kept for a manual repair
-    note = aa.after_restore(setup.wt)
+    note = aa.after_restore(setup.wt, repo_excluded=_FREE)
     assert note is not None and "belongs to another worktree" in note
 
 
@@ -699,7 +705,7 @@ def test_review_a3b_restore_treats_an_admin_dir_without_a_readable_owner_as_not_
     meta = (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").read_text(encoding="utf-8")
     admin = Path(json.loads(meta)["admin"])
     admin.mkdir(parents=True)  # present, but no `gitdir` file to say whose it is
-    note = aa.after_restore(setup.wt)
+    note = aa.after_restore(setup.wt, repo_excluded=_FREE)
     assert note is not None and "belongs to another worktree" in note
     assert list(admin.iterdir()) == []  # nothing was copied into it
     assert (setup.wt / aa.ADMIN_BACKUP_DIR / "meta.json").is_file()
@@ -715,7 +721,7 @@ def test_review_a3b_a_commit_made_after_the_proof_keeps_the_admin_entry(setup: S
     commit_file(setup.wt, "late.txt", "written after the proof\n", "late commit")
     late = git(setup.wt, "rev-parse", "HEAD").stdout.strip()
     shutil.move(str(setup.wt), str(moved))
-    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved)
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, repo_excluded=_FREE)
     assert note is not None and "admin entry was kept" in note
     admin = setup.repo / ".git" / "worktrees" / setup.wt.name
     assert (admin / "HEAD").read_text(encoding="utf-8").strip() == late
@@ -775,7 +781,7 @@ def test_review_a3b_restore_refuses_an_admin_dir_with_our_head_but_no_owner(setu
     admin = Path(json.loads((backup / "meta.json").read_text(encoding="utf-8"))["admin"])
     admin.mkdir(parents=True)
     shutil.copyfile(backup / "admin" / "HEAD", admin / "HEAD")  # same HEAD, no `gitdir`
-    note = aa.after_restore(setup.wt)
+    note = aa.after_restore(setup.wt, repo_excluded=_FREE)
     assert note is not None and "belongs to another worktree" in note
     assert sorted(p.name for p in admin.iterdir()) == ["HEAD"]  # nothing was copied into it
     assert (backup / "meta.json").is_file()
@@ -790,7 +796,7 @@ def test_review_a3b_after_vault_move_keeps_an_admin_entry_with_no_readable_owner
     moved.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(setup.wt), str(moved))
     (admin / "gitdir").unlink()
-    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved)
+    note = aa.after_vault_move(found[aa.CAT_WORKTREE].path, moved, repo_excluded=_FREE)
     assert note is not None and "belongs to another path" in note
     assert (admin / "HEAD").is_file()
     assert not (moved / aa.ADMIN_BACKUP_DIR).exists()

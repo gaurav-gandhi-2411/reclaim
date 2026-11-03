@@ -2107,7 +2107,9 @@ def apply_batch(
             _append_and_sync(manifest_fh, done_entry)
             if item_method == "vault" and candidate.category == agent_artifacts.CAT_WORKTREE:
                 note = agent_artifacts.after_vault_move(
-                    candidate.path, _require_vault_path(vault_path)
+                    candidate.path,
+                    _require_vault_path(vault_path),
+                    repo_excluded=agent_artifacts.repo_guard(safety),
                 )
                 if note is not None:
                     logger.warning(
@@ -2556,7 +2558,9 @@ def restore_batch(
                 ),
             )
             if entry.category == agent_artifacts.CAT_WORKTREE:
-                note = agent_artifacts.after_restore(entry.original_path)
+                note = agent_artifacts.after_restore(
+                    entry.original_path, repo_excluded=agent_artifacts.repo_guard(safety)
+                )
                 if note is not None:
                     logger.warning(
                         "executor.agent_worktree_repair_note",

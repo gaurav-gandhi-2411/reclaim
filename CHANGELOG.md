@@ -11,6 +11,31 @@ default for every fresh install in every release below. One exception from 1.4.0
 clean and the weekly cache clean (ADR-0034) run each tool's own cleaning command on the
 regenerable-cache list, in safe mode, without a review step and not through the Recycle Bin.
 
+## Unreleased
+
+### Security
+
+- Agent Leftovers walks a worktree's main repository for excluded projects too, before any
+  git command runs in it (#239 walked only the worktree). The walk is answered once per
+  repository per run, fails closed, and also guards the git bookkeeping after a vault move and
+  after an undo.
+- Agent Leftovers' exclusion walk now also matches the real target of every junction it meets.
+  Git for Windows lists a junction's content as the repository's own, so a junction pointing
+  straight at an excluded project (no excluded name under the junction itself) let git read
+  it. 1.4.0's "including through a junction" (#239) held for the scanner, but in Agent
+  Leftovers only when an excluded name appeared inside the junction's target.
+  Content below a junction is matched under both the junction's own path and the target's real
+  path, so a `[safety] deny` glob or regex that names content through a junction path still
+  protects it (the junction-target mode is a strict superset of the plain walk). This also
+  closes the same gap in the scanner's "no git inside an excluded project" check, where only
+  the target's real path was matched below a junction. A junction chain that would need more
+  than 8 path spellings for one directory fails closed.
+- Agent Leftovers' bookkeeping guard after a vault move or an undo now also checks the main
+  repository's own git directory the way detection does: `objects/info/alternates`, a
+  commondir, `core.worktree`, remote URLs and a `.git` pointer file naming an excluded
+  project. Before, a repository that borrowed an excluded project beside it (not beneath it)
+  still had `git rev-list` run in it.
+
 ## [1.4.0] - unreleased
 
 1.4.0 is everything merged to `main` since v1.3.0, including PR #199 (merged 1 Nov 2026:
