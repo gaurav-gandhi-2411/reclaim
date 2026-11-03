@@ -1116,7 +1116,9 @@ def repo_guard(safety: SafetyValidator) -> Callable[[Path], bool]:
     """For code that has no `AgentEnv` (the vault bookkeeping after a move or a restore): returns
     `blocked(repo)`, True when git must NOT be started in `repo` because the repository is, is
     inside, or holds anywhere beneath it an excluded project. Path strings (and the real
-    location) first, then the name-only subtree walk; a walk that fails counts as blocked."""
+    location) first, then the repository's own git dir (`_nested_git_excluded`, as the scanner
+    applies it to a repository root: alternates, commondir, core.worktree, remote URLs, a `.git`
+    pointer file), then the name-only subtree walk; anything that fails counts as blocked."""
     patterns = safety.exclusion_patterns
 
     def blocked(repo: Path) -> bool:
@@ -1124,6 +1126,8 @@ def repo_guard(safety: SafetyValidator) -> Callable[[Path], bool]:
         if _path_excluded(view, repo):
             return True
         try:
+            if _nested_git_excluded(view, repo / ".git"):
+                return True
             return (
                 safety.exclusion_match(repo, is_dir=True, match_junction_targets=True) is not None
             )

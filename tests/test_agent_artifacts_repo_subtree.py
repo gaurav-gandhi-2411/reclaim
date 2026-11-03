@@ -263,3 +263,149 @@ def test_worktree_junction_straight_to_a_protected_directory(tmp_path: Path) -> 
     assert verdict.excluded and verdict.failed_rule == "W7"
     assert run.calls == []  # excluded BEFORE any git: git status would read through the link
     assert (target / "src.txt").is_file()
+
+
+# --- the git dir of the main repository (#247 verifier F2) -------------------------------------
+# `repo_guard` checked path strings and the subtree walk only, so a main repository that BORROWS
+# an excluded project through its git dir (the project sits beside it, not beneath) still got git.
+
+
+class _Recorder:
+    """A `GitRunner` that records every call and never runs git."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], Path]] = []
+
+    def __call__(self, args: Sequence[str], cwd: Path) -> aa.GitResult:
+        self.calls.append((tuple(args), cwd))
+        return aa.GitResult(1, "")
+
+
+def _borrow_alternates(repo: Path, project: Path) -> None:
+    info = repo / ".git" / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(f"{project / '.git' / 'objects'}\n", encoding="utf-8")
+
+
+def _borrow_commondir(repo: Path, project: Path) -> None:
+    (repo / ".git" / "commondir").write_text(f"{project / '.git'}\n", encoding="utf-8")
+
+
+def _borrow_core_worktree(repo: Path, project: Path) -> None:
+    config = repo / ".git" / "config"
+    text = config.read_text(encoding="utf-8")
+    config.write_text(f"{text}[core]\n\tworktree = {project.as_posix()}\n", encoding="utf-8")
+
+
+_BORROWS = {
+    "alternates": _borrow_alternates,
+    "commondir": _borrow_commondir,
+    "core_worktree": _borrow_core_worktree,
+}
+
+
+def _borrowing_repo(tmp_path: Path, how: str, run: aa.GitRunner) -> tuple[Path, Path, Path, World]:
+    repo = make_repo(tmp_path, "proj")
+    wt = add_worktree(repo, "proj-wt-feat", "feat")
+    project = tmp_path / f"{_NAME}-proj"  # beside the repository, not beneath it
+    (project / ".git" / "objects").mkdir(parents=True)
+    _BORROWS[how](repo, project)
+    world = make_world(tmp_path, exclusions=(_NAME,), run=run)
+    vaulted = world.vault / "item"
+    vaulted.parent.mkdir(parents=True)
+    wt.rename(vaulted)
+    return repo, wt, vaulted, world
+
+
+@pytest.mark.parametrize("how", sorted(_BORROWS))
+def test_guard_blocks_a_repo_whose_git_dir_borrows_a_protected_project(
+    tmp_path: Path, how: str
+) -> None:
+    run = _Recorder()
+    repo, _wt, _vaulted, world = _borrowing_repo(tmp_path, how, run)
+
+    assert aa.repo_guard(world.safety)(repo) is True
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("how", sorted(_BORROWS))
+def test_after_vault_move_runs_no_git_in_a_repo_borrowing_a_protected_project(
+    tmp_path: Path, how: str
+) -> None:
+    run = _Recorder()
+    repo, wt, vaulted, world = _borrowing_repo(tmp_path, how, run)
+
+    note = aa.after_vault_move(wt, vaulted, run, repo_excluded=aa.repo_guard(world.safety))
+
+    assert note is not None and "excluded project" in note
+    assert run.calls == []
+    assert any((repo / ".git" / "worktrees").iterdir())  # the admin entry was kept
+
+
+@pytest.mark.parametrize("how", sorted(_BORROWS))
+def test_after_restore_runs_no_git_in_a_repo_borrowing_a_protected_project(
+    tmp_path: Path, how: str
+) -> None:
+    run = _Recorder()
+    repo, wt, vaulted, world = _borrowing_repo(tmp_path, how, run)
+    backup = vaulted / aa.ADMIN_BACKUP_DIR
+    (backup / "admin").mkdir(parents=True)
+    admin = next((repo / ".git" / "worktrees").iterdir())
+    meta = {"original_path": str(wt), "repo_root": str(repo), "admin": str(admin)}
+    (backup / "meta.json").write_text(
+        json.dumps({**meta, "root_commits": ["deadbeef"]}), encoding="utf-8"
+    )
+
+    note = aa.after_restore(vaulted, run, repo_excluded=aa.repo_guard(world.safety))
+
+    assert note is not None and "excluded project" in note
+    assert run.calls == []  # no `rev-list --max-parents=0 --all`
+    assert backup.exists()
+
+
+@pytest.mark.parametrize("pointer", ["not a pointer\n", "gitdir: {project}/.git\n"])
+def test_guard_blocks_a_repo_whose_git_pointer_is_unparseable_or_names_a_protected_project(
+    tmp_path: Path, pointer: str
+) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    repo = tmp_path / "plain"
+    repo.mkdir()
+    project = tmp_path / f"{_NAME}-proj"
+    (project / ".git").mkdir(parents=True)
+    (repo / ".git").write_text(pointer.format(project=project.as_posix()), encoding="utf-8")
+
+    assert aa.repo_guard(world.safety)(repo) is True  # nothing proves the pointer is harmless
+
+
+# --- the junction flag cannot be turned off quietly (#247 verifier: thin tests) ---------------
+
+
+def test_guard_passes_the_junction_flag_to_the_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    repo = make_repo(tmp_path, "proj")
+    seen: list[bool] = []
+
+    def spy(path: object, *, is_dir: bool, match_junction_targets: bool = False) -> None:
+        seen.append(match_junction_targets)
+
+    monkeypatch.setattr(world.safety, "exclusion_match", spy)
+
+    assert aa.repo_guard(world.safety)(repo) is False
+    assert seen == [True]
+
+
+def test_env_passes_the_junction_flag_to_the_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    seen: list[bool] = []
+
+    def spy(path: object, *, is_dir: bool, match_junction_targets: bool = False) -> None:
+        seen.append(match_junction_targets)
+
+    monkeypatch.setattr(world.safety, "exclusion_match", spy)
+
+    assert world.env.exclusion_match(tmp_path, True) is None
+    assert seen == [True]
