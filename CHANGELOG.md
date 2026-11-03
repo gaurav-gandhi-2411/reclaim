@@ -24,6 +24,17 @@ regenerable-cache list, in safe mode, without a review step and not through the 
   straight at an excluded project (no excluded name under the junction itself) let git read
   it. 1.4.0's "including through a junction" (#239) held for the scanner, but in Agent
   Leftovers only when an excluded name appeared inside the junction's target.
+  Content below a junction is matched under both the junction's own path and the target's real
+  path, so a `[safety] deny` glob or regex that names content through a junction path still
+  protects it (the junction-target mode is a strict superset of the plain walk). This also
+  closes the same gap in the scanner's "no git inside an excluded project" check, where only
+  the target's real path was matched below a junction. A junction chain that would need more
+  than 8 path spellings for one directory fails closed.
+- Agent Leftovers' bookkeeping guard after a vault move or an undo now also checks the main
+  repository's own git directory the way detection does: `objects/info/alternates`, a
+  commondir, `core.worktree`, remote URLs and a `.git` pointer file naming an excluded
+  project. Before, a repository that borrowed an excluded project beside it (not beneath it)
+  still had `git rev-list` run in it.
 
 ## [1.4.0] - unreleased
 
