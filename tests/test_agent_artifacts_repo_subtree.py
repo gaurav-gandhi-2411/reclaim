@@ -409,3 +409,45 @@ def test_env_passes_the_junction_flag_to_the_walk(
 
     assert world.env.exclusion_match(tmp_path, True) is None
     assert seen == [True]
+
+
+# --- a missing or unreadable .git never counts as harmless (data-safety pass, mutant M7) -------
+
+
+def test_nested_git_excluded_is_true_when_there_is_no_git_entry(tmp_path: Path) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    assert aa._nested_git_excluded(world.env, plain / ".git") is True
+    assert aa._nested_git_excluded(world.env, tmp_path / "nowhere" / ".git") is True
+
+
+def test_repo_guard_blocks_a_directory_without_git_and_a_nonexistent_path(tmp_path: Path) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    blocked = aa.repo_guard(world.safety)
+
+    assert blocked(plain) is True  # nothing proves it is not a protected repository
+    assert blocked(tmp_path / "nowhere") is True
+
+
+def test_an_unreadable_git_pointer_file_counts_as_excluded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = make_world(tmp_path, exclusions=(_NAME,))
+    repo = tmp_path / "plain"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def failing(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == ".git":
+            raise PermissionError("denied")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", failing)
+
+    assert aa._nested_git_excluded(world.env, repo / ".git") is True
+    assert aa.repo_guard(world.safety)(repo) is True

@@ -159,3 +159,58 @@ def test_too_many_path_aliases_fails_closed(
     assert result.startswith(UNREADABLE_PREFIX)
     assert "too many aliases" in result
     assert repo.name in result
+
+
+def test_exactly_the_bound_of_aliases_does_not_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins `>` (not `>=`): one hop gives exactly 2 texts, so a bound of 2 passes and 1 fails."""
+    repo = _linked_tree(tmp_path)
+    try:
+        monkeypatch.setattr(safety, "_MAX_PATH_ALIASES", 2)
+        on_edge = subtree_exclusion_match(repo, ["*nomatch*"], match_junction_targets=True)
+        monkeypatch.setattr(safety, "_MAX_PATH_ALIASES", 1)
+        over_edge = subtree_exclusion_match(repo, ["*nomatch*"], match_junction_targets=True)
+    finally:
+        _drop_junctions(repo)
+
+    assert on_edge is None
+    assert over_edge is not None
+    assert over_edge.startswith(UNREADABLE_PREFIX)
+    assert "too many aliases" in over_edge
+
+
+def _junction_chain(tmp_path: Path, hops: int) -> Path:
+    """d0 holds j1 -> d1, d1 holds j2 -> d2, ...: each hop adds one path alias. Returns d0."""
+    dirs = [tmp_path / f"d{index}" for index in range(hops + 1)]
+    for directory in dirs:
+        directory.mkdir()
+    for index in range(hops):
+        make_junction(dirs[index] / f"j{index + 1}", dirs[index + 1])
+    return dirs[0]
+
+
+def _drop_chain(tmp_path: Path, hops: int) -> None:
+    for index in range(hops):
+        link = tmp_path / f"d{index}" / f"j{index + 1}"
+        if link.is_junction():
+            link.rmdir()  # the link only, never its target
+
+
+@pytest.mark.parametrize(("hops", "fails_closed"), [(7, False), (8, True)])
+def test_the_real_alias_bound_sits_between_seven_and_eight_junction_hops(
+    tmp_path: Path, hops: int, fails_closed: bool
+) -> None:
+    assert safety._MAX_PATH_ALIASES == 8
+    root = _junction_chain(tmp_path, hops)
+    try:
+        result = subtree_exclusion_match(root, ["*nomatch*"], match_junction_targets=True)
+    finally:
+        _drop_chain(tmp_path, hops)
+
+    if fails_closed:
+        assert result is not None
+        assert result.startswith(UNREADABLE_PREFIX)
+        assert "too many aliases" in result
+    else:
+        assert result is None
