@@ -1273,8 +1273,9 @@ def _run_check_disk_space(args: argparse.Namespace) -> int:
     growth_db: Path = args.growth_db or data_root() / "data" / "growth.sqlite3"
     # The low-disk check and its toast run BEFORE the growth snapshot: the 80 % alert is the
     # documented backstop and must never wait on growth IO, because the scheduler's time limit
-    # can kill this process mid-snapshot (measured 157 s against the old 2 min limit; the
-    # snapshot was never stored, so every run was killed). The toast's growth line reads the
+    # can kill this process mid-snapshot (measured 157 s against the old 2 min limit; a killed
+    # snapshot is never stored, so the next run is due and can be killed again). The toast's
+    # growth line reads the
     # history already stored, at most one interval stale. The snapshot never raises; with
     # `[growth] enabled = false` there is no growth IO at all.
     result = check_disk_space(config.notifications, state_path=state_path)
